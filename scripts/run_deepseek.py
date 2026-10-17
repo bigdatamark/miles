@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Launcher script (typer command line app) for GRPO reinforcement-learning training of the
+# DeepSeek-V3 family (full model, or the 5-layer / 20-layer pruned variants selected by a
+# "<N>layer" substring in the model name) on a colocated Megatron + SGLang setup.
+# Three commands are exposed: full-train (download, cast to bf16, convert to Megatron
+# checkpoint, then train), prepare (the first three steps only) and train (training only).
+# All work is delegated to the command utilities backend; this module only assembles shell
+# command lines and the long training argument string. Nothing is executed at import time
+# other than creating the typer app and one run id (a default field value).
 """
 This file is in preview, and will be further refined and optimized.
 """
@@ -15,6 +24,16 @@ app = typer.Typer()
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC]
+    # Command line options for this launcher, extending the shared train configuration (which
+    # supplies node count, output directory, backend creation, etc.).
+    # mode: "normal" or "debug_minimal" (debug mode shrinks response length to 100 and drops
+    # dynamic sampling and eval). run_id: default is generated once at import time.
+    # model_org / model_name / megatron_model_type: Hugging Face org, repo name and Megatron
+    # model type key. num_gpus_per_node defaults to 4. enable_eval toggles periodic evaluation.
+    # task: "dapo_aime" (DAPO math train data, AIME eval) or "gsm8k". extra_args: raw string
+    # appended to the training argument line. data_dir / model_dir: shared storage for datasets
+    # and checkpoints; model_local_dir: node-local copy target; megatron_path: Megatron checkout.
     mode: Literal["normal", "debug_minimal"] = "normal"
     run_id: str = command_utils.create_run_id()
     model_org: str = "deepseek-ai"
@@ -30,12 +49,20 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     megatron_path: str = "/root/Megatron-LM"
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # If the model name contains a number followed by "layer", switch the model org to the
+        # pruned-model publisher "fzyzcjy" and set the Megatron model type to the deepseek-v3
+        # type with that layer count suffix. Otherwise leaves all fields unchanged.
         if (m := re.search(r"(\d+)layer", self.model_name)) is not None:
             self.model_org = "fzyzcjy"
             self.megatron_model_type = f"deepseek-v3-{m.group(1)}layer"
 
 
 def _prepare_download(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Download step. Creates the model and data directories, downloads the
+    # Hugging Face model repo into the model directory under the model name, then downloads the
+    # datasets for the task (DAPO math plus AIME 2024 for "dapo_aime", GSM8K for "gsm8k").
+    # Side effects: runs CPU shell commands and dataset downloads through the backend.
     U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.model_dir} {args.data_dir}")
     U.exec_command_cpu(
@@ -50,6 +77,8 @@ def _prepare_download(args: ScriptArgs):
 
 
 def _prepare_bf16_ckpt(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Casts the downloaded fp8 checkpoint to bf16, writing it to a sibling
+    # directory named with a "-bf16" suffix under the model directory. Runs via the backend.
     U = args.create_backend()
     U.fp8_cast_bf16(
         path_src=f"{args.model_dir}/{args.model_name}",
@@ -58,6 +87,13 @@ def _prepare_bf16_ckpt(args: ScriptArgs):
 
 
 def _prepare_megatron_ckpt(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Converts the bf16 Hugging Face checkpoint into a Megatron distributed
+    # checkpoint written into the model directory. Parallelism flags depend on the model name:
+    # the 5-layer prune uses pipeline 1, expert 1, a single node and at most 4 GPUs; the 20-layer
+    # prune uses expert parallel 4 on 2 nodes (pipeline size chosen by the converter); every other
+    # model uses pipeline 8, expert 4 with 7 layers in the first and 6 in the last pipeline stage
+    # on multiple nodes (node count left unset). Tensor and expert-tensor parallel are always 1.
+    # Side effect: runs the conversion job through the backend.
     # TODO unify 5layer w/ 20layer, also maybe unify the whole script
     U = args.create_backend()
     extra_args = "--tensor-model-parallel-size 1 " "--expert-tensor-parallel-size 1 "
@@ -96,6 +132,10 @@ def _prepare_megatron_ckpt(args: ScriptArgs):
 
 
 def _prepare_cmd(args: ScriptArgs) -> dict[str, str]:
+    # [FUNCTION DOC] HELPER: Builds the per-role pre-launch commands. Returns a mapping with one
+    # entry, "trainer", whose value is two rsync copy commands (Megatron distributed checkpoint
+    # and the Hugging Face model, from the shared model directory to the node-local directory)
+    # joined so that the second runs only if the first succeeds. No side effects.
     copies = [
         command_utils.rsync_cmd(
             f"{args.model_dir}/{args.model_name}_torch_dist",
@@ -107,6 +147,23 @@ def _prepare_cmd(args: ScriptArgs) -> dict[str, str]:
 
 
 def _execute_train(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Assembles the full training argument string and submits the job.
+    # Groups: checkpoint (hf checkpoint and reference load from the local model directory, load and
+    # save under the output directory run folder, save every 20 steps), rollout (math reward, 3000
+    # rollouts, batch 128 prompts, 8 samples each, temperature 1; in non-debug mode over-sampling
+    # of 256 with a nonzero-reward-std dynamic filter; response length 100 in debug mode, 32768 for
+    # dapo_aime, 256 for gsm8k), eval (only if not debug and enabled; every 20 steps, top-p 1),
+    # parallelism (chosen by node count: up to 2 nodes, up to 4 nodes, or more; the largest tier
+    # uses pipeline 1 for the 5-layer model else 4, and adds a last-stage layer count of 13 unless
+    # the model name has a layer-count suffix; two tiers are marked as temporary configurations in
+    # the code), recompute full-uniform, dynamic batch size with a
+    # deliberately tiny 2048 tokens per GPU, GRPO with zero kl and entropy coefficients and
+    # asymmetric clipping, Adam at 1e-6, SGLang engine settings (world size 4 up to 4 nodes else
+    # 64; data-parallel attention size 1 or 8; expert parallel equal to world size; DeepEP low
+    # latency all-to-all; concurrency derived from a decode batch size of 256), and misc flags
+    # (dropout off, fp32 gradient accumulation, colocate, fault tolerance, dump details).
+    # Submits through the backend with an environment variable for the DeepEP dispatch token limit
+    # and the per-role copy commands.
     U = args.create_backend()
     load_save_path = f"{args.output_dir}/{args.run_id}/checkpoints"
     ckpt_args = (
@@ -314,6 +371,8 @@ def _execute_train(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def full_train(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] Command "full-train": runs download, bf16 cast, Megatron conversion, then
+    # training, in that order. Inputs come from the command line fields.
     _prepare_download(args)
     _prepare_bf16_ckpt(args)
     _prepare_megatron_ckpt(args)
@@ -323,6 +382,7 @@ def full_train(args: ScriptArgs) -> None:
 @app.command()
 @command_utils.dataclass_cli
 def prepare(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] Command "prepare": download, bf16 cast and Megatron conversion only; no training.
     _prepare_download(args)
     _prepare_bf16_ckpt(args)
     _prepare_megatron_ckpt(args)
@@ -331,11 +391,14 @@ def prepare(args: ScriptArgs) -> None:
 @app.command()
 @command_utils.dataclass_cli
 def train(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] Command "train": runs training only; assumes prepare has already been done.
     _execute_train(args)
 
 
 @app.callback()
 def _callback() -> None:
+    # [FUNCTION DOC] HELPER: Empty typer callback; exists so the app always treats commands as
+    # sub-commands even when only one is defined. Does nothing.
     pass
 
 

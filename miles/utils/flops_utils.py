@@ -1,15 +1,35 @@
+# [MODULE DOC]
+# Analytic forward-pass FLOPs model of a decoder-only transformer (dense or mixture-of-experts,
+# optionally multi-head latent attention), plus a converter from a huggingface style model config
+# to the argument namespace the model expects. All counts are multiply-add = 2 FLOPs per matrix
+# product element, per sequence, summed over a list of sequence lengths. Reports TFLOPs per gpu by
+# dividing by the world size and 1e12. Pure functions; no I/O.
 from types import SimpleNamespace
 
 
 def calculate_embedding_flops(seqlen, hidden_size):
+    # [FUNCTION DOC] FLOPs of an embedding step modelled as 2 times sequence length times hidden
+    # size.
+    # KNOWN ISSUE: not used by the forward FLOPs total in this module.
     return 2 * seqlen * hidden_size
 
 
 def calculate_lm_head_flops(seqlen, hidden_size, vocab_size):
+    # [FUNCTION DOC] FLOPs of the output projection to the vocabulary: 2 times sequence length times
+    # hidden size times vocabulary size.
     return 2 * seqlen * hidden_size * vocab_size
 
 
 def calculate_qkv_projection_flops(args, seqlen, hidden_size, num_attention_heads, num_query_groups):
+    # [FUNCTION DOC] FLOPs of the query, key and value projections of one layer. Query: without a
+    # query low-rank setting, 2 * seqlen * hidden * heads * kv channels; with it, the low-rank path
+    # 2 * seqlen * q rank * (hidden + heads * (qk head dim + qk positional head dim)). Key/value:
+    # without a kv low-rank setting, 2 (k and v) * 2 * seqlen * hidden * query groups * kv channels;
+    # with it, 2 * seqlen * (kv rank * (hidden + heads * (qk head dim + v head dim)) + hidden * qk
+    # positional head dim). Returns the sum.
+    # KNOWN ISSUE: the low-rank branches use the hidden size and head count from args while the
+    # dense branches use the function parameters; they agree only if the caller passes the same
+    # values.
     if args.q_lora_rank is None:
         q_flops = 2 * seqlen * hidden_size * num_attention_heads * args.kv_channels
     else:
@@ -36,6 +56,12 @@ def calculate_qkv_projection_flops(args, seqlen, hidden_size, num_attention_head
 
 
 def calculate_attention_flops(args, seqlen, num_attention_heads):
+    # [FUNCTION DOC] FLOPs of the attention score and value mixing of one layer. Score product
+    # (causal, hence the factor one half): 2 * heads * seqlen^2 * head dim / 2, where head dim is
+    # qk head dim plus qk positional head dim if the latter is non-zero, else kv channels. Value
+    # product: heads * seqlen^2 * (v head dim if set and non-zero, else kv channels), not halved.
+    # KNOWN ISSUE: the causal halving is applied to the score product only, not to the value
+    # product, so the value product counts the full square.
     # QK^T with causal
     if args.qk_pos_emb_head_dim:
         flops = 2 * num_attention_heads * seqlen * seqlen * (args.qk_head_dim + args.qk_pos_emb_head_dim) / 2
@@ -50,14 +76,20 @@ def calculate_attention_flops(args, seqlen, num_attention_heads):
 
 
 def calculate_output_flops(seqlen, hidden_size):
+    # [FUNCTION DOC] FLOPs of the attention output projection, modelled as a square hidden by hidden
+    # matrix: 2 * seqlen * hidden^2.
     return 2 * seqlen * hidden_size * hidden_size
 
 
 def calculate_mlp_flops(seqlen, hidden_size, ffn_hidden_size):
+    # [FUNCTION DOC] FLOPs of a gated feed-forward block with three matrices (gate, up, down):
+    # 2 * seqlen * hidden * ffn hidden * 3.
     return 2 * seqlen * hidden_size * ffn_hidden_size * 3
 
 
 def calculate_layer_flops(args, seqlen, hidden_size, num_attention_heads, num_query_groups, ffn_hidden_size):
+    # [FUNCTION DOC] FLOPs of one transformer layer: qkv projections plus attention plus output
+    # projection plus feed-forward with the given ffn width.
     return (
         calculate_qkv_projection_flops(args, seqlen, hidden_size, num_attention_heads, num_query_groups)
         + calculate_attention_flops(args, seqlen, num_attention_heads)
@@ -70,6 +102,14 @@ def calculate_fwd_flops(
     seqlens,
     args,
 ):
+    # [FUNCTION DOC] Total forward FLOPs for a list of sequence lengths. Layer split: without
+    # experts, all layers are dense. With experts, the MoE ffn width is the expert width times the
+    # router top-k plus the shared expert width (zero if absent or none). If a layer frequency
+    # attribute exists: for a list, layers with value zero are dense and positive ones are MoE; for
+    # an integer, layer indices divisible by it are MoE and the others dense. If the attribute is
+    # absent, all layers are MoE. Then for each sequence length: dense layer FLOPs times the dense
+    # layer count (if any), MoE layer FLOPs times the MoE layer count (if any), plus the language
+    # model head FLOPs. Returns the sum over sequences.
     hidden_size = args.hidden_size
     num_attention_heads = args.num_attention_heads
     num_query_groups = args.num_query_groups
@@ -131,10 +171,14 @@ def calculate_fwd_flops(
 
 
 def fwd_tflops_per_gpu(seqlens, args, world_size):
+    # [FUNCTION DOC] Forward FLOPs of the sequences divided evenly across the world size, in units
+    # of 1e12 (TFLOPs). Assumes perfect data/model parallel division.
     return calculate_fwd_flops(seqlens, args) / world_size / 1e12
 
 
 def _first(config, *names, default=None):
+    # [FUNCTION DOC] HELPER: Returns the first attribute among the names whose value is present and
+    # not none on the config; otherwise the default.
     for name in names:
         value = getattr(config, name, None)
         if value is not None:
@@ -143,6 +187,10 @@ def _first(config, *names, default=None):
 
 
 def _moe_layer_pattern(config, num_layers, num_experts):
+    # [FUNCTION DOC] HELPER: Per-layer list of zero (dense) or one (MoE). None when there are no
+    # experts. If the config has a first-k-dense setting, layers below k are dense and the rest MoE.
+    # Otherwise layers listed as mlp-only are dense, and among others a layer is MoE when its
+    # one-based index is divisible by the sparse step (default 1; a zero or none step counts as 1).
     if num_experts is None:
         return None
     first_dense = getattr(config, "first_k_dense_replace", None)
@@ -154,6 +202,17 @@ def _moe_layer_pattern(config, num_layers, num_experts):
 
 
 def flops_args_from_hf_config(config):
+    # [FUNCTION DOC] Converts a huggingface style model config into the simple namespace of fields
+    # the FLOPs functions read. Uses the text sub-config when the config offers one (via its getter
+    # or a text config attribute), else the config itself. Layer count comes from either the hidden
+    # layers or layers attribute (assertion error if neither). Expert count from the first present
+    # of routed experts, experts, local experts. Dense ffn width is the intermediate size; MoE ffn
+    # width is the MoE intermediate size, defaulting to the dense width when experts exist. Shared
+    # expert width is the explicit shared width, else shared expert count times the MoE width.
+    # Layer pattern from the pattern helper. Raises a value error if a needed ffn width (dense for
+    # dense layers, MoE for MoE layers) is missing. Other fields: query groups from key/value heads
+    # (default heads), kv channels from head dim (default hidden divided by heads), router top-k from
+    # experts per token or top-k (default 1), low-rank settings, and head dims (none become zero).
     getter = getattr(config, "get_text_config", None)
     config = (getter() if callable(getter) else getattr(config, "text_config", None)) or config
 

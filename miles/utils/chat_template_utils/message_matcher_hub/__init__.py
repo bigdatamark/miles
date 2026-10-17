@@ -1,3 +1,10 @@
+# [PACKAGE DOC] Message-level equivalence policies used to decide whether a message replayed by a
+# client equals the stored one in a session. Two modules: utils (matcher type alias, constants
+# and normalization helpers) and funcs (the three built-in matchers named strict,
+# loose_tool_call and role_content_only, the selector resolver that also accepts a dotted
+# import path, a runtime contract wrapper and the append-only history validator). This file
+# re-exports the public names; the package depends only on the standard library at import time.
+
 """Session message matching policies and selector resolution.
 
 Owns every message-level equivalence policy the session server can select

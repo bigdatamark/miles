@@ -1,3 +1,12 @@
+# [MODULE DOC] Pure policy layer for CI: converts trigger facts (event name, cron schedule, PR label
+# JSON, optional cadence override) into a cadence (regular, nightly, weekly, release), a set of
+# included test labels, and flags (admit nightly tests, bypass fast-fail, write the perf baseline,
+# arches to dispatch to, whether tests may leave their home stage). Also provides the label
+# normalization helpers, a registration-selection predicate, GitHub output file writing and a
+# command-line main driven entirely by environment variables, which on pull requests also asks the
+# stage-selection module which GPU stages can be skipped from the changed-file list. Constants
+# define cadence names, the schedule table (cron string to cadence and labels), workflow-only
+# labels and the Blackwell-only scope label.
 """Resolve CI cadence, scope, and fast-fail policy from explicit inputs."""
 
 import json
@@ -43,6 +52,11 @@ SCHEDULE_POLICIES: dict[str, tuple[str, tuple[str, ...]]] = {
 
 @dataclass(frozen=True)
 class RunPolicy:
+    # [CLASS DOC] Immutable resolved policy of one CI run: cadence name, the frozen set of domain
+    # labels whose tests are included, whether tests marked nightly are admitted, whether failures
+    # skip the fast-fail gate, whether the run writes the rolling performance baseline, the arches
+    # the run executes on (empty means each test uses its own default) and absorb (whether a test
+    # may execute outside its home stage; set only by an explicit run-on label).
     cadence: str
     include_labels: frozenset[str]
     admit_nightly_tests: bool
@@ -57,6 +71,8 @@ class RunPolicy:
 
 @dataclass(frozen=True)
 class WorkflowPolicy:
+    # [CLASS DOC] Immutable workflow-level outputs: cadence, the tuple of canonical raw labels,
+    # the bypass-fast-fail flag, and the tuple of GPU stage names to skip.
     cadence: str
     raw_labels: tuple[str, ...]
     bypass_fastfail: bool
@@ -64,6 +80,9 @@ class WorkflowPolicy:
 
 
 def strip_run_ci_prefix(raw_labels: Iterable[str]) -> set[str]:
+    # [FUNCTION DOC] Returns the set of labels with the run-ci prefix removed. Empty strings and
+    # workflow-only labels are skipped silently; any other label lacking the prefix is skipped with
+    # a warning (attributed to the caller). Pure apart from warnings.
     """Strip the `run-ci-` prefix from each PR-side label.
 
     Inputs are the canonical PR-side CI label names forwarded by the workflow
@@ -90,6 +109,18 @@ def strip_run_ci_prefix(raw_labels: Iterable[str]) -> set[str]:
 
 
 def resolve_policy(cadence: str, raw_labels: set[str]) -> RunPolicy:
+    # [FUNCTION DOC] Builds the run policy from a cadence name and a set of raw labels. Raises a
+    # value error for an unknown cadence, or when the nightly label is present but the cadence is
+    # not nightly. Requested domain labels are the prefix-stripped labels that are known labels.
+    # Scope (first matching branch): the run-ci-all label, or weekly or release cadence, gives all
+    # known labels; nightly gives all except long and ft-long; the Blackwell-only label gives all
+    # known labels (the arch is the selection); run-ci-image gives all except long, ft-short and
+    # ft-long; otherwise empty. Include labels are scope united with requested. Dispatch arches are
+    # the known arches that have a run-on label; absorb is true iff there are any; if none but the
+    # Blackwell-only label is present, dispatch arches become Blackwell alone with absorb false.
+    # Flags: nightly tests admitted for nightly, weekly, release; bypass fast-fail for those
+    # cadences or when the bypass label is present; the baseline is written only for nightly and
+    # weekly (not release).
     """Resolve selection and within-stage failure behavior from explicit inputs.
 
     The workflow adapter resolves trigger-specific facts into a cadence and
@@ -161,6 +192,9 @@ def registration_matches_selection(
     admit_nightly_tests: bool,
     include_labels: Iterable[str],
 ) -> bool:
+    # [FUNCTION DOC] Returns false if the registration is nightly-only and nightly tests are not
+    # admitted; otherwise true if the registration declares no labels (always on) or any of its
+    # labels is in the include set.
     """Return whether one registration is selected by cadence and labels."""
     if nightly and not admit_nightly_tests:
         return False
@@ -169,6 +203,10 @@ def registration_matches_selection(
 
 
 def _canonical_pr_labels(pr_labels_json: str) -> tuple[str, ...]:
+    # [FUNCTION DOC] HELPER: Parses a JSON array of strings and keeps, in order, the labels that
+    # are workflow-only labels or fully match the safe run-ci label pattern (alphanumeric start,
+    # then letters, digits, underscore, dot, dash). Raises a value error when the text is not valid
+    # JSON or not an array of strings.
     try:
         labels = json.loads(pr_labels_json)
     except json.JSONDecodeError as exc:
@@ -184,6 +222,12 @@ def _canonical_pr_labels(pr_labels_json: str) -> tuple[str, ...]:
 def resolve_workflow_inputs(
     event_name: str, schedule: str, pr_labels_json: str, cadence_override: str = ""
 ) -> WorkflowPolicy:
+    # [FUNCTION DOC] Maps trigger facts to a workflow policy. Precedence: a non-empty cadence
+    # override (no labels) wins; else a pull request event uses the canonical PR labels and gets
+    # nightly cadence if the nightly label is present, otherwise regular; a schedule event looks
+    # the cron string up in the schedule table (value error if absent); a manual dispatch is
+    # regular with no labels; any other event raises a value error. The bypass flag comes from
+    # resolving the run policy for that cadence and labels. Skipped stages are always empty here.
     """Adapt GitHub trigger facts to the workflow's stable policy outputs.
 
     `cadence_override` carries an explicit workflow_call cadence input (e.g. a
@@ -217,6 +261,10 @@ def resolve_workflow_inputs(
 
 
 def _write_github_outputs(policy: WorkflowPolicy, output_path: str) -> None:
+    # [FUNCTION DOC] HELPER: Appends key=value lines to the GitHub output file at the path: cadence,
+    # space-joined raw labels, bypass flag as lower-case true/false, skipped stages as compact JSON
+    # array, and needs_cuda_image (true iff some CUDA stage is not in the skipped list). Also prints
+    # a one-line summary to standard output. Side effect: file append (UTF-8).
     raw_labels = " ".join(policy.raw_labels)
     bypass_fastfail = str(policy.bypass_fastfail).lower()
     skipped_stages = json.dumps(policy.skipped_stages, separators=(",", ":"))
@@ -234,6 +282,15 @@ def _write_github_outputs(policy: WorkflowPolicy, output_path: str) -> None:
 
 
 def main() -> int:
+    # [FUNCTION DOC] Command-line entry returning an exit code; configured only through environment
+    # variables: event name (required, key error if missing), schedule, PR labels JSON, cadence
+    # override, changed-files path, and the output file path (required at the end). Resolves the
+    # workflow policy. For pull request events it additionally (imports deferred to here) reads the
+    # changed-file list (printing a notice if the diff is unavailable or empty, in which case all
+    # selected GPU stages count as affected), resolves the run policy, collects and sanity-checks
+    # all registered tests, asks stage selection which GPU stages to skip, and stores them in the
+    # policy. A value error anywhere in that block prints a GitHub error annotation to standard
+    # error and returns 1. On success writes the outputs and returns 0.
     try:
         event_name = os.environ["EVENT_NAME"]
         policy = resolve_workflow_inputs(

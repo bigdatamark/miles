@@ -1,3 +1,20 @@
+# [MODULE DOC] Token-in-token-out (TITO) tokenizers: one tokenizer class per model family, used to
+# extend an already tokenized conversation prefix (the assistant's generated token ids) with the
+# tokens of newly appended messages, without re-tokenizing the prefix.
+# Contents:
+#   - FixedTemplate: per-family record of the bundled fixed chat template file, the template kwargs
+#     the family forces, which roles may be appended, and which kwargs must stay as recorded.
+#   - TITOTokenizer: default implementation (request-argument resolution pipeline, chat template
+#     rendering, suffix-diff based incremental tokenization, plain concatenation merge) plus one
+#     subclass per family (Qwen3 / 3.5 / 3.6 / 3.8 / Next, GLM 4.7 / 5.3, Nemotron 3, Kimi 2.5 /
+#     2.6, MiniMax M2.5 / M2.7, DeepSeek V3.2 / V4 / V4.1, Inkling) that overrides boundary-token
+#     handling in the merge and/or the request-argument rules.
+#   - TITOTokenizerType: string enum naming the families, mapping each to its class.
+#   - Factory and resolver helpers: build a tokenizer by type, look up a family's fixed template path
+#     and forced kwargs, and resolve the sglang reasoning-parser / tool-call-parser names bound to a
+#     family (checking them against user-supplied values).
+# Class-level attributes on each family: the sglang parser names, the fixed template record, the
+# default assistant-start string and the set of trailing token ids the comparator trims.
 """TITO tokenizer — incremental tokenization for pretokenized prefix reuse.
 
 ``TITOTokenizer`` computes incremental token IDs for messages appended after the assistant's generated token sequence, then merges them with the pretokenized prefix — handling model-specific boundary tokens at the junction.
@@ -45,6 +62,13 @@ _DUMMY_SYSTEM: dict[str, Any] = {"role": "system", "content": "dummy system"}
 
 @dataclass(frozen=True)
 class FixedTemplate:
+    # [CLASS DOC] Immutable per-family record describing how chat templates are rendered so that
+    # prompts stay append-only. Fields: template (file name relative to the bundled template
+    # directory, or nothing to keep the model's native template); extra_kwargs (mapping of template
+    # keyword arguments the family forces, default empty); allowed_append_roles (set of roles that
+    # may follow the pretokenized assistant prefix, default all four of tool, user, system,
+    # assistant); consistant_kwargs (list of kwarg names whose recorded value or absence from the
+    # earlier turn is kept, default empty). The field name is spelled "consistant" in the code.
     """A family's fixed chat template, required kwargs, and append surface.
 
     ``template`` is a path relative to ``TEMPLATE_DIR`` for a bundled fixed
@@ -62,6 +86,10 @@ class FixedTemplate:
     consistant_kwargs: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] Validates and normalizes the allowed append roles after construction.
+        # Converts the roles to an immutable set (written back despite the record being frozen);
+        # raises a value error listing the sorted unknown roles and the supported roles if any role
+        # is outside the four known ones.
         roles = frozenset(self.allowed_append_roles)
         invalid = roles - ALL_APPEND_ROLES
         if invalid:
@@ -73,6 +101,10 @@ class FixedTemplate:
 
 
 def extract_template_args(request_args: dict[str, Any]) -> dict[str, Any]:
+    # [FUNCTION DOC] Builds the complete chat-template keyword arguments from a resolved request.
+    # Input: a request mapping. Output: a new mapping holding a shallow copy of the request's
+    # template kwargs (empty if absent or null), plus the request's tools under the tools key when
+    # the request has a non-empty tools list. The input is not modified.
     """Select renderer kwargs from an already resolved request, including tools."""
     args = dict(request_args.get("chat_template_kwargs") or {})
     if request_args.get("tools"):
@@ -81,6 +113,10 @@ def extract_template_args(request_args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _build_dummy_assistant(stored_assistant: dict[str, Any]) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Makes a placeholder assistant message used as the rendering base.
+    # Returns a message with role assistant, empty content, a single-space reasoning content (so
+    # templates that render a reasoning block do so), and the stored message's tool calls (empty
+    # list if none), so the rendered base shape matches the real turn. No side effects.
     """Build a dummy assistant that preserves the stored turn's tool calls."""
     return {
         "role": "assistant",
@@ -97,6 +133,15 @@ def _build_dummy_assistant(stored_assistant: dict[str, Any]) -> dict[str, Any]:
 
 
 class TITOTokenizer:
+    # [CLASS DOC] Default tokenizer for incremental tokenization of appended messages and merging
+    # them onto a pretokenized prefix. Class attributes (overridden by families): max_trim_tokens
+    # (number of tail tokens a merge may drop, default 0; not read within this module),
+    # trailing_token_ids (token ids the comparator strips from sequence tails, default empty),
+    # FIXED_TEMPLATE (the family's fixed template record, default native template with all roles),
+    # reasoning_parser and tool_call_parser (sglang parser names bound to the family, default
+    # none). Instance state: the wrapped tokenizer, launch-time chat template kwargs, optional
+    # assistant start string, allowed append roles (from the fixed template record) and the
+    # special token ids used for segmentation. The default merge is plain concatenation.
     """Incremental tokenization and prefix merging for appended messages."""
 
     max_trim_tokens: int = 0
@@ -118,6 +163,13 @@ class TITOTokenizer:
         assistant_start_str: str | None = None,
         special_token_ids: set[int] | None = None,
     ):
+        # [FUNCTION DOC] Stores the tokenizer, a copy of the launch template kwargs (empty if
+        # none), the assistant start string, the allowed append roles taken from the family's
+        # fixed template record, and the special token ids (kept as given, may be none, in which
+        # case the comparator auto-detects them). Then resolves launch-time request arguments with
+        # the base class rules only (deliberately bypassing subclass overrides, with no turn
+        # history) and replaces the stored template kwargs with the template arguments extracted
+        # from that result, so the launch defaults include the family's forced kwargs.
         self.tokenizer = tokenizer
         self.chat_template_kwargs = dict(chat_template_kwargs or {})
         self._assistant_start_str = assistant_start_str
@@ -127,6 +179,11 @@ class TITOTokenizer:
         self.chat_template_kwargs = extract_template_args(launch_args)
 
     def request_arg_rules(self) -> list[Callable[..., None]]:
+        # [FUNCTION DOC] Returns the ordered list of rule callables applied to a request: resolve
+        # template kwargs, resolve tools, resolve history args, then apply the fixed template
+        # kwargs (so forced values win over everything before). Each rule takes the request
+        # mapping plus keyword arguments request_source and turn_args and mutates the request.
+        # Subclasses extend by appending rules. Pure; builds a new list each call.
         """Return this model's rules in execution order; subclasses may extend the list."""
         return [
             self.resolve_template_kwargs,
@@ -138,6 +195,11 @@ class TITOTokenizer:
     def resolve_request_args(
         self, request_args: dict[str, Any], *, turn_args: dict[str, Any] | None
     ) -> dict[str, Any]:
+        # [FUNCTION DOC] Runs every rule from the rule list, in order, against the request.
+        # Inputs: the request mapping (mutated in place), and turn_args (keyword only), the recorded
+        # arguments of the turn being continued or none for a fresh request. A shallow snapshot of
+        # the request taken before any rule runs is passed to each rule as the unmodified source.
+        # Returns the same request mapping. Rules may raise (for example on changed tools).
         """Apply model rules in place and return the same full request.
 
         Rules read request_source, turn_args and launch kwargs without modifying
@@ -155,6 +217,11 @@ class TITOTokenizer:
         request_source: dict[str, Any],
         turn_args: dict[str, Any] | None,
     ) -> None:
+        # [FUNCTION DOC] Rule: sets the request's template kwargs to a deep copy of the merge of
+        # three layers, lowest to highest priority: launch defaults, the recorded turn's template
+        # kwargs (if any), then the original request's template kwargs. The tools key is dropped
+        # from the merged result because requests carry tools at the top level. Mutates only the
+        # request mapping's template kwargs entry.
         """Merge request template fields over history and launch defaults."""
         kwargs = {
             **self.chat_template_kwargs,
@@ -172,6 +239,12 @@ class TITOTokenizer:
         request_source: dict[str, Any],
         turn_args: dict[str, Any] | None,
     ) -> None:
+        # [FUNCTION DOC] Rule: decides the request's tools and stores a deep copy under the tools
+        # key. Take the original request's tools (empty list treated as absent). With no recorded
+        # turn: fall back to the tools in the launch template kwargs. With a recorded turn: use the
+        # recorded tools if the request has none; otherwise compare the tool definitions of both
+        # (via the template helper that extracts tool dictionaries) and raise a value error if they
+        # differ. The stored value may be none.
         """Inherit omitted tools and reject changes to tools in a reused prefix."""
         tools = request_source.get("tools") or None
         if turn_args is None:
@@ -194,6 +267,10 @@ class TITOTokenizer:
         request_source: dict[str, Any],
         turn_args: dict[str, Any] | None,
     ) -> None:
+        # [FUNCTION DOC] Rule: if the family's fixed template record has forced kwargs, writes deep
+        # copies of them over the request's template kwargs (creating the entry if missing), so
+        # forced values override anything the caller or history supplied. Does nothing otherwise.
+        # The source and turn arguments are unused.
         """Override requested template values with the family's required settings."""
         if self.FIXED_TEMPLATE.extra_kwargs:
             request_args.setdefault("chat_template_kwargs", {}).update(deepcopy(self.FIXED_TEMPLATE.extra_kwargs))
@@ -205,6 +282,10 @@ class TITOTokenizer:
         request_source: dict[str, Any],
         turn_args: dict[str, Any] | None,
     ) -> None:
+        # [FUNCTION DOC] Rule: for a continued turn, makes the family's "consistent" kwargs equal the
+        # recorded turn's. Does nothing when there is no recorded turn. Otherwise removes each
+        # consistent kwarg from the request's template kwargs, then re-adds only those that the
+        # recorded turn actually had (deep copied), so a kwarg absent in the record stays absent.
         """Keep selected historical fields, including their absence, in a continued turn."""
         if turn_args is None:
             return
@@ -217,6 +298,8 @@ class TITOTokenizer:
         )
 
     def create_comparator(self) -> TokenSeqComparator:
+        # [FUNCTION DOC] Builds a sequence comparator using this tokenizer, its assistant start
+        # string, its special token ids, and its trailing token ids (passed as none when empty).
         """Create a :class:`TokenSeqComparator` configured with this
         tokenizer's model-specific settings."""
         return TokenSeqComparator(
@@ -227,6 +310,8 @@ class TITOTokenizer:
         )
 
     def default_template_args(self, tools: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        # [FUNCTION DOC] Returns a copy of the launch template kwargs, with the given tools added
+        # under the tools key when non-empty (overriding any launch tools). Does not mutate state.
         """Return launch template kwargs with optional tools for direct rendering."""
         args = dict(self.chat_template_kwargs)
         if tools:
@@ -241,6 +326,11 @@ class TITOTokenizer:
         tokenize: bool = False,
         template_args: dict[str, Any] | None = None,
     ) -> str | list[int]:
+        # [FUNCTION DOC] Renders messages through the shared chat template helper using this
+        # tokenizer. Inputs: messages; add_generation_prompt flag; tokenize flag (default off, so
+        # text is returned); template_args, a complete argument set that replaces (is not merged
+        # with) the launch defaults, or none to use the launch defaults. Returns rendered text, or
+        # token ids when tokenize is on.
         """Render messages using resolved template kwargs and tools.
 
         Pass `template_args` as the complete argument set; it is not merged with
@@ -264,6 +354,11 @@ class TITOTokenizer:
         assistant_message: dict[str, Any],
         completion_token_ids: list[int],
     ) -> dict[str, Any]:
+        # [FUNCTION DOC] Hook run on an upstream completion before the assistant message is
+        # stored. Inputs (keyword only): the completion choice mapping (may be mutated by
+        # overrides), the assistant message already parsed by the engine, and the completion token
+        # ids. Returns the message to store. The default returns the engine-parsed message
+        # unchanged and ignores the choice and token ids.
         """Postprocess an upstream completion and return the message to store.
 
         The default path trusts SGLang's parsed message. Model families that
@@ -277,10 +372,15 @@ class TITOTokenizer:
         stored_messages: list[dict[str, Any]],
         request_messages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
+        # [FUNCTION DOC] Hook that re-applies server-owned extra fields from stored messages onto
+        # the messages a client replayed. Returns a new list. The default returns a plain copy of
+        # the request messages and ignores the stored ones.
         """Restore model-specific server-owned sidecars after client replay."""
         return list(request_messages)
 
     def _encode_text(self, text: str) -> list[int]:
+        # [FUNCTION DOC] HELPER: Encodes text to token ids with the wrapped tokenizer, without
+        # adding special tokens (no beginning-of-sequence marker).
         return self.tokenizer.encode(text, add_special_tokens=False)
 
     def _tokenize_rendered_suffix(
@@ -291,6 +391,12 @@ class TITOTokenizer:
         template_args: dict[str, Any] | None = None,
         add_generation_prompt: bool = False,
     ) -> list[int]:
+        # [FUNCTION DOC] HELPER: Computes token ids of the text a template adds when messages are
+        # appended to a base. Renders the base alone (no generation prompt) and the base plus the
+        # appended messages (generation prompt per the flag, default off); the second text must
+        # start with the first, otherwise raises a value error naming the appended roles (or a
+        # generation-prompt placeholder when nothing was appended). Returns the encoding of the
+        # extra text, without special tokens. template_args is passed through to rendering.
         """Render *base_messages* and *base_messages + appended_messages*, return
         tokens for the suffix.
 
@@ -317,6 +423,12 @@ class TITOTokenizer:
         *,
         template_args: dict[str, Any] | None = None,
     ) -> list[int]:
+        # [FUNCTION DOC] Verifies the new message list extends the old one append-only with only
+        # allowed roles (the shared checker raises on violation), then takes the messages beyond
+        # the old length. Renders them under a synthetic base of a dummy system message plus a
+        # dummy assistant message built from the last old message (keeping its tool calls) and
+        # returns the suffix tokens including the generation prompt. Assumes old messages are
+        # non-empty and end with the assistant turn.
         """Compute incremental token IDs for messages appended after the
         pretokenized prefix.
 
@@ -352,6 +464,9 @@ class TITOTokenizer:
         *,
         template_args: dict[str, Any] | None = None,
     ) -> list[int]:
+        # [FUNCTION DOC] Returns the full prompt token ids: a copy of the pretokenized prefix
+        # followed by the incremental tokens for the appended messages. The default does no
+        # boundary repair at the junction.
         """Merge *pretokenized_token_ids* with incremental tokens to produce
         the complete prompt token IDs (including generation prompt).
 
@@ -368,6 +483,10 @@ class TITOTokenizer:
 
 
 class Qwen3TITOTokenizer(TITOTokenizer):
+    # [CLASS DOC] Qwen3 family base. Binds the qwen3 reasoning parser and qwen25 tool-call parser,
+    # the qwen3 fixed template with thinking-clearing disabled, and the default assistant start
+    # marker. Records the newline token as the trailing token the comparator ignores. The merge
+    # appends the missing newline after a trailing end-of-message token.
     """Qwen3 variant: handles missing newline at the boundary.
 
     The Qwen3 chat template emits ``<|im_end|>\\n`` after every message, but
@@ -392,6 +511,11 @@ class Qwen3TITOTokenizer(TITOTokenizer):
         chat_template_kwargs: dict[str, Any] | None = None,
         assistant_start_str: str | None = None,
     ):
+        # [FUNCTION DOC] Initializes the base with the given assistant start string or the class
+        # default. Requires the tokenizer to encode a newline as exactly one token (assertion
+        # failure otherwise); stores that id, looks up the id of the end-of-message special token,
+        # and marks the newline as the only trailing token id. Does not pass special token ids, so
+        # they are auto-detected by the comparator.
         super().__init__(
             tokenizer,
             chat_template_kwargs,
@@ -411,6 +535,11 @@ class Qwen3TITOTokenizer(TITOTokenizer):
         *,
         template_args: dict[str, Any] | None = None,
     ) -> list[int]:
+        # [FUNCTION DOC] Computes incremental tokens, then, when the prefix ends with the
+        # end-of-message token (the model stops there without the newline the template emits),
+        # appends a newline token to a copy of the prefix before concatenating. A prefix ending
+        # with the pretraining end-of-text token is deliberately not repaired, so the strict
+        # comparator still reports it.
         incremental = self.tokenize_additional_messages(old_messages, new_messages, template_args=template_args)
         prefix = list(pretokenized_token_ids)
         # Weakly post-trained Qwen3 models, notably 0.6B, may emit the pretraining/padding token `<|endoftext|>`.
@@ -427,6 +556,9 @@ class Qwen3TITOTokenizer(TITOTokenizer):
 
 
 class Qwen35TITOTokenizer(Qwen3TITOTokenizer):
+    # [CLASS DOC] Qwen3.5 family: qwen3_coder tool-call parser, the qwen3.5 fixed template with
+    # thinking preserved, appendable roles tool, user and assistant (no system), and the
+    # add-vision-id kwarg kept as recorded. Boundary handling is inherited from Qwen3.
     """Qwen3.5 template and Qwen3 token boundary."""
 
     tool_call_parser = "qwen3_coder"
@@ -440,6 +572,8 @@ class Qwen35TITOTokenizer(Qwen3TITOTokenizer):
 
 
 class Qwen36TITOTokenizer(Qwen3TITOTokenizer):
+    # [CLASS DOC] Qwen3.6 family: same configuration as Qwen3.5 but with the qwen3.6 fixed
+    # template file. Boundary handling inherited from Qwen3.
     """Qwen3.6 template and Qwen3 token boundary."""
 
     tool_call_parser = "qwen3_coder"
@@ -453,6 +587,10 @@ class Qwen36TITOTokenizer(Qwen3TITOTokenizer):
 
 
 class Qwen38SmallTITOTokenizer(Qwen3TITOTokenizer):
+    # [CLASS DOC] Qwen3.8 small/flash-next family (also used for the qwen4 experimental type):
+    # qwen3_coder tool-call parser, its own fixed template, thinking preserved, appendable roles
+    # tool, user and assistant, and the add-vision-id, enable-thinking and reasoning-effort kwargs
+    # kept as recorded. Boundary handling inherited from Qwen3.
     """Qwen3.8 reasoning-effort template with the Qwen3 token boundary."""
 
     tool_call_parser = "qwen3_coder"
@@ -466,6 +604,9 @@ class Qwen38SmallTITOTokenizer(Qwen3TITOTokenizer):
 
 
 class QwenNextTITOTokenizer(Qwen3TITOTokenizer):
+    # [CLASS DOC] Qwen3-Thinking-2507 / Qwen3-Next family: only overrides the fixed template
+    # (the shared thinking-2507-and-next file, thinking-clearing disabled). Parsers and boundary
+    # handling are inherited from Qwen3.
     """Qwen3-Thinking-2507 / Qwen3-Next-Thinking — same boundary behavior as
     Qwen3, distinct (shared) fixed template."""
 
@@ -481,6 +622,11 @@ class QwenNextTITOTokenizer(Qwen3TITOTokenizer):
 
 
 class GLM47TITOTokenizer(TITOTokenizer):
+    # [CLASS DOC] GLM 4.7 family: glm45 reasoning parser, glm47 tool-call parser, the native
+    # template with thinking-clearing disabled, default assistant marker "<|assistant|>". The
+    # observation and user marker tokens are the ambiguous boundary tokens and also the trailing
+    # token ids ignored by the comparator. Merge drops a trailing boundary token from the prefix.
+    # KNOWN ISSUE: the max_trim_tokens attribute (set to 1) is not read anywhere in this module.
     """GLM 4.7 variant: handles ambiguous boundary tokens in ``merge_tokens``.
 
     ``<|user|>`` and ``<|observation|>`` are both assistant stop tokens *and*
@@ -511,6 +657,9 @@ class GLM47TITOTokenizer(TITOTokenizer):
         chat_template_kwargs: dict[str, Any] | None = None,
         assistant_start_str: str | None = None,
     ):
+        # [FUNCTION DOC] Initializes the base with the given or default assistant start string,
+        # looks up the ids of the observation and user marker tokens, stores them as the ambiguous
+        # boundary id set, and uses the same set as the trailing token ids.
         super().__init__(
             tokenizer,
             chat_template_kwargs,
@@ -529,6 +678,9 @@ class GLM47TITOTokenizer(TITOTokenizer):
         *,
         template_args: dict[str, Any] | None = None,
     ) -> list[int]:
+        # [FUNCTION DOC] Computes incremental tokens (which begin with their own boundary marker),
+        # then removes the last prefix token if it is an observation or user marker, regardless of
+        # whether it equals the first incremental token, and concatenates.
         incremental = self.tokenize_additional_messages(old_messages, new_messages, template_args=template_args)
         prefix = list(pretokenized_token_ids)
         if prefix and prefix[-1] in self._ambiguous_boundary_ids:
@@ -537,6 +689,9 @@ class GLM47TITOTokenizer(TITOTokenizer):
 
 
 class GLM53TITOTokenizer(GLM47TITOTokenizer):
+    # [CLASS DOC] GLM-5.3 family: only overrides the fixed template record (native template,
+    # thinking-clearing disabled, thinking forced on) and keeps the reasoning-effort kwarg as
+    # recorded. Everything else inherited from GLM 4.7.
     """GLM-5.3 native text renderer with the shared GLM token boundary.
 
     The GLM-5.3 and GLM-5.3-Flash templates start generation with ``<think>`` even when ``enable_thinking=False``, so this family pins ``enable_thinking=True``. Flash support covers tokenizer text inputs, not multimodal processor inputs.
@@ -555,6 +710,10 @@ class GLM53TITOTokenizer(GLM47TITOTokenizer):
 
 
 class Nemotron3TITOTokenizer(Qwen3TITOTokenizer):
+    # [CLASS DOC] Nemotron 3 family: Qwen3 boundary handling with the nemotron_3 reasoning parser,
+    # qwen3_coder tool-call parser, native template with history-thinking truncation forced off,
+    # the low-effort kwarg kept as recorded, and default assistant marker that includes a trailing
+    # newline.
     """NVIDIA Nemotron 3 family: ``<|im_end|>\\n`` message boundaries.
 
     Inherits Qwen3's boundary handling — Nemotron 3 emits the same
@@ -590,6 +749,8 @@ class Nemotron3TITOTokenizer(Qwen3TITOTokenizer):
         chat_template_kwargs: dict[str, Any] | None = None,
         assistant_start_str: str | None = None,
     ):
+        # [FUNCTION DOC] Delegates to the Qwen3 initializer with the given assistant start string
+        # or this class's default (which ends in a newline). Adds nothing else.
         super().__init__(
             tokenizer,
             chat_template_kwargs,
@@ -603,12 +764,21 @@ class Nemotron3TITOTokenizer(Qwen3TITOTokenizer):
 
 
 def _kimi_segment_special_token_ids(tokenizer: Any) -> set[int]:
+    # [FUNCTION DOC] HELPER: Returns the set of special token ids the comparator treats as segment
+    # boundaries for Kimi: all auto-detected special ids minus the id of the middle separator
+    # token, which sits inside a role turn.
     """Kimi specials minus ``<|im_middle|>`` (intra-turn role-name/body
     separator, not a role boundary; must not be a segment boundary)."""
     return TokenSeqComparator.collect_special_ids(tokenizer) - {tokenizer.convert_tokens_to_ids("<|im_middle|>")}
 
 
 class Kimi25TITOTokenizer(TITOTokenizer):
+    # [CLASS DOC] Kimi K2.5 family: bundled fixed template, thinking preserved, thinking and
+    # tools-timestamp-string kwargs kept as recorded, default assistant marker "<|im_assistant|>".
+    # Uses the default merge (plain concatenation) and the Kimi-specific segment special ids. No
+    # parsers are bound.
+    # KNOWN ISSUE: the docstring says only the tool and user surface is registered, but the fixed
+    # template record does not narrow the roles, so all four append roles are allowed.
     """Moonshot Kimi K2.5: ``<|im_end|>`` boundary (no trailing newline).
 
     K2.5 has no kwarg escape hatch for the "drop reasoning of prior assistants
@@ -633,6 +803,8 @@ class Kimi25TITOTokenizer(TITOTokenizer):
         chat_template_kwargs: dict[str, Any] | None = None,
         assistant_start_str: str | None = None,
     ):
+        # [FUNCTION DOC] Initializes the base with the given or default assistant start string and
+        # the Kimi segment special ids computed from the tokenizer.
         super().__init__(
             tokenizer,
             chat_template_kwargs,
@@ -642,6 +814,9 @@ class Kimi25TITOTokenizer(TITOTokenizer):
 
 
 class Kimi26TITOTokenizer(TITOTokenizer):
+    # [CLASS DOC] Kimi K2.6 family: native template, thinking preserved, tools-timestamp-string
+    # kwarg kept as recorded, kimi_k2 reasoning parser, kimi_k2_raw_id tool-call parser (keeps
+    # model-emitted tool call ids), default merge, Kimi segment special ids.
     """Moonshot Kimi K2.6: same boundary as K2.5 + native ``preserve_thinking`` kwarg.
 
     K2.6's HF-native template already carries the ``preserve_thinking`` gate
@@ -672,6 +847,8 @@ class Kimi26TITOTokenizer(TITOTokenizer):
         chat_template_kwargs: dict[str, Any] | None = None,
         assistant_start_str: str | None = None,
     ):
+        # [FUNCTION DOC] Same as the K2.5 initializer: given or default assistant start string and
+        # the Kimi segment special ids computed from the tokenizer.
         super().__init__(
             tokenizer,
             chat_template_kwargs,
@@ -687,6 +864,10 @@ class Kimi26TITOTokenizer(TITOTokenizer):
 
 
 class MinimaxM25TITOTokenizer(TITOTokenizer):
+    # [CLASS DOC] MiniMax M2.5 family: minimax-append-think reasoning parser, minimax-m2 tool-call
+    # parser, bundled M2.5 fixed template with thinking-clearing disabled, appendable roles tool,
+    # user and assistant, default assistant marker "]~b]ai". The newline token is the trailing
+    # token id; the merge appends a newline after a trailing end-of-sequence marker.
     """MiniMax-M2.5 family: bespoke ``]~!b[`` / ``[e~[`` / ``]~b]`` tag set.
 
     Shares tokenizer.json (sha256) and architecture (MiniMaxM2ForCausalLM)
@@ -722,6 +903,10 @@ class MinimaxM25TITOTokenizer(TITOTokenizer):
         chat_template_kwargs: dict[str, Any] | None = None,
         assistant_start_str: str | None = None,
     ):
+        # [FUNCTION DOC] Initializes the base with the given or default assistant start string.
+        # Requires the newline to encode as exactly one token (assertion failure otherwise); stores
+        # its id, looks up the end-of-sequence marker id, and sets the trailing token ids to the
+        # newline only.
         super().__init__(
             tokenizer,
             chat_template_kwargs,
@@ -741,6 +926,9 @@ class MinimaxM25TITOTokenizer(TITOTokenizer):
         *,
         template_args: dict[str, Any] | None = None,
     ) -> list[int]:
+        # [FUNCTION DOC] Computes incremental tokens; when the prefix ends with the
+        # end-of-sequence marker, appends a newline token to a copy of the prefix (the model stops
+        # at the marker without the newline the template emits); then concatenates.
         incremental = self.tokenize_additional_messages(old_messages, new_messages, template_args=template_args)
         prefix = list(pretokenized_token_ids)
         if prefix and prefix[-1] == self._eos_id:
@@ -749,6 +937,8 @@ class MinimaxM25TITOTokenizer(TITOTokenizer):
 
 
 class MinimaxM27TITOTokenizer(MinimaxM25TITOTokenizer):
+    # [CLASS DOC] MiniMax M2.7 family: identical to M2.5 except the fixed template file is the
+    # M2.7 one.
     """MiniMax-M2.7 family: tokenizer / arch / stop-token semantics identical
     to M2.5; the chat template only differs by default system identity string.
 
@@ -773,6 +963,11 @@ _DEEPSEEK_MODE_KWARG_ALIASES = frozenset({"thinking_mode", "enable_thinking", "t
 
 
 class DeepSeekV32TITOTokenizer(TITOTokenizer):
+    # [CLASS DOC] DeepSeek V3.2 family: no jinja template, rendering goes through the vendored
+    # encoder bridge. Binds the deepseek-v3 reasoning parser and deepseekv32 tool-call parser;
+    # native template with history-thinking dropping disabled; default-bos-token and context
+    # kwargs kept as recorded; appendable roles are the default four. Adds a rule that normalizes
+    # the thinking-mode aliases into one canonical thinking flag. Uses the default merge.
     """DeepSeek V3.2 — miles' vendored copy of the official ``encoding_dsv32``.
 
     V3.2 ships no jinja chat_template; prompts render through
@@ -806,6 +1001,9 @@ class DeepSeekV32TITOTokenizer(TITOTokenizer):
         chat_template_kwargs: dict[str, Any] | None = None,
         assistant_start_str: str | None = None,
     ):
+        # [FUNCTION DOC] Initializes the base with the given or default assistant start string
+        # (the assistant sentinel) and, as segment special ids, exactly the user and assistant
+        # sentinel token ids (not the auto-detected set).
         # V3.2 has no jinja template, so assistant_start_str can't be sniffed
         # from one; pin it explicitly.  The comparator keys off the User /
         # Assistant sentinels to find assistant-content boundaries.
@@ -820,6 +1018,8 @@ class DeepSeekV32TITOTokenizer(TITOTokenizer):
         )
 
     def request_arg_rules(self) -> list[Callable[..., None]]:
+        # [FUNCTION DOC] Returns the base rule list with the thinking-resolution rule appended as
+        # the last rule.
         rules = super().request_arg_rules()
         rules.append(self.resolve_thinking)
         return rules
@@ -831,6 +1031,13 @@ class DeepSeekV32TITOTokenizer(TITOTokenizer):
         request_source: dict[str, Any],
         turn_args: dict[str, Any] | None,
     ) -> None:
+        # [FUNCTION DOC] Rule: runs the base merge, then makes the three thinking-mode aliases
+        # (thinking_mode, enable_thinking, thinking) act as one setting. Looks at three sources in
+        # priority order: recorded turn kwargs, request kwargs, launch kwargs; the first source
+        # containing any alias supplies its alias entries (all aliases it has). All aliases are
+        # removed from the merged kwargs and the chosen entries are put back, so a lower-priority
+        # alias cannot linger next to a higher-priority one. If no source has an alias, nothing is
+        # re-added.
         super().resolve_template_kwargs(request_args, request_source=request_source, turn_args=turn_args)
         # Thinking aliases are one setting: history overrides the request and launch defaults.
         for source in (
@@ -853,6 +1060,10 @@ class DeepSeekV32TITOTokenizer(TITOTokenizer):
         request_source: dict[str, Any],
         turn_args: dict[str, Any] | None,
     ) -> None:
+        # [FUNCTION DOC] Rule: asks the V3.2 encoder bridge whether thinking is enabled for the
+        # merged template kwargs, removes all thinking-mode aliases, and stores the boolean result
+        # under the canonical thinking key (the key the engine's reasoning parser reads). Requires
+        # the template kwargs entry to exist already. Mutates the request.
         kwargs = request_args["chat_template_kwargs"]
         thinking = deepseek.V32.render_thinking_enabled(kwargs)
         for alias in _DEEPSEEK_MODE_KWARG_ALIASES:
@@ -867,6 +1078,12 @@ class DeepSeekV32TITOTokenizer(TITOTokenizer):
 
 
 class DeepSeekV4TITOTokenizer(TITOTokenizer):
+    # [CLASS DOC] DeepSeek V4 family: like V3.2 (no jinja template, encoder bridge, same alias
+    # normalization and canonical thinking rule using the V4 encoder) with deepseek-v4 reasoning
+    # parser and deepseekv4 tool-call parser, appendable roles tool, user and assistant, and the
+    # reasoning-effort kwarg also kept as recorded. Trailing token ids are the assistant sentinel
+    # and the think open/close tags. Its incremental tokenization diffs full renders of old and
+    # new messages instead of using a dummy base.
     """DeepSeek V4 — official encoder via sglang's ``encoding_dsv4``.
 
     Like V3.2, V4 ships no jinja chat_template; miles' ``apply_chat_template``
@@ -893,6 +1110,10 @@ class DeepSeekV4TITOTokenizer(TITOTokenizer):
         chat_template_kwargs: dict[str, Any] | None = None,
         assistant_start_str: str | None = None,
     ):
+        # [FUNCTION DOC] Initializes the base with the given or default assistant start string and
+        # the user and assistant sentinel ids as segment special ids. Then stores the assistant
+        # sentinel id and the ids of the think open and close tags, and sets the trailing token
+        # ids to the union of those three.
         super().__init__(
             tokenizer,
             chat_template_kwargs=chat_template_kwargs,
@@ -910,6 +1131,8 @@ class DeepSeekV4TITOTokenizer(TITOTokenizer):
         self.trailing_token_ids = frozenset({self._assistant_id} | self._think_bracket_ids)
 
     def request_arg_rules(self) -> list[Callable[..., None]]:
+        # [FUNCTION DOC] Returns the base rule list with the thinking-resolution rule appended as
+        # the last rule.
         rules = super().request_arg_rules()
         rules.append(self.resolve_thinking)
         return rules
@@ -921,6 +1144,10 @@ class DeepSeekV4TITOTokenizer(TITOTokenizer):
         request_source: dict[str, Any],
         turn_args: dict[str, Any] | None,
     ) -> None:
+        # [FUNCTION DOC] Rule: identical to the V3.2 version. Runs the base merge, then collapses
+        # the thinking-mode aliases (thinking_mode, enable_thinking, thinking) to the alias entries
+        # of the highest-priority source that has any (recorded turn, then request, then launch).
+        # KNOWN ISSUE: duplicated verbatim from the V3.2 class instead of shared.
         super().resolve_template_kwargs(request_args, request_source=request_source, turn_args=turn_args)
         # Thinking aliases are one setting: history overrides the request and launch defaults.
         for source in (
@@ -943,6 +1170,9 @@ class DeepSeekV4TITOTokenizer(TITOTokenizer):
         request_source: dict[str, Any],
         turn_args: dict[str, Any] | None,
     ) -> None:
+        # [FUNCTION DOC] Rule: same as the V3.2 version but asks the V4 encoder bridge whether
+        # thinking is enabled; removes all aliases and stores the boolean under the canonical
+        # thinking key.
         kwargs = request_args["chat_template_kwargs"]
         thinking = deepseek.V4.render_thinking_enabled(kwargs)
         for alias in _DEEPSEEK_MODE_KWARG_ALIASES:
@@ -957,6 +1187,11 @@ class DeepSeekV4TITOTokenizer(TITOTokenizer):
         *,
         template_args: dict[str, Any] | None = None,
     ) -> list[int]:
+        # [FUNCTION DOC] Verifies append-only extension with allowed roles (shared checker raises
+        # otherwise). Renders the old messages without a generation prompt and the new messages
+        # with one; raises a value error if the second text does not start with the first.
+        # Returns the encoding of the remaining text. Unlike the base, no dummy prefix is used,
+        # because V4 merges adjacent tool and user turns.
         """Diff real-history renders because V4 folds adjacent ``tool``/``user`` turns."""
         assert_messages_append_only_with_allowed_role(old_messages, new_messages, self.allowed_append_roles)
         text_old = self.apply_chat_template(old_messages, add_generation_prompt=False, template_args=template_args)
@@ -970,6 +1205,8 @@ class DeepSeekV4TITOTokenizer(TITOTokenizer):
 
 
 class DeepSeekV41TITOTokenizer(DeepSeekV4TITOTokenizer):
+    # [CLASS DOC] DeepSeek V4.1 family: V4 behavior with deepseek-v41 reasoning parser and
+    # deepseekv41 tool-call parser, and a launch default that pins the canonical thinking flag.
     """DeepSeek V4.1 — official encoder via sglang's ``encoding_dsv41``; the
     V4 incremental-render machinery applies unchanged."""
 
@@ -982,6 +1219,9 @@ class DeepSeekV41TITOTokenizer(DeepSeekV4TITOTokenizer):
         chat_template_kwargs: dict[str, Any] | None = None,
         assistant_start_str: str | None = None,
     ):
+        # [FUNCTION DOC] Runs the V4 initializer, then replaces the launch template kwargs with a
+        # copy that has the thinking key set to what the V4.1 encoder bridge reports for the
+        # current launch kwargs.
         super().__init__(tokenizer, chat_template_kwargs=chat_template_kwargs, assistant_start_str=assistant_start_str)
         self.chat_template_kwargs = {
             **self.chat_template_kwargs,
@@ -990,6 +1230,11 @@ class DeepSeekV41TITOTokenizer(DeepSeekV4TITOTokenizer):
 
 
 class InklingTITOTokenizer(TITOTokenizer):
+    # [CLASS DOC] Inkling family: bundled inkling fixed template (default role surface), the
+    # reasoning-effort kwarg kept as recorded, default assistant marker "<|message_model|>", and
+    # all four message-role sentinels (user, model, system, tool) as segment special ids. Parses
+    # completions with a lazily created response parser and preserves content blocks of stored
+    # assistant messages. Default merge.
     """Inkling family (Inkling / Inkling-Small).
 
     The runtime serves Inkling through sglang's token-level renderer
@@ -1010,6 +1255,9 @@ class InklingTITOTokenizer(TITOTokenizer):
         chat_template_kwargs: dict[str, Any] | None = None,
         assistant_start_str: str | None = None,
     ):
+        # [FUNCTION DOC] Initializes the base with the given or default assistant start string and
+        # the four role sentinel ids as segment special ids, and leaves the response parser unset
+        # (created on first use).
         super().__init__(
             tokenizer,
             chat_template_kwargs=chat_template_kwargs,
@@ -1030,6 +1278,13 @@ class InklingTITOTokenizer(TITOTokenizer):
         assistant_message: dict[str, Any],
         completion_token_ids: list[int],
     ) -> dict[str, Any]:
+        # [FUNCTION DOC] Parses the completion token ids with the Inkling response parser (created
+        # lazily on first call from the tokenizer), passing the choice's finish reason. Side
+        # effects on the choice: replaces its message with the parsed client-facing message; in
+        # its meta info (created if missing) records the parser name and, if parsing failed, the
+        # parse error; if there is no error, the client message has tool calls and the finish
+        # reason is stop, changes the finish reason to tool calls. Ignores the engine-parsed
+        # assistant message. Returns the parsed stored message.
         if self._response_parser is None:
             self._response_parser = InklingResponseParser(self.tokenizer)
         parsed = self._response_parser.parse(
@@ -1050,6 +1305,11 @@ class InklingTITOTokenizer(TITOTokenizer):
         stored_messages: list[dict[str, Any]],
         request_messages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
+        # [FUNCTION DOC] Returns a copy of the request messages in which, for each position that
+        # exists in the stored messages, a stored assistant message that strictly matches the
+        # request message at that position and carries content blocks passes those blocks into a
+        # new copy of the request message. Non-assistant, non-matching or block-less positions are
+        # left as the request had them. Stops at the end of the stored list.
         preserved = list(request_messages)
         for index, request_message in enumerate(preserved):
             if index >= len(stored_messages):
@@ -1070,6 +1330,11 @@ class InklingTITOTokenizer(TITOTokenizer):
 
 
 class TITOTokenizerType(StrEnum):
+    # [CLASS DOC] String enumeration of supported tokenizer families; the values are the strings
+    # accepted by the command-line model option (default, qwen3, qwen35, qwen36, qwen38small,
+    # qwen4exp, qwennext, glm47, glm53, nemotron3, kimi25, kimi26, minimax_m25, minimax_m27,
+    # deepseekv32, deepseekv4, deepseekv41, inkling). qwen4exp is an alias of the qwen3.8 small
+    # class.
     DEFAULT = "default"
     QWEN3 = "qwen3"
     QWEN35 = "qwen35"
@@ -1091,6 +1356,9 @@ class TITOTokenizerType(StrEnum):
 
     @classmethod
     def get_tokenizer_class(cls, t: TITOTokenizerType) -> type[TITOTokenizer]:
+        # [FUNCTION DOC] Class method mapping a family enum member to its tokenizer class (the base
+        # class for the default member; the qwen3.8 small class for both qwen38small and qwen4exp).
+        # Raises a value error for an unrecognized member.
         """Resolve the concrete ``TITOTokenizer`` subclass for *t*."""
         match t:
             case cls.DEFAULT:
@@ -1137,6 +1405,10 @@ def get_tito_tokenizer(
     chat_template_kwargs: dict[str, Any] | None = None,
     assistant_start_str: str | None = None,
 ) -> TITOTokenizer:
+    # [FUNCTION DOC] Factory. Raises a value error if the tokenizer is none. Converts a string
+    # type to the enum (an invalid string raises a value error). Instantiates the family class
+    # with the tokenizer, the template kwargs, and the assistant start string only when one is
+    # given (otherwise the class default applies). Returns the instance.
     """Create a ``TITOTokenizer`` instance.
 
     Args:
@@ -1167,6 +1439,10 @@ def get_tito_tokenizer(
 def resolve_fixed_chat_template(
     tito_model: TITOTokenizerType | str,
 ) -> tuple[str | None, dict[str, Any]]:
+    # [FUNCTION DOC] Looks up the family's fixed template record (string types are converted to
+    # the enum first) and returns the absolute path of its bundled template file as a string, or
+    # none for native templates, together with a copy of the forced kwargs. Logs the family, path,
+    # kwargs and sorted allowed roles at info level.
     """The family's fixed chat template and required kwargs.
 
     Returns ``(template_path, extra_kwargs)``:
@@ -1206,6 +1482,9 @@ def resolve_reasoning_and_tool_call_parser(
     user_reasoning_parser: str | None = None,
     user_tool_call_parser: str | None = None,
 ) -> tuple[str | None, str | None]:
+    # [FUNCTION DOC] Resolves both parser names for a family (string types converted to the enum).
+    # Each is resolved independently by the nested helper; returns the pair (reasoning parser,
+    # tool-call parser). Raises a value error from the helper on a user/family disagreement.
     """Resolve sglang ``--reasoning-parser`` and ``--tool-call-parser`` for the
     given TITO family.
 
@@ -1228,6 +1507,10 @@ def resolve_reasoning_and_tool_call_parser(
     cls = TITOTokenizerType.get_tokenizer_class(tito_model)
 
     def _resolve_one(field: str, bound: str | None, user: str | None) -> str | None:
+        # [FUNCTION DOC] HELPER: Picks one parser name. No user value: the family's bound value
+        # (possibly none). Family unbound: the user value. Both set and equal: the user value.
+        # Both set and different: raises a value error whose message names the command-line flag
+        # (field name with underscores turned into hyphens), both values and the family.
         if user is None:
             return bound
         if bound is None:

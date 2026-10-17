@@ -1,3 +1,11 @@
+# [MODULE DOC] Launcher for GRPO training of a Qwen3-4B model on Ascend NPUs with the Megatron
+# train backend in bridge mode and SGLang rollout on NPU. Configuration is read from environment
+# variables at import time: model name (default Qwen3-4B-Instruct-2507), device count (default 4),
+# an external-ray flag (read but unused), and train backend (fsdp or megatron, validated by an
+# assertion at import; also unused since the megatron block is always used). All paths are fixed
+# under the root directory (models, datasets, Megatron checkout). Running the file as a script
+# calls execute only; the prepare call is commented out. Uses the NPU-specific execute function
+# from command_utils.
 import os
 
 from miles.utils.external_utils import command_utils
@@ -16,6 +24,9 @@ TRAIN_DATA_PATH = os.path.join(DATA_ROOT, "dapo-math-17k.jsonl")
 
 
 def get_megatron_model_type(model_name: str) -> str:
+    # [FUNCTION DOC] HELPER: Maps a supported model name to its Megatron model type string
+    # (Instruct-2507 to its own type; Base and plain 4B both to the generic 4B type). Raises a key
+    # error for any other model name.
     megatron_model_type = {
         "Qwen3-4B-Instruct-2507": "qwen3-4B-Instruct-2507",
         "Qwen3-4B-Base": "qwen3-4B",
@@ -25,6 +36,10 @@ def get_megatron_model_type(model_name: str) -> str:
 
 
 def prepare():
+    # [FUNCTION DOC] Creates the fixed models and datasets directories, downloads the HF model, and
+    # downloads the dapo-math-17k dataset only if the training file is absent. Side effects: shell
+    # commands through a backend built from the default config; network and disk. Raises a
+    # file-not-found error if the training data file still does not exist afterwards.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -36,6 +51,21 @@ def prepare():
 
 
 def execute():
+    # [FUNCTION DOC] Builds the training argument string and submits it with the NPU execute
+    # function. No inputs (uses module constants); no return value.
+    # Rollout: dapo-math-17k, math reward, 3000 rollouts, 32 prompts x 8 samples, max response 4096,
+    # global batch 256. Algorithm: grpo with zero kl coefficients, clip 0.2/0.28. Optimizer adam
+    # lr 1e-6. SGLang: one NPU per engine, memory fraction 0.6, graph batch sizes 4, 8 then 16 to
+    # 256 step 8, ascend attention, radix cache disabled, prefill/total token limits. Megatron
+    # block: TP4 with sequence parallel, all other parallel sizes 1, full recompute, dynamic batch
+    # with 4096 tokens per GPU, bridge mode, load from the HF model dir. Misc: 1 actor node, actor
+    # and rollout GPU counts both equal the device count (not colocated), gradient accumulation
+    # fusion off, flash attention. Wandb flags (including the key on the command line) only if the
+    # WANDB_API_KEY environment variable is set, and the key is also passed as an extra environment
+    # variable. Side effect: sets the process environment variable for the rotary base to 5000000
+    # before submission. The Megatron checkout path is fixed.
+    # KNOWN ISSUE: the external-ray and train-backend settings and the fsdp choice are ignored;
+    # the commented-out eval block is dead; the wandb group/project are hardcoded names.
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ "
 
     wandb_args = (

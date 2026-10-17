@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Launcher script (typer command line app) for GRPO training of DeepSeek-V4.1 (full model or a
+# 4-layer pruned smoke-test model) using the in-repo "miles" model implementation for Megatron
+# training and SGLang with the dsv4 attention backend for rollout. Commands: prepare-download
+# (model for the pruned variant plus dataset), prepare-data (dataset only), prepare-spmd
+# (convert a Hugging Face checkpoint into a Megatron distributed checkpoint on one node) and
+# train. Module-level tables give the Megatron model type per model name and the Hugging Face org
+# of the pruned model (the full model has no org entry, so it must be supplied via an explicit
+# checkpoint path). The command utilities module is imported under the short alias U.
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -13,6 +22,19 @@ _MODEL_ORG = {"DeepSeek-V4.1-4layer": "CharyZeng"}
 
 @dataclass
 class ScriptArgs(U.ExecuteTrainConfig):
+    # [CLASS DOC]
+    # Command line options extending the shared train configuration. Groups: identity and task
+    # (mode, run id, model name, task defaulting to gsm8k, eval off); paths (explicit hf checkpoint,
+    # data/model/save dirs, Megatron path); parallelism (tensor 4, pipeline 1, context 1, sequence
+    # parallel on, optional expert size defaulting to total actor GPUs divided by pipeline size);
+    # memory offload options (optimizer CPU offload, disk offload with optional directory, colocate
+    # peak-memory device); SGLang options (GPUs per engine, memory fraction, cuda graph switch and max
+    # batch, engram host table, running request cap, radix cache); rollout layout (rollout_num_nodes
+    # zero means colocated, fully async switch); load_from_hf (use the Hugging Face checkpoint as
+    # reference load); sizes (5 rollouts, 16 prompts, 8 samples, optional response length, tokens
+    # per GPU); debug replay options; precision/replay switches (routing replay on, indexer replay
+    # off, deterministic on). Derived fields: colocate, actor_num_nodes, actor_num_gpus_per_node,
+    # rollout_num_gpus.
     mode: Literal["normal", "debug_minimal"] = "debug_minimal"
     run_id: str = U.create_run_id()
     model_name: Literal["DeepSeek-V4.1", "DeepSeek-V4.1-4layer"] = "DeepSeek-V4.1"
@@ -74,6 +96,13 @@ class ScriptArgs(U.ExecuteTrainConfig):
     rollout_num_gpus: int = field(init=False)
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Resolves hardware and GPUs per node (per-hardware table when unset). Asserts rollout node
+        # count is in [0, total nodes). Derives colocate (no rollout nodes), actor nodes, actor GPUs per
+        # node, and expert parallel size (actor GPUs divided by pipeline size) when unset. When colocated,
+        # rollout GPUs are all GPUs and the engram host table switch is forced on (overriding the user's
+        # value); otherwise rollout GPUs are those of the rollout nodes. Response length defaults to 256
+        # for gsm8k and 4096 otherwise.
         self.hardware = U.resolve_hardware(self)
         self.num_gpus_per_node = self.num_gpus_per_node or U.NUM_GPUS_OF_HARDWARE[self.hardware]
         assert 0 <= self.rollout_num_nodes < self.num_nodes
@@ -92,14 +121,20 @@ class ScriptArgs(U.ExecuteTrainConfig):
 
     @property
     def megatron_model_type(self):
+        # [FUNCTION DOC] Property: Megatron model type key looked up from the model name table.
         return _MEGATRON_MODEL_TYPE[self.model_name]
 
     @property
     def torch_dist_name(self):
+        # [FUNCTION DOC] Property: folder name of the Megatron distributed checkpoint (model name
+        # plus a "_torch_dist" suffix) under the model directory.
         return f"{self.model_name}_torch_dist"
 
 
 def _prepare_download(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Creates model and data directories; if no explicit checkpoint was given and
+    # the model has a known org (only the 4-layer prune), downloads it from Hugging Face into the model
+    # directory; then downloads the task dataset. The full model is never downloaded by this script.
     U_backend = args.create_backend()
     U_backend.exec_command_cpu(f"mkdir -p {args.model_dir} {args.data_dir}")
     if args.hf_checkpoint is None and args.model_name in _MODEL_ORG:
@@ -109,6 +144,8 @@ def _prepare_download(args: ScriptArgs):
 
 
 def _download_dataset(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Downloads the task dataset(s) into the data directory: DAPO math plus
+    # AIME 2024 for dapo_aime, or GSM8K for gsm8k.
     backend = args.create_backend()
     match args.task:
         case "dapo_aime":
@@ -119,6 +156,9 @@ def _download_dataset(args: ScriptArgs):
 
 
 def _parallel_args(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: Returns the space-terminated parallelism flag string: tensor, pipeline and
+    # context sizes, the all-gather context split only when context > 1, sequence parallel if enabled,
+    # expert size and expert-tensor size 1.
     return (
         f"--tensor-model-parallel-size {args.tp_size} "
         f"--pipeline-model-parallel-size {args.pp_size} "
@@ -131,6 +171,11 @@ def _parallel_args(args: ScriptArgs) -> str:
 
 
 def _prepare_spmd(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Converts the Hugging Face checkpoint (required, assertion error if missing)
+    # into a Megatron distributed checkpoint under the model directory, on a single node using all GPUs
+    # per node, with the miles implementation, tensor size from options, pipeline 1, expert size equal
+    # to GPUs per node, expert-tensor 1 and context 1.
+    # KNOWN ISSUE: pipeline_size and expert size options are ignored for conversion (fixed values).
     assert args.hf_checkpoint is not None
     args.create_backend().convert_checkpoint(
         model_name=args.model_name,
@@ -155,22 +200,46 @@ def _prepare_spmd(args: ScriptArgs):
 @app.command()
 @U.dataclass_cli
 def prepare_spmd(args: ScriptArgs):
+    # [FUNCTION DOC] Command "prepare-spmd": checkpoint conversion to Megatron format.
     _prepare_spmd(args)
 
 
 @app.command()
 @U.dataclass_cli
 def prepare_data(args: ScriptArgs):
+    # [FUNCTION DOC] Command "prepare-data": downloads only the dataset.
     _download_dataset(args)
 
 
 @app.command()
 @U.dataclass_cli
 def prepare_download(args: ScriptArgs):
+    # [FUNCTION DOC] Command "prepare-download": downloads the pruned model (if applicable) and data.
     _prepare_download(args)
 
 
 def _train(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Builds the training argument string and submits the job. Requires an
+    # explicit checkpoint path (assertion error otherwise). Checkpoint: hf checkpoint; reference load is
+    # the hf checkpoint itself when load_from_hf else the local Megatron distributed folder; load/save
+    # (every 20 steps) only when saving is enabled (default is skipping). Rollout: math reward, chat
+    # template, shuffled, temperature 0.8, balanced data, one step per rollout; non-debug mode adds
+    # over-sampling 512 with a nonzero-reward-std filter. Data: dapo_aime adds thinking-mode template
+    # kwargs and optional AIME eval; gsm8k uses messages key and optional GSM8K eval (eval args only when
+    # enabled). Perf: parallel flags, micro batch 1, tokens per GPU. GRPO with zero coefficients, Adam
+    # 1e-6, optional CPU optimizer offload, optional disk offload (and disk offload of the train target
+    # when colocated, optional directory). SGLang: engine GPUs default to GPUs per node, tensor/expert =
+    # engine size, data parallel 1, dsv4 attention, auto moe backend, cuda graph on only if switched
+    # (else disabled), running request cap, radix cache disabled unless enabled, memory fraction.
+    # Environment: many SGLang/JIT-cache/engram variables; node-local cache dirs; the engram host table
+    # layout is per-rank if an engine spans more than one node, else shared. Misc: peak-memory device
+    # defaults to GPU on GB300 else CPU; gradient reduce dtype choice; colocate or explicit rollout GPU
+    # count; fully async; weight-update equality check (skipping engram parameters) when enabled;
+    # recompute full or selective; dump details; fault tolerance; debug replay (rollout id defaults to
+    # 1); routing replay; a vocab-size divisibility flag when the vocabulary 129280 is not divisible by
+    # 64 times tensor size; indexer replay with a token cap; deterministic mode with environment
+    # variables. Submits through the backend (no per-role copy commands).
+    # KNOWN ISSUE: the debug rollout id field is typed as text but defaulted to an integer.
     assert args.hf_checkpoint is not None
     load_save_path = f"{args.save_dir}/{args.run_id}/checkpoints"
     ref_load = args.hf_checkpoint if args.load_from_hf else f"{args.model_dir}/{args.torch_dist_name}"
@@ -365,6 +434,7 @@ def _train(args: ScriptArgs):
 @app.command()
 @U.dataclass_cli
 def train(args: ScriptArgs):
+    # [FUNCTION DOC] Command "train": runs training; needs an explicit checkpoint path.
     _train(args)
 
 

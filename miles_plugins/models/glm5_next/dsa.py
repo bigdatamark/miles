@@ -1,3 +1,8 @@
+# [MODULE DOC] Full-attention layer of the GLM-5.3 hybrid model: sparse multi-latent attention without
+# rotary embedding, whose key selection comes from a pooled-key indexer. Subclasses the GLM-5
+# attention layer, reusing its projections and indexer modules, and adds a learned (frozen here)
+# compression gate and position bias used to pool indexer keys. Context parallelism is not supported
+# for the selection step. Works on packed (THD) sequences only.
 import torch
 import torch.nn.functional as F
 from megatron.core import parallel_state
@@ -16,6 +21,10 @@ _SPARSE_MLA_TAIL_DIM = 64
 
 
 class Glm5NextDSAAttention(DSAMLASelfAttention):
+    # [CLASS DOC] Overrides the query/key/value computation (no rotary; query absorbed into the latent
+    # space; key is the normalized latent alone; extra pooling gate scores), adds the pooled-key
+    # selection step, and replaces the forward. The tail padding of 64 zero channels appended to
+    # queries and keys before the sparse attention kernel is a constant required by the kernel.
 
     def __init__(
         self,
@@ -30,6 +39,14 @@ class Glm5NextDSAAttention(DSAMLASelfAttention):
         pg_collection=None,
         name: str | None = None,
     ):
+        # [FUNCTION DOC] Asserts the config's rope head dim is zero. Calls the parent constructor with
+        # the same arguments, then overrides: softmax scale (query head dim to the minus half, without
+        # yarn scaling), selected-key count (config value, default 2048) and pool size (config value,
+        # default 4). Creates two parameters: a pooling gate matrix (index head dim by hidden size,
+        # zeros) and a per-position bias (pool size by index head dim, float32 and kept in float32,
+        # zeros); both are frozen (no gradient) so they are expected to come from the checkpoint. If
+        # replay is enabled, sets the replay stream index to this layer's rank among the full-attention
+        # layers listed on the config (value error if the layer is not listed).
         assert config.qk_pos_emb_head_dim == 0, "GLM-5.3 DSA skips rope; qk_pos_emb_head_dim must be 0"
         super().__init__(
             config=config,
@@ -68,6 +85,21 @@ class Glm5NextDSAAttention(DSAMLASelfAttention):
         *,
         inference_params=None,
     ):
+        # [FUNCTION DOC] Requires 3-dimensional hidden states and packed sequence parameters
+        # (assertions); other arguments ignored. Returns (absorbed query, key, value up-projection
+        # weight per head, index query, index key, head weights, pooling gate scores) as seven values
+        # (the parent returns six). Steps: query down projection (squeezed) and key/value down
+        # projection (gathered over sequence parallel if on) with the key/value layernorm module (an
+        # identity in the spec); query layernorm and up projection to heads; the key/value up weight is
+        # split per head into key-nope and value parts; the query is absorbed by contracting with the
+        # key-nope part. The latent is RMS-normalized in float32 with the fused layernorm weight and
+        # gathered across the context-parallel group to form the key; no rotary anywhere. Indexer
+        # inputs (detached from the attention graph): the query latent re-normalized in float32 with
+        # the fused weight, projected to index queries (sequence-parallel gathered); hidden states
+        # projected to an index key, layer-normalized in float32, cast to bfloat16, gathered over
+        # sequence parallel and context parallel; pooling gate scores as a linear map of hidden states
+        # gathered the same way; head weights in float32 via the router-gating function, scaled by index
+        # heads and index head dim to the minus half powers, gathered over sequence parallel.
         assert hidden_states.ndim == 3, f"hidden_states should be 3D, [s, b, n*h], got {hidden_states.ndim}D"
         assert packed_seq_params is not None
 
@@ -140,6 +172,10 @@ class Glm5NextDSAAttention(DSAMLASelfAttention):
         return query, key, w_vc, index_q, index_k, head_weights, gate_score
 
     def _kpool_select(self, index_q, index_k, head_weights, gate_score, packed_seq_params):
+        # [FUNCTION DOC] HELPER: Raises not-implemented if context parallel size is above one. Uses the
+        # key cumulative sequence lengths, computes per-sequence pool boundaries for the pool size,
+        # builds pooled keys from the index keys, gate scores and the position bias, and returns the
+        # selected token indices from the pooled top-k selection (tokens, 1, selected count).
         if parallel_state.get_context_parallel_world_size() > 1:
             raise NotImplementedError("GLM-5.3 kpool indexer selection does not support context parallelism yet.")
         cu_seqlens = packed_seq_params.cu_seqlens_kv
@@ -180,6 +216,14 @@ class Glm5NextDSAAttention(DSAMLASelfAttention):
         router_token_masks=None,
         loss_mask=None,
     ):
+        # [FUNCTION DOC] Asserts no rotary embedding or attention bias is passed; other arguments
+        # (mask, cos/sin, inference args, offsets, router masks, loss mask) are ignored. Computes the
+        # absorbed tensors, selects token indices with the pooled-key indexer, zero-pads queries and keys
+        # by 64 channels on the last dim, runs sparse attention (singleton batch axis added then removed;
+        # value dim equals kv lora rank), contracts the latent output with the per-head value weights,
+        # flattens heads to (tokens, 1, heads times value dim), and applies the output projection.
+        # Returns (output, bias). Unlike the parent, no cross-layer top-k sharing and no
+        # recompute-of-up-projection handling happens here.
         assert rotary_pos_emb is None, "Rotary position embeddings should not be passed into GLM-5.3 DSA."
         assert attention_bias is None, "Attention bias should not be passed into GLM-5.3 DSA."
 

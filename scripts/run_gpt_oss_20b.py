@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Launcher script (single command, run through typer) for GRPO training of gpt-oss-20b in bf16 on
+# DAPO math, Megatron plus SGLang colocated on one or more nodes. Runs in bridge mode: the Hugging
+# Face checkpoint is read directly, so there is no converted checkpoint, no reference load, no load
+# path and no kl loss. The model's sink attention forces the bshd layout with the fused attention
+# backend, which forces a static micro batch size of 1. Training only (the model and dataset must
+# already be present). Optionally exports a bf16 Hugging Face checkpoint periodically.
 """gpt-oss-20b bf16 GRPO training script.
 
 =====================
@@ -36,6 +43,11 @@ from miles.utils.external_utils import command_utils
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC]
+    # Command line options extending the shared train configuration (num_nodes, output dir, backend
+    # creation). Fields: run id, GPUs per node (8), save switch (export bf16 Hugging Face checkpoint
+    # every 50 steps when on, default off), number of rollouts (1000), extra raw args, data and model
+    # directories, Megatron checkout path. No derived fields.
     run_id: str = command_utils.create_run_id()
     num_gpus_per_node: int = 8
     save: bool = False
@@ -47,6 +59,21 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Builds the training argument string and submits the job (no prepare step, no
+    # per-role commands, no eval). Checkpoint: hf checkpoint in the model directory under "gpt-oss-20b",
+    # bridge mode; if save is on, saves (as a bf16 Hugging Face export) to the model directory under
+    # "gpt-oss-20b-BF16" every 50 steps. Rollout: DAPO math, math reward, chat template, shuffled,
+    # rollouts from options, 32 prompts x 8 samples, response length 8192, temperature 1.0, one step
+    # per rollout. Parallelism: tensor 8 with sequence parallel (required with expert parallel),
+    # pipeline 1, context 1, expert 8, expert-tensor 1; full uniform recompute (needed to fit optimizer
+    # states in 80 GB); micro batch 1 (dynamic batching unsupported with bshd). GRPO without any kl
+    # terms (a reference checkpoint would be needed), zero entropy coefficient, asymmetric clip.
+    # Adam 1e-6 with CPU offload, overlapped transfers and precision-aware optimizer. SGLang: 4 GPUs
+    # per engine, bfloat16, decode log interval 1000, memory fraction 0.70. Misc: dropouts off, bshd
+    # layout, fused attention backend, colocate, actor nodes and GPUs from options. Submits with the
+    # fixed Megatron model type "gpt-oss-20b".
+    # KNOWN ISSUE: parallel size tensor 8 / expert 8 and SGLang engine size 4 are fixed, so GPUs per
+    # node values other than 8 (or multiples) are not meaningfully supported despite the option.
     # Bridge mode loads the HF weights directly, hence no --ref-load / --load here.
     U = args.create_backend()
     ckpt_args = f"--hf-checkpoint {args.model_dir}/gpt-oss-20b " "--megatron-to-hf-mode bridge "
@@ -150,6 +177,7 @@ def execute(args: ScriptArgs):
 
 @command_utils.dataclass_cli
 def main(args: ScriptArgs):
+    # [FUNCTION DOC] Command line entry point: runs execute with the parsed options.
     execute(args)
 
 

@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Launcher script (typer command line app with a single "train" command) for GRPO training of the
+# Inkling model family (Inkling, Inkling-Small and truncated layer slices of each) on already
+# converted checkpoints; no download or conversion happens here. Choices: full-parameter or LoRA
+# training; text task (DAPO math) or vision task (geo3k with frozen towers); colocated rollout
+# (default) or fully asynchronous disaggregated rollout on dedicated nodes (full mode only, separate
+# async training driver, no eval). Parallel layouts are only provided for verified cluster shapes;
+# others raise a not implemented error. The module table maps a model name to the model definition
+# file, where layer-slice names reuse the base definition and get their layer count through an
+# environment variable set as a side effect of argument post-processing.
 """
 Inkling family training script (Inkling / Inkling-Small / layer slices).
 
@@ -76,12 +86,25 @@ _MODEL_REGISTRY = {
 
 
 def _slice_num_layers(model_name: str) -> int | None:
+    # [FUNCTION DOC] HELPER: Parses a trailing "-<N>layer" suffix from the model name and returns N as
+    # an integer, or None when the name has no such suffix (full models).
     match = re.search(r"-(\d+)layer$", model_name)
     return int(match.group(1)) if match else None
 
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC]
+    # Command line options extending the shared train configuration (provides num_nodes, output
+    # directory, backend creation). Fields: run id, model name (five allowed values), train mode (full
+    # or lora), task (dapo_math or geo3k), fully_async switch with rollout_num_nodes (default 4, used
+    # only when fully async), eval switch, rollout counts and batch sizes (100 rollouts, 32 prompts x 8
+    # samples, global batch 64), checkpoint locations (hf checkpoint, shared distributed checkpoint, and
+    # a node-local distributed checkpoint copy target; all derived when unset), directories, optional
+    # save dir (no saving when unset), GPUs per node (4), SGLang GPUs per engine (16) and context
+    # length, learning rate (None derives it), response length, disk offload directory, LoRA rank,
+    # alpha and optional starting adapter path, routing replay switch (on), extra raw args. Derived
+    # (non-init) fields: colocate, actor_num_nodes, actor_num_gpus_per_node.
     run_id: str = command_utils.create_run_id()
     model_name: Literal[
         "Inkling", "Inkling-4layer", "Inkling-Small", "Inkling-Small-4layer", "Inkling-Small-6layer"
@@ -124,6 +147,14 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     extra_args: str = ""
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Side effect: for a layer-slice model name, sets the process environment variable that the model
+        # definition reads for its layer count (global mutation visible to later model-arg loading).
+        # Fills defaults: hf checkpoint = model dir + name; distributed checkpoint = model dir + name +
+        # "_torch_dist"; local distributed checkpoint = the shared one (no copy); learning rate = 5e-6
+        # for LoRA else 1e-6. Fully async mode asserts full-parameter training, no eval, and
+        # 0 < rollout nodes < total nodes; it disables colocate and sets actor nodes to the rest.
+        # Otherwise colocate is on and actor nodes equal all nodes. Actor GPUs per node = GPUs per node.
         if (num_layers := _slice_num_layers(self.model_name)) is not None:
             os.environ["MODEL_ARGS_NUM_LAYERS"] = str(num_layers)
         if self.hf_checkpoint is None:
@@ -147,10 +178,19 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
     @property
     def is_mm(self):
+        # [FUNCTION DOC] Property: True when the task is the vision (geo3k) task.
         return self.task == "geo3k"
 
 
 def _get_parallel_config(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: Returns the parallelism flag string for verified setups, checking cases in
+    # order using the actor GPU total: (1) fully async with the full Inkling model on 32 actor GPUs:
+    # tensor 4, sequence parallel, pipeline 2, expert 16; (2) Inkling-Small on 32 GPUs: tensor 4,
+    # sequence parallel, pipeline 8 with last stage 7 layers, expert 4; (3) any layer slice on one actor
+    # node: tensor 4, pipeline 1, expert 4; (4) with 4 GPUs per node: 64 GPUs gives tensor 4, pipeline 4
+    # with last stage 15 layers, expert 16; 48 GPUs gives tensor 4, pipeline 3, expert 16. Expert-tensor
+    # is always 1. Anything else raises a not implemented error naming the GPU total. Matches the
+    # existing docstring.
     """Return parallel config args for tested GPU configurations.
 
     Only includes configurations that have been verified to work.
@@ -214,6 +254,36 @@ def _get_parallel_config(args: ScriptArgs) -> str:
 
 
 def _train(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Builds the training argument string and submits the job. Prints a topology
+    # summary. Checkpoint: hf checkpoint, the local distributed checkpoint as load path (no reference
+    # load), model name inkling, raw Megatron-to-HF mode, no loading of optimizer or RNG state, fine-tune
+    # mode; saves under the save dir run folder every 10 steps only if a save dir is given. Rollout:
+    # for fully async, adds async flags and in-place generation pause; then input/label keys, shuffle,
+    # math reward, rollout sizes, temperature 1, global batch, balanced data. Task data: dapo_math uses
+    # DAPO data with chat template and optional AIME 2025 eval; geo3k uses its train file and optional
+    # validation eval (eval every 5 steps, 1 sample, temperature 1, same max length as training).
+    # GRPO: zero entropy, clip 0.2 / 0.28, dual-clip constant 3.0, truncated importance sampling, and
+    # optional routing replay. Optimizer: Adam with learning rate from options, distributed optimizer,
+    # no nan check; gradient reduction in bf16 for fully async else fp32 accumulation. Parallelism from
+    # the verified table plus full uniform recompute. Full mode: fully async streams optimizer state to
+    # disk (256 MB chunks) while colocated mode offloads the training target to disk; micro batch 1;
+    # SGLang engine settings differ (fully async: fixed 16 GPUs per engine, fraction 0.80, 128 running
+    # requests, cuda graph 128; colocated: engine size from options, fraction 0.6, 64 requests).
+    # LoRA mode: LoRA flags (all-linear, shared-outer expert adapters, triton LoRA backend with virtual
+    # experts, rank, optional adapter path), dynamic batch with 4096 tokens per GPU, engine size from
+    # options with expert size equal to it, fraction 0.65, 32 running requests, and no offload flags
+    # when the engine has at least 16 GPUs. All modes add attention backend fa4, triton moe, Mamba radix
+    # cache strategy, multimodal support, context length, custom all-reduce disabled. The vision task
+    # adds a custom model provider path that overrides the text provider. Misc: transformer engine
+    # implementation, bf16, dropout off, fp32 softmax, distributed timeout 30 minutes, actor and GPU
+    # counts, then either explicit rollout GPU count with broadcast weight transfer (fully async) or
+    # colocate. Environment variables: SGLang radix tree, kernel check skip, logprob return, ray memory
+    # monitor off, NCCL multi-node NVLink on, NVLS and RAS off, plus others. Submits through the backend
+    # using the async driver script when fully async, with the model definition name from the table and
+    # the per-role copy command.
+    # KNOWN ISSUE: in fully async full mode the number of GPUs per engine is hard-coded to 16 and the
+    # SGLang GPUs-per-engine option is ignored there.
+    # KNOWN ISSUE: the inline comment about the model "sh" is stale; model definitions are python files.
     U = args.create_backend()
     topology = (
         f"{args.actor_num_nodes} train + {args.rollout_num_nodes} rollout nodes (fully-async)"
@@ -430,11 +500,16 @@ def _train(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def train(args: ScriptArgs):
+    # [FUNCTION DOC] Command "train": runs training (copying the distributed checkpoint to node-local
+    # storage first when the local path differs from the shared one).
     """Run training; each trainer pod first copies torch_dist to node-local NVMe when the two differ."""
     _train(args)
 
 
 def _prepare_cmd(args: ScriptArgs) -> dict[str, str]:
+    # [FUNCTION DOC] HELPER: Per-role pre-launch commands. Returns an empty mapping when the local and
+    # shared distributed checkpoint paths are equal; otherwise a "trainer" entry with a single copy
+    # command from the shared to the local path.
     if args.torch_dist_local == args.torch_dist:
         return {}
     return {"trainer": command_utils.rsync_cmd(args.torch_dist, args.torch_dist_local)}
@@ -442,6 +517,7 @@ def _prepare_cmd(args: ScriptArgs) -> dict[str, str]:
 
 @app.callback()
 def _callback() -> None:
+    # [FUNCTION DOC] HELPER: Empty typer callback so the single command stays a sub-command. Does nothing.
     pass
 
 

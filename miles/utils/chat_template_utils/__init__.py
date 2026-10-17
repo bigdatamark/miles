@@ -1,3 +1,13 @@
+# [PACKAGE DOC] Chat template handling for agentic workflows, aimed at keeping the tokens that
+# training sees identical to those the inference server produced. Contents: message_matcher_hub
+# (dependency-free policies deciding whether a replayed message equals a stored one, plus
+# append-only validation), template (loading and rendering chat templates in the inference
+# server's style), deepseek (bridge to the DeepSeek official encoders), inkling and
+# inkling_parser (Inkling model support), tito_tokenizer (token-in-token-out tokenizers for
+# incremental tokenization) and token_seq_comparator (token sequence diffing); templates holds
+# bundled template assets. This file re-exports the main public names; import order matters
+# because of the dependency chain noted below.
+
 """Chat template utilities for agentic-workflow token consistency."""
 
 # Import order matters: message_matcher_hub is the dependency-free base,

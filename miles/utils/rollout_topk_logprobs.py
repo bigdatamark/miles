@@ -1,3 +1,7 @@
+# [MODULE DOC] Validation helpers for the rollout top-k logprobs feature (recording the sampler's
+# candidate log-probs per generated token). Two checks: one on launch arguments (run once at
+# startup) and one on the per-call sampling parameters of each generation request. Both only
+# raise value errors; they have no side effects.
 """Rollout top-k logprobs: the sampler's candidate log-probs recorded for each generated token.
 
 ``--rollout-top-logprobs-num`` sets the width of ``Sample.rollout_topk_token_ids`` /
@@ -14,6 +18,13 @@ from typing import Any
 
 
 def validate_rollout_topk_logprobs_args(args: Any) -> None:
+    # [FUNCTION DOC] Validates the parsed launch arguments. Reads the candidate count
+    # (rollout_top_logprobs_num): raises a value error if negative; returns silently if zero
+    # (feature off). Otherwise raises a value error if the logprobs mode is "support" and the
+    # candidate count is smaller than the rollout top-k (candidates could not hold the whole
+    # sampling support), and raises a value error if on-policy-distillation is used with a
+    # positive student top-k log-prob count and a top-k strategy other than "only-teacher"
+    # (incompatible combination). Returns nothing.
     """Reject rollout top-k logprobs settings whose recorded candidates cannot match the sampler."""
     k = args.rollout_top_logprobs_num
     if k < 0:
@@ -33,6 +44,16 @@ def validate_rollout_topk_logprobs_args(args: Any) -> None:
 def validate_rollout_topk_logprobs_sampling(
     sampling: Mapping[str, Any], *, temperature: float, candidate_count: int
 ) -> None:
+    # [FUNCTION DOC] Validates one generation call's sampling-parameter mapping against the run's
+    # rollout temperature and the candidate count. Raises a value error if: the call's
+    # temperature (default: the run's) differs from the run's, or the run's temperature is not a
+    # finite positive number; the call's top_k (default -1, meaning off) is greater than the
+    # candidate count; min_p (default 0.0) is nonzero; any truthy constraint key among json
+    # schema, regex, ebnf, structural tag, custom logit processor or logit bias is present; a
+    # truthy response_format is not a mapping or has a type other than "text" (default "text");
+    # tool_choice (default "auto") is something other than none/"auto"/"none"; or, unless tool
+    # choice is "none", any provided tool has a truthy "strict" flag in its function section.
+    # Returns nothing.
     """Require per-call sampling whose distribution the recorded candidates describe.
 
     Top-p/top-k bounds are checked by the rollout args and sampling-support replay;

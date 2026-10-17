@@ -1,3 +1,8 @@
+# [MODULE DOC] HELPER: Client-side helpers to consume an OpenAI-style streaming chat completions
+# response (server-sent events over HTTP) and rebuild the equivalent non-streaming response. Two
+# pieces: a pure accumulator that folds chunk objects into one response, and an async function that
+# posts a request with streaming enabled through an httpx async client, validates the event stream
+# framing, and returns the accumulated response.
 """Black-box OpenAI streaming client for e2e agents.
 
 Consumes a ``stream: true`` chat completions response as SSE and rebuilds the
@@ -17,6 +22,17 @@ import httpx
 
 
 def accumulate_chat_chunks(chunks: list[dict], *, label: str = "") -> dict:
+    # [FUNCTION DOC] Merges a list of chunk mappings into one response mapping. Asserts the list is
+    # non-empty and each chunk's object type is the chunk type; each chunk must have exactly one
+    # choice (unpacking error otherwise). Message: starts with role assistant and null content;
+    # a delta role overrides the role; content and reasoning-content fragments (when not null) are
+    # concatenated in order; tool-call fragments are merged per their index: all keys except the
+    # index and function (and null values) overwrite the entry's keys, the function name overwrites
+    # when present, and the function arguments fragments are concatenated. The last non-empty finish
+    # reason wins, and the last non-null usage wins. If any tool calls were seen, they are put on
+    # the message ordered by index. The result has id, creation time and model taken from the first
+    # chunk, object type chat completion, a single choice at index 0 with the message and finish
+    # reason (none if never seen), and usage only when seen. The label prefixes assertion messages.
     """Fold ``chat.completion.chunk`` dicts into a non-streaming response."""
     assert chunks, f"{label}: SSE stream contained no chunks before [DONE]"
     message: dict = {"role": "assistant", "content": None}
@@ -64,6 +80,14 @@ def accumulate_chat_chunks(chunks: list[dict], *, label: str = "") -> dict:
 
 
 async def stream_chat_completions(client: httpx.AsyncClient, url: str, payload: dict, *, label: str = "") -> dict:
+    # [FUNCTION DOC] Sends a streaming POST of the payload with the stream flag forced on (the
+    # caller's mapping is not mutated). Raises an assertion error with status and decoded body if
+    # the status is not 200, and asserts the content type starts with the event-stream type.
+    # Reads lines: skips empty lines and comment lines (starting with a colon); every other line
+    # must start with "data: " (assertion error otherwise) and must not come after the done marker;
+    # the done marker "[DONE]" ends the stream, other data lines are parsed as JSON into chunks.
+    # Asserts the done marker was seen, then returns the accumulated response (which asserts at
+    # least one chunk). The label is used in messages.
     """POST *payload* with ``stream: true`` via httpx and rebuild the response."""
     chunks: list[dict] = []
     done = False

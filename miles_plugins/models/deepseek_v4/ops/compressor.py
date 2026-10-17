@@ -1,3 +1,9 @@
+# [MODULE DOC] KV compressor for DeepSeek-V4 attention. Pools every group of compress_ratio consecutive
+# tokens into one compressed key/value entry using a learned softmax gate over the group (plus a
+# learned per-position bias), then applies RMS norm, rotary embedding on the trailing rope dims, and
+# optional rotation and fp8 quantization-aware-training simulation. Supports ratio 4 (with overlapping
+# groups, doubled width) and ratio 128 (no overlap). Provides a regular batch-major path (with
+# contiguous context-parallel support) and a packed variable-length (THD) path.
 import einops
 import torch
 import torch.nn as nn
@@ -15,6 +21,13 @@ from miles_plugins.models.deepseek_v4.ops.utils import rotate_activation
 
 
 def _overlap_transform(tensor: torch.Tensor, *, compress_ratio: int, head_dim: int, value=0) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Builds the overlapped group tensor for the batch-major layout. Input is
+    # batch, group count, ratio, 2*head_dim (the doubled width of the overlap mode). Output has the
+    # ratio axis doubled and width head_dim, filled with the given value by default. The second
+    # half of the channels of each group goes into the last ratio slots of the same group; the first
+    # half of the channels of the previous group goes into the first ratio slots of the current group.
+    # The first group has no predecessor, so its first slots keep the fill value. Returns a new tensor;
+    # the input is not modified.
     """Overlap-transform for compress_ratio=4: for each token group of size ``ratio``,
     split into (first_half, second_half) halves along ``head_dim`` and re-arrange
     them across a doubled ratio axis (`2 * ratio`), shifting the first half by one
@@ -30,6 +43,11 @@ def _overlap_transform(tensor: torch.Tensor, *, compress_ratio: int, head_dim: i
 def _overlap_transform_thd(
     tensor: torch.Tensor, *, compress_ratio: int, head_dim: int, is_first: torch.Tensor, value=0
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Packed-stream variant of the overlap transform. Groups are flat along
+    # dim 0 and the batch axis comes after the ratio axis. The current group's second channel half
+    # fills the last ratio slots; the previous flat group's first channel half (a circular shift by one
+    # along the group axis) fills the first ratio slots, and rows flagged as first-of-segment are reset
+    # to the fill value so no data leaks across segment boundaries. Returns a new tensor.
     """Overlap-transform for packed THD groups.
 
     Same rearrangement as :func:`_overlap_transform`, but groups are flat along dim 0
@@ -49,6 +67,10 @@ def _overlap_transform_thd(
 
 
 class DeepSeekV4Compressor(nn.Module):
+    # [CLASS DOC] Learned gated-pooling compressor. Owns a float32 position bias of shape ratio by
+    # coff*head_dim (coff is 2 when overlapping, i.e. ratio 4, else 1), two bias-free bfloat16 linear
+    # projections (key/value and gate) from hidden size to coff*head_dim, and an RMS norm over head_dim.
+    # Optional context-parallel group makes the batch-major path gather groups across ranks.
     def __init__(
         self,
         config: TransformerConfig,
@@ -57,6 +79,14 @@ class DeepSeekV4Compressor(nn.Module):
         rotate: bool,
         cp_group: torch.distributed.ProcessGroup | None = None,
     ):
+        # [FUNCTION DOC] Reads hidden size, rope head dim (qk_pos_emb_head_dim), and norm epsilon from
+        # the config and builds the submodules. head_dim must be 128 or 512, rope head dim must be 64,
+        # compress_ratio must be 4 or 128, epsilon must be 1e-6, and the compress rotary base must be
+        # 160000; each is enforced with an assertion. Overlap mode is on only for ratio 4. fp8 QAT
+        # simulation is enabled when the config has fp8 set. cp size and rank come from the group
+        # (1 and 0 when absent). The position bias is marked to stay in float32 under Megatron's
+        # mixed-precision casting. The bias is created uninitialized (empty); initialization is
+        # expected to come from checkpoint loading.
         super().__init__()
 
         dim = config.hidden_size
@@ -95,10 +125,22 @@ class DeepSeekV4Compressor(nn.Module):
         assert base == 160000
 
     def overlap_transform_raw(self, tensor: torch.Tensor, value=0):
+        # [FUNCTION DOC] Thin wrapper applying the batch-major overlap transform with this module's
+        # ratio and head_dim; no context-parallel communication. Returns the transformed tensor.
         """Raw overlap transform without CP handling."""
         return _overlap_transform(tensor, compress_ratio=self.compress_ratio, head_dim=self.head_dim, value=value)
 
     def overlap_transform_with_cp(self, tensor: torch.Tensor, value=0) -> torch.Tensor:
+        # [FUNCTION DOC] Overlap transform that is correct across contiguous context-parallel ranks.
+        # With a single rank it just applies the raw transform. Otherwise it all-gathers the local
+        # groups along the group axis (so the previous-group dependency at the rank boundary is
+        # satisfied), applies the raw transform on the full group axis, and slices back this rank's
+        # contiguous block of groups. Fill value is 0 for key/value and negative infinity for scores.
+        # Communication: one differentiable all-gather over the cp group.
+        # KNOWN ISSUE: the docstring's output shape says the last dim is coff*d and ratio unchanged,
+        # but after the transform the ratio axis is doubled and the last dim is head_dim. Also the
+        # gather helper is wrapped in a single-entry cache keyed on its tensor arguments, which is
+        # suspicious for tensors that change every call.
         """
         Overlap transform with CP support.
 
@@ -121,6 +163,19 @@ class DeepSeekV4Compressor(nn.Module):
         return tensor[:, start : start + G_local, :, :]
 
     def forward_raw(self, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] Batch-major compression. Input is batch, local sequence length, hidden dim;
+        # local length must be a multiple of the ratio (and of twice the ratio when cp size > 1) and
+        # at least the ratio. Output is batch, local length / ratio, head_dim. Steps: project to
+        # key/value and gate scores with a bf16-in float32-out linear; split the sequence axis into
+        # groups of ratio; add the position bias to scores; in overlap mode apply the cp-aware
+        # overlap transform (fill 0 for values, negative infinity for scores); softmax the scores over
+        # the within-group axis and take the weighted sum of values; cast back to the input dtype and
+        # RMS-normalize; apply rotary embedding in place to the last rope_head_dim channels using
+        # frequencies computed for the global length, sliced for this rank and strided by the ratio
+        # (position of each group is its first token); finally if rotate is set, apply the activation
+        # rotation and (with fp8 QAT) simulate fp8 quantization with block 128; otherwise with fp8 QAT
+        # clone and simulate fp8 with block 64 on only the non-rope channels. Asserts that parameter
+        # dtypes are float32 bias and bf16 weights.
         assert self.ape.dtype == torch.float32
         assert self.linear_wkv.weight.dtype == torch.bfloat16
         assert self.linear_wgate.weight.dtype == torch.bfloat16
@@ -172,6 +227,19 @@ class DeepSeekV4Compressor(nn.Module):
         return kv
 
     def _forward_thd(self, x: torch.Tensor, thd_layout: ThdLayout):
+        # [FUNCTION DOC] HELPER: Packed-stream compression; same math as the batch-major path
+        # (projection, bias, optional overlap, gated softmax pooling, norm, rotary, optional rotation
+        # and fp8 QAT simulation) but group boundaries follow per-segment cumulative lengths. Two input
+        # modes. Unpacked-groups mode: the number of compressed rows per segment is derived from the
+        # cumulative sequence lengths; returns None if the total is zero; each group's token rows are
+        # gathered by index (segment start plus group index times ratio plus offset in group). Pre-grouped
+        # mode (layout carries group ids): rows are already contiguous per group so the projections are
+        # just reshaped; raises a value error if the layout lacks max_seqlen. Group ids give each
+        # group's index within its segment and drive the overlap first-group mask; padding groups carry
+        # a negative id which is clamped to zero for the rotary position lookup. Rotary frequencies are
+        # computed up to max_seqlen (pre-grouped) or the total token count, and indexed at group index
+        # times ratio. Here softmax runs over dim 1 (the ratio axis) since the layout is group, ratio,
+        # batch, width.
         """Compress a THD-packed stream, grouping tokens within each segment.
 
         The trailing ``seqlen % compress_ratio`` tokens of a segment get no compressed
@@ -273,6 +341,9 @@ class DeepSeekV4Compressor(nn.Module):
         return kv
 
     def forward(self, x: torch.Tensor, thd_layout: ThdLayout | None = None):
+        # [FUNCTION DOC] Dispatches: with a packed layout, delegates to the packed path; otherwise
+        # transposes sequence-major input to batch-major, runs the batch-major path, and transposes the
+        # result back to compressed-sequence-major.
         """
         Args:
             x: [seqlen, batch, dim] SBHD layout (Megatron standard); [total, batch, dim]

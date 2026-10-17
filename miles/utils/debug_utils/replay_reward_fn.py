@@ -1,3 +1,7 @@
+# [MODULE DOC] Command-line tool that re-runs a custom reward function over dumped rollout
+# samples and prints each sample's reward next to its index, status and truncated prompt and
+# response. Loads the dump with the torch loader, starts Ray if it is not running (the reward
+# function may use Ray), and runs all reward calls concurrently.
 import asyncio
 from typing import Annotated
 
@@ -10,6 +14,9 @@ from miles.utils.types import Sample
 
 
 def _truncate(text, max_len=200):
+    # [FUNCTION DOC] HELPER: Returns none for none input; otherwise converts to text, escapes
+    # newlines into the two characters backslash and n, and cuts to max_len characters (default
+    # 200) with an ellipsis appended when cut.
     """Truncate text and add ellipsis if too long."""
     if text is None:
         return None
@@ -23,6 +30,10 @@ def main(
     rollout_data_path: Annotated[str, typer.Option()],
     custom_rm_path: Annotated[str, typer.Option()],
 ):
+    # [FUNCTION DOC] Entry point. Inputs: path of a rollout dump file and the import path of the
+    # custom reward function. Initializes Ray if not initialized (side effect, default settings),
+    # loads the dump, rebuilds Sample objects from its samples list, and runs the async replay to
+    # completion.
     if not ray.is_initialized():
         ray.init()
 
@@ -32,6 +43,11 @@ def main(
 
 
 async def _main_async(samples, custom_rm_path):
+    # [FUNCTION DOC] HELPER: Loads the reward function by path (it must be an async callable taking
+    # an arguments object, here none, and a sample), calls it for all samples concurrently and
+    # waits for all; any failure propagates. Then prints, per sample in order, a separator, the
+    # position out of total, index, status, reward, and prompt and response each truncated to 200
+    # characters, plus a closing separator.
     rm_function = load_function(custom_rm_path)
     rewards = await asyncio.gather(*[rm_function(None, sample) for sample in samples])
 

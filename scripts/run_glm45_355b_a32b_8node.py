@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Launcher script (single command, run through typer) for GSPO training of GLM-4.5-355B-A32B on an
+# already prepared cluster rack of 8 nodes x 8 GPUs, ported from a shell recipe. Training-only: it
+# assumes the Megatron distributed checkpoint exists and does no download or conversion. Requires the
+# MASTER_ADDR environment variable (ray head address). Optionally joins the hosts listed in a
+# hostfile to the ray cluster over ssh just before job submission. Defines the cluster tuning
+# environment variables (InfiniBand, NCCL, OpenMPI) passed to the ray runtime environment.
 """GLM-4.5-355B-A32B GSPO training script for a rack of 8 nodes x 8 GPUs.
 
 =====================
@@ -45,6 +52,11 @@ from miles.utils.external_utils import command_utils
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC]
+    # Command line options extending the shared train configuration. Fields: run id, model name and
+    # Megatron model type, GPUs per node (8), actor node count (8), save switch (off: checkpoint
+    # writing disabled by default), join_ray_workers switch (on), ray hostfile path, number of
+    # rollouts (3000), extra raw args, and data/model/Megatron directories. No derived fields.
     run_id: str = command_utils.create_run_id()
     model_name: str = "GLM-4.5-355B-A32B"
     megatron_model_type: str = "glm4.5-355B-A32B"
@@ -62,6 +74,15 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
 # InfiniBand / NVLink / OpenMPI tuning this rack needs, propagated by ray to every worker.
 def _cluster_env_vars(master_addr: str) -> dict[str, str]:
+    # [FUNCTION DOC] HELPER: Builds the environment variables propagated to every ray worker. Input:
+    # the ray head address. Returns a mapping from variable name to text: a no-proxy list (local
+    # hosts, the wildcard address and the head address), NCCL settings for the rack's InfiniBand and
+    # NVLink fabric (cumem off, traffic class, GID index, GPU direct level, retry and timeout,
+    # queue pairs, peer-to-peer level, record-stream avoidance, NVLS off, minimum CTAs), a layernorm
+    # backward SM margin, and OpenMPI transport options. Only if the MLP_SOCKET_IFNAME environment
+    # variable is set (read at call time) are the socket interface variables for Gloo, the tensor
+    # parallel socket and the two OpenMPI interface-include options added, all set to its value;
+    # otherwise those keys are omitted so no empty interface name is pinned. No other side effects.
     env_vars = {
         # execute_train exempts only 127.0.0.1 and the head; this cluster also needs 0.0.0.0
         "no_proxy": f"localhost,127.0.0.1,0.0.0.0,{master_addr}",
@@ -98,6 +119,28 @@ def _cluster_env_vars(master_addr: str) -> dict[str, str]:
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Builds the training arguments and submits the job. Requires MASTER_ADDR in the
+    # environment (assertion error with an explanatory message if missing or empty). Checkpoint: hf
+    # checkpoint and reference load from the model directory (distributed folder); writes checkpoints
+    # to the output directory every 20 steps only when save is on (never loads). Rollout: DAPO math,
+    # deepscaler reward, chat template, shuffled, 3000 rollouts by default, 128 prompts x 8 samples
+    # with 256 prompts over-sampled and filtered to nonzero reward standard deviation, response
+    # length 32768, temperature 1, 4 optimizer steps per rollout, balanced data, GLM stop token ids.
+    # Eval: AIME 2024 every 20 steps, 8 samples, length 32768, top-p 1 (the AIME dataset must be
+    # present although this script does not download it). Parallelism: tensor 8 with sequence
+    # parallel, pipeline 4, context 2, expert 16, expert-tensor 1; full uniform recompute; dynamic
+    # batch with 16384 tokens per GPU. GSPO estimator with zero coefficients, very small clip values
+    # (1e-4 and 2e-4) and truncated importance sampling; no kl loss so the reference is not loaded.
+    # Adam 1e-6 with CPU offload and precision-aware optimizer. SGLang: 32-GPU engines with
+    # data-parallel attention size 4, expert parallel 32, EAGLE speculative decoding (1 step, 1 top-k,
+    # 2 draft tokens, draft weights CPU backup), memory fraction 0.7. Misc: dropouts off, fp32 grad
+    # accumulation, flash attention, flex token dispatcher with DeepEP (overriding the model args'
+    # all-to-all), actor nodes and GPUs from options, colocate. Submits through the backend with the
+    # cluster environment variables and, when join_ray_workers is on, a pre-submit callback that
+    # starts ray workers over ssh on the hostfile hosts (head host taken from the MLP_WORKER_0_HOST
+    # environment variable, possibly unset); no callback otherwise.
+    # KNOWN ISSUE: the existing comment "need to comment this when using model with MLA" above the
+    # attention backend flag is stale for this non-MLA model (informational only).
     U = args.create_backend()
     master_addr = os.environ.get("MASTER_ADDR")
     assert master_addr, "MASTER_ADDR is not set. Point it at the ray head (the .sh used $MLP_WORKER_0_HOST)."
@@ -245,6 +288,7 @@ def execute(args: ScriptArgs):
 
 @command_utils.dataclass_cli
 def main(args: ScriptArgs):
+    # [FUNCTION DOC] Command line entry point: runs execute with the parsed options.
     execute(args)
 
 

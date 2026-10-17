@@ -1,3 +1,8 @@
+# [MODULE DOC] Launcher for GSPO training of Qwen3-Next-80B-A3B in one of two topologies: a 4-node
+# colocated production layout or a single-node layout with 2 rollout GPUs and 6 training GPUs.
+# Topology differences are captured in a frozen recipe table (module-level lookup keyed by
+# topology name). No prepare step: the converted torch_dist checkpoint and datasets must exist.
+# Entry points are execute and the typer-wrapped main.
 """Qwen3-Next-80B-A3B GSPO training script.
 
 =====================
@@ -44,6 +49,12 @@ _TOPOLOGIES = Literal["4node", "single-node"]
 
 @dataclass(frozen=True)
 class _Recipe:
+    # [CLASS DOC] HELPER: Immutable per-topology recipe: actor nodes and GPUs per node, rollout GPU
+    # count (none means rollout shares the training GPUs, i.e. colocated), rollout count, rollout
+    # batch size, samples per prompt, temperature, global batch size, tensor/pipeline/context/
+    # expert parallel sizes, dynamic-batch token budget, eval samples per prompt and top-p, GPUs
+    # per rollout engine, SGLang expert parallel size, whether to enable speculative decoding,
+    # the MoE token dispatcher type and whether to enable DeepEP.
     actor_num_nodes: int
     actor_num_gpus_per_node: int
     # None means the rollout engines share the training GPUs
@@ -117,6 +128,10 @@ _RECIPES: dict[str, _Recipe] = {
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC] Command-line configuration extending the shared train config. Fields: run id,
+    # topology (4node or single-node), model name and Megatron model type, physical GPUs per node
+    # (8), join_ray_workers (on; only applied for multi-node recipes), extra raw args, and data,
+    # model and Megatron directories. The selected recipe is exposed by a read-only property.
     run_id: str = command_utils.create_run_id()
     topology: _TOPOLOGIES = "4node"
     model_name: str = "Qwen3-Next-80B-A3B-Thinking"
@@ -130,10 +145,26 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
     @property
     def recipe(self) -> _Recipe:
+        # [FUNCTION DOC] Property: looks up the recipe for the chosen topology.
         return _RECIPES[self.topology]
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Builds the training argument string from the topology recipe and submits the
+    # job. Checkpoints: HF and torch_dist reference under the model dir, load and save in the
+    # checkpoints folder under the output dir every 20 steps. Rollout: dapo-math-17k, deepscaler
+    # reward, max response 8192, other sizes and temperature from the recipe. Eval: AIME every 20,
+    # max 16384, sample count and top-p from the recipe. Parallel sizes from the recipe with
+    # sequence parallel, expert tensor parallel 1, full recompute, dynamic batch. Algorithm: gspo
+    # with zero kl/entropy coefficients, clip 4e-4. Optimizer: adam lr 1e-6 constant with CPU
+    # offload. SGLang: engine size and EP size from the recipe, memory fraction 0.8, graph batch
+    # sizes up to 128; with speculative decoding also an EAGLE setup (2 steps, top-k 1, 3 draft
+    # tokens, draft weights CPU backup, max running requests 512). Misc: dropout off, fp32
+    # allreduce, flash attention, dispatcher type, node and GPU counts, DeepEP flag if set, and
+    # either colocate (no rollout GPU count) or an explicit rollout GPU count.
+    # Ray workers are joined over ssh (using the MASTER_ADDR environment variable, which must then
+    # be set or a key error is raised when the callback runs, and the optional MLP_WORKER_0_HOST)
+    # only if join_ray_workers is on and the recipe has more than one actor node.
     U = args.create_backend()
     ckpt_args = (
         f"--hf-checkpoint {args.model_dir}/{args.model_name} "
@@ -275,6 +306,7 @@ def execute(args: ScriptArgs):
 
 @command_utils.dataclass_cli
 def main(args: ScriptArgs):
+    # [FUNCTION DOC] Command-line entry point; just calls execute (no prepare step).
     execute(args)
 
 

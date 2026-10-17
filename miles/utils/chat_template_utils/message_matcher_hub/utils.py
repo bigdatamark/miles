@@ -1,3 +1,9 @@
+# [MODULE DOC] Policy-free building blocks for message matchers: the matcher callable type alias
+# (takes stored and replayed message mappings, returns a boolean), the message keys that matter to
+# templates (role, content, reasoning content, tool calls), the tool-call keys that exist only on
+# the wire (index), a sentinel object for "not a valid JSON object", and normalization helpers
+# including a strict JSON-object canonicalizer that keeps JSON types apart. All pure.
+
 """Shared matcher building blocks: type alias, constants, and normalization.
 
 Everything here is representation-level and policy-free, so custom matchers
@@ -24,6 +30,9 @@ _INVALID_JSON_OBJECT = object()
 
 
 def _normalize_value(value: Any) -> Any:
+    # [FUNCTION DOC] HELPER: Returns None for None, the empty string or the empty list; every
+    # other value is returned unchanged (so whitespace-only strings stay distinct). Note the
+    # comparison is by equality, so any value equal to an empty string or empty list is collapsed.
     """Normalize falsy sentinels that produce identical Jinja2 output.
 
     None, "" and [] are all falsy in Jinja2 and render the same way,
@@ -40,6 +49,9 @@ def _normalize_value(value: Any) -> Any:
 
 
 def _normalize_tool_calls(value: Any) -> Any:
+    # [FUNCTION DOC] HELPER: If the value is not a list, returns it as is. Otherwise returns a new
+    # list where each dictionary element is copied without the wire-only keys; non-dictionary
+    # elements are kept unchanged. Does not mutate the input.
     """Project tool_calls down to template-relevant content for comparison.
 
     Only keys in `_WIRE_ONLY_TOOL_CALL_KEYS` are removed; all other values remain part of history matching.
@@ -63,6 +75,8 @@ def _normalize_tool_calls(value: Any) -> Any:
 
 
 def _reject_duplicate_object_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: JSON object-pairs hook; builds a dictionary from key-value pairs and
+    # raises a value error on the first repeated key.
     result: dict[str, Any] = {}
     for key, value in pairs:
         if key in result:
@@ -72,6 +86,8 @@ def _reject_duplicate_object_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any
 
 
 def _parse_json_number(raw: str) -> Decimal:
+    # [FUNCTION DOC] HELPER: JSON float hook; parses the literal as an exact decimal number.
+    # Raises a value error if it is not a valid number or is not finite.
     try:
         value = Decimal(raw)
     except InvalidOperation as exc:
@@ -82,10 +98,19 @@ def _parse_json_number(raw: str) -> Decimal:
 
 
 def _reject_json_constant(raw: str) -> Any:
+    # [FUNCTION DOC] HELPER: JSON constant hook (NaN, Infinity, minus Infinity); always raises a
+    # value error naming the constant.
     raise ValueError(f"non-standard JSON constant: {raw!r}")
 
 
 def _tag_json_value(value: Any, *, allow_decimal: bool) -> tuple[Any, ...]:
+    # [FUNCTION DOC] HELPER: Recursively converts a JSON-compatible value to a tagged tuple form:
+    # null, boolean, string, number (always an exact decimal; integers and finite floats are
+    # converted, floats via their shortest string form), array (tuple of tagged items in order)
+    # and object (tuple of key and tagged value pairs sorted by key). Decimal inputs are accepted
+    # only when allowed and finite. Raises a value error for non-finite numbers, non-string object
+    # keys, or any other type (exact type checks, so subclasses such as an integer-like boolean
+    # are handled by their exact type). Deep nesting may raise a recursion error.
     """Convert a parsed JSON value into a type-tagged, key-sorted form.
 
     Tagging keeps JSON types apart under Python equality (True vs 1,
@@ -131,6 +156,13 @@ def _tag_json_value(value: Any, *, allow_decimal: bool) -> tuple[Any, ...]:
 
 
 def _normalize_json_object(value: Any) -> tuple[Any, ...] | object:
+    # [FUNCTION DOC] HELPER: Returns the tagged empty-object form for None or an empty string. A
+    # string is parsed strictly as JSON (duplicate keys, NaN and infinities rejected; integers and
+    # floats kept as exact decimals); any parse failure returns the invalid sentinel. A non-string
+    # value is used as is. The parsed result must be exactly a dictionary, else the invalid
+    # sentinel. The dictionary is converted to the tagged form, with decimals allowed only when
+    # the input was a string; conversion errors give the invalid sentinel. Never raises for
+    # ordinary bad input.
     """Normalize an ``arguments`` value to a comparable JSON-object form.
 
     None, "" and a valid empty-object spelling all map to the empty object.
@@ -161,6 +193,10 @@ def _normalize_json_object(value: Any) -> tuple[Any, ...] | object:
 
 
 def _raw_values_match(stored: Any, replayed: Any) -> bool:
+    # [FUNCTION DOC] HELPER: Strict structural equality. False when the exact types differ (so 1
+    # and 1.0 or True and 1 differ). Lists need equal length and pairwise matches; dictionaries
+    # need equal key sets and matching values per key; other values use ordinary equality. Returns
+    # False (instead of raising) on excessive recursion depth.
     """Type-sensitive structural equality for non-normalizable values."""
     try:
         if type(stored) is not type(replayed):

@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Launcher script (typer command line app with a single "train" command) for GRPO training of
+# GLM-5.3-Flash or its 4-layer prune on DAPO math, with Megatron training and SGLang rollout
+# colocated, intended for an already running ray cluster. Training only: the Megatron distributed
+# checkpoint and Hugging Face checkpoint must already exist. Cluster shapes are validated: the full
+# model on 32 or 64 GPUs, the 4-layer model on exactly 8 GPUs. Offloads the training state to disk
+# during rollout. The module table maps model names to Megatron model types.
 """GLM-5.3-Flash DAPO training on an already-running ray cluster (MILES_SCRIPT_EXTERNAL_RAY=1).
 
 python scripts/run_glm5_3_flash.py train --model-name GLM-5.3-Flash --num-nodes 8 --num-gpus-per-node 4
@@ -22,6 +29,13 @@ _MODEL_REGISTRY = {
 
 @dataclass
 class ScriptArgs(U.ExecuteTrainConfig):
+    # [CLASS DOC]
+    # Command line options extending the shared train configuration, overriding the node count default
+    # (2 nodes) and fixing GPUs per node (4). Fields: model name (default 4-layer prune), run id,
+    # optional explicit hf checkpoint (derived in post-init), directories (models, converted Megatron
+    # checkpoints, datasets, run outputs, Megatron checkout, training-state disk offload), number of
+    # rollouts (5), response length (4096), weight-update equality check switch (on), routing replay
+    # switch (off), skip saving (on), extra raw args.
     model_name: Literal["GLM-5.3-Flash", "GLM-5.3-Flash-4layer"] = "GLM-5.3-Flash-4layer"
     num_nodes: int = 2
     num_gpus_per_node: int = 4
@@ -41,11 +55,34 @@ class ScriptArgs(U.ExecuteTrainConfig):
     extra_args: str = ""
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # If no hf checkpoint was given, sets it to the model directory plus the model name.
         if self.hf_checkpoint is None:
             self.hf_checkpoint = f"{self.model_dir}/{self.model_name}"
 
 
 def _train(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Builds the training argument string and submits the job. Looks up the
+    # Megatron model type. Checkpoint: hf checkpoint; reference load from the converted-checkpoint
+    # directory under "<model type>_torch_dist"; unless saving is skipped (default), load/save under
+    # the save directory run folder every 10 steps without optimizer or RNG state. Rollout: math
+    # reward, chat template, shuffled, rollouts and response length from options, 4 prompts x 8
+    # samples, temperature 0.8, one step per rollout, balanced data, DAPO data. Parallelism: with the
+    # full model, asserts total GPUs is 32 or 64 and uses tensor 8, sequence parallel, pipeline 4
+    # (11 first / 12 last layers), context 1, expert = GPUs / 4, 8-GPU engines; with the 4-layer model,
+    # asserts exactly 8 GPUs and uses tensor 2, pipeline 2, expert 2, 4-GPU engines. Full uniform
+    # recompute, micro batch 1, 8192 tokens per GPU. GRPO zero coefficients. Adam 1e-6. SGLang: tensor
+    # and expert size = engine size, triton moe (so routing replay has materialized top-k), chunked
+    # prefill 8192, radix cache off, tilelang prefill/decode backends, bf16 KV cache, router health
+    # settings. Misc: memory margin, training-state offload to disk, memory fraction 0.7, colocate,
+    # model name flag for loading, packed layout, long distributed timeout, health checks, optional
+    # weight-update equality check skipping the visual parameters, optional routing replay. Environment
+    # variables: health check timeout, the caller's python path (copied at call time), single-thread
+    # compile pool (avoids a deadlock), and the triton and inductor cache directories if set in the
+    # caller's environment (because ray replaces the worker environment). Submits via the backend.
+    # Raises an assertion error on unsupported GPU counts.
+    # KNOWN ISSUE: the assertion on GPU count compares the total across nodes, so the node count and
+    # GPUs per node options are only valid in combinations giving those totals.
     megatron_model_type = _MODEL_REGISTRY[args.model_name]
 
     ckpt_args = f"--hf-checkpoint {args.hf_checkpoint} --ref-load {args.ckpt_dir}/{megatron_model_type}_torch_dist "
@@ -197,6 +234,7 @@ def _train(args: ScriptArgs):
 @app.command()
 @U.dataclass_cli
 def train(args: ScriptArgs):
+    # [FUNCTION DOC] Command "train": runs training; assumes checkpoints and datasets exist.
     _train(args)
 
 

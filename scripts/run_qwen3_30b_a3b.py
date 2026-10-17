@@ -1,3 +1,11 @@
+# [MODULE DOC] Launcher for GRPO training of Qwen3-30B-A3B (MoE) with Megatron and SGLang, covering
+# several hardware generations (H100, Blackwell parts, Rubin) and optional low-precision modes
+# (FP8, MXFP8, INT4, NVFP4 rollout; FP8, MXFP8, NVFP4 training), Megatron bridge mode, and
+# train/infer mismatch correction. Structure: a script-args dataclass with derived defaults,
+# prepare (download models and datasets, convert to low precision and to Megatron torch_dist),
+# execute (assemble grouped flag strings and submit the job via command_utils), and main (runs
+# prepare then execute). Relies on command_utils for shell commands, hardware resolution and the
+# pseudo-file encoding of inline config text.
 import os
 from dataclasses import dataclass
 from typing import Literal
@@ -9,6 +17,14 @@ from miles.utils.external_utils import command_utils
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC] Command-line configuration, extending the shared train config. Key fields: mode
+    # (normal or a minimal debug mode with short responses and frequent saves), run id, model name,
+    # Megatron model type, GPU counts (per node, actor per node, rollout total; all optional and
+    # derived), no_colocate (separate actor and rollout GPUs), hardware (auto-detected by default),
+    # enable_eval, extra raw args, directories, boolean precision switches for rollout (fp8, mxfp8,
+    # int4, nvfp4, attention fp8) and training (fp8, mxfp8, nvfp4), megatron bridge switch, mis
+    # (train-infer mismatch correction) switch, and tis_use_rs (whether the mis config also uses
+    # rejection sampling, default on). Validation happens in the post-init step.
     mode: Literal["normal", "debug_minimal"] = "normal"
     run_id: str = command_utils.create_run_id()
     model_name: str = "Qwen3-30B-A3B"
@@ -37,6 +53,14 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     tis_use_rs: bool = True
 
     def __post_init__(self):
+        # [FUNCTION DOC] Resolves derived defaults and validates the configuration, mutating self.
+        # Steps: resolve hardware (auto detects), default GPUs per node from a per-hardware table,
+        # force no_colocate on when rollout nvfp4 is chosen. In non-colocated mode the actor gets
+        # half the node's GPUs (integer division) and rollout the remainder; in colocated mode
+        # both default to the full node. Explicitly given values are kept. Raises assertion errors
+        # if more than one rollout precision mode or more than one training precision mode is set,
+        # or if mxfp8/nvfp4 (rollout or train) is requested on non-Blackwell hardware (only B200,
+        # B300, GB200, GB300 allowed, so Rubin is rejected).
         self.hardware = command_utils.resolve_hardware(self)
         self.num_gpus_per_node = self.num_gpus_per_node or command_utils.NUM_GPUS_OF_HARDWARE[self.hardware]
         self.no_colocate = self.no_colocate or self.rollout_nvfp4
@@ -58,6 +82,15 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
 
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Downloads and converts everything needed before training. Side effects (all
+    # via the backend's shell runners): create model and data directories; download the HF model
+    # and the dapo-math-17k and aime-2024 datasets; if rollout fp8, download the prebuilt FP8
+    # model; if rollout mxfp8, nvfp4 or int4, run the matching conversion tool on GPU into a
+    # sibling directory with the precision suffix (extra args are passed to the mxfp8 and nvfp4
+    # converters only). The nvfp4 conversion is prefixed with environment assignments that disable
+    # fast math, merged with any NVTE, FLASHINFER or TRTLLM fast-math variables already in the
+    # caller's environment (the caller's values win). Unless megatron bridge is enabled, converts
+    # the HF checkpoint to Megatron torch_dist format into the shared model directory.
     U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.model_dir} {args.data_dir}")
     U.exec_command_cpu(f"hf download Qwen/{args.model_name} --local-dir {args.model_dir}/{args.model_name}")
@@ -114,6 +147,38 @@ def prepare(args: ScriptArgs):
 
 # TODO improve layering: split algorithm vs infra
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Builds the training argument string and extra environment variables, then
+    # submits the job through the backend. Raises not-implemented error for unsupported
+    # (hardware, node count) combinations: supported are H100 with 1 node, Blackwell parts with 1, 2
+    # or 4 nodes, and Rubin with 1 node.
+    # Checkpoint selection (first match): rollout fp8 gives the FP8 dir, train mxfp8 gives the
+    # MXFP8 dir, rollout nvfp4 the NVFP4 dir, rollout int4 the INT4 dir, else the plain HF dir.
+    # Reference load is the HF dir in bridge mode, else the torch_dist dir; load and save use a
+    # per-run checkpoints folder. Save interval is 2 in debug mode else 20.
+    # Rollout: dapo-math-17k, deepscaler reward, 3000 rollouts, 32 prompts x 8 samples, response
+    # max 100 (debug) or 8192, global batch 256. Eval (AIME, 16 samples, 16384 tokens, top-p 1,
+    # every 20) only when not debug and enable_eval. Algorithm: grpo with kl loss (coef zero),
+    # clip 0.2/0.28. Perf: full recompute, dynamic batch, 32768 tokens per GPU.
+    # Misc: fault tolerance, dump details into run dir; colocated runs add colocate flag, others
+    # pass actor and rollout GPU counts. Int4 rollout sets fake-QAT environment variables (group
+    # size 128) and disables gradient accumulation fusion. Train fp8/mxfp8 uses transformer engine
+    # bf16 with the mxfp8 recipe on Blackwell/Rubin or the blockwise recipe (with an fp32 scale
+    # variable) on H100/H200. Train nvfp4 adds fp4 flags, several NVTE environment variables, CPU
+    # offloaded precision-aware optimizer, and a YAML precision config passed as a pseudo-file
+    # (routed expert linear layers in nvfp4, everything else bf16). Bridge mode adds the bridge
+    # flag. Mismatch correction (mis) passes a pseudo-file config (token-level truncated TIS with
+    # bounds 0.5 to 2.0, optional rejection sampling, veto threshold 1e-4, batch normalize) plus
+    # the custom weights function path.
+    # Parallelism and sglang by case: H100 1 node uses TP4, EP8, CPU offloaded optimizer, engine
+    # size 2 (fp8), 1 (int4) or 8. Blackwell/Rubin: TP is min(4, actor GPUs per node), EP equals
+    # actor GPUs when not colocated, else the node GPU count for train mxfp8 or 4; trtllm_mha
+    # attention; Rubin uses the triton moe runner; rollout fp8, mxfp8, nvfp4 each set engine size,
+    # backends, max running requests and CUDA graph batch size (256); nvfp4 also sets extra
+    # environment variables and copies NVTE/FLASHINFER variables from the caller; otherwise engine
+    # size 4 and graph batch 512. Attention fp8 rollout adds an fp8 KV cache.
+    # KNOWN ISSUE: the H200 case in the train fp8 hardware match is unreachable because the
+    # hardware field does not allow H200. Also, the checkpoint chosen for train mxfp8 is the MXFP8
+    # directory, which prepare only creates when rollout mxfp8 is set.
     U = args.create_backend()
     ref_load_path = (
         f"{args.model_dir}/{args.model_name}/"
@@ -431,6 +496,7 @@ tis_batch_normalize: true
 
 @command_utils.dataclass_cli
 def main(args: ScriptArgs):
+    # [FUNCTION DOC] Command-line entry point: runs prepare, then execute, with the parsed args.
     prepare(args)
     execute(args)
 

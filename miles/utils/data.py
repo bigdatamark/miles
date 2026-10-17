@@ -1,3 +1,10 @@
+# [MODULE DOC] Prompt dataset loading and rollout-data helpers.
+# Provides: a file reader for jsonl / parquet prompt files (with an optional row-slice suffix on
+# the path), prompt length filtering, conversion of raw rows to chat messages (including
+# multimodal placeholder expansion), the Dataset class (builds Sample objects, supports
+# per-epoch deterministic shuffling), a first-fit micro-batch counter, helpers that fetch and
+# split a rollout data shard from the object store for one data-parallel rank, and helpers that
+# delete stored rollout/train-output objects. Only Dataset is exported by the all list.
 import itertools
 import json
 import logging
@@ -31,6 +38,14 @@ logger = logging.getLogger(__name__)
 
 
 def read_file(path):
+    # [FUNCTION DOC] Generator yielding one record (a mapping) at a time from a prompt file.
+    # Input: a path, optionally suffixed with a row range in square brackets (see the path parser).
+    # Raises a file-not-found error if the file is missing, an import error if a parquet file is
+    # requested without the parquet library, a value error for any extension other than jsonl or
+    # parquet. Jsonl: blank lines skipped; lines that fail to parse are reported with a printed
+    # message and skipped. Parquet: reads record batches and yields rows as mappings. If a row
+    # range was given, only that range of the yielded rows is produced (logged at info level).
+    # Errors for missing file / bad extension surface on first iteration since this is a generator.
     path, row_slice = _parse_generalized_path(path)
     reader = None
 
@@ -40,6 +55,9 @@ def read_file(path):
     if path.endswith(".jsonl"):
 
         def jsonl_reader(p):
+            # [FUNCTION DOC] HELPER: Generator over a utf-8 text file; yields the parsed json value
+            # of each non-blank line, printing the zero-based line number and error for undecodable
+            # lines and continuing.
             with open(p, encoding="utf-8") as f:
                 for line_num, line in enumerate(f):
                     line = line.strip()
@@ -58,6 +76,8 @@ def read_file(path):
             raise ImportError("pyarrow is required for parquet support")
 
         def parquet_reader(p):
+            # [FUNCTION DOC] HELPER: Generator opening the parquet file and yielding every row of
+            # every record batch as a mapping from column name to value, in file order.
             pf = pq.ParquetFile(p)
 
             for batch in pf.iter_batches():
@@ -77,6 +97,12 @@ def read_file(path):
 
 
 def _parse_generalized_path(s: str):
+    # [FUNCTION DOC] HELPER: Splits an optional trailing row range of the form "@[start:end]" off
+    # a path string, where start and end are optional integers (negative allowed by the pattern).
+    # Returns (path without the suffix, slice object with missing bounds as none), or (the string
+    # unchanged, none) when there is no suffix.
+    # KNOWN ISSUE: negative bounds are accepted here but the later iterator slicing rejects
+    # negative values at read time.
     if (m := re.match(r"^(?P<real_path>.*)@\[(?P<start>-?\d*):(?P<end>-?\d*)\]$", s)) is not None:
         path = m.group("real_path")
         start = int(x) if (x := m.group("start")) != "" else None
@@ -87,6 +113,15 @@ def _parse_generalized_path(s: str):
 
 
 def filter_long_prompt(origin_samples: list[Sample], tokenizer, processor, max_length: int | None) -> list[Sample]:
+    # [FUNCTION DOC] Drops samples whose prompt token count exceeds max_length. Returns the input
+    # list unchanged when max_length is none, and also (with a warning) when the first sample's
+    # prompt is not a string (list prompts are not length-filtered); an empty input list with a
+    # non-none max_length raises an index error. Without a processor: tokenizes all prompts in one
+    # batch without special tokens. With a processor: samples with any non-none multimodal input
+    # value go through the vision-info helper and the processor (first row's input ids counted),
+    # text-only samples are batch-tokenized. Logs the number removed.
+    # KNOWN ISSUE: with a processor the result lists text-only survivors first and multimodal
+    # survivors after, so the original sample order is not preserved.
     if max_length is None:
         return origin_samples
 
@@ -136,6 +171,17 @@ def filter_long_prompt(origin_samples: list[Sample], tokenizer, processor, max_l
 
 
 def _build_messages(data: dict, prompt_key: str, as_conversation: bool, multimodal_keys: dict = None):
+    # [FUNCTION DOC] HELPER: Turns one raw row into the prompt value for a sample. A string prompt
+    # is returned as is unless as_conversation is set, in which case it becomes a single user
+    # message. If multimodal_keys (mapping from modality name to the row column holding the media
+    # list) is given: for each known modality builds a lookup from its placeholder text to a copy
+    # of the media list; then for every message whose content is a string, splits the content on
+    # the placeholders and rebuilds it as a list of parts, a text part per plain segment and a
+    # media part per placeholder consuming media items in order from the front. Messages whose
+    # content is already a list are left untouched with a warning; any other content type raises a
+    # value error. Mutates the message mappings inside the row's prompt in place. Returns the
+    # prompt (string or list of messages). Unknown modality names are skipped; a missing media
+    # column or too few media items for the placeholders causes a type or index error.
     prompt = data.get(prompt_key)
 
     if isinstance(prompt, str):
@@ -189,6 +235,10 @@ def _build_messages(data: dict, prompt_key: str, as_conversation: bool, multimod
 
 
 class Dataset:
+    # [CLASS DOC] In-memory prompt dataset of Sample objects. Attributes: origin_samples (filtered
+    # samples in file order), samples (current ordering, initially the same list object), epoch_id
+    # (last shuffled epoch, starts at -1) and seed. Supports indexing and length. Shuffling is
+    # deterministic per epoch.
     def __init__(
         self,
         path,
@@ -205,6 +255,20 @@ class Dataset:
         apply_chat_template=False,
         apply_chat_template_kwargs=None,
     ):
+        # [FUNCTION DOC] Reads every row of the file at the path and builds one Sample per row.
+        # Keyword options: prompt_key column holding the prompt (default "text"); multimodal_keys
+        # mapping modality to media column; label_key column for the label (none means no label;
+        # a missing column raises a key error); tool_key column holding tool definitions (a json
+        # string is parsed, an array converted to a list, must end up a list or an assertion
+        # fails; stored into the sample metadata under tools); metadata_key column of metadata
+        # (default "metadata", missing or empty gives an empty mapping); seed (default 42);
+        # apply_chat_template flag with extra template kwargs. Rows are treated as conversations
+        # when the chat template is applied or multimodal keys exist. With the chat template
+        # applied, the prompt becomes the rendered text including the generation prompt (tools
+        # passed). If a processor is given and the prompt is a message list, multimodal inputs are
+        # extracted via the vision-info helper. After building, samples longer than max_length
+        # tokens are filtered out (skipped when max_length is none). Sets epoch id -1 and the
+        # working sample list to the origin list.
         origin_samples = []
         for data in read_file(path):
             # Both chat templates and multimodal inputs require conversation format (list of message dicts)
@@ -260,6 +324,11 @@ class Dataset:
         self.samples = self.origin_samples
 
     def shuffle(self, new_epoch_id):
+        # [FUNCTION DOC] Reorders the working samples for an epoch. Does nothing if that epoch is
+        # already current. Otherwise seeds the global random generator with seed plus the epoch id
+        # (side effect on global random state), shuffles a permutation of indices, rebuilds the
+        # working list from the original (unshuffled) samples in that order, and records the
+        # epoch id. The same epoch id always yields the same order.
         if self.epoch_id == new_epoch_id:
             return
 
@@ -270,13 +339,20 @@ class Dataset:
         self.epoch_id = new_epoch_id
 
     def __getitem__(self, idx):
+        # [FUNCTION DOC] Returns the sample at the index in the current (possibly shuffled) order.
         return self.samples[idx]
 
     def __len__(self):
+        # [FUNCTION DOC] Number of samples in the current ordering.
         return len(self.samples)
 
 
 def get_minimum_num_micro_batch_size(total_lengths, max_tokens_per_gpu):
+    # [FUNCTION DOC] Returns the number of micro batches a first-fit packing needs. Walks the
+    # sequence lengths in the given order and puts each into the first existing batch whose token
+    # sum would stay within the per-GPU token limit, else opens a new batch. This is a greedy
+    # estimate, not guaranteed minimal; an item longer than the limit gets a batch of its own.
+    # Empty input returns zero.
     # use first fit to get the number of micro batches
     batches = []
     for length in total_lengths:
@@ -297,6 +373,14 @@ def process_rollout_data(
     dp_size,
     witness_info: WitnessInfo | None,
 ) -> tuple[dict, object_store.ObjectStoreGetResult]:
+    # [FUNCTION DOC] Fetches this data-parallel rank's rollout data from the object store and
+    # returns (processed shard, the store get result). Two modes by the delay-split option in args:
+    # (1) delayed split: the reference is a single object; fetch it, add the witness ids under the
+    # sequence witness key when witness info is given, split the whole data by data-parallel size
+    # with the shared splitter and take the shard for this rank. (2) pre-split: asserts the
+    # reference list has one entry per rank and that no witness info is given, fetches this rank's
+    # entry and copies it into a plain mapping. Finally runs the shared shard-processing function
+    # (imported locally, probably to avoid an import cycle) on the shard.
     from miles.ray.rollout.train_data_conversion import process_rollout_data_shard
 
     store = object_store.get_instance()
@@ -318,23 +402,33 @@ def process_rollout_data(
 
 
 class RolloutDataPack(StrictBaseModel):
+    # [CLASS DOC] Strict data model describing stored rollout data: optional list of sample
+    # indices, and an optional object-store reference that is either one reference or a list of
+    # them (default none for both).
     sample_indices: list[int] | None = None
     data_ref: object_store.StoreObjectRef | list[object_store.StoreObjectRef] | None = None
 
     @property
     def data_refs(self) -> list[object_store.StoreObjectRef]:
+        # [FUNCTION DOC] Property normalizing the reference field to a list: empty list when none,
+        # the list itself when already a list, otherwise a one-element list.
         if (ref := self.data_ref) is None:
             return []
         return ref if isinstance(ref, list) else [ref]
 
 
 def remove_rollout_data_refs(args, rollout_data_pack: RolloutDataPack) -> None:
+    # [FUNCTION DOC] Deletes every object referenced by the pack from the object store (side
+    # effect on the shared store).
+    # KNOWN ISSUE: the args parameter is unused.
     store = object_store.get_instance()
     for ref in rollout_data_pack.data_refs:
         store.remove(ref)
 
 
 def remove_train_output_refs(train_outputs: Sequence["TrainStepOutput"]) -> None:
+    # [FUNCTION DOC] For each train step output that has a values reference, deletes that object
+    # from the object store; outputs without one are skipped.
     store = object_store.get_instance()
     for train_output in train_outputs:
         if (ref := train_output.values) is not None:

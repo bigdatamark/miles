@@ -1,3 +1,9 @@
+# [MODULE DOC] Entry script that serves the Tinker-compatible HTTP gateway on top of a miles
+# multi-LoRA training and rollout deployment. When run as a script it parses the canonical miles
+# arguments plus Tinker-specific ones (entry name serve, with a Tinker preprocessing step), forces
+# dynamic global batch size and delayed data-parallel splitting (each command ships one work unit
+# whose size is the batch size), and runs the serve coroutine under a disposer that cleans up
+# registered resources. Needs GPUs, a Ray cluster, a frozen HF base checkpoint and rollout routers.
 import asyncio
 import logging
 from contextlib import suppress
@@ -25,6 +31,33 @@ logger = logging.getLogger(__name__)
 
 
 async def serve(args, *, disposer: Disposer):
+    # [FUNCTION DOC] Brings up the inference side, one trainer and the Tinker gateway, then runs
+    # the gateway until either its dispatcher or the HTTP server ends. Inputs: parsed args and a
+    # disposer that receives every created resource for cleanup. Raises assertion errors if multi
+    # LoRA is not enabled (adapter count must be above zero), if the load path differs from the HF
+    # checkpoint (trainers and engines must share the same frozen base), if no checkpoint root can
+    # be derived (explicit Tinker checkpoint root, else a tinker subfolder of the save path), or
+    # if the trainer token budget is not positive.
+    # Steps: (1) load the HF text config; the per-datum token limit is the model's maximum
+    # position embeddings, further capped when max tokens per GPU is set: the per-GPU limit is
+    # rounded down to a multiple of tensor-parallel size times the data pad multiplier, made even
+    # when context parallelism is above 1 (each rank holds two zigzag chunks), then multiplied by
+    # the context-parallel size. (2) Initialize the orchestration script (worker manager, result
+    # unused) and the HTTP client. (3) Determine the backend capability, resolve router addresses
+    # from providers, create the inference controller, initialize it and register it for disposal.
+    # (4) Compute trainer configs, pick the single actor-role config (unpacking fails unless
+    # exactly one exists), create trainer handles, initialize the actor trainer with its computed
+    # args and register it. (5) Build the gateway config: base model (Tinker base model argument or
+    # the HF checkpoint), adapter slots, checkpoint root, vocabulary size, per-datum token limit,
+    # LoRA alpha and max rank, and flags for whether attention, MLP and unembedding groups are
+    # trained according to the LoRA group list. (6) Compute data-parallel size as actor world size
+    # (nodes x GPUs per node) divided by tensor x pipeline x context parallel sizes, build the
+    # service around a backend using the trainer, router URL (from router ip and port) and that
+    # size, and an ASGI server on the configured host and port with info logging. (7) Run the
+    # service loop and the server as concurrent tasks, wait for the first to finish and re-raise its
+    # error if any; finally cancel both and await them, ignoring cancellation. A crash of the
+    # dispatcher thus takes the HTTP server down instead of leaving a healthy-looking server whose
+    # training futures never resolve.
     assert args.multi_lora, "serve_tinker requires --multi-lora-n-adapters > 0"
     assert args.load == args.hf_checkpoint, "Tinker trainers and engines must load the same frozen HF base"
     checkpoint_root = args.tinker_checkpoint_root or (args.save and f"{args.save}/tinker")

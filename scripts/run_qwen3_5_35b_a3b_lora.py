@@ -1,3 +1,8 @@
+# [MODULE DOC] Launcher for single-node GRPO LoRA training of Qwen3.5 or Qwen3.6 35B-A3B through the
+# Megatron bridge path, with colocated SGLang rollout serving LoRA adapters. Provides lookup tables
+# from model name to HF repo and Megatron model type, a script-args dataclass, helper functions
+# for parallel config, downloading and training, and a typer app with prepare, train and
+# full_train commands (plus an empty callback so subcommands are kept).
 """
 Qwen3.5/3.6 35B-A3B GRPO LoRA training script (Megatron-Bridge / bridge mode).
 
@@ -50,6 +55,14 @@ _MEGATRON_MODEL_TYPE = {
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC] Command-line configuration extending the shared train config. Groups: model and
+    # task (gsm8k or dapo-math), paths (optional HF checkpoint path, model, save, data and Megatron
+    # directories), GPUs per node (8), LoRA settings (rank 16, alpha 32, dropout 0, target module
+    # spec, CPU backup of base weights on, shared-outer expert adapters on), rollout sizes (10
+    # rollouts, 8 prompts x 8 samples, global batch 64, response length where zero means a task
+    # default), rollout engine settings (8 GPUs per engine, memory fraction 0.4, triton LoRA
+    # backend), wandb switch (on) and extra raw args. The Megatron model type is a read-only
+    # property looked up from the model name.
     run_id: str = command_utils.create_run_id()
     model_name: Literal[
         "Qwen3.5-35B-A3B",
@@ -92,6 +105,9 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     extra_args: str = ""
 
     def __post_init__(self):
+        # [FUNCTION DOC] Fills defaults in place: the HF checkpoint path defaults to the model
+        # directory plus model name; a response length of zero becomes 4096 for the dapo-math task
+        # and 512 otherwise.
         if self.hf_checkpoint is None:
             self.hf_checkpoint = f"{self.model_dir}/{self.model_name}"
         if self.rollout_max_response_len == 0:
@@ -99,10 +115,16 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
     @property
     def megatron_model_type(self) -> str:
+        # [FUNCTION DOC] Property: the Megatron model type (LoRA variant) for the model name, taken
+        # from the module lookup table.
         return _MEGATRON_MODEL_TYPE[self.model_name]
 
 
 def _get_parallel_config(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: Returns the parallelism and performance flag string: tensor parallel 2
+    # with sequence parallel, pipeline and context parallel 1, expert parallel equal to GPUs per
+    # node, expert tensor parallel 1, full uniform recompute of 1 layer, bshd sequence format,
+    # micro batch 1 and 4096 max tokens per GPU. Pure function of the args; no side effects.
     """Single-node layout: TP2 (num_query_groups=2 caps TP), EP = num GPUs, DP for the rest.
 
     bshd is required because the megatron-core GatedDeltaNet forward rejects packed
@@ -118,6 +140,8 @@ def _get_parallel_config(args: ScriptArgs) -> str:
 
 
 def _download_dataset(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Downloads the dataset for the chosen task (gsm8k or dapo-math-17k)
+    # into the data directory through the backend (network and disk side effects).
     U = args.create_backend()
     match args.task:
         case "gsm8k":
@@ -127,6 +151,8 @@ def _download_dataset(args: ScriptArgs):
 
 
 def _prepare_download(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Creates data and model directories, downloads the HF model into the
+    # model directory when the model name is in the repo table, then downloads the task dataset.
     U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.data_dir} {args.model_dir}")
     repo = _HF_REPO.get(args.model_name)
@@ -136,6 +162,17 @@ def _prepare_download(args: ScriptArgs):
 
 
 def _train(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Prints a one-line run summary, builds the training argument string and
+    # submits it through the backend (colocated, one node). Blocks: checkpoint (HF checkpoint,
+    # bridge mode); LoRA (rank, alpha, dropout, quoted target modules; optional shared-outer expert
+    # adapters; gradient accumulation fusion always disabled; optional CPU backup of base weights);
+    # rollout (math reward, chat template, temperature 1, sizes from args, prompt file and input
+    # key depend on task: gsm8k parquet with messages key, dapo-math jsonl with prompt key);
+    # algorithm grpo with clip 0.2/0.28 and zero entropy; adam lr 1e-5 constant; parallel config
+    # helper; SGLang (engine size, memory fraction, bfloat16, max LoRA rank equal to LoRA rank,
+    # LoRA backend); save every rollout into a per-run folder under the save directory; misc
+    # (dropout off, 512 MiB weight update buffer). Wandb flags only when enabled. Extra args last.
+    # There is no load path and no evaluation block.
     U = args.create_backend()
     print(
         f"[run] Qwen3.5/3.6 LoRA: model={args.model_name} (megatron_model_type={args.megatron_model_type}), {args.num_gpus_per_node} GPUs, rollout tp={args.rollout_num_gpus_per_engine}"
@@ -208,6 +245,7 @@ def _train(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Command that downloads the model and task dataset (calls the download helper).
     """Download the model checkpoint and the task dataset (gsm8k or dapo-math). Run once per node before training."""
     _prepare_download(args)
 
@@ -215,6 +253,7 @@ def prepare(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def train(args: ScriptArgs):
+    # [FUNCTION DOC] Command that runs only the LoRA training job (calls the train helper).
     """Run GRPO LoRA training (assumes the dataset is already prepared)."""
     _train(args)
 
@@ -222,6 +261,7 @@ def train(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def full_train(args: ScriptArgs):
+    # [FUNCTION DOC] Command that downloads, then trains.
     """Download the model checkpoint + dataset, then run GRPO LoRA training."""
     _prepare_download(args)
     _train(args)
@@ -229,6 +269,7 @@ def full_train(args: ScriptArgs):
 
 @app.callback()
 def _callback() -> None:
+    # [FUNCTION DOC] HELPER: Empty typer callback so that the commands stay subcommands. No effect.
     pass
 
 

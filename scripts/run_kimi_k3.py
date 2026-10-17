@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Launcher script (typer command line app) for GRPO training of Kimi K3 (a 93-layer mixture of
+# experts model with 896 routed experts and 96 attention heads, shipped with MXFP4 experts) or its
+# two 4-layer prunes (all experts, or only the first 64), using LoRA adapters or full-parameter
+# training with Megatron plus SGLang colocated. Rollout serves the native MXFP4 checkpoint (or the
+# bf16 dequantization if requested) while the trainer loads a bf16 reference converted to a Megatron
+# distributed checkpoint. Commands: prepare-data, prepare-download, prepare-bf16, prepare-torch-dist
+# (4-layer models only; the full model is converted by a separate documented tool) and train. The
+# parallel layout for the full model is derived only for 64 GPUs unless the user overrides tensor and
+# expert sizes; many option combinations are validated when the arguments are built. Module tables
+# give default org, Megatron model type, layer count and expert count per model name.
 """Kimi K3 RL launcher: LoRA or full-parameter training on the native MXFP4 checkpoint.
 
 python scripts/run_kimi_k3.py prepare-download --model-name Kimi-K3-4layer-64experts
@@ -37,6 +48,21 @@ _VALIDATED_FULL_MODEL_GPUS = 64
 
 @dataclass
 class ScriptArgs(U.ExecuteTrainConfig):
+    # [CLASS DOC]
+    # Command line options extending the shared train configuration (num_nodes, output dir, backend
+    # creation, and the num_gpus-style derived values defined in this class). Groups: mode (default
+    # debug_minimal), run id, org (empty means derived), model name (full or two 4-layer prunes,
+    # default the 64-expert prune), train mode (lora default or full), task (gsm8k default or
+    # dapo-math), hardware and GPUs per node; checkpoint paths (native MXFP4 hf checkpoint, bf16
+    # dequantization, converted reference load; None derives each from the model directory), an option
+    # to feed the bf16 checkpoint to rollout, directories and SGLang python path; parallel options
+    # (pipeline and context sizes, tensor/expert overrides, rollout tensor/expert sizes, maximum
+    # rollout concurrency); LoRA hyperparameters; optional overrides for reward model, rollout counts
+    # and sizes, response length, SGLang total token cap, global batch size, eval interval, learning
+    # rate, tokens per GPU; distributed timeout (minutes), optional debug rollout dump path, wandb
+    # switch, skip-saving switch, weight-update check switches, optional weight update buffer size,
+    # extra raw args. Most "None" values are replaced by mode- and task-dependent defaults when the
+    # training arguments are built.
     mode: Literal["normal", "debug_minimal"] = "debug_minimal"
     run_id: str = U.create_run_id()
     model_org: str = ""
@@ -94,6 +120,19 @@ class ScriptArgs(U.ExecuteTrainConfig):
     extra_args: str = ""
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Resolves hardware and GPUs per node, then fills defaults: org from the table; hf checkpoint =
+        # model dir + name; bf16 checkpoint = model dir + bf16 name; reference load = model dir + bf16
+        # name + "_torch_dist"; learning rate 1e-5 for LoRA else 1e-6; rollout tensor size min(8, total
+        # GPUs); rollout expert size 1 (the LoRA-capable expert runner replicates experts across the
+        # tensor group). Validation, raising value errors: LoRA rank positive in LoRA mode; SGLang token
+        # cap positive if set; timeout positive; total GPUs and 96 attention heads divisible by rollout
+        # tensor size; rollout tensor size divisible by rollout expert size which must divide the expert
+        # count. For 4-layer models: raises not implemented if pipeline or context size is not 1, then
+        # returns without further checks. For the full model: unless total GPUs is 64, a tensor-size
+        # override is required (value error otherwise); with pipeline > 1 the layer split must give a
+        # last stage of between 1 and the first-stage layers; tensor*context*pipeline must divide the
+        # GPU count; expert size must divide the tensor*context*data ranks within one pipeline stage.
         self.hardware = U.resolve_hardware(self)
         self.num_gpus_per_node = self.num_gpus_per_node or U.NUM_GPUS_OF_HARDWARE[self.hardware]
         if not self.model_org:
@@ -160,30 +199,39 @@ class ScriptArgs(U.ExecuteTrainConfig):
 
     @property
     def is_4layer(self) -> bool:
+        # [FUNCTION DOC] Property: True for either pruned model (anything other than the full model name).
         return self.model_name != "Kimi-K3"
 
     @property
     def num_layers(self) -> int:
+        # [FUNCTION DOC] Property: number of transformer layers of the selected model from the table.
         return _NUM_LAYERS[self.model_name]
 
     @property
     def num_experts(self) -> int:
+        # [FUNCTION DOC] Property: number of routed experts of the selected model from the table.
         return _NUM_EXPERTS[self.model_name]
 
     @property
     def num_gpus(self) -> int:
+        # [FUNCTION DOC] Property: total GPUs, nodes times GPUs per node.
         return self.num_nodes * self.num_gpus_per_node
 
     @property
     def bf16_name(self) -> str:
+        # [FUNCTION DOC] Property: folder name of the bf16 dequantized model (model name plus "-bf16").
         return f"{self.model_name}-bf16"
 
     @property
     def megatron_model_type(self) -> str:
+        # [FUNCTION DOC] Property: Megatron model type key looked up from the model name table.
         return _MEGATRON_MODEL_TYPE[self.model_name]
 
     @property
     def tensor_parallel_size(self) -> int:
+        # [FUNCTION DOC] Property: training tensor-parallel size. Order: explicit override; for 4-layer
+        # models min(8, total GPUs); for the full model with no pipeline parallelism a fixed 32; with
+        # pipeline parallelism total GPUs divided by pipeline times context size.
         if self.tp_size_override is not None:
             return self.tp_size_override
         if self.is_4layer:
@@ -194,6 +242,10 @@ class ScriptArgs(U.ExecuteTrainConfig):
 
     @property
     def expert_parallel_size(self) -> int:
+        # [FUNCTION DOC] Property: training expert-parallel size. Order: explicit override; for 4-layer
+        # models equal to tensor size; otherwise tensor * context * data-parallel size, where data
+        # parallel = total GPUs / (tensor * context * pipeline) using integer division (the rank count
+        # inside one pipeline stage).
         if self.ep_size_override is not None:
             return self.ep_size_override
         if self.is_4layer:
@@ -205,6 +257,10 @@ class ScriptArgs(U.ExecuteTrainConfig):
 
     @property
     def pipeline_layer_split(self) -> tuple[int, int]:
+        # [FUNCTION DOC] Property: layer counts for the first and last pipeline stages (the existing
+        # docstring is accurate). First = ceiling of layers divided by pipeline size; last = remaining
+        # layers after giving every other stage "first" layers. The result may be invalid (last
+        # above first or non-positive); callers validate it.
         """(first, last) stage layer counts; middle stages each take `first` layers."""
         pp = self.pipeline_parallel_size
         first = -(-self.num_layers // pp)
@@ -213,6 +269,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
 
 
 def _download_dataset(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] HELPER: Downloads GSM8K for the gsm8k task, otherwise the DAPO math and AIME 2024
+    # datasets, into the data directory.
     backend = args.create_backend()
     if args.task == "gsm8k":
         backend.hf_download_dataset("zhuzilin/gsm8k", data_dir=args.data_dir)
@@ -224,10 +282,14 @@ def _download_dataset(args: ScriptArgs) -> None:
 @app.command()
 @U.dataclass_cli
 def prepare_data(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] Command "prepare-data": downloads only the task datasets.
     _download_dataset(args)
 
 
 def _prepare_download(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] HELPER: Creates model/data directories; downloads the Hugging Face model only when
+    # the hf checkpoint path equals the default model directory plus name (an explicit custom path is
+    # assumed to already exist); then downloads the datasets.
     """Native MXFP4 checkpoint + task dataset. Idempotent: hf skips existing blobs."""
     backend = args.create_backend()
     backend.exec_command_cpu(f"mkdir -p {args.model_dir} {args.data_dir}")
@@ -239,10 +301,13 @@ def _prepare_download(args: ScriptArgs) -> None:
 @app.command()
 @U.dataclass_cli
 def prepare_download(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] Command "prepare-download": model (if default path) plus datasets.
     _prepare_download(args)
 
 
 def _prepare_bf16(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] HELPER: Runs the repository's MXFP4-to-bf16 conversion tool as a GPU command on
+    # the hf checkpoint, saving to the bf16 checkpoint path, on the CUDA device.
     """Dequantize the MXFP4 experts; Megatron loads BF16. One node, GPU."""
     backend = args.create_backend()
     backend.exec_command_gpu(
@@ -254,10 +319,17 @@ def _prepare_bf16(args: ScriptArgs) -> None:
 @app.command()
 @U.dataclass_cli
 def prepare_bf16(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] Command "prepare-bf16": MXFP4-to-bf16 dequantization (one node, GPU).
     _prepare_bf16(args)
 
 
 def _prepare_torch_dist(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] HELPER: Raises a not implemented error for the full model (it is converted by a
+    # separate documented tool on 32 ranks). For the 4-layer models, converts the bf16 checkpoint to a
+    # Megatron distributed checkpoint in the model directory on a single node using all GPUs per node,
+    # with bf16, tensor/pipeline/context size 1, expert size = GPUs per node, expert-tensor 1 and raw
+    # conversion mode. The output re-shards at load time, so the layout need not match training
+    # (tensor > 1 is avoided because it needs an environment setting the converter does not apply).
     """BF16 HF -> torch_dist in the training layout. The output re-shards at load."""
     if not args.is_4layer:
         raise NotImplementedError(
@@ -286,10 +358,46 @@ def _prepare_torch_dist(args: ScriptArgs) -> None:
 @app.command()
 @U.dataclass_cli
 def prepare_torch_dist(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] Command "prepare-torch-dist": bf16-to-Megatron conversion (4-layer models only).
     _prepare_torch_dist(args)
 
 
 def _train(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] HELPER: Builds the training argument string and submits the job, passing the
+    # whole options object to the backend as the config. Debug mode is mode "debug_minimal"; LoRA mode
+    # is train mode "lora". Dataset: GSM8K test-train parquet with messages key, else DAPO jsonl with
+    # prompt key. Checkpoint: hf checkpoint (the bf16 one if rollout bf16), reference load, raw mode,
+    # model name for loading. LoRA flags (LoRA mode): rank, alpha, dropout, quoted targets, gradient
+    # accumulation fusion off, base CPU backup, optional shared-outer expert adapters, optional LoRA
+    # weight equality check. Rollout defaults when options are unset: reward is math for gsm8k, else
+    # deterministic-random in debug or deepscaler; rollouts 2 (debug) or 3000; batch 8 or 32 prompts;
+    # samples 2 or 8; response length 256 for gsm8k, else 32 (debug) or 16384; global batch 16 or 256;
+    # dynamic global batch size; temperature 1; optional eval (interval from options; held-out set of
+    # the task; 1 sample at temperature 0); optional dump path for rollout data. Parallelism flags from
+    # derived sizes, with explicit first/last stage layer counts only when pipeline > 1 and the split is
+    # uneven; tokens per GPU 512 (4-layer) or 8192 unless overridden; full uniform recompute; dynamic
+    # batch; log-prob chunk 512; distributed timeout. Optimizer: in debug mode plain SGD without
+    # momentum at 1e-6 and distributed optimizer; otherwise Adam at the option rate with CPU offload of
+    # 80 percent, overlap and precision-aware optimizer. GRPO zero coefficients, asymmetric clip. Weight
+    # update buffer default: 2 GiB for 4-layer or full-parameter mode, else 256 MiB. SGLang: request
+    # capacity 16 (4-layer) or option; Mamba cache capacity 16 or five per request; graph batch sizes up
+    # to the concurrency; engine and expert sizes from options; server concurrency 16; project router;
+    # LoRA mode adds the triton LoRA backend with strict loading, max rank, disables virtual-experts
+    # LoRA when engine tensor size > 8, and (full model) disables the host copy; the expert runner is
+    # triton when rollout bf16 else marlin; 4-layer: fixed graph sizes, memory fraction 0.7, shared
+    # experts fusion off; full model: trtllm latent-attention decode, extra-buffer radix strategy,
+    # computed graph sizes, prefill graphs disabled; optional token cap; debug context length 8192.
+    # Misc: dropouts off, fp32 accumulation, colocate, offload train, buffer size, memory margin
+    # (2 GiB debug else 4 GiB), node and GPU counts, optional nan check off (4-layer), skip lists for
+    # weight update checks with allowed quantization error, optional equality check, and save under the
+    # save directory run folder every 50 steps unless skipping. Wandb: custom flags with fixed project
+    # name when the wandb switch is on, else default arguments. Environment variables: NCCL timeout,
+    # python path (repository root plus SGLang path), JIT radix routing on, NUMA binding value read from
+    # the caller's environment (default 0), K3 all-reduce fusion off in LoRA mode, plus the triton and
+    # inductor cache directories if set in the caller's environment.
+    # KNOWN ISSUE: the wandb project name "miles-run_kimi_k3" is hard-coded when the wandb switch is on.
+    # KNOWN ISSUE: rollout bf16 changes only the hf checkpoint and moe backend; the prune bf16 folder is
+    # used as given with no check that it exists.
     is_debug = args.mode == "debug_minimal"
     is_lora = args.train_mode == "lora"
     if args.task == "gsm8k":
@@ -537,6 +645,7 @@ def _train(args: ScriptArgs) -> None:
 @app.command()
 @U.dataclass_cli
 def train(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] Command "train": runs training; assumes checkpoints and datasets are prepared.
     _train(args)
 
 

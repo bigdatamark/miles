@@ -1,3 +1,5 @@
+# [MODULE DOC] HELPER: Thin wrapper that launches the sglang debug-utils tensor comparator as a
+# subprocess for two dump directories.
 import subprocess
 import sys
 from pathlib import Path
@@ -13,6 +15,17 @@ def run_comparator(
     grouping_skip_keys: list[str] | None = None,
     extra_args: list[str] | None,
 ) -> subprocess.CompletedProcess[str]:
+    # [FUNCTION DOC] HELPER: Runs the comparator module with the current Python interpreter and
+    # waits for it, inheriting standard output and error (nothing is captured). Inputs: baseline
+    # and target dump directories, a list of (tensor-name pattern, predicate) threshold pairs,
+    # regexes for tensors allowed to be skipped or to fail, optional extra grouping skip keys list
+    # (default: just the rank key), and an optional list of extra command-line arguments (this
+    # parameter has no default and must be passed explicitly, possibly as none). Raises an
+    # assertion error if the grouping skip keys do not include the rank key. Command layout:
+    # paths, JSON output format, grouping skip keys, the two allow patterns, then extra
+    # arguments, and finally the diff-threshold option with its pattern/predicate tokens, which
+    # must stay last because that option consumes every following token. Returns the completed
+    # process (the caller inspects its return code; the function does not raise on failure).
     # Skip 'rank' when grouping bundles: under FT (target) and non-FT (baseline) the same
     # logical (pp_rank, cp_rank, ep_rank, tp_rank) coordinate maps to a different absolute
     # rank ID (e.g. baseline rank=4 vs target cell0 rank=2 for PP=1, CP=0). Without skipping

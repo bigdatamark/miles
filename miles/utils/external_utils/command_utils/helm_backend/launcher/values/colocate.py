@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Computes the colocate pairing configuration: which inference pools share the trainer pool's gpus
+# and how their cells and pods map onto trainer nodes. Validates the supported topologies with
+# assertion errors that explain the unsupported cases.
 from __future__ import annotations
 
 from miles.utils.external_utils.colocate_pairing.config import InferencePool, PairingConfig, PairingLayout
@@ -11,6 +15,12 @@ from miles.utils.workers.worker_spec import BaseWorkerSpec
 
 
 def pairing_config(specs: list[BaseWorkerSpec], plan: LaunchPlan) -> PairingConfig:
+    # [FUNCTION DOC] Builds the pairing config. Splits specs into inference and trainer by section.
+    # Asserts exactly one trainer pool exists. The trainer's total gpus is its cell count times gpus
+    # per cell. Inference specs whose placement-group slot offset lies below that total are the
+    # colocated ones; asserts at least one exists. Each colocated spec gets a pairing layout. Returns
+    # a config with the plan's namespace and release, the trainer pool id and the list of inference
+    # pools with their layouts.
     inference_specs = [spec for spec in specs if SECTION_OF_CATEGORY[spec.category] == INFERENCE_ENGINES_SECTION]
     trainer_specs = [spec for spec in specs if SECTION_OF_CATEGORY[spec.category] == TRAINER_ENGINES_SECTION]
     assert len(trainer_specs) == 1, (
@@ -46,6 +56,9 @@ def pairing_config(specs: list[BaseWorkerSpec], plan: LaunchPlan) -> PairingConf
 
 
 def _compute_pairing_layout(*, inference: BaseWorkerSpec, trainer: BaseWorkerSpec) -> PairingLayout:
+    # [FUNCTION DOC] HELPER: After validating support, returns the layout: cell counts and pods per
+    # cell of both sides, gpus per node (taken from the trainer), gpus per inference pod, and the
+    # gpu offset (the inference spec's placement-group slot offset).
     _assert_colocate_supported(
         num_gpus_per_node=trainer.scheduling.num_gpus_per_node,
         gpus_per_inference_pod=inference.scheduling.gpus_per_pod(),
@@ -65,6 +78,10 @@ def _compute_pairing_layout(*, inference: BaseWorkerSpec, trainer: BaseWorkerSpe
 def _assert_colocate_supported(
     *, num_gpus_per_node: int, gpus_per_inference_pod: int, gpus_per_trainer_pod: int
 ) -> None:
+    # [FUNCTION DOC] HELPER: Asserts two constraints: an inference pod must not hold more gpus than
+    # a node, and a trainer pod must hold exactly all gpus of a node (sub-node trainer pods are not
+    # supported because card indices are chosen at runtime by the device plugin). Raises assertion
+    # errors with explanations.
     assert gpus_per_inference_pod <= num_gpus_per_node, (
         f"An inference pod holding {gpus_per_inference_pod} of a node's {num_gpus_per_node} gpus reaches past the "
         f"node it is pinned to; colocate gives it the trainer's node, not a share of the next one as well"

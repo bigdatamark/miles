@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Launcher-side observer that waits for a helm run's verdict. It polls (every 10 seconds) the
+# orchestrator state file and the orchestrator pod, and decides when the run is over and with what
+# exit code. A verdict comes either from the orchestrator's own terminal state, or is synthesized
+# as exit code 1 when the pod is gone, dead, or stuck in a startup failure for three consecutive
+# polls without an exit code. It also follows "generations": if a later launch took over the run,
+# the active state file changes and the verdict of the old generation is discarded.
 from __future__ import annotations
 
 import logging
@@ -22,16 +29,21 @@ _NO_VERDICT_EXIT_CODE = 1
 
 
 class ObservedPod(FrozenStrictBaseModel):
+    # [CLASS DOC] Snapshot of the orchestrator pod: its phase text and the startup failure reason
+    # of a container if one is in a failing waiting state (else none).
     phase: str
     startup_failure: str | None = None
 
 
 class _RunOutcome(FrozenStrictBaseModel):
+    # [CLASS DOC] HELPER: Final verdict of a run: process exit code and a human-readable reason.
     exit_code: int
     reason: str
 
 
 class _GenerationRead(NamedTuple):
+    # [CLASS DOC] HELPER: Result of reading the active generation: whether the read succeeded and,
+    # if so, the active state file (none when no generation is recorded).
     readable: bool
     state_file: Path | None
 
@@ -42,6 +54,19 @@ def wait_for_run(
     read_pod: Callable[[], ObservedPod | None],
     read_active_state_file: Callable[[], Path | None],
 ) -> _RunOutcome:
+    # [FUNCTION DOC] Blocks until the run has a verdict and returns it. Inputs: the state file of
+    # the launch being watched, a callable returning the orchestrator pod snapshot (none if absent;
+    # may raise), and a callable returning the currently active state file (none if unknown; may
+    # raise). Loop, sleeping 10 seconds between iterations: (1) read the active generation; if
+    # unreadable, sleep and retry. (2) If the active state file differs from the watched one, switch
+    # to it and reset all consecutive-poll counters. (3) Read the pod; on error log a warning, treat
+    # it as phase Unknown and reset the dead and failing counters (the missing counter is kept);
+    # otherwise update the counters: missing, dead (phase failed or succeeded) and failing (startup
+    # failure present) each increase by one while the condition holds and reset to zero otherwise.
+    # (4) Compute the outcome from the state file and counters. (5) If there is an outcome,
+    # re-read the active generation: unreadable means sleep and retry; changed means discard the
+    # verdict and loop again immediately (without sleeping); otherwise log and return it.
+    # Side effects: sleeping, reading the state file, logging.
     state_file = Path(state_file)
     missing_polls = 0
     dead_polls = 0
@@ -94,6 +119,8 @@ def wait_for_run(
 
 
 def _read_active_generation(read_active_state_file: Callable[[], Path | None]) -> _GenerationRead:
+    # [FUNCTION DOC] HELPER: Calls the reader; success gives a readable result carrying the path;
+    # any exception is logged as a warning and gives an unreadable result.
     try:
         return _GenerationRead(readable=True, state_file=read_active_state_file())
     except Exception:
@@ -109,6 +136,12 @@ def _compute_run_outcome(
     dead_polls: int,
     failing_polls: int,
 ) -> _RunOutcome | None:
+    # [FUNCTION DOC] HELPER: Pure decision function; returns the verdict or none (keep waiting).
+    # Order: (1) a terminal state wins: its exit code, or exit code 1 if it has none. (2) pod
+    # missing: verdict (exit code 1) only if a state exists and the pod has been missing for at
+    # least three polls. (3) pod phase failed or succeeded for at least three polls: exit code 1.
+    # (4) pod has a startup failure for at least three polls: exit code 1 naming the failure.
+    # (5) otherwise none.
     if state is not None and state.is_terminal:
         if state.exit_code is None:
             return _RunOutcome(

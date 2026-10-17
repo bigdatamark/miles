@@ -1,3 +1,16 @@
+# [MODULE DOC]
+# Launcher script (typer command line app) for GRPO training of DeepSeek-V4 models (Flash, a
+# 4-layer pruned Flash for smoke tests, Pro, and the official MXFP4 Flash release) using Megatron
+# for training and SGLang for rollout. Pipeline stages, each also a command: prepare-download
+# (model plus dataset), prepare-fp8 (lossless cast of MXFP4 experts to blockwise FP8, only for the
+# official release), prepare-single (FP8 to BF16 cast), prepare-mxfp8 (BF16 to MXFP8 for Blackwell
+# rollout), prepare-spmd (BF16 to Megatron distributed checkpoint with a parallelism layout verified
+# per model and cluster size), train, and full-train (all stages, skipping any stage whose sentinel
+# output file already exists). Supports colocated or disaggregated rollout, FP8/MXFP8 precision for
+# train and rollout independently, MTP speculative decoding, mismatch correction, rollout routing
+# replay, deterministic mode and debug replay of dumped rollout data. Module-level tables map the
+# model name to default Hugging Face org and Megatron model type; a constant holds the transformer
+# engine precision config text that keeps the sparse-attention indexer projection in bf16.
 """
 DeepSeek V4 training script.
 
@@ -79,6 +92,17 @@ matchers:
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC]
+    # Command line options extending the shared train configuration (provides num_nodes, output
+    # directory and backend creation). Inputs: model identity (name restricted to four values; org
+    # defaults from a table), task (dapo_aime or gsm8k), optional explicit hf_checkpoint path,
+    # directories (model_local_dir defaults to model_dir), hardware (auto-resolved), rollout_num_nodes
+    # (0 means colocated; 0 < value < num_nodes means disaggregated), MTP / implementation / kernel
+    # backend options, optimizer offload, fault tolerance, batch sizes, cp_size override, debug replay
+    # options, and precision switches (train and rollout fp8 default on; mxfp8 variants default off;
+    # each pair is mutually exclusive). Derived (not init) fields: colocate, actor_num_nodes,
+    # actor_num_gpus_per_node, rollout_num_gpus. The derived name properties give checkpoint folder
+    # names under the model directory.
     mode: Literal["normal", "debug_minimal"] = "debug_minimal"
     run_id: str = command_utils.create_run_id()
     model_org: str = ""
@@ -143,6 +167,14 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     extra_args: str = ""
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Resolves hardware and GPUs per node (from a per-hardware table when unset), fills model org
+        # and local model directory defaults, and turns off routing replay for the Pro model.
+        # Validates with assertions: fp8/mxfp8 mutual exclusion on both train and rollout sides, mxfp8
+        # not on H100/H200, rollout_num_nodes in [0, num_nodes), and cp_size at least 1 if given.
+        # Derives colocate (rollout_num_nodes is zero), actor nodes (total minus rollout nodes), actor
+        # GPUs per node (same as per node) and rollout GPUs (all GPUs when colocated, else only the
+        # rollout nodes' GPUs).
         self.hardware = command_utils.resolve_hardware(self)
         self.num_gpus_per_node = self.num_gpus_per_node or command_utils.NUM_GPUS_OF_HARDWARE[self.hardware]
         if not self.model_org:
@@ -168,30 +200,40 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
     @property
     def megatron_model_type(self):
+        # [FUNCTION DOC] Property: Megatron model type key looked up from the model name table.
         return _MEGATRON_MODEL_TYPE[self.model_name]
 
     @property
     def fp8_name(self):
+        # [FUNCTION DOC] Property: folder name of the FP8 checkpoint; for MXFP4 official releases it
+        # is the model name with an "-FP8" suffix (the cast output), otherwise the model name itself.
         if self.model_name in _MXFP4_MODEL_NAMES:
             return f"{self.model_name}-FP8"
         return self.model_name
 
     @property
     def torch_dist_name(self):
+        # [FUNCTION DOC] Property: folder name of the Megatron distributed checkpoint (model name plus
+        # a "_torch_dist" suffix).
         return f"{self.model_name}_torch_dist"
 
     @property
     def bf16_name(self):
+        # [FUNCTION DOC] Property: folder name of the BF16 checkpoint; the Pro model maps to a special
+        # "DeepSeek-V4-Pro-BF16" name, all others to the model name plus "-bf16".
         if self.model_name == "DeepSeek-V4-Pro-FP8":
             return "DeepSeek-V4-Pro-BF16"
         return f"{self.model_name}-bf16"
 
     @property
     def mxfp8_name(self):
+        # [FUNCTION DOC] Property: folder name of the MXFP8 checkpoint (model name plus "-MXFP8").
         return f"{self.model_name}-MXFP8"
 
     @property
     def rollout_name(self):
+        # [FUNCTION DOC] Property: folder name of the checkpoint served by the rollout engines;
+        # MXFP8 name if rollout mxfp8, else FP8 name if rollout fp8, else the BF16 name.
         if self.rollout_mxfp8:
             return self.mxfp8_name
         if self.rollout_fp8:
@@ -200,6 +242,8 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
 
 def _download_dataset(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Downloads the datasets of the selected task into the data directory
+    # (DAPO math and AIME 2024, or GSM8K) via the backend.
     """Download the task-specific dataset(s)."""
     U = args.create_backend()
     match args.task:
@@ -211,11 +255,17 @@ def _download_dataset(args: ScriptArgs):
 
 
 def _hf_checkpoint_path(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: Returns the explicit checkpoint path if given, otherwise the model
+    # directory joined with the model name.
     """Resolve hf_checkpoint path: explicit override wins, else {model_dir}/{model_name}."""
     return args.hf_checkpoint or f"{args.model_dir}/{args.model_name}"
 
 
 def _ensure_4layer_model_type(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: For the 4-layer pruned model only, if its config file exists in the
+    # checkpoint folder and still declares the legacy "deepseek_ref" model type, rewrites the file
+    # in place to the "deepseek_v4" type and prints a patch notice. Does nothing otherwise
+    # (other models, missing config, already patched). Side effect: reads and writes the file.
     """Undo the old deepseek_ref workaround for local 4-layer prunes."""
     if args.model_name != "DeepSeek-V4-Flash-FP8-4layer":
         return
@@ -229,6 +279,9 @@ def _ensure_4layer_model_type(args: ScriptArgs):
 
 
 def _prepare_download(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Creates model and data directories; if no explicit checkpoint path was
+    # given, downloads the Hugging Face repo (org plus model name) into the model directory; then
+    # patches the 4-layer config if needed and downloads the dataset.
     """Download HF checkpoint + task dataset. Idempotent: hf skips existing blobs."""
     U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.model_dir} {args.data_dir}")
@@ -244,11 +297,16 @@ def _prepare_download(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def prepare_download(args: ScriptArgs):
+    # [FUNCTION DOC] Command "prepare-download": runs the download step (intended for one node on
+    # shared storage).
     """Download HF checkpoint + dataset from HuggingFace. Run on one node (shared NFS)."""
     _prepare_download(args)
 
 
 def _prepare_fp8(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: For MXFP4 official releases only, runs the MXFP4-to-FP8 conversion tool on
+    # the downloaded checkpoint, saving to the FP8-named folder under the model directory (GPU
+    # command). For other models prints a notice and returns without doing anything.
     """MXFP4 experts -> blockwise FP8 (lossless cast). Only for official MXFP4 releases."""
     U = args.create_backend()
     if args.model_name not in _MXFP4_MODEL_NAMES:
@@ -264,11 +322,15 @@ def _prepare_fp8(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def prepare_fp8(args: ScriptArgs):
+    # [FUNCTION DOC] Command "prepare-fp8": runs the MXFP4-to-FP8 step; needs download done first.
     """MXFP4 -> FP8 cast (needs prepare-download done first). One node."""
     _prepare_fp8(args)
 
 
 def _prepare_single(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Downloads the task dataset again (idempotent) and casts FP8 weights to
+    # BF16 into the BF16-named folder under the model directory. The source is the cast FP8 folder
+    # for MXFP4 releases, otherwise the resolved checkpoint path.
     U = args.create_backend()
     _download_dataset(args)
 
@@ -285,11 +347,15 @@ def _prepare_single(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def prepare_single(args: ScriptArgs):
+    # [FUNCTION DOC] Command "prepare-single": FP8-to-BF16 cast on one node.
     """FP8 -> BF16 cast for Megatron. Needs --hf-checkpoint (or pre-downloaded). One node."""
     _prepare_single(args)
 
 
 def _prepare_mxfp8(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Only when rollout_mxfp8 is set: asserts the hardware generation is
+    # Blackwell (raises an assertion error otherwise), then runs the BF16-to-MXFP8 conversion tool
+    # from the BF16 folder into the MXFP8 folder (GPU command). No-op otherwise.
     """BF16 -> MXFP8 conversion for sglang rollout (Blackwell only).
 
     head/wo_a/ffn.gate/compressor/norms/embed and the DSA indexer weights_proj
@@ -309,11 +375,21 @@ def _prepare_mxfp8(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def prepare_mxfp8(args: ScriptArgs):
+    # [FUNCTION DOC] Command "prepare-mxfp8": BF16-to-MXFP8 conversion; needs prepare-single first.
     """BF16 -> MXFP8 conversion (needs prepare-single done first). One node."""
     _prepare_mxfp8(args)
 
 
 def _prepare_spmd(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Converts the BF16 checkpoint to a Megatron distributed checkpoint in the
+    # model directory. Builds converter options: model implementation, expert-tensor parallel 1,
+    # context parallel 1, optional kernel backend, plus a layout chosen by cluster shape: 1 actor node
+    # with the 4-layer model (all parallel sizes 1); 8 actor nodes with a full Flash model (tensor 1,
+    # pipeline 8, expert 4, first stage 7 layers, last 6); 32 nodes of 8 GPUs with the Pro model
+    # (tensor 8, pipeline 8, expert 32, stages 7 and 6, vocab divisible by 32). Any other shape raises
+    # a not implemented error. The 4-layer model converts on one GPU (pipeline size 1) to avoid a
+    # converter assertion with hash-routed MoE layers; otherwise uses all actor GPUs per node. The
+    # conversion runs multi-node when there is more than one actor node.
     U = args.create_backend()
     is_4layer = args.model_name == "DeepSeek-V4-Flash-FP8-4layer"
     actor_num_nodes = args.actor_num_nodes
@@ -373,10 +449,14 @@ def _prepare_spmd(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def prepare_spmd(args: ScriptArgs):
+    # [FUNCTION DOC] Command "prepare-spmd": BF16-to-Megatron checkpoint conversion.
     _prepare_spmd(args)
 
 
 def _prepare_cmd(args: ScriptArgs) -> dict[str, str]:
+    # [FUNCTION DOC] HELPER: Per-role pre-launch commands. Returns an empty mapping when the local
+    # model directory equals the shared one. Otherwise a "trainer" entry joining two rsync copies
+    # (Megatron distributed checkpoint and the rollout checkpoint folder) run in sequence.
     if args.model_local_dir == args.model_dir:
         return {}
 
@@ -392,6 +472,13 @@ def _prepare_cmd(args: ScriptArgs) -> dict[str, str]:
 
 
 def _get_parallel_config(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: Selects the parallelism flag string from the verified set (the existing
+    # docstring is accurate). Cases: one actor node (megatron implementation: tensor 1, context 1,
+    # expert = GPUs; miles implementation: context = cp_size or 1, tensor = GPUs / context, raising a
+    # not implemented error if context does not divide the GPU count); 8 nodes x 4 GPUs (megatron:
+    # tensor 1, pipeline 8 with edge stages 4 and 3 layers, context 1, expert 4; miles: tensor 2,
+    # context 2); 64 GPUs as 8x8 (tensor 8, pipeline 8, edges 4 and 3, expert 8); 256 GPUs as 32x8
+    # (Pro; tensor 8, pipeline 8, edges 7 and 6, expert 32). Anything else raises not implemented.
     """Return parallel config args for tested GPU configurations.
 
     Only includes configurations that have been verified to work.
@@ -437,6 +524,11 @@ def _get_parallel_config(args: ScriptArgs) -> str:
 def _parallel_flags(
     args: ScriptArgs, *, tp: int, cp: int, ep: int, pp: int = 1, pp_edge_layers: tuple[int, int] | None = None
 ) -> str:
+    # [FUNCTION DOC] HELPER: Formats one recipe's parallel flags as a space-terminated string: tensor
+    # size, sequence parallel only if tensor > 1, pipeline size, optional first/last stage layer
+    # counts from the edge layers pair, context size, all-gather context-parallel split only if
+    # context > 1 (the model rejects the zigzag split), expert size and expert-tensor size 1.
+    # Raises a not implemented error if the user's cp_size is set and differs from the recipe's.
     """One recipe's parallel flags; a recipe runs its own CP size, so ``cp_size`` must be unset or equal."""
     if args.cp_size not in (None, cp):
         raise NotImplementedError(
@@ -458,6 +550,33 @@ def _parallel_flags(
 
 
 def _train(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Builds the full training argument string and submits the job.
+    # Steps: assert Blackwell hardware if any mxfp8 option is on; decide the rollout checkpoint (when
+    # rollout fp8 is off, no explicit checkpoint was given, or the model is an MXFP4 release, the
+    # checkpoint is replaced with the local rollout-named folder, printing the change); print
+    # precision and cluster summaries; patch the 4-layer config. Checkpoint args: hf checkpoint, ref
+    # load from local distributed folder, plus load/save (every 20 steps) unless skip_saving.
+    # Rollout: math reward, chat template, shuffled, 3000 rollouts, temperature 0.8, one step per
+    # rollout, balanced data; non-debug mode adds over-sampling of 512 with a nonzero-reward-std
+    # filter. Eval (if enabled): every 20 steps, top-p 0.7. Task data: dapo_aime uses response length
+    # 4096 with thinking mode in chat template kwargs and AIME eval (8 samples); gsm8k uses length 256
+    # and 1 eval sample. Perf: parallel config, full uniform recompute, then for the megatron
+    # implementation dynamic batch size with 4096 tokens per GPU, else micro batch 1 with 2048.
+    # GRPO with zero coefficients; Adam 1e-6; optional CPU offload of the optimizer.
+    # SGLang: engine size 32 (tensor, data and expert) for Pro with data-parallel attention, DeepEP and
+    # decode batch 8; on GB200/GB300 min(rollout GPUs, 8) tensor/expert with data parallel 1 (tensor 4
+    # reportedly OOMs host memory when colocated); otherwise 4. Asserts the engine fits the rollout
+    # GPU count. MXFP8 rollout picks flashinfer gemm and moe backends; Pro picks deep gemm moe.
+    # Optional speculative decoding (EAGLE, 3 steps, 4 draft tokens) when MTP is enabled. Environment
+    # variables for SGLang checks, cache dirs and multimem all-gather disabled; extra DeepEP vars for Pro.
+    # Misc flags: dropouts off, memory margins, colocate or explicit rollout GPU count, optional dump
+    # details, mismatch correction, fault tolerance, debug replay of a dumped rollout (defaults
+    # rollout id to 1 when only a run id is given, and sets debug train-only), routing replay,
+    # deterministic mode (adds environment variables for ring all-reduce and workspace config), train
+    # precision flags (mxfp8 or blockwise fp8 via transformer engine) and the precision config
+    # pseudo-file unless the user supplied one. Submits through the backend.
+    # KNOWN ISSUE: the debug rollout id field is declared as a text type but defaulted to an integer.
+    # KNOWN ISSUE: one flag string uses an f-string prefix with no placeholders (harmless).
     U = args.create_backend()
     if args.train_mxfp8 or args.rollout_mxfp8:
         assert command_utils.GENERATION_HARDWARE[args.hardware] == "Blackwell", "MXFP8 requires Blackwell"
@@ -726,6 +845,7 @@ def _train(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def train(args: ScriptArgs):
+    # [FUNCTION DOC] Command "train": runs training only; everything must already be prepared.
     """Run training. Assumes data/model/torch_dist are already prepared on {model_local_dir}."""
     _train(args)
 
@@ -733,6 +853,12 @@ def train(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def full_train(args: ScriptArgs):
+    # [FUNCTION DOC] Command "full-train": runs download, then each conversion stage only when its
+    # sentinel output file is missing (MXFP4-to-FP8 for MXFP4 releases checks the FP8 index file;
+    # FP8-to-BF16 checks the BF16 index file; BF16-to-MXFP8 when rollout mxfp8 checks the MXFP8 index
+    # file; Megatron conversion checks the latest-iteration file), printing a skip notice when
+    # present. If no explicit checkpoint was given, sets it to the local rollout-named folder. Then
+    # trains. Reads the filesystem to test sentinels.
     _prepare_download(args)
 
     if args.model_name in _MXFP4_MODEL_NAMES:

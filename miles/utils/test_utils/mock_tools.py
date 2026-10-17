@@ -1,3 +1,12 @@
+# [MODULE DOC] HELPER: Mock tool-calling agent support for tests. Provides two sample tool
+# definitions (get current year, get temperature for a location) with deterministic executors, an
+# agent loop that talks to a chat completions endpoint and executes tool calls until the model stops
+# calling tools, tiny agent functions for other test paths, and two scripted conversation stubs
+# (two-turn and three-turn) that pair exact rendered prompts with canned model replies, together
+# with the token ids and message lists the tests expect on the wire. Importing this module loads
+# a real tokenizer (Qwen3-0.6B, remote code trusted) at import time to precompute prompt token
+# ids. Two module-level knobs (maximum turns override and canned agent return metadata) are
+# globals that tests may set.
 import json
 from collections.abc import Callable
 from copy import deepcopy
@@ -38,11 +47,16 @@ SAMPLE_TOOLS = [
 
 
 def _get_year(params: dict) -> str:
+    # [FUNCTION DOC] HELPER: Tool executor returning a JSON string with the fixed year 2026.
+    # Asserts the parameters mapping is empty.
     assert len(params) == 0
     return json.dumps({"year": 2026})
 
 
 def _get_temperature(params: dict) -> str:
+    # [FUNCTION DOC] HELPER: Tool executor returning a JSON string with a temperature for the
+    # location in the parameters: minus 60 for "Mars", 15 for "Earth". Asserts the location is one
+    # of those two (assertion error naming it otherwise, including when missing).
     temps = {"Mars": -60, "Earth": 15}
     location = params.get("location")
     assert location in temps, f"Unknown location: {location}"
@@ -56,6 +70,9 @@ TOOL_EXECUTORS = {
 
 
 async def execute_tool_call(name: str, params: dict) -> str:
+    # [FUNCTION DOC] HELPER: Runs the named tool's executor on the parameters and returns its JSON
+    # string result. Raises a key error for an unknown tool name, and assertion errors from the
+    # executors. Declared async but runs synchronously.
     return TOOL_EXECUTORS[name](params)
 
 
@@ -69,6 +86,21 @@ async def run_agentic_tool_call(
     max_turns: int = 8,
     **kwargs,
 ) -> dict[str, Any] | None:
+    # [FUNCTION DOC] HELPER: Agent loop against a chat completions server. Inputs: the server base
+    # URL; a prompt that is either a message list (deep-copied) or a string (wrapped as a single
+    # user message); optional request keyword mapping (model, default "default"; tools, default the
+    # two sample tools); a maximum number of turns (default 8, overridden by the module-level
+    # override when set); extra keywords (only the "metadata" one is used at the end). Each turn
+    # posts the messages and tools to the base URL plus the chat completions path using the shared
+    # HTTP post helper, takes the first choice's message, and stops if it has no tool calls.
+    # Otherwise appends an assistant message (content, refusal, role defaulting to assistant,
+    # annotations, audio, function call and the tool calls) and, for each tool call, parses the
+    # arguments (JSON string, or a mapping passed through; an empty or missing value means an empty
+    # object; malformed JSON becomes an empty mapping), executes the tool and appends a tool
+    # message with the call id, result and tool name. After the loop (including when the turn limit
+    # is exhausted without a final answer) returns the module-level canned return metadata: if it
+    # is callable, the result of calling it with the metadata keyword (taken from the extra
+    # keywords, possibly none); otherwise the value itself (default none).
     if AGENTIC_MAX_TURNS is not None:
         max_turns = AGENTIC_MAX_TURNS
     messages = deepcopy(prompt) if isinstance(prompt, list) else [{"role": "user", "content": prompt}]
@@ -118,12 +150,16 @@ async def run_agentic_tool_call(
 
 
 async def run_agentic_tool_call_returning_reward(**kwargs) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Runs the agent loop with the given keywords (discarding its return
+    # value) and returns a mapping with an agent reward of 42.0, independent of module state so it
+    # works in a fresh process where the globals are unset.
     """``run_agentic_tool_call`` returning a fixed reward without module state, which a fresh process lacks."""
     await run_agentic_tool_call(**kwargs)
     return {"agent_reward": 42.0}
 
 
 async def run_agentic_noop(**kwargs) -> None:
+    # [FUNCTION DOC] HELPER: Ignores all keywords, makes no requests and returns nothing.
     """Agent function that makes no model calls — for testing the no-records path."""
     return None
 
@@ -151,6 +187,18 @@ _TOKENIZER = load_tokenizer("Qwen/Qwen3-0.6B", trust_remote_code=True)
 
 
 class TwoTurnStub:
+    # [CLASS DOC] HELPER: Scripted two-request conversation. Constants: the user question; the first
+    # model reply (a sentence plus two tool calls, to get the year and the temperature on Mars, in
+    # the Qwen tool-call tag format, ending with the end-of-turn token); the rendered tool response
+    # block that follows; the final answer text; the exact rendered first prompt (shared system
+    # prompt with tool descriptions, the user turn, the assistant start) and second prompt (first
+    # prompt plus first reply plus tool responses); the prompt message list; precomputed token ids
+    # of both prompts (without special tokens added); the tool calls in OpenAI shape with ids
+    # call00000 and call00001 and in the inference server's wire shape (adding the tool's index in
+    # the tools list: 0 and 1); the expected message lists the OpenAI client sends for the first
+    # turn and, replaying the assistant message and tool results, for the second turn. The static
+    # process function returns the first reply for the first prompt and the final answer for the
+    # second prompt, with finish reason "stop".
     """Stub for 2-turn: get_year + get_temperature(Mars) -> final answer"""
 
     USER_QUESTION = "What is 42 + year + temperature?"
@@ -222,6 +270,9 @@ class TwoTurnStub:
 
     @staticmethod
     def process_fn(prompt: str) -> ProcessResult:
+        # [FUNCTION DOC] HELPER: Process function for the mock server: returns the canned reply
+        # (finish reason "stop") whose expected rendered prompt equals the given prompt exactly;
+        # raises a value error showing the prompt if it matches neither.
         prompt_response_pairs = {
             TwoTurnStub.FIRST_PROMPT: TwoTurnStub.FIRST_RESPONSE,
             TwoTurnStub.SECOND_PROMPT: TwoTurnStub.SECOND_RESPONSE,
@@ -235,6 +286,14 @@ class TwoTurnStub:
 
 
 class ThreeTurnStub:
+    # [CLASS DOC] HELPER: Scripted three-request conversation (year plus Mars temperature, then
+    # Earth temperature, then the final answer). Same kinds of constants as the two-turn stub, with
+    # an additional second reply (a sentence plus one tool call for Earth's temperature), second
+    # tool response block, third prompt (second prompt plus second reply plus second tool
+    # response), third prompt token ids, second-turn tool calls (id call00000, wire index 1 being
+    # the position of the temperature tool in the tools list), and the expected client message
+    # lists for the first, second and third turns. The static process function maps each of the
+    # three exact prompts to the matching reply (finish reason "stop").
     """Stub for 3-turn: get_year + get_temperature(Mars) -> get_temperature(Earth) -> final answer"""
 
     USER_QUESTION = "What is 42 + year + Mars temperature + Earth temperature?"
@@ -346,6 +405,9 @@ class ThreeTurnStub:
 
     @staticmethod
     def process_fn(prompt: str) -> ProcessResult:
+        # [FUNCTION DOC] HELPER: Process function for the mock server: returns the canned reply
+        # (finish reason "stop") for the first, second or third exact prompt; raises a value error
+        # showing the prompt otherwise.
         prompt_response_pairs = {
             ThreeTurnStub.FIRST_PROMPT: ThreeTurnStub.FIRST_RESPONSE,
             ThreeTurnStub.SECOND_PROMPT: ThreeTurnStub.SECOND_RESPONSE,

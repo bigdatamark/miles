@@ -1,3 +1,6 @@
+# [MODULE DOC] Turns the logits captured by the worker into a per-rank json file of per-token
+# logprob entries (rank_<n>.json in the output directory) that the logprob comparator later
+# reads. Skips critic-style outputs whose last dimension is not a vocabulary.
 """Compute and save output info (logprobs, etc.) from forward-pass results."""
 
 from __future__ import annotations
@@ -19,6 +22,11 @@ def compute_and_save_output_info(
     position_ids: torch.Tensor,
     output_dir: Path,
 ) -> None:
+    # [FUNCTION DOC] Keyword-only inputs: logits, labels, position ids and output directory.
+    # Determines this process's rank (0 when not distributed), builds the payload; if there is
+    # none (logits not vocabulary-shaped) prints a skip message and returns without writing.
+    # Otherwise creates the directory (with parents) and writes rank_<rank>.json containing the
+    # payload as indented json, then prints the path.
     """Compute output info and save one JSON file per rank."""
     rank = _get_rank()
     payload = _compute_output_info(
@@ -50,6 +58,9 @@ def _compute_output_info(
     position_ids: torch.Tensor,
     rank: int,
 ) -> dict[str, Any] | None:
+    # [FUNCTION DOC] HELPER: Computes the entry lists; returns none if that is none. Otherwise
+    # returns a mapping with the rank, the tensor / context / pipeline parallel sizes (each 1 when
+    # torch distributed is not initialized) and the logprob entries.
     """Assemble the full output info payload for one rank.
 
     Returns None if there is nothing to compute (e.g. critic model logits).
@@ -77,6 +88,12 @@ def _compute_logprob_entries(
     labels: torch.Tensor,
     position_ids: torch.Tensor,
 ) -> list[list[dict[str, Any]]] | None:
+    # [FUNCTION DOC] HELPER: Returns none when logits have fewer than three dimensions or a final
+    # dimension of size one. Otherwise takes log-softmax over the vocabulary in float32 and, for
+    # each batch row and local position (a slow per-element loop with host transfers), produces an
+    # entry with the global position (from position ids), token id (the label, or -1 if ignored),
+    # logprob of the label (0.0 if ignored) and a validity flag (label not equal to -100). Result
+    # is a list over batch rows of lists over local positions.
     """Compute per-token logprob entries.
 
     Returns ``entries[batch][seq]`` dicts, or None if logits don't look like
@@ -115,4 +132,6 @@ def _compute_logprob_entries(
 
 
 def _get_rank() -> int:
+    # [FUNCTION DOC] HELPER: Global distributed rank, or 0 when torch distributed is not
+    # initialized.
     return dist.get_rank() if dist.is_initialized() else 0

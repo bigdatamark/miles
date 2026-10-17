@@ -1,3 +1,16 @@
+# [MODULE DOC] HELPER: runtime monkey-patches (applied by calling the install function once) that
+# make Megatron-Bridge's Qwen3-VL model correct for packed (THD, a single row of concatenated
+# sequences) batches, with and without context parallelism (CP). Three independent patches:
+# (1) the text rotary embedding forward tolerates a packed-sequence-params keyword; (2) the model
+# forward is wrapped so multimodal rotary positions (3 axes) are computed per packed segment and fed
+# to the bridge through a patched rope-index function, and the bridge's internal re-sharding
+# helper is turned into an identity when Miles has already sharded the row for CP; (3) the vision
+# embedding all-gather autograd function is wrapped so it accepts its CP group as a keyword.
+# All patches are idempotent (guarded by marker attributes) and silently skip when the bridge
+# modules cannot be imported. Per-call state is passed through a thread-local holder holding the
+# pending positions and the CP-local context, always cleared after the model forward.
+# CP layout: ranks hold zigzag chunks (rank r owns chunks r and 2*cp-1-r of 2*cp equal partitions of
+# every segment); the cumulative lengths of the packed params are the FULL padded boundaries.
 """miles-side fix for Qwen3-VL THD packed mRoPE positions (no Megatron-Bridge edit).
 
 Bridge's Qwen3VLModel.forward resets position_ids=None and recomputes via the
@@ -22,12 +35,19 @@ _tls = threading.local()
 
 
 def install_qwen3_vl_packed_mrope_patch() -> None:
+    # [FUNCTION DOC] Public entry point: applies the three patches in order (rotary signature,
+    # model forward plus rope index, vision-embedding all-gather keyword). Safe to call repeatedly.
+    # Mutates classes and module attributes of the Megatron-Bridge package in process.
     _patch_rotary_signature()
     _patch_model_forward_and_rope_index()
     _patch_allgather_vision_embeddings_kwarg()
 
 
 def _patch_allgather_vision_embeddings_kwarg() -> None:
+    # [FUNCTION DOC] HELPER: replace the bridge model module's vision-embedding all-gather symbol
+    # with a shim class whose apply accepts the CP group as a keyword (torch autograd functions
+    # reject keyword arguments) and forwards it positionally to the original. Does nothing if the
+    # bridge module cannot be imported, the symbol is absent, or it is already the shim.
     """megatron-bridge 0.5.0 calls AllGatherVisionEmbeddings.apply(..., cp_group=...) in the
     Qwen3-VL vision_dp_when_cp path, but torch.autograd.Function.apply rejects keyword args
     (TypeError: apply() takes no keyword arguments). Replace the symbol with a shim whose
@@ -42,16 +62,25 @@ def _patch_allgather_vision_embeddings_kwarg() -> None:
         return
 
     class _AllGatherVisionEmbeddingsKwargShim:
+        # [CLASS DOC] HELPER: stand-in for the original autograd function class; carries a marker
+        # attribute so the patch is not applied twice, and exposes only a static apply.
         _miles_kwarg_shim = True
 
         @staticmethod
         def apply(input, seqlens_on_cp_ranks, cp_group=None):
+            # [FUNCTION DOC] HELPER: call the original function's apply with the input, the
+            # per-CP-rank sequence lengths and the CP group (default none) as positional arguments;
+            # returns its result.
             return orig.apply(input, seqlens_on_cp_ranks, cp_group)
 
     model_mod.AllGatherVisionEmbeddings = _AllGatherVisionEmbeddingsKwargShim
 
 
 def _patch_rotary_signature() -> None:
+    # [FUNCTION DOC] HELPER: for the dense and MoE Qwen3-VL text rotary embedding classes in the
+    # bridge's text model module, wrap their forward so an extra packed-sequence-params keyword is
+    # accepted and dropped before calling the original. Skips classes that are absent or already
+    # marked patched (marker stored on the class itself); returns silently if import fails.
     # Let the rotary embedding forward tolerate the packed_seq_params kwarg.
     try:
         text_model = importlib.import_module("megatron.bridge.models.qwen_vl.modelling_qwen3_vl.text_model")
@@ -64,7 +93,11 @@ def _patch_rotary_signature() -> None:
         _orig = cls.forward
 
         def _make(orig):
+            # [FUNCTION DOC] HELPER: factory binding the original forward (needed so each loop
+            # iteration captures its own original); returns the wrapper function.
             def _fwd(self, *args, packed_seq_params=None, **kwargs):
+                # [FUNCTION DOC] HELPER: wrapper forward that discards the packed-sequence-params
+                # keyword and delegates everything else to the original forward.
                 return orig(self, *args, **kwargs)
 
             return _fwd
@@ -74,6 +107,16 @@ def _patch_rotary_signature() -> None:
 
 
 def _patch_model_forward_and_rope_index() -> None:
+    # [FUNCTION DOC] HELPER: the main patch. Returns silently if the bridge model module cannot be
+    # imported or is already marked patched. Steps: (1) replace the module-level rope-index
+    # function with a wrapper that returns the thread-local pending positions when set, else
+    # delegates to the original; (2) install the identity wrapper for the packed-sequence
+    # preprocessing function; (3) log a warning if the bridge model class lacks native CP-local
+    # vision-embed selection (CP runs with vision tokens would misplace embeddings); (4) unless
+    # the model class is missing or already patched, replace its forward with a wrapper that parses
+    # the packed batch, builds per-segment positions and the CP-local context, stores them in the
+    # thread-local, calls the original forward, and always clears the thread-local afterwards;
+    # (5) mark the class and module as patched.
     try:
         model_mod = importlib.import_module("megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model")
     except ImportError:
@@ -84,6 +127,8 @@ def _patch_model_forward_and_rope_index() -> None:
     orig_get_rope_index = model_mod.get_rope_index
 
     def patched_get_rope_index(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: if positions were stashed for this forward, return them as the
+        # pair (positions, None) without computing; otherwise call the original with all arguments.
         pending = getattr(_tls, "packed_positions", None)
         if pending is not None:
             return pending, None
@@ -113,6 +158,11 @@ def _patch_model_forward_and_rope_index() -> None:
     orig_forward = Qwen3VLModel.forward
 
     def patched_forward(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: wrapper around the model forward (all arguments passed through).
+        # Parses the packed THD batch (none for non-packed), computes per-segment multimodal
+        # positions (none means use the bridge's dense path), prepares the CP-local context, stores
+        # whichever are not none in the thread-local, runs the original forward and returns its
+        # result; the stashed positions and context are reset to none in a finally block.
         parsed = _parse_packed_thd(args, kwargs)
         packed = _build_packed_positions(self, parsed, kwargs, orig_get_rope_index)
         ctx = _prepare_cp_local_context(parsed)
@@ -132,11 +182,19 @@ def _patch_model_forward_and_rope_index() -> None:
 
 
 def _patch_preprocess_packed_seqs_identity(model_mod) -> None:
+    # [FUNCTION DOC] HELPER: wrap the bridge model module's packed-sequence preprocessing function
+    # (which splits the full input for CP internally) so that, while a CP-local context is stashed,
+    # it returns the already-local input ids together with Miles' packed-sequence params instead of
+    # re-sharding; otherwise it calls the original. No-op when the function is absent or already
+    # wrapped (marker attribute on the wrapper).
     orig = getattr(model_mod, "preprocess_packed_seqs", None)
     if orig is None or getattr(orig, "_miles_identity_wrapped", False):
         return
 
     def wrapped(input_ids, attention_mask, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: identity-with-params when a CP-local context is stashed (returns
+        # the input ids unchanged and the stashed packed-sequence params); otherwise delegates to
+        # the original with all arguments. The attention mask is ignored in the identity case.
         ctx = getattr(_tls, "cp_local", None)
         if ctx is not None:
             # Already CP-local: skip re-sharding and hand back miles' full-cu packed_seq_params.
@@ -148,6 +206,10 @@ def _patch_preprocess_packed_seqs_identity(model_mod) -> None:
 
 
 class _PackedTHD(NamedTuple):
+    # [CLASS DOC] HELPER: immutable parsed view of a single-row packed THD batch. Fields: the
+    # packed-sequence params object; the flat 1-D token ids; the query cumulative sequence lengths
+    # as a host list and as the original tensor; the local row length (token count on this rank);
+    # CP size and CP rank.
     """Parsed view of a THD single-row packed batch (see ``_parse_packed_thd``)."""
 
     psp: object
@@ -160,6 +222,12 @@ class _PackedTHD(NamedTuple):
 
 
 def _parse_packed_thd(args, kwargs):
+    # [FUNCTION DOC] HELPER: extract the packed-batch view from the model forward's arguments.
+    # Input ids come from the keyword or else the first positional argument. Returns none unless
+    # the packed-sequence params exist with the "thd" format, the ids are 2-D with batch size 1,
+    # and the query cumulative lengths exist with at least two entries. Otherwise flattens the ids,
+    # reads CP size / rank, copies the cumulative lengths to the host (one device sync) and returns
+    # the packed view.
     """Extract the preamble shared by the mRoPE-position and CP-context paths, doing the one
     GPU->host copy of cu_seqlens_q a single time. Returns None when this is not a THD packed
     ``[1, T]`` batch, in which case both callers run the dense / unchanged path."""
@@ -180,6 +248,10 @@ def _parse_packed_thd(args, kwargs):
 
 
 def _prepare_cp_local_context(parsed):
+    # [FUNCTION DOC] HELPER: decide whether the row is already CP-sharded. Returns a mapping with
+    # the packed-sequence params (key psp) only when a packed view exists, CP size > 1, the first
+    # cumulative length is zero and the last equals CP size times the local row length; otherwise
+    # none (the bridge then runs unchanged).
     """When CP has already pre-sharded this THD row, capture miles' packed_seq_params so the
     preprocess_packed_seqs identity wrapper can hand them back unchanged (the bridge does
     CP-local vision-embed selection natively). Returns None for the non-CP / full-input cases
@@ -192,6 +264,8 @@ def _prepare_cp_local_context(parsed):
 
 
 def _cp_size_rank():
+    # [FUNCTION DOC] HELPER: return (context-parallel world size, rank) from Megatron's parallel
+    # state; on any error (e.g. parallel state not initialised) returns (1, 0).
     """Context-parallel (size, rank); (1, 0) when CP is unavailable."""
     try:
         from megatron.core import parallel_state as _ps
@@ -202,6 +276,10 @@ def _cp_size_rank():
 
 
 def _natural_to_zigzag_slice(t, cp_size, cp_rank, dim):
+    # [FUNCTION DOC] HELPER: take this rank's two chunks (indices rank and 2*cp-1-rank, in that
+    # order) out of the 2*cp equal chunks of t along the given dim, concatenated along that dim.
+    # Chunk size is the integer quotient of the length by 2*cp; no divisibility check, so a
+    # non-divisible length would silently drop trailing elements. Returns a new tensor.
     """Slice a full-length tensor into this rank's zigzag (load-balanced ring-attn) CP chunks.
 
     Mirrors miles.backends.training_utils.data.context_parallel.slice_with_cp / natural_to_zigzag_slice:
@@ -215,6 +293,10 @@ def _natural_to_zigzag_slice(t, cp_size, cp_rank, dim):
 
 
 def _cp_allgather_unzigzag(flat, cu, cp_size):
+    # [FUNCTION DOC] HELPER: collective. All-gathers every CP rank's local flat row over the CP
+    # group (same length on every rank assumed) and reassembles the full natural-order row via the
+    # reassembly helper. Returns the full row, or none if some segment length is not divisible by
+    # 2*cp. Must be called by all CP ranks.
     """Reconstruct the full THD packed row from this rank's zigzag chunks.
 
     Under CP, ``flat`` holds only chunks [cp_rank, 2*cp-1-cp_rank] of every segment, and
@@ -232,6 +314,12 @@ def _cp_allgather_unzigzag(flat, cu, cp_size):
 
 
 def _reassemble_full_row(gathered, cu, cp_size):
+    # [FUNCTION DOC] HELPER: pure function (no collectives). Allocates a zero row of the full
+    # length (last cumulative length) with the dtype and device of the gathered rows. For each
+    # non-empty segment (length from the cumulative list), returns none if the length is not a
+    # multiple of 2*cp; else with chunk size length/(2*cp) and the segment's local offset (segment
+    # start divided by cp), copies for every rank r its first local chunk to natural chunk r and
+    # its second local chunk to natural chunk 2*cp-1-r. Returns the full row.
     """De-interleave per-rank zigzag rows back into the full natural-order packed row.
 
     ``gathered[r]`` is rank r's local row; ``cu`` (full padded per-segment boundaries, i.e.
@@ -257,6 +345,18 @@ def _reassemble_full_row(gathered, cu, cp_size):
 
 
 def _segment_positions(model, flat, cu, cu_t, kwargs, orig_get_rope_index):
+    # [FUNCTION DOC] HELPER: compute multimodal rotary positions for every non-empty segment of a
+    # full (unsharded) packed row. Inputs: model (provides spatial merge size and the image, video
+    # and vision-start token ids), flat ids, host and tensor cumulative lengths, the forward's
+    # keyword arguments (image and video grid tables, each a count by 3 table), and the original
+    # rope-index function. Returns a list of position tensors of shape 3 by 1 by segment length.
+    # Media counting: finds every vision-start token that is not the last token, looks at the token
+    # after it, assigns it to a segment by bucketing against the cumulative lengths, and counts
+    # image and video starts per segment (one device-to-host copy). Segments with no media get a
+    # plain 0..L-1 range expanded over the 3 axes (a non-contiguous view); others call the original
+    # rope-index function with the segment's ids (batch of one), the next image / video grid rows
+    # (offsets advance by each segment's counts), and no attention mask, and trim the result to the
+    # segment length.
     """Per-segment MRoPE positions for a full (unsharded) packed row `flat` with boundaries `cu`.
 
     Returns a list of [3, 1, seg_len] tensors (one per non-empty segment), text segments get
@@ -307,6 +407,15 @@ def _segment_positions(model, flat, cu, cu_t, kwargs, orig_get_rope_index):
 
 
 def _build_packed_positions(model, parsed, kwargs, orig_get_rope_index):
+    # [FUNCTION DOC] HELPER: produce the positions tensor (3 by 1 by local row length, contiguous)
+    # to feed the bridge, or none to let the bridge use its dense path. Returns none when there is
+    # no packed view, or the first cumulative length is nonzero. Three cases: (a) the last
+    # cumulative length equals the local length (non-CP or single chunk): positions per segment,
+    # concatenated along the token axis (none if no non-empty segment); (b) CP size > 1 and the last
+    # cumulative length equals CP size times the local length: all-gather the full row (collective;
+    # none, with a debug log, if a segment is not divisible by 2*cp), compute full per-segment
+    # positions, re-slice each segment into this rank's zigzag chunks along the token axis and
+    # concatenate; (c) any other layout: debug log and none.
     """Per-segment MRoPE positions for a THD packed batch; None to run the dense path."""
     if parsed is None or parsed.cu[0] != 0:
         return None
@@ -345,4 +454,6 @@ def _build_packed_positions(model, parsed, kwargs, orig_get_rope_index):
 
 
 def _slice(grid, offset, count):
+    # [FUNCTION DOC] HELPER: rows offset .. offset+count of a grid table, or none if the table is
+    # none or the count is zero.
     return None if grid is None or count == 0 else grid[offset : offset + count]

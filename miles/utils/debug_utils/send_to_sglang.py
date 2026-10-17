@@ -1,3 +1,6 @@
+# [MODULE DOC] Command-line tool that sends every prompt of a dataset file to an sglang server
+# through its OpenAI-compatible chat endpoint (several samples per prompt) and prints the results
+# as json lines. Reads the file with the shared dataset file reader.
 import asyncio
 import json
 from typing import Annotated
@@ -18,6 +21,17 @@ def main(
     rollout_temperature: Annotated[float, typer.Option()] = 1.0,
     rollout_top_p: Annotated[float, typer.Option()] = 1.0,
 ):
+    # [FUNCTION DOC] Entry point. Options (named like the main training arguments): prompt_data
+    # file path (jsonl or parquet, optional row range suffix), server url (default
+    # http://localhost:30000/v1), input_key column holding the chat message list (default
+    # "input"), samples per prompt (1), maximum response tokens (1024), temperature (1.0) and
+    # top-p (1.0). Creates an async client with a dummy API key against the url, then, for every
+    # row and every repeat index, launches one concurrent chat completion request (all rows are
+    # read and all requests started at once, with no concurrency limit), waits for all, and prints
+    # one json line per result in task order. Each result holds the row index, repeat index, all
+    # original row fields (a row field named like the result keys would collide and raise an
+    # error) and the response text of the first choice. The model name sent is a fixed dummy
+    # name. Any request failure aborts the whole run.
     """
     Minimally send prompts to SGLang using OpenAI endpoints with arguments in the same format as main Miles.
 
@@ -26,6 +40,8 @@ def main(
     """
 
     async def _main_async():
+        # [FUNCTION DOC] HELPER: Builds one task per (row, repeat) pair, awaits all together and
+        # prints each output as a json line in task order.
         tasks = [
             asyncio.create_task(_run_one(row, row_index=row_index, repeat_index=repeat_index))
             for row_index, row in enumerate(read_file(prompt_data))
@@ -36,6 +52,10 @@ def main(
             print(json.dumps(output))
 
     async def _run_one(row, row_index: int, repeat_index: int):
+        # [FUNCTION DOC] HELPER: Sends one chat completion request with the row's messages under
+        # the input key, the dummy model name and the sampling options from the enclosing scope
+        # (client created after this function is defined but before it runs). Returns a mapping of
+        # row index, repeat index, the row's fields and the first choice's message content.
         resp = await client.chat.completions.create(
             messages=row[input_key],
             model="dummy_model",

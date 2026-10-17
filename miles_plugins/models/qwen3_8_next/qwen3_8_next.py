@@ -1,3 +1,10 @@
+# [MODULE DOC] Entry point that builds the Megatron transformer block spec for Qwen3.8-Next:
+# starts from the stock GPT decoder block spec, then per layer (a) attaches hyper-connection
+# modules for the attention and MLP slots (the attention one also owns the per-layer embedding
+# module on PLE layers), (b) swaps the attention for either the replicated GDN wrapper (linear
+# layers) or the QSA sparse attention (full-attention layers), and (c) strips block layernorms
+# because the hyper-connection norm replaces them. Also maps the HuggingFace config fields onto
+# extra config attributes that Megatron has no command-line flags for.
 """Qwen3.8-Next block spec: the GPT decoder with Qwen3.8-Next hyper-connections.
 
 Every block layernorm is dropped: the checkpoint has none (each HC's ``hc_norm`` is the
@@ -26,6 +33,10 @@ from miles_plugins.models.qwen3_8_next.ops.attention import Qwen38NextAttention
 
 
 def _layer_types(text_config):
+    # [FUNCTION DOC] HELPER: list of per-layer type labels. Uses the config's non-empty layer types
+    # list when present; otherwise derives: every interval-th layer (config's full attention
+    # interval, default 4, one-based) is full attention, the rest linear attention, for the
+    # config's hidden layer count.
     """Per-layer ``linear_attention`` / ``full_attention`` labels, with Qwen3.5's fallback."""
     if hasattr(text_config, "layer_types") and text_config.layer_types:
         return list(text_config.layer_types)
@@ -35,6 +46,8 @@ def _layer_types(text_config):
 
 
 def _hc_spec(*, with_ple: bool = False):
+    # [FUNCTION DOC] HELPER: module spec for a hyper-connection slot: the PLE-aware connection when
+    # with_ple is true, else the plain connection. No parameters or submodules.
     """The attention-site HC on the PLE layer also owns the PLE module.
 
     PLE's increment lands on the widened residual before the read gate, and the HC
@@ -44,6 +57,9 @@ def _hc_spec(*, with_ple: bool = False):
 
 
 def _strip_block_layernorms(layer_spec):
+    # [FUNCTION DOC] HELPER: mutate a layer spec in place. If the self-attention spec has a qkv
+    # linear submodule, replace it with the plain Transformer Engine column-parallel linear (no
+    # fused layernorm); set the input layernorm and pre-MLP layernorm slots to the identity op.
     """Replace the fused-layernorm qkv with a plain TE linear, and drop pre_mlp_layernorm."""
     submodules = layer_spec.submodules
     attn = submodules.self_attention
@@ -54,6 +70,8 @@ def _strip_block_layernorms(layer_spec):
 
 
 class Qwen38NextLinearAttention(Qwen35LinearAttention):
+    # [CLASS DOC] The replicated GDN attention wrapper whose input layernorm is replaced by an
+    # identity, since the hyper-connection already normalises its input.
     """Qwen3.5's gated-delta-net wrapper with its input layernorm removed.
 
     The attention HC's ``hc_norm`` already normalises the GDN input. Identity rather
@@ -61,11 +79,20 @@ class Qwen38NextLinearAttention(Qwen35LinearAttention):
     """
 
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC] Pass all arguments to the parent, then overwrite its input layernorm with
+        # an identity module.
         super().__init__(*args, **kwargs)
         self.input_layernorm = torch.nn.Identity()
 
 
 def _apply_qwen3_8_next_config(config, text_config) -> None:
+    # [FUNCTION DOC] HELPER: copy model hyper-parameters from the HF text config onto the Megatron
+    # config object (mutated in place). Turns on hyper-connections; sets residual stream count
+    # (default 4) and HC low rank (320). PLE: layer ids converted from one-based to zero-based,
+    # de-duplicated and sorted (empty if absent); embed dim (2560), n-gram size (3), heads per n-gram
+    # (8), vocabulary size base (20 million), number of table shards (128), conv kernel size (4), EOS
+    # token id (0). Indexer: token budget (2048), compress ratio (4), query heads (4), head dim
+    # (128), key heads (1). Defaults in parentheses apply when the HF field is missing.
     """Put the Qwen3.8-Next fields on a TransformerConfig built from argparse.
 
     Megatron has no CLI flags for them; mirrors ``Qwen38NextBridge._build_config``.
@@ -91,6 +118,18 @@ def _apply_qwen3_8_next_config(config, text_config) -> None:
 
 
 def get_qwen3_8_next_spec(args, config, vp_stage=None):
+    # [FUNCTION DOC] Build the block spec for the layers on this pipeline stage. Side effects:
+    # registers HF config aliases, loads the HF config from args.hf_checkpoint, mutates the
+    # Megatron config (Qwen3.8-Next fields, HF checkpoint path, and for dense models the MoE layer
+    # frequency list set to all zeros). Raises not-implemented error for interleaved virtual
+    # pipeline parallelism, and if a PLE layer is on any stage whose first layer offset is nonzero
+    # (PLE needs input token ids, only on the first stage). Asserts no custom pipeline layout.
+    # Per built layer: deep-copy the stock layer spec; set the attention hyper-connection (PLE
+    # variant when the layer is a PLE layer) and the MLP hyper-connection; replace self-attention
+    # with the replicated-GDN wrapper (params: args) for linear-attention layers, or with the QSA
+    # attention (keeping the existing params and submodules) for full-attention layers; strip block
+    # layernorms. Finally sets the model-level hyper-connection head contraction and replaces the
+    # final layernorm with identity. Returns the modified block spec.
     """Transformer block spec for Qwen3.8-Next."""
     register_hf_config_aliases()
     hf_config = load_hf_config(args.hf_checkpoint)

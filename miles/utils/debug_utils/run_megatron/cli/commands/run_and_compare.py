@@ -1,3 +1,7 @@
+# [MODULE DOC] The run-and-compare command: runs the same model under a baseline and a target
+# parallel layout (sequentially, each through the run routine) into separate output directories,
+# then compares the two dumps. Optional routing replay (baseline records, target replays) and
+# logprob comparison.
 """``run-and-compare`` CLI command."""
 
 from __future__ import annotations
@@ -20,12 +24,22 @@ from miles.utils.typer_utils import dataclass_cli
 
 
 def register(app: typer.Typer) -> None:
+    # [FUNCTION DOC] HELPER: Adds the run-and-compare command, under the hyphenated name, to the
+    # given typer app.
     """Register the ``run-and-compare`` command on *app*."""
     app.command(name="run-and-compare")(run_and_compare)
 
 
 @dataclass_cli(env_var_prefix="")
 def run_and_compare(args: RunAndCompareArgs) -> None:
+    # [FUNCTION DOC] The command (options from the dataclass, no environment prefix). Parses the
+    # baseline and target layout strings into parallel configs; output directories are the base
+    # directory joined with each config's directory name. Copies the shared option values into a
+    # mapping. If routing replay is on, the replay directory is "routing_replay" under the base
+    # directory. If logprob comparison is on, each run writes logprobs to a "logprobs"
+    # subdirectory of its output. Executes both runs, then compares the "standalone" subdirectories
+    # of the two outputs with json output format, the activation threshold and logprob threshold.
+    # Comparison failure ends the process via the compare routine.
     """Run baseline + target configs, then compare dumps."""
     baseline_config: ParallelConfig = ParallelConfig.from_parsed_args(parse_parallel_args(args.baseline))
     target_config: ParallelConfig = ParallelConfig.from_parsed_args(parse_parallel_args(args.target))
@@ -71,6 +85,9 @@ def run_and_compare(args: RunAndCompareArgs) -> None:
 
 
 def _append_extra_args(common_fields: dict[str, object], extra: str) -> dict[str, object]:
+    # [FUNCTION DOC] HELPER: Returns the mapping unchanged (same object) if the extra string is
+    # empty; otherwise a shallow copy whose extra_args entry is the old value, a space, and the
+    # extra string, with surrounding whitespace stripped. Does not mutate the input.
     if not extra:
         return common_fields
     result: dict[str, object] = dict(common_fields)
@@ -91,6 +108,13 @@ def _run_baseline_and_target(
     baseline_logprob_dir: Path | None,
     target_logprob_dir: Path | None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: With routing replay enabled, requires the baseline to be a
+    # single-process run (raises a value error otherwise) and prints a notice. Then performs the
+    # baseline run (step 1 of 2) followed by the target run (step 2 of 2), each by constructing a
+    # run-args record from the common fields (with that run's extra arguments appended), the
+    # layout's fields, its output directory and logprob directory. The baseline writes the routing
+    # replay dump to the replay directory and loads none; the target loads from it and dumps none.
+    # Runs strictly sequentially; the target does not run if the baseline fails.
     if replay_dir is not None:
         if baseline_config.nproc != 1:
             raise ValueError(f"Routing replay requires single-rank baseline (nproc=1), got {baseline_config}")

@@ -1,3 +1,12 @@
+# [MODULE DOC] Worker entry point launched by torchrun on every rank. Flow: parse Megatron plus
+# script arguments, initialize distributed Megatron, optionally apply source patches, set up
+# routing replay before building the model, build and load the model, register the dumper on every
+# model chunk, load replay data, read the token ids file and build the batch, run one forward
+# (and optionally backward) step capturing the output logits, write logprob output and print
+# top-k predictions on the last pipeline stage if requested, save replay data, finalize the
+# dumper, then barrier and tear down the process group. Rank 0 prints progress lines.
+# KNOWN ISSUE: the docstring below says the script is launched by "cli.py run" and consumes
+# MODEL_ARGS from a shell script; the launcher is now the cli package's run command.
 """Torchrun worker script for standalone Megatron forward/backward.
 
 This script is launched by ``cli.py run`` via ``torchrun`` and runs inside
@@ -44,6 +53,13 @@ from miles_plugins.models.glm5.arguments import add_dsa_arguments
 
 
 def main() -> None:
+    # [FUNCTION DOC] Orchestrates the worker as described in the module doc. Details: the replay
+    # data loader is told whether sequence parallelism is on (defaulting to off when the argument
+    # is missing); the batch uses the micro batch size and this rank's context-parallel rank and
+    # size; logprob files are written only on the last pipeline stage when a logprob output
+    # directory is set and logits were captured; top-k printing happens under the same stage and
+    # capture conditions when top-k is positive. Ends with a distributed barrier and destruction
+    # of the process group.
     args, script = _parse_args()
     _initialize_megatron(args)
 
@@ -109,6 +125,9 @@ def main() -> None:
 
 
 def _register_worker_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    # [FUNCTION DOC] HELPER: Extra-arguments provider for Megatron's parser. Registers the script
+    # option group via the bridge and the DeepSeek V4 and DSA plugin arguments (so model-argument
+    # strings that mention them still parse). Returns the same parser.
     """Worker arguments plus the plugin arguments the model scripts pass through."""
     WORKER_SCRIPT_ARGS_BRIDGE.register_on_parser(parser)
     add_dsv4_arguments(parser)
@@ -117,6 +136,10 @@ def _register_worker_arguments(parser: argparse.ArgumentParser) -> argparse.Argu
 
 
 def _parse_args() -> tuple[argparse.Namespace, WorkerScriptArgs]:
+    # [FUNCTION DOC] HELPER: Parses the process command line with Megatron's argument parser plus
+    # the worker arguments, extracts the script options dataclass from the namespace, and, if a
+    # reference checkpoint path is set, stores it (as text) as the namespace's load path. Returns
+    # (namespace, script options).
     args: argparse.Namespace = parse_args(extra_args_provider=_register_worker_arguments)
     script_args: WorkerScriptArgs = WORKER_SCRIPT_ARGS_BRIDGE.from_namespace(args)
 
@@ -127,6 +150,12 @@ def _parse_args() -> tuple[argparse.Namespace, WorkerScriptArgs]:
 
 
 def _initialize_megatron(args: argparse.Namespace) -> None:
+    # [FUNCTION DOC] HELPER: Side effects: initializes the NCCL process group; selects the CUDA
+    # device from the LOCAL_RANK environment variable (default 0); sets the namespace's HF
+    # checkpoint path (as text) from the script option; fills defaults for megatron-to-HF mode
+    # ("raw"), batch-size decrease (false) and deterministic collectives (false) only when absent;
+    # applies miles' default Megatron arguments, runs Megatron's argument validation, and runs
+    # miles' initializer.
     torch.distributed.init_process_group(backend="nccl")
     local_rank: int = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
@@ -142,6 +171,11 @@ def _initialize_megatron(args: argparse.Namespace) -> None:
 
 
 def _build_and_load_model(args: argparse.Namespace, script: WorkerScriptArgs) -> list[Any]:
+    # [FUNCTION DOC] HELPER: Builds the model chunks for the script's role with Megatron's model
+    # builder, wrapping in distributed data parallel only when running backward (to avoid
+    # allocating the large gradient buffer). If the namespace has a load path, loads the checkpoint
+    # into the model only (no optimizer or scheduler). Puts every chunk in training mode (dropout
+    # was set to zero on the command line). Returns the list of chunks.
     model_provider: Callable[..., Any] = get_model_provider_func(args, role=script.role)
     # Forward-only runs skip DDP wrapping so the distributed-optimizer grad buffer
     # (tens-to-hundreds of GB for large MoE models) is never allocated -> avoids OOM.
@@ -162,6 +196,9 @@ def _build_and_load_model(args: argparse.Namespace, script: WorkerScriptArgs) ->
 
 
 def _apply_source_patches(config_path: Path) -> None:
+    # [FUNCTION DOC] HELPER: Reads the YAML file and applies the source patches it describes via
+    # sglang's patcher, making the dumper object available to patched code through an extra import
+    # line. Modifies loaded code in the process; prints a confirmation.
     yaml_content: str = config_path.read_text()
     apply_patches_from_config(
         yaml_content,
@@ -176,6 +213,13 @@ def _run_forward_backward(
     model: list[Any],
     batch: dict[str, torch.Tensor],
 ) -> torch.Tensor | None:
+    # [FUNCTION DOC] HELPER: Runs one micro batch through Megatron's pipeline schedule (a single
+    # microbatch fed from a one-element iterator, forward only unless backward was requested) with
+    # a step function that fetches the batch, runs the model chunk with gathered output across
+    # tensor parallel ranks, stores a detached copy of the output in a local list and returns the
+    # output with the loss callback bound to the labels. Rank 0 prints the returned losses if any.
+    # Returns the first captured output, or none if the step function never ran (for example on
+    # pipeline stages that do not produce logits it still captures whatever the chunk returns).
     """Run forward (and optionally backward) pass, returning captured logits."""
     forward_backward_func: Callable[..., Any] = get_forward_backward_func()
     captured: list[torch.Tensor] = []
@@ -184,6 +228,10 @@ def _run_forward_backward(
         data_iterator: Any,
         model_chunk: Any,
     ) -> tuple[torch.Tensor, partial[tuple[torch.Tensor, dict[str, Any]]]]:
+        # [FUNCTION DOC] HELPER: Schedule step callback. Takes the next batch from the data
+        # iterator, calls the model chunk with input ids, position ids, the optional attention mask
+        # and gathered output, appends the detached output to the enclosing capture list, and
+        # returns the output together with the loss function partially applied to the labels.
         data: dict[str, torch.Tensor] = next(data_iterator)
         output: torch.Tensor = model_chunk(
             input_ids=data["input_ids"],
@@ -212,6 +260,8 @@ def _run_forward_backward(
 
 
 def _print_config(args: argparse.Namespace, script: WorkerScriptArgs) -> None:
+    # [FUNCTION DOC] HELPER: Prints three flushed lines: sequence length and micro batch size; the
+    # tensor, pipeline, context, expert and expert-tensor parallel sizes; backward flag and role.
     print(f"[worker] seq_length={args.seq_length}, micro_batch_size={args.micro_batch_size}", flush=True)
     print(
         f"[worker] tp={args.tensor_model_parallel_size}, pp={args.pipeline_model_parallel_size}, "
@@ -223,6 +273,8 @@ def _print_config(args: argparse.Namespace, script: WorkerScriptArgs) -> None:
 
 
 def _finalize_dumper() -> None:
+    # [FUNCTION DOC] HELPER: Only when the DUMPER_ENABLE environment variable equals "1": advances
+    # the dumper by one step and then turns the dumper off. Otherwise does nothing.
     """Step + disable dumper after forward/backward."""
     if os.environ.get("DUMPER_ENABLE", "0") == "1":
         dumper.step()

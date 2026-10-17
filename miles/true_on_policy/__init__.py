@@ -1,3 +1,11 @@
+# [PACKAGE DOC] Package for the "true-on-policy" feature: making the trainer (FSDP or Megatron)
+# produce log-probabilities bit-aligned with the SGLang rollout engine. It is split into four
+# layers: schema (declarative contract identity), contracts (contract objects plus the rules
+# deriving kernel switches), model_profiles (per-model-family capabilities and Megatron model
+# type names) and config (validation of a run's parallel layout and construction of a launch plan
+# with CLI argument lists and environment variables). This file only re-exports the public
+# names of those modules via the package-level export list.
+
 """True-on-policy launch contract helpers."""
 
 from .config import (

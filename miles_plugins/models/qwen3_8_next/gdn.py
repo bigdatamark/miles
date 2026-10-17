@@ -1,3 +1,9 @@
+# [MODULE DOC] Replicated (non-head-sharded) Gated DeltaNet for Qwen3.8-Next. Every tensor-parallel
+# rank holds the full set of heads and weights and runs the whole layer, wrapped in the
+# HuggingFace-attention shim (which handles gathering / scattering sequences around the HF-style
+# forward). Contains the pure-torch-module GDN (ReplicatedGatedDeltaNet) and the Megatron-facing
+# wrapper (ReplicatedGDNAttention). The fla import for the norm and conv is optional at import
+# time (skipped silently when fla is missing).
 """Qwen3.8-Next runs its GDN replicated on every TP rank through the HF-attention shim.
 Moved from qwen3_5.py when Qwen3.5 / Qwen3-Next switched to the head-sharded layer."""
 
@@ -20,6 +26,13 @@ from miles_plugins.models.qwen3_5 import _get_text_config
 
 # Adapted from Qwen3NextGatedDeltaNet but with separate in_proj_qkv and in_proj_z
 class ReplicatedGatedDeltaNet(nn.Module):
+    # [CLASS DOC] Full (unsharded) Gated DeltaNet layer with variable-length (packed sequence) and
+    # context-parallel support. Parameters: separate bias-free linears in_proj_qkv (flat layout:
+    # all q, then all k, then all v), in_proj_z (output gate), in_proj_b (beta logits per value head),
+    # in_proj_a (decay input per value head); out_proj; fla short convolution over the full qkv width;
+    # dt_bias (ones, one per value head); A_log (fp32, log of uniform samples from 0 to 16); fla fused
+    # gated RMS norm over the value head dim. The output-gate activation of the norm comes from the
+    # config's output gate type (sigmoid for Qwen3.8-Next) falling back to the hidden activation.
     """
     Qwen3.5 GatedDeltaNet with varlen support.
     Unlike Qwen3Next which uses a combined in_proj_qkvz, Qwen3.5 uses
@@ -27,6 +40,19 @@ class ReplicatedGatedDeltaNet(nn.Module):
     """
 
     def __init__(self, config, layer_idx: int, args=None):
+        # [FUNCTION DOC] Build all sub-modules from the HuggingFace text config. The kernel backend
+        # is taken from args' linear attention backend attribute (default fla if args is missing or
+        # lacks it) and resolved eagerly (may raise ImportError / value error). Reads head counts and
+        # dims (value heads, key heads, key / value head dims), conv kernel size, hidden activation,
+        # rms norm epsilon. Key dim and value dim are head dim times head count; the conv and qkv
+        # projection width is twice key dim plus value dim. The A_log parameter is marked as an
+        # fp32 parameter (held in fp32 even when the HF checkpoint is bf16, to match the rollout
+        # engine). The norm is created on the current CUDA device in the config's dtype.
+        # layer_idx is stored but otherwise unused here.
+        # KNOWN ISSUE: when config.dtype is None the fallback calls a torch function for the current
+        # default dtype that does not exist in torch (the real one is get_default_dtype), so that
+        # path would raise an attribute error. Also, the activation module (self.act) and the
+        # activation name stored for the conv are not used by forward.
         super().__init__()
         self.gdn_backend = getattr(args, "linear_attention_backend", "fla")
         self.chunk_gated_delta_rule = gdn_kernel(self.gdn_backend)
@@ -91,6 +117,19 @@ class ReplicatedGatedDeltaNet(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor = None,
     ):
+        # [FUNCTION DOC] Forward over hidden_states of shape batch, sequence, hidden; cu_seqlens are
+        # the packed-sequence boundaries (global when context parallelism is on). Returns a tensor of
+        # shape batch, sequence, hidden.
+        # Steps: build a context-parallel context (None when CP is off); project qkv, z, b, a (z
+        # reshaped per value head); run the conv on the flat qkv (with the CP context's own
+        # boundaries when present); split flat into q, k, v and reshape to heads; beta is the
+        # sigmoid of b; the log-decay g is negative exp of A_log (fp32) times softplus of (a in fp32
+        # plus dt_bias); if value heads outnumber key heads, repeat q and k along the head dim by the
+        # ratio (interleaved); run the chunked gated delta rule with in-kernel q/k L2 norm: with a CP
+        # context only the fla backend is allowed (else not-implemented error) and the CP context's
+        # boundaries plus the context are passed; without CP, the flashqla backend first makes
+        # inputs contiguous, and no initial / final state is used. Finally flatten to rows of one
+        # value head, apply the fused gated norm with z as the gate, restore shape and apply out_proj.
         batch_size, seq_len, _ = hidden_states.shape
 
         cp_context = build_gdn_cp_context(self, cu_seqlens, hidden_states.device)
@@ -174,6 +213,9 @@ class ReplicatedGatedDeltaNet(nn.Module):
 
 
 class ReplicatedGDNAttention(HuggingfaceAttention):
+    # [CLASS DOC] Megatron self-attention module that hosts a ReplicatedGatedDeltaNet through the
+    # HuggingFace-attention shim. Adds an input RMS norm; the shim calls hf_forward with the
+    # packed-sequence params.
     def __init__(
         self,
         args,
@@ -183,6 +225,11 @@ class ReplicatedGDNAttention(HuggingfaceAttention):
         pg_collection=None,
         name: str | None = None,
     ):
+        # [FUNCTION DOC] Runs the shim's constructor (which loads the HF config), then narrows the
+        # HF config to its text sub-config if nested (VLM), mutates it to request the
+        # flash-attention-2 attention implementation, builds the replicated GDN for the HF layer
+        # index with args, and creates the input norm: the HF Qwen3-Next RMS norm when importable,
+        # otherwise torch's built-in RMS norm, both over hidden size with the config's epsilon.
         super().__init__(
             args,
             config,
@@ -208,6 +255,8 @@ class ReplicatedGDNAttention(HuggingfaceAttention):
             self.input_layernorm = RMSNorm(self.hf_config.hidden_size, eps=self.hf_config.rms_norm_eps)
 
     def hf_forward(self, hidden_states, packed_seq_params):
+        # [FUNCTION DOC] Apply the input norm, then the replicated GDN with the packed params' query
+        # cumulative sequence lengths as boundaries. Returns the layer output (shape of the input).
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.linear_attn(
             hidden_states=hidden_states,

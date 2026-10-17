@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Actions behind the workbench commands. They shell out to helm and kubectl (checking the binaries
+# exist first) and report failures by logging and raising a system exit with the failing exit code.
+# Covers install (namespace ensure, preflight or dependency build, helm upgrade-install, rollout
+# wait), exec, uninstall and diagnosis collection.
 from __future__ import annotations
 
 import logging
@@ -17,6 +22,11 @@ logger = logging.getLogger(__name__)
 
 
 def install(args: InstallArgs) -> None:
+    # [FUNCTION DOC] Installs the workbench. Dry run: only runs the preflight checks and logs that
+    # nothing was created. Otherwise: ensure the namespace exists; if preflight is skipped, build
+    # the chart's helm dependencies, else run the preflight checks; run the helm upgrade-install
+    # command; wait for the stateful set rollout up to the timeout; log how to get a shell. Any
+    # failing step raises a system exit.
     if args.dry_run:
         run_preflight_checks(args)
         logger.info("Dry run: nothing was created, installed or waited for")
@@ -41,15 +51,25 @@ def install(args: InstallArgs) -> None:
 
 
 def exec_shell(args: ExecArgs) -> None:
+    # [FUNCTION DOC] Runs an interactive command in the workbench stateful set pod (named from the
+    # release) through kubectl exec. A leading double-dash token in the command is dropped; an
+    # empty command defaults to bash. Raises a system exit with the command's exit code on failure.
     command = (args.command[1:] if args.command[:1] == ("--",) else args.command) or ("bash",)
     _run(["kubectl", "exec", "-it", f"statefulset/{object_name(args.release)}", "-n", args.namespace, "--", *command])
 
 
 def uninstall(args: ReleaseArgs) -> None:
+    # [FUNCTION DOC] Runs helm uninstall for the release in the namespace; a nonzero exit becomes a
+    # system exit with that code.
     _run(["helm", "uninstall", args.release, "--namespace", args.namespace])
 
 
 def collect_diagnosis_command(args: DiagnosisArgs) -> None:
+    # [FUNCTION DOC] Requires kubectl. If a run directory is given, finds its latest state file.
+    # Collects the diagnosis (writes files under the output directory), prints the diagnosis
+    # directory path to standard output, and if anything could not be collected (including a missing
+    # verdict when a run directory was given) logs an error listing the missing items and exits
+    # with status 1.
     _require_binary("kubectl")
 
     state_file = RunFiles.latest_state_file(run_directory=args.run_dir) if args.run_dir is not None else None
@@ -63,17 +83,25 @@ def collect_diagnosis_command(args: DiagnosisArgs) -> None:
 
 
 def _missing_verdict(args: DiagnosisArgs, *, state_file: Path | None) -> tuple[str, ...]:
+    # [FUNCTION DOC] HELPER: Empty tuple if no run directory was requested or the state file exists
+    # as a regular file; otherwise a one-item tuple describing the missing verdict.
     if args.run_dir is None or (state_file is not None and state_file.is_file()):
         return ()
     return (f"a verdict under {args.run_dir}",)
 
 
 def _helm_install_command(args: InstallArgs) -> list[str]:
+    # [FUNCTION DOC] HELPER: Helm upgrade command for the release, namespace and workbench chart
+    # directory (no extra value files, not a ci run), followed by the value override arguments
+    # rendered from the install arguments.
     upgrade = Helm.upgrade_command(args.release, args.namespace, CHART_DIR, [], ci_run=False)
     return upgrade + helm_value_overrides(args)
 
 
 def _ensure_namespace(namespace: str) -> None:
+    # [FUNCTION DOC] HELPER: Makes sure the namespace exists. Reads it with kubectl: success means
+    # done; a not-found response creates it; a forbidden response falls back to probing from inside
+    # the namespace; any other failure logs an error and exits with status 1.
     _require_binary("kubectl")
 
     existing = Kubectl.run_raw("get", "namespace", "--", namespace)
@@ -93,6 +121,10 @@ def _ensure_namespace(namespace: str) -> None:
 
 
 def _probe_namespace_from_inside(namespace: str) -> None:
+    # [FUNCTION DOC] HELPER: For accounts that cannot read the namespace object itself: lists
+    # service accounts in it. Non-empty success means the namespace exists. A not-found response
+    # logs an error and exits with status 1. Anything else (empty list or other error) only logs a
+    # warning and continues, relying on namespaced rights.
     result = Kubectl.run_raw("get", "serviceaccounts", "-n", namespace, "-o", "name")
     output = (result.stdout + result.stderr).strip()
     if result.returncode == 0 and result.stdout.strip():
@@ -115,6 +147,10 @@ def _probe_namespace_from_inside(namespace: str) -> None:
 
 
 def _wait_until_ready(*, namespace: str, release: str, timeout: int) -> None:
+    # [FUNCTION DOC] HELPER: Waits for the workbench stateful set rollout with kubectl up to the
+    # timeout seconds. On failure logs an error, prints the namespace pods and the stateful set
+    # description for diagnosis (their exit codes are ignored) and raises a system exit with the
+    # rollout's exit code.
     fullname = object_name(release)
     command = ["kubectl", "rollout", "status", f"statefulset/{fullname}", "-n", namespace, f"--timeout={timeout}s"]
     if (code := _exit_code_of(command)) == 0:
@@ -127,17 +163,25 @@ def _wait_until_ready(*, namespace: str, release: str, timeout: int) -> None:
 
 
 def _run(command: list[str]) -> None:
+    # [FUNCTION DOC] HELPER: Runs the command with inherited output; a nonzero exit logs an error
+    # and raises a system exit with the same code.
     if (code := _exit_code_of(command)) != 0:
         logger.error("FAIL  %s exited %s", " ".join(command), code)
         raise SystemExit(code)
 
 
 def _exit_code_of(command: list[str]) -> int:
+    # [FUNCTION DOC] HELPER: Requires the command's binary on the path, runs it without capturing
+    # output or raising on failure, and returns its exit code.
     _require_binary(command[0])
     return run_process(command, capture_output=False, check=False).returncode
 
 
 def _require_binary(binary: str) -> None:
+    # [FUNCTION DOC] HELPER: Exits with status 1 after logging an error if the binary is not found
+    # on the path.
+    # KNOWN ISSUE: the error message says the binary "is installed" (check-name style wording
+    # prefixed by FAIL) which reads as the opposite of the failure.
     if shutil.which(binary) is None:
         logger.error("FAIL  %s is installed", binary)
         raise SystemExit(1)

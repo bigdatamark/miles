@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Converts one worker spec into a pool entry of the helm values. Because an entry describes a whole
+# pool rather than one pod, the launch command and environment are rendered once with a fixed cell
+# index and sentinel values for per-pod data, and then sentinels become runtime placeholders.
+# Command specs use their own launch command; serve specs run the serve module (wrapped by the
+# process supervisor when a pod hosts several workers).
 from __future__ import annotations
 
 import shlex
@@ -48,6 +54,14 @@ def build_entry(
     addresses: dict[str, dict[str, NamedHostAndPorts]],
     pairing_layout: PairingLayout | None = None,
 ) -> PoolEntry:
+    # [FUNCTION DOC] Builds the pool entry for a spec. Asserts the spec has at least one cell. Name
+    # and pool id are the spec name; object name is the component name from release and spec name.
+    # Command: the spec command (with optional trainer prepare wrapping). Ports: one per spec port
+    # with the computed port name and static port. Env: command specs' environment (none when
+    # empty; serve specs have none). Meta: gpu id list label. Service account from platform access.
+    # Replicas: cell count. Size: pods per cell only when above one. Resources: gpu limit only if
+    # the pod needs gpus. Restart stamp: rendered for the spec name. The pairing layout only
+    # determines whether pods are sub-node (use runtime base gpu id).
     assert spec.scheduling.num_cells > 0, (
         f"Spec '{spec.name}' asks for {spec.scheduling.num_cells} cells; a spec a run has turned off is dropped "
         f"before conversion, because a values entry always renders at least one pod"
@@ -80,6 +94,8 @@ def build_entry(
 
 
 def _service_account_name(spec: BaseWorkerSpec, *, plan: LaunchPlan) -> str | None:
+    # [FUNCTION DOC] HELPER: None when the spec needs no platform access, else the platform account
+    # name for the release and access level.
     if (access := spec.platform_access) is PlatformAccess.NONE:
         return None
     return naming.platform_account_name(release=plan.release, access=access)
@@ -92,6 +108,11 @@ def _command_env_of_spec(
     addresses: dict[str, dict[str, NamedHostAndPorts]],
     is_sub_node: bool,
 ) -> dict[str, str]:
+    # [FUNCTION DOC] HELPER: Environment of a command spec's pods. Serve specs return an empty
+    # mapping. Otherwise the spec's environment is computed for the rendering context and for a
+    # second context (cell 1, worker 1); asserts both are equal, proving the environment does not
+    # depend on cell or worker (it is rendered once for the whole pool). Returns it with sentinel
+    # values replaced by placeholders.
     if isinstance(spec, ServeWorkerSpec):
         return {}
 
@@ -116,6 +137,11 @@ def _command_env_of_spec(
 
 
 def _with_prepare_cmd(command: list[str], spec: BaseWorkerSpec, plan: LaunchPlan) -> list[str]:
+    # [FUNCTION DOC] HELPER: For trainer-section specs with a non-empty trainer prepare command in
+    # the plan, returns a shell invocation that runs the prepare command, then replaces the shell
+    # with the quoted original command. Asserts pods take whole nodes (gpus per pod at least gpus
+    # per node) so that two pods never run the prepare command on one node concurrently. Otherwise
+    # returns the command unchanged.
     if SECTION_OF_CATEGORY[spec.category] != TRAINER_ENGINES_SECTION:
         return command
     prepare = plan.prepare_cmd.get(TRAINER_ROLE)
@@ -132,6 +158,10 @@ def _with_prepare_cmd(command: list[str], spec: BaseWorkerSpec, plan: LaunchPlan
 
 
 def _meta_of_spec(spec: BaseWorkerSpec) -> dict[str, str]:
+    # [FUNCTION DOC] HELPER: Empty mapping for gpu-less specs; otherwise a single entry under the
+    # gpu ids meta label key holding the comma-joined ids zero to gpus per pod minus one.
+    # KNOWN ISSUE: for sub-node colocated pods the real gpu ids are offset at runtime (base gpu id),
+    # yet this label always lists ids starting at zero.
     gpus_per_pod = spec.scheduling.gpus_per_pod()
     if not gpus_per_pod:
         return {}
@@ -146,6 +176,10 @@ def _launch_context(
     worker_in_cell_index: int,
     is_sub_node: bool = False,
 ) -> LaunchCommandContext:
+    # [FUNCTION DOC] HELPER: Builds the launch context used to render commands. Own addresses: per
+    # port, host is the leader address placeholder for master-mode ports and the any-address bind
+    # host otherwise, with the static port. Gpu ids (global and local) come from the real or
+    # sentinel gpu id helper. Pool addresses: for each pool the list of its cells' addresses.
     self_addrs = {
         port.name: HostAndPort(
             host=LEADER_ADDRESS_PLACEHOLDER if port.mode == "master" else _BIND_HOST,
@@ -165,6 +199,9 @@ def _launch_context(
 
 
 def _command_of_spec(spec: BaseWorkerSpec, context: LaunchCommandContext, plan: LaunchPlan) -> list[str]:
+    # [FUNCTION DOC] HELPER: Command specs: shell-split the spec's launch command and substitute
+    # sentinels with placeholders. Serve specs: the serve command. Anything else raises an
+    # assertion error.
     match spec:
         case CommandWorkerSpec():
             return sentinels_to_placeholders(shlex.split(spec.launch_command(context)), spec)
@@ -175,6 +212,9 @@ def _command_of_spec(spec: BaseWorkerSpec, context: LaunchCommandContext, plan: 
 
 
 def _serve_command(spec: ServeWorkerSpec, plan: LaunchPlan) -> list[str]:
+    # [FUNCTION DOC] HELPER: Argument vector running the serve module with the specs function, the
+    # pool id (spec name), a separator and then the plan's worker arguments. If a pod hosts more
+    # than one worker, wraps it in the process supervisor module with the number of subprocesses.
     interpreter_prefix = python_argv_prefix()
     workers_per_pod = spec.scheduling.workers_per_pod()
     serve = [
@@ -200,6 +240,8 @@ def _serve_command(spec: ServeWorkerSpec, plan: LaunchPlan) -> list[str]:
 
 
 def _is_sub_node(pairing_layout: PairingLayout | None) -> bool:
+    # [FUNCTION DOC] HELPER: True when a pairing layout exists and its inference pods hold fewer
+    # gpus than a node.
     if pairing_layout is None:
         return False
     return pairing_layout.num_gpus_per_inference_pod < pairing_layout.num_gpus_per_node

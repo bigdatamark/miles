@@ -1,3 +1,11 @@
+# [MODULE DOC] CI test registration: the no-op marker functions that test files call at top level to
+# declare their CI placement (CPU, CUDA, ROCm), plus the AST-based parser that discovers and
+# validates those declarations without importing or executing the test files. The parser extracts
+# literal arguments only (est_time, suite, labels, nightly, disabled, hardware), validates them
+# (required fields, types, known labels, CUDA arch and home stage consistency), and produces
+# registry records. Discovery scans fixed roots for test_*.py files; files under the fast
+# directory that declare nothing get an implicit CPU registration in the first CPU stage. All paths
+# are repo-relative, so callers must run from the repository root.
 import ast
 import glob
 import warnings
@@ -33,6 +41,7 @@ _UNSET = object()
 
 
 class HWBackend(Enum):
+    # [CLASS DOC] Enumeration of CI hardware backends a registration targets: CPU, CUDA and ROCm.
     CPU = auto()
     CUDA = auto()
     ROCM = auto()
@@ -40,6 +49,12 @@ class HWBackend(Enum):
 
 @dataclass
 class CIRegistry:
+    # [CLASS DOC] One parsed CI registration of a test file: backend, repo-relative filename,
+    # estimated runtime in seconds, suite (stage) name, domain labels (empty means always on for
+    # CPU), supported GPU generations (CUDA only, non-empty there), nightly flag (cadence gate),
+    # disabled reason (none means enabled) and implicit flag (true only for synthesized entries of
+    # fast-directory files without a register call). One file may yield several records (for
+    # example one CUDA and one ROCm).
     backend: HWBackend
     filename: str
     est_time: float
@@ -63,6 +78,10 @@ def register_cpu_ci(
     nightly: bool = False,
     disabled: str | None = None,
 ):
+    # [FUNCTION DOC] Marker declaring CPU CI registration. Does nothing at runtime and returns none;
+    # all semantics come from the AST parser, which accepts only literal arguments. Labels are
+    # optional for CPU (none or an empty list mean the same). Parameters are described by the
+    # parser's validation: est_time must be a number, suite a string.
     """Marker for CPU CI registration (parsed via AST; runtime no-op).
 
     `labels=None` and `labels=[]` are equivalent for CPU tests: the test is
@@ -84,6 +103,10 @@ def register_cuda_ci(
     nightly: bool = False,
     disabled: str | None = None,
 ):
+    # [FUNCTION DOC] Marker declaring CUDA CI registration. Does nothing at runtime and returns
+    # none. Labels and hardware are required keyword arguments here; the parser additionally
+    # requires a non-empty label list, a valid arch list, a known CUDA suite, and that the suite's
+    # arch equals the first supported arch.
     """Marker for CUDA CI registration (parsed via AST; runtime no-op).
 
     `labels` must contain at least one domain label so GPU tests run only when
@@ -106,6 +129,8 @@ def register_rocm_ci(
     nightly: bool = False,
     disabled: str | None = None,
 ):
+    # [FUNCTION DOC] Marker declaring ROCm CI registration. Does nothing at runtime and returns
+    # none. The parser requires a non-empty label list and rejects a hardware argument.
     """Marker for ROCm CI registration (parsed via AST; runtime no-op).
 
     `labels` must contain at least one domain label so GPU tests run only when
@@ -123,6 +148,8 @@ _REGISTER_BACKEND_MAP = {
 
 
 def _extract_constant(node: ast.AST) -> object:
+    # [FUNCTION DOC] HELPER: Returns the literal value of a constant syntax node, or the module's
+    # unset sentinel object for any other node kind (no exception, so callers can build messages).
     """Return the literal value of an ast.Constant; otherwise return _UNSET.
 
     Sentinel return (instead of raising) lets callers compose richer error
@@ -134,6 +161,10 @@ def _extract_constant(node: ast.AST) -> object:
 
 
 def _extract_list_constant(node: ast.AST, *, context: str = "value") -> list:
+    # [FUNCTION DOC] HELPER: Converts a list-literal syntax node of string literals to a list of
+    # strings; a literal none gives an empty list. Raises a value error (message starts with the
+    # context text) when the node is not a list literal, when an element is not a literal, or when
+    # an element is not a string.
     """Return a list of literal string constants from `ast.List`.
 
     Accepts `None` (as `ast.Constant(None)`) and treats it as an empty list,
@@ -158,12 +189,33 @@ def _extract_list_constant(node: ast.AST, *, context: str = "value") -> list:
 
 
 class RegistryVisitor(ast.NodeVisitor):
+    # [CLASS DOC] Syntax-tree visitor that collects registrations from a parsed module. Only
+    # top-level expression statements that are plain-name calls to one of the three register
+    # functions count (no aliases, attribute calls or nested calls). State: the filename (used in
+    # error messages and stored in records), the set of allowed labels, and the list of collected
+    # registrations in source order.
     def __init__(self, filename: str, *, known_labels=KNOWN_LABELS):
+        # [FUNCTION DOC] Stores the filename and the known label collection (default: the global
+        # label table) and starts with an empty registry list.
         self.filename = filename
         self.known_labels = known_labels
         self.registries: list[CIRegistry] = []
 
     def _parse_call_args(self, func_call: ast.Call, func_name: str) -> CIRegistry:
+        # [FUNCTION DOC] HELPER: Parses and validates one register call into a registry record.
+        # Every failure raises a value error whose message begins with the filename. Rules, in
+        # order: no starred positional arguments; at most two positional arguments (est_time then
+        # suite), each a literal; keyword arguments must not be double-star, duplicated or outside
+        # the allowed set (est_time, suite, labels, nightly, disabled, hardware); labels and
+        # hardware are lists of string literals (none allowed), others literals; est_time and suite
+        # are required; est_time is a number, suite a string; labels must be a list; non-CPU
+        # backends need at least one label; nightly must be a boolean; disabled a string or none;
+        # CUDA hardware is validated against the home suite by the helper, while a non-empty
+        # hardware list on CPU or ROCm is rejected; every label must be in the known label set
+        # (the message lists valid labels and how to add one). Returns a record with est_time as a
+        # float, copies of the lists, and the implicit flag false.
+        # KNOWN ISSUE: a boolean passes the numeric est_time check because booleans count as
+        # integers.
         if any(isinstance(arg, ast.Starred) for arg in func_call.args):
             raise ValueError(f"{self.filename}: starred arguments are not supported in {func_name}()")
 
@@ -258,6 +310,10 @@ class RegistryVisitor(ast.NodeVisitor):
         )
 
     def _check_cuda_hardware(self, func_name: str, suite: str, hardware: list) -> None:
+        # [FUNCTION DOC] HELPER: Validates the CUDA hardware list and ties it to the suite. Raises a
+        # value error if the list is empty, has an unknown arch, has duplicates, if the suite is not
+        # a known CUDA stage, or if the stage's arch differs from the arch the test runs on by
+        # default (the first known arch it supports). Returns nothing.
         """Validate `hardware` and tie it to the declared home stage.
 
         The home stage must sit on the test's first supported arch, so "where
@@ -288,6 +344,9 @@ class RegistryVisitor(ast.NodeVisitor):
             )
 
     def _collect_ci_registry(self, func_call: ast.Call):
+        # [FUNCTION DOC] HELPER: Returns the parsed registry record if the call is a plain-name call
+        # to one of the register functions, else none (attribute calls and other names are
+        # ignored). Parse errors propagate.
         if not isinstance(func_call.func, ast.Name):
             return None
         if func_call.func.id not in _REGISTER_NAMES:
@@ -295,6 +354,9 @@ class RegistryVisitor(ast.NodeVisitor):
         return self._parse_call_args(func_call, func_call.func.id)
 
     def visit_Module(self, node):
+        # [FUNCTION DOC] Visitor hook for the module node: walks only the direct body statements
+        # (no recursion into functions, classes or conditionals), and for each expression statement
+        # that is a call, appends the parsed registration if it is a register call.
         for stmt in node.body:
             if not isinstance(stmt, ast.Expr) or not isinstance(stmt.value, ast.Call):
                 continue
@@ -304,6 +366,10 @@ class RegistryVisitor(ast.NodeVisitor):
 
 
 def ut_parse_one_file(filename: str, *, known_labels=KNOWN_LABELS) -> list[CIRegistry]:
+    # [FUNCTION DOC] Reads the file (path relative to the current directory), parses it to a syntax
+    # tree (nothing is executed) and returns the list of registrations found at top level, in
+    # source order; empty if none. Raises file errors, syntax errors, or value errors from the
+    # validation.
     with open(filename) as f:
         file_content = f.read()
     tree = ast.parse(file_content, filename=filename)
@@ -313,6 +379,8 @@ def ut_parse_one_file(filename: str, *, known_labels=KNOWN_LABELS) -> list[CIReg
 
 
 def _is_implicit_fast_cpu_path(filename: str) -> bool:
+    # [FUNCTION DOC] HELPER: True iff the repo-relative path starts with the fast CPU test
+    # directory prefix (those files are CPU-only by location).
     return filename.startswith("tests/fast/")
 
 
@@ -325,6 +393,10 @@ _DISCOVERY_ROOTS = ("tests/fast", "tests/fast-gpu", "tests/e2e", "tests/ci")
 
 
 def discover_ci_files() -> list[str]:
+    # [FUNCTION DOC] Recursively globs for test files (names starting with test_ and ending in .py)
+    # under each discovery root (relative to the current directory) and returns the combined sorted
+    # list of repo-relative paths. Symlinks are followed by the glob here (unlike the file-run
+    # module's stricter discovery).
     """Return every CI test file (sorted, repo-relative) across the roots."""
     files: list[str] = []
     for root in _DISCOVERY_ROOTS:
@@ -333,6 +405,8 @@ def discover_ci_files() -> list[str]:
 
 
 def _file_text_mentions_register(filename: str) -> bool:
+    # [FUNCTION DOC] HELPER: Substring check of the raw file text for the CPU or CUDA register
+    # function name (the ROCm name is not checked). Returns false if the file cannot be read.
     """True when the file's text contains `register_cpu_ci` or
     `register_cuda_ci` as a substring anywhere.
 
@@ -352,6 +426,9 @@ def _file_text_mentions_register(filename: str) -> bool:
 
 
 def _make_implicit_cpu_registry(filename: str) -> CIRegistry:
+    # [FUNCTION DOC] HELPER: Builds the synthesized registration for an undeclared fast-directory
+    # test: CPU backend, estimated time 1 second, first CPU stage suite, no labels, not nightly,
+    # enabled, implicit flag set.
     return CIRegistry(
         backend=HWBackend.CPU,
         filename=filename,
@@ -365,6 +442,13 @@ def _make_implicit_cpu_registry(filename: str) -> CIRegistry:
 
 
 def collect_tests(files: list[str], sanity_check: bool = True, *, known_labels=KNOWN_LABELS) -> list[CIRegistry]:
+    # [FUNCTION DOC] Collects registrations for the given files in order. For files in the fast
+    # directory: any non-CPU registration raises a value error (move to the GPU fast directory);
+    # a file with no parsed registration whose text mentions the CPU or CUDA register name raises
+    # a value error (likely alias or non-top-level call); otherwise an implicit CPU registration is
+    # synthesized. For other files with no registration: with sanity_check on (default) a value
+    # error is raised, else a warning is emitted and the file is skipped. Returns all records in
+    # file order.
     ci_tests: list[CIRegistry] = []
     for file in files:
         registries = ut_parse_one_file(file, known_labels=known_labels)

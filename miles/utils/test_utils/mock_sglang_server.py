@@ -1,3 +1,12 @@
+# [MODULE DOC] HELPER: Mock of the inference server's HTTP API for tests, served by FastAPI under
+# a background uvicorn thread. Endpoints: the native generate endpoint, the OpenAI-style chat
+# completions endpoint, a health check and an abort endpoint (both always return status ok). Reply
+# text comes from a pluggable process function that maps the rendered prompt string to a result
+# (text, finish reason, cached token count, extra metadata); tokenization uses a real tokenizer
+# loaded by model name; logprobs are synthetic (the i-th output token gets log probability
+# minus i divided by 128). Tracks the request payloads and the maximum number of concurrent
+# in-flight requests. Also provides a default process function that answers simple "1 plus N"
+# arithmetic prompts, and a context manager that starts and stops a server.
 import asyncio
 import re
 import time
@@ -20,6 +29,10 @@ from miles.utils.test_utils.uvicorn_thread_server import UvicornThreadServer
 
 @dataclass(frozen=True)
 class ProcessResultMetaInfo:
+    # [CLASS DOC] HELPER: Immutable optional extra metadata fields that a canned result may add to
+    # the response metadata: weight version, list of weight version records, routed experts
+    # payload, and three speculative-decoding counters (correct drafts, proposed drafts, verify
+    # count). All default to absent.
     weight_version: str | None = None
     weight_versions: list[dict[str, str | int]] | None = None
     routed_experts: str | None = None
@@ -28,11 +41,15 @@ class ProcessResultMetaInfo:
     spec_verify_ct: int | None = None
 
     def to_dict(self) -> dict:
+        # [FUNCTION DOC] HELPER: Returns the fields as a mapping, omitting those that are none.
         return {k: v for k, v in asdict(self).items() if v is not None}
 
 
 @dataclass(frozen=True)
 class ProcessResult:
+    # [CLASS DOC] HELPER: Immutable canned reply from the process function: the reply text, the
+    # finish reason (default "stop"), the number of cached prompt tokens to report (default 0),
+    # and extra metadata fields (default all absent).
     text: str
     finish_reason: str = "stop"
     cached_tokens: int = 0
@@ -43,6 +60,10 @@ ProcessFn = Callable[[str], ProcessResult]
 
 
 class MockSGLangServer:
+    # [CLASS DOC] HELPER: The mock server object. Lifecycle: construct (loads tokenizer, builds the
+    # app and routes), start (runs uvicorn in a background thread bound on all interfaces), stop.
+    # Public state: tokenizer, process function, host and port, simulated latency, the list of
+    # received request payloads (both endpoints, in arrival order), and the peak concurrency.
     def __init__(
         self,
         model_name: str,
@@ -52,6 +73,13 @@ class MockSGLangServer:
         latency: float = 0.0,
         chat_template_path: str | None = None,
     ):
+        # [FUNCTION DOC] HELPER: Loads the tokenizer for the model name (optionally overriding the
+        # chat template from a file path, trusting remote code), stores the process function,
+        # resolves the advertised host (given, else the node IP) and port (given and truthy, else
+        # the first available port from 30000 upward; note a port of zero or none both trigger the
+        # search), stores the artificial per-request latency in seconds, creates the FastAPI app
+        # and an empty request log and concurrency counter, and registers the routes. Does not
+        # start listening.
         self.tokenizer = load_tokenizer(model_name, chat_template_path=chat_template_path, trust_remote_code=True)
         self.process_fn = process_fn
         self.host = host or NodeProbeMixin._get_node_ip()
@@ -68,42 +96,65 @@ class MockSGLangServer:
 
     @property
     def max_concurrent(self) -> int:
+        # [FUNCTION DOC] HELPER: Peak number of simultaneously in-flight generate-like requests
+        # since construction or the last reset.
         return self._concurrency.max_value
 
     def reset_stats(self):
+        # [FUNCTION DOC] HELPER: Clears the request log and resets the concurrency counter (current
+        # and peak) to zero.
         self.request_log.clear()
         self._concurrency.reset()
 
     def start(self):
+        # [FUNCTION DOC] HELPER: Creates a uvicorn thread server for the app on the advertised
+        # port, binding to all interfaces, and starts it (see that class for readiness behavior).
         self._server = UvicornThreadServer(self.app, host=self.host, port=self.port, bind_host="0.0.0.0")
         self._server.start()
 
     def stop(self):
+        # [FUNCTION DOC] HELPER: Stops the background server if it was started; otherwise does
+        # nothing.
         if self._server is not None:
             self._server.stop()
 
     @property
     def url(self) -> str:
+        # [FUNCTION DOC] HELPER: Base http URL using the advertised host and port.
         return f"http://{self.host}:{self.port}"
 
     def _setup_routes(self):
+        # [FUNCTION DOC] HELPER: Registers four routes on the app: POST generate and POST chat
+        # completions (both through the shared request handler with different response
+        # computers), GET health and POST abort request (both return a JSON object whose status is
+        # ok and ignore their input; abort does nothing).
         @self.app.post("/generate")
         async def generate(request: Request):
+            # [FUNCTION DOC] HELPER: Route handler for the native generate endpoint.
             return await self._handle_generate_like_request(request, self._compute_generate_response)
 
         @self.app.post("/v1/chat/completions")
         async def chat_completions(request: Request):
+            # [FUNCTION DOC] HELPER: Route handler for the chat completions endpoint.
             return await self._handle_generate_like_request(request, self._compute_chat_completions_response)
 
         @self.app.get("/health")
         async def health():
+            # [FUNCTION DOC] HELPER: Route handler returning the ok status object.
             return JSONResponse(content={"status": "ok"})
 
         @self.app.post("/abort_request")
         async def abort_request(_request: Request):
+            # [FUNCTION DOC] HELPER: Route handler that accepts and ignores an abort request,
+            # returning the ok status object.
             return JSONResponse(content={"status": "ok"})
 
     async def _handle_generate_like_request(self, request: Request, compute_fn: Callable[[dict], dict]):
+        # [FUNCTION DOC] HELPER: Shared handler: parses the JSON body, appends it to the request
+        # log, then inside the concurrency tracker optionally sleeps the configured latency
+        # (asynchronously) and calls the synchronous response computer on the payload; returns its
+        # result as a JSON response with status 200. Exceptions from the computer propagate and
+        # become server errors.
         payload = await request.json()
         self.request_log.append(payload)
         with self._concurrency.track():
@@ -113,6 +164,16 @@ class MockSGLangServer:
         return JSONResponse(content=response)
 
     def _compute_generate_response(self, payload: dict) -> dict:
+        # [FUNCTION DOC] HELPER: Builds the native generate response. Asserts that the payload's
+        # return-logprob flag (default true) is true. Decodes the input token ids (default empty)
+        # to a prompt string keeping special tokens, calls the process function, and encodes the
+        # reply text without special tokens to get output ids. Metadata: finish reason as an object
+        # with a type (plus the completion token count under a length key when the reason is
+        # "length"), prompt token count, cached token count from the result, completion token
+        # count, output token logprobs as pairs of (synthetic logprob, token id) with the i-th
+        # logprob equal to minus i over 128, and the optional extra metadata fields. Returns a
+        # mapping with the reply text and that metadata. Sampling parameters in the payload are
+        # ignored.
         assert payload.get("return_logprob", True) is True, "MockSGLangServer requires return_logprob=True"
         input_ids = payload.get("input_ids", [])
 
@@ -141,6 +202,26 @@ class MockSGLangServer:
         return {"text": process_result.text, "meta_info": meta_info}
 
     def _compute_chat_completions_response(self, payload: dict) -> dict:
+        # [FUNCTION DOC] HELPER: Builds a chat completion response. Renders the messages (default
+        # empty) with the tokenizer's chat template as text with a generation prompt and the
+        # payload's tools. If the payload asks to return prompt token ids, uses the payload's input
+        # ids when given, else encodes the rendered prompt without special tokens. Calls the process
+        # function on the rendered prompt and encodes its text to output ids; per-token logprob
+        # entries carry the token string, id and synthetic logprob (minus i over 128). Tool
+        # parsing: only when tools are given and the finish reason is "stop", parses the reply
+        # text with the qwen2.5-style function call parser; if tool calls are found, the content
+        # becomes the parser's remaining normal text, the finish reason becomes "tool_calls", and
+        # each call becomes an entry with id "call" plus a five-digit zero-padded position, the
+        # tool's index in the tools list, type function, name and arguments (an empty object string
+        # when there are none). Otherwise the content is the reply text (when tools are given and
+        # the reason is "stop" but no calls parse, the content is the parser's remaining text).
+        # Builds one choice (index 0) with assistant message (content and tool calls, none when
+        # absent), logprobs content, finish reason, and a metadata object with output token
+        # logprobs pairs, completion count and extra metadata fields; plus prompt token ids if
+        # requested. The usage prompt count is the payload input ids length when given, else the
+        # encoded rendered prompt length. Returns an OpenAI-shaped completion with a random
+        # eight-hex-digit id, object type, creation time in seconds, the fixed model name
+        # "mock-model", the choice and usage totals. Request sampling parameters are ignored.
         messages = payload.get("messages", [])
         tools = payload.get("tools")
 
@@ -234,20 +315,28 @@ class MockSGLangServer:
 
 
 class Counter:
+    # [CLASS DOC] HELPER: Tracks the current and peak number of simultaneously active scopes.
+    # Not thread-safe; intended for single event-loop use.
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Starts with current and peak both zero.
         self._current = 0
         self._max = 0
 
     @property
     def max_value(self) -> int:
+        # [FUNCTION DOC] HELPER: The peak concurrent count seen so far.
         return self._max
 
     def reset(self):
+        # [FUNCTION DOC] HELPER: Resets both current and peak counts to zero (do not call while
+        # scopes are active, since their exits would drive the current count negative).
         self._current = 0
         self._max = 0
 
     @contextmanager
     def track(self):
+        # [FUNCTION DOC] HELPER: Context manager: on entry increments the current count and
+        # updates the peak; on exit (also on error) decrements the current count.
         self._current += 1
         self._max = max(self._max, self._current)
         try:
@@ -257,6 +346,10 @@ class Counter:
 
 
 def default_process_fn(prompt: str) -> ProcessResult:
+    # [FUNCTION DOC] HELPER: Default reply function. Searches the prompt for the phrase "What is
+    # 1+N?" (N one or more digits; the first match wins). If found, replies with the sum 1+N
+    # wrapped in a LaTeX boxed expression with finish reason "stop"; otherwise replies "I don't
+    # understand." with finish reason "stop".
     match = re.search(r"What is 1\+(\d+)\?", prompt)
     if match:
         num = int(match.group(1))
@@ -273,6 +366,10 @@ def with_mock_server(
     port: int | None = None,
     latency: float = 0.0,
 ):
+    # [FUNCTION DOC] HELPER: Context manager that builds a mock server with the given model name
+    # (default a small Qwen3 model), process function (default the arithmetic one), optional
+    # host and port (port none means auto-pick), and latency; starts it, yields the server, and
+    # always stops it on exit (even on error). If construction raises, nothing is yielded.
     server = MockSGLangServer(
         model_name=model_name,
         process_fn=process_fn,

@@ -1,3 +1,8 @@
+# [MODULE DOC] Declarative, dependency-free description of true-on-policy contracts: the literal
+# type aliases naming contracts, model families, kernel contracts and logprob contracts, the frozen
+# schema record, and the single concrete schema instance for dense Qwen3. Higher layers wrap this
+# record; nothing here has behavior or side effects.
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -12,6 +17,11 @@ LogprobContract = Literal["sglang_prefill"]
 
 @dataclass(frozen=True)
 class TrueOnPolicyContractSchema:
+    # [CLASS DOC] Immutable record identifying a parity contract shared across repos (Miles,
+    # SGLang, Megatron). Fields: contract name; the model family it targets; the tuple of kernel
+    # contracts the backends must implement; the log-probability contract; the SGLang attention
+    # backend name; the Hugging Face attention implementation name used under FSDP; and whether
+    # Megatron sequence parallelism must be turned off.
     """Declarative cross-repo identity for a true-on-policy parity contract."""
 
     name: TrueOnPolicyContractName

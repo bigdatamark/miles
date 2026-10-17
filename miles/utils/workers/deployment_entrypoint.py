@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Command-line entrypoint for a deployed component that has no orchestration script: it launches
+# the worker manager so the component's workers run, optionally serves fault tolerance for the
+# trainer cells, and then stays alive until the process is torn down.
 import asyncio
 import logging
 
@@ -16,10 +20,18 @@ logger = logging.getLogger(__name__)
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Parse the command-line arguments and run the serving coroutine to completion on a new event
+    # loop. Normally never returns, since serving waits forever.
     asyncio.run(_serve_deployed_workers(parse_args()))
 
 
 async def _serve_deployed_workers(args) -> None:
+    # [FUNCTION DOC] HELPER: Main flow. Configure logging with a process identity named main; read
+    # the deployed component from the arguments and assert it does not carry an orchestration
+    # script (such components must be started through their driver script). Launch the worker
+    # manager, log the names of the specs of this run, start the fault-tolerance API if applicable,
+    # then block forever on an event that is never set.
     configure_logger(args, source=SimpleProcessIdentity(component="main"))
     component = DeployComponent(args.deploy_component)
     assert not component.deploys_orchestration_script(), (
@@ -39,6 +51,12 @@ async def _serve_deployed_workers(args) -> None:
 
 
 def _maybe_serve_fault_tolerance(args, *, component: DeployComponent) -> None:
+    # [FUNCTION DOC] HELPER: Does nothing unless an API server port is configured and the deployed
+    # component selects the trainer. Otherwise builds the backend capability, then starts the API
+    # server with one trainer controller handle per trainer id (computed from the arguments), no
+    # inference controller, the configured port and fault-tolerance components, and the cell
+    # operations of the capability. Then starts the mini fault-tolerance controller if configured
+    # and logs the port.
     if not args.api_server_port or not component.selects(DeployComponent.TRAINER):
         return
 

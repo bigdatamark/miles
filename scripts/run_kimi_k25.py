@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Launcher script (typer command line app) for full-parameter GRPO training of Kimi-K2.5 (mixture of
+# experts with latent attention, shipped with INT4 group-quantized weights) or its 2-layer prune, on
+# DAPO math with optional AIME eval, Megatron plus SGLang colocated. The rollout engine serves the INT4
+# checkpoint while Megatron loads a bf16 dequantized reference through the bridge conversion mode (no
+# offline Megatron checkpoint). Training uses fake INT4 quantization-aware training controlled by
+# environment variables. Commands: full-train (download, dequantize, train), prepare (download and
+# dequantize) and train. A single node runs the 2-layer test layout; any other node count uses the
+# 32-node full-model layout. Module constants: INT4 group size, bridge model identifier, and the list
+# of cuda graph batch sizes for rollout as space-separated text.
 """
 Kimi-K2.5 full-parameter GRPO training script.
 
@@ -53,6 +63,13 @@ _CUDA_GRAPH_BS = " ".join(str(bs) for bs in [1, 2, 4, 8, *range(16, 129, 8)])
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC]
+    # Command line options extending the shared train configuration (num_nodes, output dir, backend
+    # creation). Fields: mode (debug_minimal gives response length 100, saves every 2 steps, no eval),
+    # run id, Hugging Face org/name and Megatron model type (both re-derived in post-init), GPUs per
+    # node (None derived from hardware), eval switch (off), number of rollouts (3000), rollout batch
+    # 32 prompts x 8 samples, global batch 256, extra raw args, data/model/Megatron directories,
+    # hardware.
     mode: Literal["normal", "debug_minimal"] = "normal"
     run_id: str = command_utils.create_run_id()
     model_org: str = "moonshotai"
@@ -71,6 +88,11 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     hardware: Literal["auto", "H200", "H100", "B200"] = "auto"
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Resolves hardware and GPUs per node. Sets org and Megatron model type by model name: the full
+        # model uses its official org and type; the 2-layer prune uses a community org and the pruned
+        # type; any other name raises a not implemented error (overriding user-supplied org and type).
+        # On a single node, forces debug_minimal mode.
         self.hardware = command_utils.resolve_hardware(self)
         self.num_gpus_per_node = self.num_gpus_per_node or command_utils.NUM_GPUS_OF_HARDWARE[self.hardware]
         if self.model_name == "Kimi-K2.5":
@@ -87,10 +109,14 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
 
 def _bf16_ref_dir(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: Returns the folder of the dequantized bf16 reference checkpoint: model
+    # directory, model name, with a "-bf16" suffix.
     return f"{args.model_dir}/{args.model_name}-bf16"
 
 
 def _prepare_download(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Creates model/data directories, downloads the Hugging Face model into the
+    # model directory, downloads the DAPO math dataset, and the AIME 2024 dataset only if eval is enabled.
     U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.model_dir} {args.data_dir}")
     U.exec_command_cpu(
@@ -102,6 +128,9 @@ def _prepare_download(args: ScriptArgs):
 
 
 def _convert_to_bf16(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Runs the repository's INT4-to-bf16 dequantization tool (GPU command,
+    # located via the repository base directory) reading the model folder and writing the bf16
+    # reference folder. Not idempotent: no check for an existing output.
     """Dequantize the INT4 checkpoint to a BF16 reference for the Megatron bridge."""
     U = args.create_backend()
     U.exec_command_gpu(
@@ -112,6 +141,22 @@ def _convert_to_bf16(args: ScriptArgs):
 
 
 def _execute_train(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Builds the training argument string and submits the job. Checkpoint: hf
+    # checkpoint (INT4, used by rollout), reference load from the bf16 folder, bridge mode with the
+    # bridge model identifier, load/save under the output directory run folder every 2 (debug) or 20
+    # steps. Rollout: DAPO math, deepscaler reward, chat template, shuffled, balanced, sizes from
+    # options, response length 100 (debug) or 16384, temperature 1, dynamic global batch size. Eval
+    # (non-debug and enabled): AIME every 20 steps, 16 samples, length 16384, top-p 1. Parallelism:
+    # single node: tensor = expert = GPUs per node, sequence parallel, pipeline 1, context 1, 2048
+    # tokens per GPU; otherwise tensor 8, pipeline 8, context 4, expert 32, last stage 5 layers, 4096
+    # tokens per GPU. Full uniform recompute and dynamic batch. GRPO with zero kl and entropy
+    # coefficients, asymmetric clip. Adam 1e-6 with CPU offload and distributed optimizer. SGLang: one
+    # engine per node's worth of GPUs, memory fraction 0.7, expert parallel = GPUs per node, concurrency
+    # 1024, listed cuda graph batch sizes, rollout routing replay. Misc: dropouts off, fp32
+    # accumulation, flash attention, no nan check, gradient accumulation fusion disabled (it would drop
+    # gradients of the fake-quantized weights), colocate, weight update buffer 2 GiB, node and GPU
+    # counts. Environment variables: 3600 s NCCL timeout, fake INT4 quantization-aware training flag
+    # on, and the INT4 group size. Submits via the backend with no per-role copy commands.
     U = args.create_backend()
     load_save_path = f"{args.output_dir}/{args.run_id}/checkpoints"
     ckpt_args = (
@@ -261,6 +306,7 @@ def _execute_train(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def full_train(args: ScriptArgs):
+    # [FUNCTION DOC] Command "full-train": download, dequantize to bf16, then train.
     """Full pipeline: download, convert INT4->BF16, train."""
     _prepare_download(args)
     _convert_to_bf16(args)
@@ -270,6 +316,7 @@ def full_train(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Command "prepare": download and bf16 dequantization only (run on head node).
     """Download model/data and dequantize the BF16 reference (run on head node)."""
     _prepare_download(args)
     _convert_to_bf16(args)
@@ -278,12 +325,14 @@ def prepare(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def train(args: ScriptArgs):
+    # [FUNCTION DOC] Command "train": training only; assumes preparation is done.
     """Run training only (assumes data is prepared)."""
     _execute_train(args)
 
 
 @app.callback()
 def _callback() -> None:
+    # [FUNCTION DOC] HELPER: Empty typer callback so commands stay sub-commands. Does nothing.
     pass
 
 

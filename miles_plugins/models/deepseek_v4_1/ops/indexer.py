@@ -1,3 +1,11 @@
+# [MODULE DOC] Sparse-attention indexer for DeepSeek-V4.1. Scores each query against compressed
+# index keys with a weighted multi-head logit kernel and selects top-k picks, optionally restricted to
+# a set of candidate blocks: the "candidate source" layer computes block-level candidates (highest
+# block maxima plus each query's most recent block), and later layers reuse them as a mask. Has an
+# optional fast selection path (external deep_select package, only on GPUs of compute capability 10 or
+# higher, switchable by environment variable MILES_DSV41_DEEP_SELECT, default on) and a generic
+# top-k path. Queries are processed in chunks (environment variable MILES_DSV41_INDEXER_QUERY_CHUNK,
+# default 8192) to bound memory. Everything runs without gradients.
 import functools
 import os
 
@@ -19,6 +27,14 @@ from miles_plugins.models.deepseek_v4.ops.norm import RMSNorm
 def select_candidate_blocks(
     logits: torch.Tensor, compress_lens: torch.Tensor, topk_blocks: int, block_size: int
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Builds a boolean mask of candidate keys. Pads the key axis with negative
+    # infinity to a multiple of block size, takes the max logit per block, forces the block holding
+    # each query's last visible key (index of compress length minus one, integer-divided by block size)
+    # to positive infinity so it is always chosen, selects the top blocks (at most the requested count,
+    # at most the number of blocks), keeps only selected blocks whose score is not negative infinity,
+    # and expands the block mask back to key resolution, trimmed to the original width. Returns a
+    # boolean tensor shaped like the logits. The compress lengths must be broadcastable against the
+    # block axis (one per query, with a trailing singleton).
     width = logits.size(-1)
     scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
     scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
@@ -40,6 +56,10 @@ except ImportError:  # the torch path stays for images without it
 
 @functools.lru_cache(maxsize=1)
 def use_deep_select() -> bool:
+    # [FUNCTION DOC] HELPER: Cached (computed once per process) decision whether to use the fast
+    # selection package: false if it is not importable or the environment variable disables it (any
+    # value other than "1"); otherwise true only when the current GPU's major compute capability is at
+    # least 10. Queries the CUDA device on first call.
     if deep_select is None or os.environ.get("MILES_DSV41_DEEP_SELECT", "1") != "1":
         return False
     # the package carries sm100a and sm103a cubins, so anything older keeps torch.topk
@@ -62,6 +82,25 @@ def indexer_select(
     allow_deep_select: bool,
     query_chunk: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    # [FUNCTION DOC] HELPER: Inputs: queries (batch, sequence, heads, head dim), index keys (batch,
+    # keys, head dim), per-head weights (batch, sequence, heads), per-query number of visible keys
+    # (compress lengths, one per sequence position, shared across batch), optional candidate mask,
+    # and flags/sizes. Keys are transposed to key-major; with the fast path, the key count is padded
+    # up to the kernel's required row alignment. Queries are processed in chunks (whole sequence if the
+    # chunk size is unset or large). Per chunk: compute logits with the logit kernel with key range
+    # zero to the visible length (outside-range entries are negative infinity). If this is the
+    # candidate source, compute the candidate mask from the logits; else if it uses candidates,
+    # asserts a mask is given and masks out non-candidate keys in place. Then select: fast path takes
+    # the top picks bounded by each row's visible end, fills out-of-bound slots with -1, pads to the
+    # full top-k width with -1 when keys are fewer than top-k, and sorts indices ascending per row (so
+    # -1 comes first); generic path pads logits with negative infinity to top-k width, calls the given
+    # top-k function, sorts ascending, converts to 64-bit and replaces picks at or beyond the visible
+    # length with -1. Returns (picks of shape batch, sequence, top-k as 64-bit integers; candidate
+    # mask concatenated over chunks if this layer is the candidate source, otherwise the input mask
+    # unchanged).
+    # KNOWN ISSUE: the placement of invalid (-1) picks differs between paths: the fast path sorts
+    # after filling, so -1 entries come first in each row, while the generic path sorts before
+    # replacing out-of-range picks, so -1 entries come last. Consumers must not rely on position.
     bsz, seqlen = q.shape[:2]
     n_kv = index_k.size(1)
     k_t = index_k.transpose(0, 1).contiguous()
@@ -122,6 +161,11 @@ def indexer_select(
 
 
 class DeepSeekV41Indexer(MegatronModule):
+    # [CLASS DOC] Megatron module with duplicated (not tensor-parallel) projections producing index
+    # queries (heads times index head dim) from the low-rank query and per-head weights from hidden
+    # states; if it owns keys (is a key/value source layer) also a key projection from the latent to
+    # index head dim plus norm. Flags say whether it is the candidate source and whether it consumes
+    # candidates. Registers with the indexer replay manager.
     def __init__(
         self,
         config: TransformerConfig,
@@ -132,6 +176,13 @@ class DeepSeekV41Indexer(MegatronModule):
         is_candidate_source: bool,
         uses_candidates: bool,
     ):
+        # [FUNCTION DOC] Reads candidate top-k block count and block size (v41 config fields), indexer
+        # head count, head dim, top-k, rope head dim from the config; the softmax scale is index head
+        # dim to the minus one half. Query low-rank rank falls back to hidden size when unset. Builds
+        # the two bias-free duplicated linears; if owns_k, builds a bf16 key projection and a norm with
+        # fp32 scale. Registers with the replay manager using the layer's rank among the sorted index
+        # source layers as stream index (raises a value error if the layer is not an index source).
+        # The head_dim argument is the latent width; compress_ratio is stored but not otherwise used.
         super().__init__(config=config)
         self.layer_id = layer_id
         self.compress_ratio = compress_ratio
@@ -177,6 +228,10 @@ class DeepSeekV41Indexer(MegatronModule):
 
     @torch.no_grad()
     def index_keys(self, latent: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] No-gradient. Projects the compressed latent (batch, groups, latent dim) to
+        # index head dim, normalizes, copies, applies rotary in place on the trailing rope dims with
+        # the given per-group frequencies, and fake-quantizes to fp4. Returns index keys (batch,
+        # groups, index head dim). Only valid on modules that own keys.
         k = self.k_norm(F.linear(latent, self.linear_wk.weight)).clone()
         apply_rotary_emb(k[..., -self.rope_head_dim :], freqs_cis)
         return fake_quant_fp4(k)
@@ -191,6 +246,14 @@ class DeepSeekV41Indexer(MegatronModule):
         compress_lens: torch.Tensor,
         candidates: torch.Tensor | None,
     ):
+        # [FUNCTION DOC] No-gradient. Inputs: hidden states (batch, sequence, hidden), low-rank query,
+        # index keys, rotary frequencies for queries, per-query visible compressed count, and optional
+        # candidate mask. Projects queries to heads, copies, rotates the trailing rope dims in place,
+        # fake-quantizes to fp4; weights are the projection scaled by softmax scale times head count to
+        # the minus half. Builds the top-k function from the replay manager wrapped around the generic
+        # torch top-k backend (the backend is hard coded, not taken from a config). The fast path is
+        # allowed unless replay is enabled and not in its fallthrough stage. Delegates to the select
+        # helper with the configured top-k and chunk size. Returns (picks, candidates).
         bsz, seqlen, _ = x.shape
         rd = self.rope_head_dim
         q, _ = self.linear_wq_b(qr)

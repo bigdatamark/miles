@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Tests for tests.ci.ci_register: parsing of top-level register_cuda_ci / register_rocm_ci /
+# register_cpu_ci calls from test file source (ut_parse_one_file), the low-level AST literal
+# extractors, the tests/fast path classifier, the textual "mentions register" detector, and
+# collect_tests (implicit CPU registration under tests/fast, explicit-call precedence, strictness of
+# tests/fast-gpu, the ban on CUDA registration in tests/fast, and the suspicious-pattern guard).
+# Also holds a tree-scan regression guard that no tests/fast file still uses the default-form CPU
+# registration. Every test runs with the working directory set to a throwaway temporary directory
+# (autouse fixture) so repo-relative paths resolve there. Registers itself as a CPU test in suite
+# stage-a-cpu.
 """AST-time validation tests for register_cuda_ci / register_cpu_ci.
 
 Covers the AST-collection behavior of the suite-as-runner-class refactor:
@@ -31,6 +41,8 @@ register_cpu_ci(est_time=1, suite="stage-a-cpu", labels=[])
 
 @pytest.fixture(autouse=True)
 def _run_from_tmp_repo_root(tmp_path, monkeypatch):
+    # [FUNCTION DOC] HELPER: Autouse fixture that changes the working directory to the per-test
+    # temporary directory for the duration of each test (restored by monkeypatch). Yields nothing.
     """Run every test with cwd at a throwaway tmp_path "repo root".
 
     The collect_tests helpers below write fixture files under
@@ -44,6 +56,9 @@ def _run_from_tmp_repo_root(tmp_path, monkeypatch):
 
 
 def _make_fixture(body: str, tmp_path: Path, name: str = "fixture.py") -> str:
+    # [FUNCTION DOC] HELPER: Write the body text to a file (default name fixture.py) in the temporary
+    # directory, after removing common leading indentation and leading blank lines. Returns the
+    # file path as a string.
     p = tmp_path / name
     p.write_text(textwrap.dedent(body).lstrip("\n"))
     return str(p)
@@ -53,7 +68,12 @@ def _make_fixture(body: str, tmp_path: Path, name: str = "fixture.py") -> str:
 
 
 class TestRegisterPositive:
+    # [CLASS DOC] Tests that valid register call shapes are parsed into registry entries with the
+    # expected fields.
     def test_cuda_basic_with_one_label(self, tmp_path):
+        # [FUNCTION DOC] Parses a CUDA registration with one label and hopper hardware. Asserts one
+        # registry with the CUDA backend, the given suite and labels, and no leftover num_gpus or
+        # always_on attributes.
         path = _make_fixture(
             """
             from tests.ci.ci_register import register_cuda_ci
@@ -71,6 +91,8 @@ class TestRegisterPositive:
         assert not hasattr(r, "always_on")
 
     def test_labels_omitted_is_always_run(self, tmp_path):
+        # [FUNCTION DOC] Parses a CPU registration without a labels keyword; asserts CPU backend,
+        # suite stage-a-cpu and an empty label list (always-run semantics).
         # No `labels=` keyword at all: defaults to [] (always-run semantics).
         path = _make_fixture(
             """
@@ -85,6 +107,8 @@ class TestRegisterPositive:
         assert r.labels == []
 
     def test_cuda_multiple_labels(self, tmp_path):
+        # [FUNCTION DOC] Parses a multi-line CUDA registration with labels megatron and sglang;
+        # asserts the labels list preserves both in order.
         path = _make_fixture(
             """
             from tests.ci.ci_register import register_cuda_ci
@@ -100,6 +124,8 @@ class TestRegisterPositive:
         assert ut_parse_one_file(path)[0].labels == ["megatron", "sglang"]
 
     def test_disabled_string_passthrough(self, tmp_path):
+        # [FUNCTION DOC] Parses a CUDA registration with a disabled reason string; asserts the string
+        # is carried through unchanged on the registry.
         path = _make_fixture(
             """
             from tests.ci.ci_register import register_cuda_ci
@@ -117,6 +143,8 @@ class TestRegisterPositive:
         assert r.disabled == "known regression in megatron 0.12"
 
     def test_nightly_true_passthrough(self, tmp_path):
+        # [FUNCTION DOC] Parses a CUDA registration with nightly true; asserts the registry's nightly
+        # flag is true.
         path = _make_fixture(
             """
             from tests.ci.ci_register import register_cuda_ci
@@ -137,9 +165,13 @@ class TestRegisterPositive:
 
 
 class TestRegisterNegative:
+    # [CLASS DOC] Tests that invalid register call shapes are rejected with a value error whose
+    # message matches a specific fragment (the messages are part of the contract).
     @pytest.mark.parametrize("func_name", ["register_cuda_ci", "register_rocm_ci"])
     @pytest.mark.parametrize("labels_arg", ["", ", labels=None", ", labels=[]"])
     def test_gpu_labels_must_be_non_empty(self, tmp_path, func_name, labels_arg):
+        # [FUNCTION DOC] For CUDA and ROCm registrations with labels omitted, none, or empty, parsing
+        # must raise a value error saying labels must contain at least one domain label.
         path = _make_fixture(
             f"""
             from tests.ci.ci_register import {func_name}
@@ -151,6 +183,8 @@ class TestRegisterNegative:
             ut_parse_one_file(path)
 
     def test_unknown_label_rejected(self, tmp_path):
+        # [FUNCTION DOC] A misspelled label (megatorn) must raise a value error naming the unknown
+        # labels.
         path = _make_fixture(
             """
             from tests.ci.ci_register import register_cuda_ci
@@ -163,6 +197,8 @@ class TestRegisterNegative:
 
     @pytest.mark.parametrize("hardware_arg", ["", ", hardware=None", ", hardware=[]"])
     def test_cuda_hardware_must_be_non_empty(self, tmp_path, hardware_arg):
+        # [FUNCTION DOC] A CUDA registration with hardware omitted, none or empty must raise a value
+        # error saying hardware must list at least one arch.
         path = _make_fixture(
             f"""
             from tests.ci.ci_register import register_cuda_ci
@@ -176,6 +212,7 @@ class TestRegisterNegative:
             ut_parse_one_file(path)
 
     def test_unknown_arch_rejected(self, tmp_path):
+        # [FUNCTION DOC] Hardware naming ampere must raise a value error naming the unknown arches.
         path = _make_fixture(
             """
             from tests.ci.ci_register import register_cuda_ci
@@ -189,6 +226,8 @@ class TestRegisterNegative:
             ut_parse_one_file(path)
 
     def test_duplicated_arch_rejected(self, tmp_path):
+        # [FUNCTION DOC] Hardware listing hopper twice must raise a value error about a duplicated
+        # arch.
         path = _make_fixture(
             """
             from tests.ci.ci_register import register_cuda_ci
@@ -205,6 +244,8 @@ class TestRegisterNegative:
             ut_parse_one_file(path)
 
     def test_unknown_cuda_suite_rejected(self, tmp_path):
+        # [FUNCTION DOC] A suite name with no workflow job (stage-c-8-gpu-b300) must raise a value
+        # error naming the unknown CUDA suite, instead of silently running zero tests.
         # A suite with no workflow job used to run zero tests in silence.
         path = _make_fixture(
             """
@@ -229,6 +270,10 @@ class TestRegisterNegative:
         ],
     )
     def test_home_stage_must_match_default_arch(self, tmp_path, suite, hardware):
+        # [FUNCTION DOC] Parametrized over mismatches between the suite's GPU generation and the first
+        # listed hardware: the Blackwell suite with hopper first, the Blackwell suite with only
+        # hopper, and the Hopper suite with only blackwell. Each must raise a value error saying the
+        # home stage must be on the first supported arch.
         path = _make_fixture(
             f"""
             from tests.ci.ci_register import register_cuda_ci
@@ -243,6 +288,8 @@ class TestRegisterNegative:
 
     @pytest.mark.parametrize("func_name", ["register_cpu_ci", "register_rocm_ci"])
     def test_hardware_rejected_outside_cuda(self, tmp_path, func_name):
+        # [FUNCTION DOC] Passing a hardware list to a CPU registration (stage-a-cpu) or a ROCm
+        # registration (stage-c-4-gpu-mi350) must raise a value error saying hardware is CUDA-only.
         suite = "stage-a-cpu" if func_name == "register_cpu_ci" else "stage-c-4-gpu-mi350"
         path = _make_fixture(
             f"""
@@ -257,6 +304,8 @@ class TestRegisterNegative:
             ut_parse_one_file(path)
 
     def test_num_gpus_kwarg_rejected(self, tmp_path):
+        # [FUNCTION DOC] The removed num_gpus keyword must raise a value error naming it as an
+        # unknown argument.
         path = _make_fixture(
             """
             from tests.ci.ci_register import register_cuda_ci
@@ -270,6 +319,8 @@ class TestRegisterNegative:
             ut_parse_one_file(path)
 
     def test_always_on_kwarg_rejected(self, tmp_path):
+        # [FUNCTION DOC] The removed always_on keyword must raise a value error naming it as an
+        # unknown argument.
         # `always_on` is gone in the new design; passing it must error.
         path = _make_fixture(
             """
@@ -284,6 +335,8 @@ class TestRegisterNegative:
             ut_parse_one_file(path)
 
     def test_labels_string_rejected(self, tmp_path):
+        # [FUNCTION DOC] Labels given as a single string must raise a value error saying it must be a
+        # list of string literals or none.
         path = _make_fixture(
             """
             from tests.ci.ci_register import register_cuda_ci
@@ -296,6 +349,8 @@ class TestRegisterNegative:
 
     @pytest.mark.parametrize("value", ['"yes"', "1", "None"])
     def test_nightly_non_boolean_rejected(self, tmp_path, value):
+        # [FUNCTION DOC] Nightly given as a string, an integer or none must raise a value error saying
+        # nightly must be a boolean.
         path = _make_fixture(
             f"""
             from tests.ci.ci_register import register_cuda_ci
@@ -312,6 +367,8 @@ class TestRegisterNegative:
             ut_parse_one_file(path)
 
     def test_positional_third_arg_rejected(self, tmp_path):
+        # [FUNCTION DOC] Three positional arguments must raise a value error about too many
+        # positional arguments (labels is keyword-only).
         # labels is keyword-only; a third positional argument must be rejected.
         path = _make_fixture(
             """
@@ -324,6 +381,8 @@ class TestRegisterNegative:
             ut_parse_one_file(path)
 
     def test_duplicate_kwarg_rejected(self, tmp_path):
+        # [FUNCTION DOC] Repeating the suite keyword in the call must raise a value error about a
+        # duplicated argument named suite.
         path = _make_fixture(
             """
             from tests.ci.ci_register import register_cuda_ci
@@ -341,46 +400,62 @@ class TestRegisterNegative:
 
 
 class TestSelectionHelpers:
+    # [CLASS DOC] Tests of the literal extraction helpers on small parsed expressions.
     def test_extract_constant_int(self):
+        # [FUNCTION DOC] The constant extractor returns the integer value 42 for a literal 42.
         node = ast.parse("42", mode="eval").body
         assert _extract_constant(node) == 42
 
     def test_extract_constant_str(self):
+        # [FUNCTION DOC] The constant extractor returns the string for a string literal.
         node = ast.parse("'hello'", mode="eval").body
         assert _extract_constant(node) == "hello"
 
     def test_extract_constant_bool(self):
+        # [FUNCTION DOC] The constant extractor returns the true and false boolean values themselves
+        # for boolean literals.
         assert _extract_constant(ast.parse("True", mode="eval").body) is True
         assert _extract_constant(ast.parse("False", mode="eval").body) is False
 
     def test_extract_constant_non_constant_returns_unset(self):
+        # [FUNCTION DOC] For a variable-name expression the extractor returns the unset sentinel.
         node = ast.parse("some_var", mode="eval").body
         assert _extract_constant(node) is _UNSET
 
     def test_extract_list_constant_strings(self):
+        # [FUNCTION DOC] The list extractor returns the strings of a list literal in order.
         node = ast.parse('["a", "b"]', mode="eval").body
         assert _extract_list_constant(node) == ["a", "b"]
 
     def test_extract_list_constant_empty(self):
+        # [FUNCTION DOC] The list extractor returns an empty list for an empty list literal.
         node = ast.parse("[]", mode="eval").body
         assert _extract_list_constant(node) == []
 
     def test_extract_list_constant_none_is_empty(self):
+        # [FUNCTION DOC] The list extractor treats a literal none as an empty list (the CPU
+        # always-run spelling).
         # Literal `None` remains the CPU always-run spelling.
         node = ast.parse("None", mode="eval").body
         assert _extract_list_constant(node) == []
 
     def test_extract_list_constant_non_list(self):
+        # [FUNCTION DOC] A variable-name expression makes the list extractor raise a value error
+        # saying it must be a list of string literals or none.
         node = ast.parse("some_var", mode="eval").body
         with pytest.raises(ValueError, match=r"must be a list of string literals or None"):
             _extract_list_constant(node)
 
     def test_extract_list_constant_non_literal_element(self):
+        # [FUNCTION DOC] A list whose element is a function call makes the list extractor raise a
+        # value error saying it must be a list of string literals.
         node = ast.parse("[get_label()]", mode="eval").body
         with pytest.raises(ValueError, match=r"must be a list of string literals"):
             _extract_list_constant(node)
 
     def test_extract_list_constant_non_string_element(self):
+        # [FUNCTION DOC] A list of integers makes the list extractor raise a value error saying it
+        # must be a list of string literals.
         node = ast.parse("[1, 2]", mode="eval").body
         with pytest.raises(ValueError, match=r"must be a list of string literals"):
             _extract_list_constant(node)
@@ -390,40 +465,55 @@ class TestSelectionHelpers:
 
 
 class TestIsImplicitFastCpuPath:
+    # [CLASS DOC] Tests of the path classifier that decides whether a repo-relative file path lies
+    # under the tests/fast directory (and so gets an implicit CPU registration). Matching is
+    # anchored on the path prefix.
     def test_relative_tests_fast_path(self):
+        # [FUNCTION DOC] A relative path directly under tests/fast is recognized.
         assert _is_implicit_fast_cpu_path("tests/fast/test_x.py")
 
     def test_dot_prefixed_path_not_recognized(self):
+        # [FUNCTION DOC] A path prefixed with "./" is out of contract and not recognized.
         # Inputs are the bare repo-relative paths glob.glob yields
         # (tests/fast/...); a ./-prefixed form is out of contract.
         assert not _is_implicit_fast_cpu_path("./tests/fast/test_x.py")
 
     def test_absolute_path_not_recognized(self):
+        # [FUNCTION DOC] An absolute path containing tests/fast is not recognized.
         # Classification is on the repo-relative path; absolute paths are not
         # recognized (open(filename) would already require cwd == repo root).
         assert not _is_implicit_fast_cpu_path("/abs/repo/tests/fast/test_x.py")
 
     def test_nested_subdir(self):
+        # [FUNCTION DOC] A deeply nested path under tests/fast is recognized.
         assert _is_implicit_fast_cpu_path("tests/fast/sub/dir/test_x.py")
 
     def test_fast_gpu_sibling_rejected(self):
+        # [FUNCTION DOC] A path under the sibling tests/fast-gpu directory is not recognized.
         assert not _is_implicit_fast_cpu_path("tests/fast-gpu/test_x.py")
 
     def test_fast_gpu_absolute_rejected(self):
+        # [FUNCTION DOC] An absolute path under a fast-gpu directory is not recognized.
         assert not _is_implicit_fast_cpu_path("/abs/repo/tests/fast-gpu/test_x.py")
 
     def test_fast_gpu_nested_rejected(self):
+        # [FUNCTION DOC] A nested path under tests/fast-gpu is not recognized.
         assert not _is_implicit_fast_cpu_path("tests/fast-gpu/sub/test_x.py")
 
     def test_same_prefix_siblings_rejected(self):
+        # [FUNCTION DOC] Directories sharing the textual prefix (fastish, fastfoo) are not
+        # recognized; the match needs a full path component.
         assert not _is_implicit_fast_cpu_path("tests/fastish/test_x.py")
         assert not _is_implicit_fast_cpu_path("tests/fastfoo/test_x.py")
 
     def test_bare_directory_without_file_rejected(self):
+        # [FUNCTION DOC] The bare directory path tests/fast (no file) is not recognized; the helper is
+        # for file paths.
         # "tests/fast" alone is a directory path; helper is for file paths.
         assert not _is_implicit_fast_cpu_path("tests/fast")
 
     def test_other_subtrees_rejected(self):
+        # [FUNCTION DOC] Paths under tests/e2e, tests/utils and tests/ci are not recognized.
         assert not _is_implicit_fast_cpu_path("tests/e2e/short/test_x.py")
         assert not _is_implicit_fast_cpu_path("tests/utils/test_x.py")
         assert not _is_implicit_fast_cpu_path("tests/ci/test_x.py")
@@ -433,7 +523,10 @@ class TestIsImplicitFastCpuPath:
 
 
 class TestFileTextMentionsRegister:
+    # [CLASS DOC] Tests of the substring-based detector that reports whether a file's text mentions
+    # a CPU or CUDA register call (used to catch registrations the AST visitor cannot see).
     def test_file_with_cpu_call_matches(self, tmp_path):
+        # [FUNCTION DOC] A file importing and calling the CPU register function is detected.
         p = tmp_path / "f.py"
         p.write_text(
             "from tests.ci.ci_register import register_cpu_ci\nregister_cpu_ci(est_time=10, suite='stage-a-cpu', labels=[])\n"
@@ -441,6 +534,7 @@ class TestFileTextMentionsRegister:
         assert _file_text_mentions_register(str(p))
 
     def test_file_with_cuda_call_matches(self, tmp_path):
+        # [FUNCTION DOC] A file importing and calling the CUDA register function is detected.
         p = tmp_path / "f.py"
         p.write_text(
             "from tests.ci.ci_register import register_cuda_ci\nregister_cuda_ci(est_time=60, suite='stage-b-2-gpu-h200', labels=['precision'], hardware=['hopper'])\n"
@@ -448,11 +542,13 @@ class TestFileTextMentionsRegister:
         assert _file_text_mentions_register(str(p))
 
     def test_clean_file_does_not_match(self, tmp_path):
+        # [FUNCTION DOC] A file with a plain test function and no register mention is not detected.
         p = tmp_path / "f.py"
         p.write_text("def test_x():\n    assert True\n")
         assert not _file_text_mentions_register(str(p))
 
     def test_missing_file_does_not_raise(self, tmp_path):
+        # [FUNCTION DOC] A nonexistent path yields a false result rather than raising.
         assert not _file_text_mentions_register(str(tmp_path / "nonexistent.py"))
 
 
@@ -460,6 +556,9 @@ class TestFileTextMentionsRegister:
 
 
 def _make_under(tmp_path: Path, subtree: str, rel_path: str, body: str) -> str:
+    # [FUNCTION DOC] HELPER: Write the dedented body (leading blank lines removed) to
+    # <tmp>/<subtree>/<rel_path>, creating parent directories, and return the repo-relative path
+    # string "<subtree>/<rel_path>".
     """Create a file under tmp_path/<subtree>/<rel_path> and return the
     repo-relative path (<subtree>/<rel_path>).
 
@@ -474,15 +573,24 @@ def _make_under(tmp_path: Path, subtree: str, rel_path: str, body: str) -> str:
 
 
 def _make_under_tests_fast(tmp_path: Path, rel_path: str, body: str) -> str:
+    # [FUNCTION DOC] HELPER: Create the file under the tests/fast subtree and return its
+    # repo-relative path.
     return _make_under(tmp_path, "tests/fast", rel_path, body)
 
 
 def _make_under_tests_fast_gpu(tmp_path: Path, rel_path: str, body: str) -> str:
+    # [FUNCTION DOC] HELPER: Create the file under the tests/fast-gpu subtree and return its
+    # repo-relative path.
     return _make_under(tmp_path, "tests/fast-gpu", rel_path, body)
 
 
 class TestCollectTestsImplicitFallback:
+    # [CLASS DOC] Tests of the implicit CPU registration that collect_tests synthesizes for tests/fast
+    # files that have no register call (and its absence elsewhere).
     def test_fast_cpu_no_register_call_synthesizes_default(self, tmp_path):
+        # [FUNCTION DOC] A tests/fast file with no register call yields exactly one implicit CPU
+        # registry: suite stage-a-cpu, est_time 1.0, no labels, not nightly, not disabled, implicit
+        # flag set, and file name equal to the given path.
         # AC-1 positive: a tests/fast/ file with no register call yields
         # one implicit CPU CIRegistry with the documented default values.
         path = _make_under_tests_fast(
@@ -503,6 +611,7 @@ class TestCollectTestsImplicitFallback:
         assert r.filename == path
 
     def test_fast_cpu_nested_subdir_also_synthesizes(self, tmp_path):
+        # [FUNCTION DOC] A deeply nested tests/fast file also gets one implicit registry.
         # AC-1 positive: deep subdirectories under tests/fast/ behave the same.
         path = _make_under_tests_fast(
             tmp_path,
@@ -513,6 +622,9 @@ class TestCollectTestsImplicitFallback:
         assert len(registries) == 1 and registries[0].implicit is True
 
     def test_outside_fast_raises_with_sanity_check(self, tmp_path):
+        # [FUNCTION DOC] For files without a register call under tests/utils, tests/e2e/short and
+        # tests/ci, collecting with the sanity check enabled raises a value error saying no CI
+        # registry was found.
         # AC-1 negative: non-tests/fast/ subtrees still hit the existing
         # ValueError path under sanity_check=True.
         for subtree in ("tests/utils", "tests/e2e/short", "tests/ci"):
@@ -522,7 +634,11 @@ class TestCollectTestsImplicitFallback:
 
 
 class TestCollectTestsExplicitPrecedence:
+    # [CLASS DOC] Tests that an explicit register call in a tests/fast file overrides the implicit
+    # default.
     def test_explicit_cpu_call_wins_over_implicit(self, tmp_path):
+        # [FUNCTION DOC] An explicit CPU call with est_time 20 and label megatron yields one registry
+        # with those values (est_time 20.0) and the implicit flag unset.
         # AC-2 positive: when registries is non-empty, no implicit
         # synthesis fires; explicit values take effect verbatim.
         path = _make_under_tests_fast(
@@ -541,6 +657,8 @@ class TestCollectTestsExplicitPrecedence:
         assert r.implicit is False
 
     def test_explicit_overrides_can_use_alternate_suite(self, tmp_path):
+        # [FUNCTION DOC] An explicit CPU call may select the stage-b-cpu suite with est_time 15; the
+        # collected registry carries that suite, est_time 15.0 and is not implicit.
         # AC-2 positive: register_cpu_ci is allowed to override any field,
         # including switching to a non-default CPU suite.
         path = _make_under_tests_fast(
@@ -558,7 +676,11 @@ class TestCollectTestsExplicitPrecedence:
 
 
 class TestCollectTestsFastGpuStrict:
+    # [CLASS DOC] Tests that tests/fast-gpu files must register explicitly (no implicit fallback) and
+    # may use CUDA registrations.
     def test_fast_gpu_with_cuda_call_accepted(self, tmp_path):
+        # [FUNCTION DOC] A tests/fast-gpu file with a CUDA call is collected as one non-implicit CUDA
+        # registry.
         # AC-3 positive: tests/fast-gpu/ files with register_cuda_ci pass
         # through unchanged, just like any other CUDA registry.
         path = _make_under_tests_fast_gpu(
@@ -575,6 +697,8 @@ class TestCollectTestsFastGpuStrict:
         assert registries[0].implicit is False
 
     def test_fast_gpu_with_cuda_alternate_suite_accepted(self, tmp_path):
+        # [FUNCTION DOC] A tests/fast-gpu file registering stage-c-8-gpu-h100 with the megatron label
+        # is collected with that suite.
         # AC-3 positive: other CUDA suites and label sets work too.
         path = _make_under_tests_fast_gpu(
             tmp_path,
@@ -590,6 +714,8 @@ class TestCollectTestsFastGpuStrict:
         assert registries[0].suite == "stage-c-8-gpu-h100"
 
     def test_fast_gpu_with_no_register_raises(self, tmp_path):
+        # [FUNCTION DOC] A tests/fast-gpu file without any register call raises a value error saying
+        # no CI registry was found (no implicit fallback there).
         # AC-3 negative: tests/fast-gpu/ does NOT enjoy implicit fallback;
         # zero register calls still go through the ValueError path.
         path = _make_under_tests_fast_gpu(
@@ -602,7 +728,10 @@ class TestCollectTestsFastGpuStrict:
 
 
 class TestCollectTestsCudaBanInFast:
+    # [CLASS DOC] Tests of the rule that CUDA registrations are forbidden under tests/fast.
     def test_register_cuda_ci_in_fast_raises(self, tmp_path):
+        # [FUNCTION DOC] A CUDA call in a tests/fast file makes collection raise a value error saying
+        # the CUDA register function is forbidden in tests/fast.
         # AC-4 positive: register_cuda_ci anywhere in tests/fast/ is a
         # hard error directing the developer to tests/fast-gpu/.
         path = _make_under_tests_fast(
@@ -617,6 +746,8 @@ class TestCollectTestsCudaBanInFast:
             collect_tests([path], sanity_check=True)
 
     def test_same_call_accepted_in_fast_gpu(self, tmp_path):
+        # [FUNCTION DOC] The identical CUDA call in a tests/fast-gpu file is accepted and yields a
+        # CUDA-backend registry.
         # AC-4 negative: identical call inside tests/fast-gpu/ passes.
         path = _make_under_tests_fast_gpu(
             tmp_path,
@@ -631,7 +762,11 @@ class TestCollectTestsCudaBanInFast:
 
 
 class TestCollectTestsSuspiciousPattern:
+    # [CLASS DOC] Tests of the guard that raises when a tests/fast file mentions a register function
+    # textually but the AST visitor found no registration (so the implicit default would hide it).
     def test_aliased_import_no_call_raises(self, tmp_path):
+        # [FUNCTION DOC] Importing the CPU register function under an alias and calling the alias
+        # raises a value error saying the file mentions the register functions.
         # AC-6 positive: file mentions register_cpu_ci textually (via
         # aliased import) but visitor finds zero registries; suspicious
         # guard must raise instead of silently synthesizing default.
@@ -647,6 +782,8 @@ class TestCollectTestsSuspiciousPattern:
             collect_tests([path], sanity_check=True)
 
     def test_non_toplevel_call_raises(self, tmp_path):
+        # [FUNCTION DOC] A register call nested inside an if block (not a top-level statement) is not
+        # parsed, but the textual mention triggers the same value error.
         # AC-6 positive: register_cpu_ci buried inside an `if` block is
         # not parsed by RegistryVisitor (top-level Expr(Call) only), but
         # the textual substring trips the suspicious guard.
@@ -663,6 +800,8 @@ class TestCollectTestsSuspiciousPattern:
             collect_tests([path], sanity_check=True)
 
     def test_attribute_access_call_raises(self, tmp_path):
+        # [FUNCTION DOC] A call through a module attribute (module dot function) is not recognized by
+        # the visitor, which only matches bare names; the textual mention raises the same value error.
         # AC-6 positive: ci_register.register_cpu_ci(...) is parsed as
         # ast.Attribute, not ast.Name, so the visitor produces zero
         # registries; suspicious guard catches it.
@@ -678,6 +817,8 @@ class TestCollectTestsSuspiciousPattern:
             collect_tests([path], sanity_check=True)
 
     def test_clean_file_passes_implicit(self, tmp_path):
+        # [FUNCTION DOC] A tests/fast file with no register mention passes the guard and receives the
+        # implicit registry.
         # AC-6 negative: a file with neither substring present takes the
         # legitimate implicit-fallback path.
         path = _make_under_tests_fast(
@@ -693,6 +834,11 @@ class TestCollectTestsSuspiciousPattern:
 
 
 def _is_semantic_default_register_cpu_ci(call: ast.Call) -> bool:
+    # [FUNCTION DOC] HELPER: Predicate on a parsed call node: true when it is a bare-name call to the
+    # CPU register function with no positional arguments, whose keyword names are exactly
+    # {est_time, suite, labels} or {est_time, suite}, est_time literal 10, suite literal
+    # "stage-a-cpu", and labels (if present) an empty list literal or literal none. Any other
+    # shape (attribute call, extra keywords, other values, positional args) returns false.
     """Mirror of `strip_default_cpu_register._is_default_form_register_cpu_ci`.
 
     True when the call matches any of three semantically identical shapes
@@ -732,6 +878,8 @@ def _is_semantic_default_register_cpu_ci(call: ast.Call) -> bool:
 
 
 class TestNoSemanticDefaultRegisterCpuCi:
+    # [CLASS DOC] Regression guard that scans the real tests/fast tree for default-form CPU
+    # registrations, plus unit tests of the matching predicate on parsed snippets.
     """AC-9 meta-test: every file under `tests/fast/` that still calls
     `register_cpu_ci` must do so with a *non-default* signature.
 
@@ -748,6 +896,11 @@ class TestNoSemanticDefaultRegisterCpuCi:
     """
 
     def test_no_default_form_register_cpu_ci_in_tests_fast(self):
+        # [FUNCTION DOC] Locates the repository root from this file's location; skips if tests/fast is
+        # missing. Parses every python file under tests/fast (unreadable or syntactically invalid
+        # files are skipped), and for each top-level expression statement that is a call, records
+        # "<relative path>:<line>" when the predicate matches. Asserts there are no offenders, with a
+        # message telling the developer to remove the call or run the strip script.
         repo_root = Path(__file__).resolve().parents[3]
         fast_root = repo_root / "tests" / "fast"
         if not fast_root.is_dir():
@@ -790,46 +943,58 @@ class TestNoSemanticDefaultRegisterCpuCi:
 
     @staticmethod
     def _parse_call(src: str) -> ast.Call:
+        # [FUNCTION DOC] HELPER: Static method. Parse the source as a module, assert its first
+        # statement is an expression statement holding a call, and return that call node.
         tree = ast.parse(src, mode="exec")
         expr = tree.body[0]
         assert isinstance(expr, ast.Expr) and isinstance(expr.value, ast.Call)
         return expr.value
 
     def test_predicate_accepts_full_empty_list_form(self):
+        # [FUNCTION DOC] The predicate accepts the three-keyword form with an empty labels list.
         call = self._parse_call('register_cpu_ci(est_time=10, suite="stage-a-cpu", labels=[])')
         assert _is_semantic_default_register_cpu_ci(call)
 
     def test_predicate_accepts_omitted_labels_form(self):
+        # [FUNCTION DOC] The predicate accepts the two-keyword form without labels.
         call = self._parse_call('register_cpu_ci(est_time=10, suite="stage-a-cpu")')
         assert _is_semantic_default_register_cpu_ci(call)
 
     def test_predicate_accepts_labels_none_literal_form(self):
+        # [FUNCTION DOC] The predicate accepts the form where labels is the literal none.
         # The third equivalence class Codex flagged: `labels=None` literal
         # is identical to omitted / `labels=[]` per `_extract_list_constant`.
         call = self._parse_call('register_cpu_ci(est_time=10, suite="stage-a-cpu", labels=None)')
         assert _is_semantic_default_register_cpu_ci(call)
 
     def test_predicate_rejects_nonempty_labels(self):
+        # [FUNCTION DOC] The predicate rejects a call whose labels list is non-empty.
         call = self._parse_call('register_cpu_ci(est_time=10, suite="stage-a-cpu", labels=["megatron"])')
         assert not _is_semantic_default_register_cpu_ci(call)
 
     def test_predicate_rejects_nondefault_est_time(self):
+        # [FUNCTION DOC] The predicate rejects est_time other than 10.
         call = self._parse_call('register_cpu_ci(est_time=20, suite="stage-a-cpu", labels=[])')
         assert not _is_semantic_default_register_cpu_ci(call)
 
     def test_predicate_rejects_nondefault_suite(self):
+        # [FUNCTION DOC] The predicate rejects a suite other than stage-a-cpu.
         call = self._parse_call('register_cpu_ci(est_time=10, suite="stage-b-cpu", labels=[])')
         assert not _is_semantic_default_register_cpu_ci(call)
 
     def test_predicate_rejects_extra_kwarg(self):
+        # [FUNCTION DOC] The predicate rejects a call with an additional keyword (nightly).
         call = self._parse_call('register_cpu_ci(est_time=10, suite="stage-a-cpu", labels=[], nightly=True)')
         assert not _is_semantic_default_register_cpu_ci(call)
 
     def test_predicate_rejects_positional_args(self):
+        # [FUNCTION DOC] The predicate rejects a call using positional arguments.
         call = self._parse_call('register_cpu_ci(10, "stage-a-cpu")')
         assert not _is_semantic_default_register_cpu_ci(call)
 
     def test_predicate_rejects_labels_non_literal_name(self):
+        # [FUNCTION DOC] The predicate rejects labels given as a variable name (neither an empty list
+        # literal nor literal none).
         # `labels=SOME_NAME` is neither an empty-list literal nor a literal
         # `None`; the predicate must keep its hands off the call.
         call = self._parse_call('register_cpu_ci(est_time=10, suite="stage-a-cpu", labels=SOME_NAME)')

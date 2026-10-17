@@ -1,3 +1,9 @@
+# [MODULE DOC] Spec builder for the GLM-5.3 hybrid model. Reads the Hugging Face text config to turn on
+# multi-stream hyper-connections (with checked epsilon, unfused kernels), set indexer sizes and pool
+# parameters, and decide which layers are full (sparse) attention versus linear (Kimi delta)
+# attention. Monkey-patches the hyper-connection constructor to use a reference projection-and-RMS
+# routine, and builds Megatron's decoder block spec with per-layer attention specs replaced
+# accordingly and a mean output contraction.
 import copy
 
 import torch
@@ -21,6 +27,11 @@ _MHC_EPS = 1e-6
 
 
 def full_attn_layers(text_config) -> list[int]:
+    # [FUNCTION DOC] Returns the zero-based layer indices that use full attention. Priority: (1) the
+    # linear-attention config mapping's list of full attention layers, if that is a mapping with a
+    # non-null list (sorted, as integers); (2) the config's layer types list, if non-empty: every
+    # index whose type is not linear attention; (3) default: layers whose index modulo 4 equals 3,
+    # over the number of hidden layers.
     linear_attn_config = getattr(text_config, "linear_attn_config", None)
     if isinstance(linear_attn_config, dict) and linear_attn_config.get("full_attn_layers") is not None:
         return sorted(int(i) for i in linear_attn_config["full_attn_layers"])
@@ -31,6 +42,12 @@ def full_attn_layers(text_config) -> list[int]:
 
 
 def _apply_glm5_next_config(config, text_config) -> None:
+    # [FUNCTION DOC] HELPER: Mutates the Megatron config from the HF text config. Asserts the
+    # hyper-connection epsilon (default 1e-6) equals the constant Megatron hard codes. Sets:
+    # hyper-connections on, number of residual streams (default 4), Sinkhorn iterations (default 20),
+    # fused mHC off; index head count, head dim, top-k, and pool size from the HF config (missing ones
+    # raise attribute errors); asserts pool size above one and that the config enables pool
+    # compression and always selecting the tail; stores the full-attention layer list on the config.
     hc_eps = getattr(text_config, "hc_eps", _MHC_EPS)
     assert hc_eps == _MHC_EPS, (
         f"GLM-5.3 hc_eps={hc_eps} but Megatron's mHC sinkhorn/compute-h eps are the "
@@ -55,29 +72,42 @@ def _apply_glm5_next_config(config, text_config) -> None:
 
 
 class Glm5NextMeanOutputContraction(torch.nn.Module):
+    # [CLASS DOC] HELPER: Output-stage contraction of the residual streams: delegates to the
+    # hyper-connection module's static contraction with the configured stream count.
     """Plain mean over the residual streams, with no learned head weights."""
 
     def __init__(self, config):
+        # [FUNCTION DOC] HELPER: Records the number of residual streams from the config.
         super().__init__()
         self.num_streams = config.num_residual_streams
 
     def forward(self, hidden_states):
+        # [FUNCTION DOC] HELPER: Collapses the stream-expanded hidden states back to a single stream
+        # using Megatron's output-contract routine (documented here as a plain mean over streams).
         return HyperConnectionModule.output_contract(hidden_states, self.num_streams)
 
 
 def _reference_proj_rms(x, weight, eps):
+    # [FUNCTION DOC] HELPER: Reference (unfused) computation for hyper-connection mapping: returns
+    # the matrix product of x with the transposed weight, and the reciprocal root of the mean square of
+    # x over the last dim plus epsilon (kept with a trailing singleton dim).
     proj = torch.matmul(x, weight.t())
     r = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
     return proj, r
 
 
 def _patch_reference_proj_rms() -> None:
+    # [FUNCTION DOC] HELPER: Idempotent (marker attribute on the hyper-connection module) global
+    # monkey patch of the hyper-connection constructor: after the original constructor, asserts the
+    # config does not use the fused mHC path, records the layer-norm epsilon, and installs a
+    # torch-compiled version of the reference projection-and-RMS routine as the projection op.
     if getattr(hyper_connection, "_glm5_next_reference_proj_rms_patched", False):
         return
 
     original_init = HyperConnectionModule.__init__
 
     def _init_with_reference_proj_rms(self, config, layer_number):
+        # [FUNCTION DOC] HELPER: Replacement constructor described above; wraps the original.
         original_init(self, config, layer_number)
         assert not config.use_fused_mhc, "GLM-5.3 mHC requires the native (unfused) proj_rms path"
         self.norm_eps = config.layernorm_epsilon
@@ -88,6 +118,15 @@ def _patch_reference_proj_rms() -> None:
 
 
 def get_glm5_next_spec(args, config, vp_stage=None):
+    # [FUNCTION DOC] Entry point. Loads the HF config from the checkpoint path, takes its text config
+    # (nested one if present), applies config changes, installs the global patch. Builds Megatron's
+    # decoder block spec (Transformer Engine; with the virtual pipeline stage if given) and sets its
+    # hyper-connection head contraction to the mean contraction. Asserts no explicit pipeline layout
+    # is used. For each layer to build on this stage (global index = local index plus the stage's
+    # layer offset): a deep copy of the layer spec gets the sparse-attention spec (causal mask, top-k
+    # backend from args, TE-provider submodules, identity layernorms) if the global index is a
+    # full-attention layer, otherwise the Kimi delta attention spec taking the args. Returns the
+    # block spec.
     hf_config = load_hf_config(args.hf_checkpoint)
     text_config = _get_text_config(hf_config)
 

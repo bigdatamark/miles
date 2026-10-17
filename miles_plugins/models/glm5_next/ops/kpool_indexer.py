@@ -1,3 +1,8 @@
+# [MODULE DOC] Top-k token selection for the GLM-5.3 pooled-key indexer. Keys are pooled in groups of
+# kpool consecutive tokens per sequence; queries score the pooled keys, the best pools are chosen, and
+# the chosen pools are expanded back to token indices with each query's most recent (tail) tokens
+# always included. Supports an RL record/replay mode that routes the pool top-k through the replay
+# manager.
 import torch
 
 from miles.kernels.attention.dsa.kpool import append_tail_and_pad, pool_topk_to_token_fn, select_expand_tail
@@ -13,6 +18,21 @@ def kpool_select_topk(
     index_topk: int,
     kpool: int,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Inputs: index queries (tokens, heads, dim), pooled keys (pools, dim), per-head
+    # weights, cumulative sequence lengths of tokens and of pools (pool counts per sequence from the
+    # pool boundary helper), top-k count, pool size. Per token computes: its sequence (by binary
+    # search of the token index in the cumulative lengths), the sequence's token base and pool base,
+    # the local position inside the sequence, and the number of eligible pools: (local position plus
+    # one) integer-divided by pool size, i.e. only completed pools that end at or before the query.
+    # Scores: if there are pooled keys, runs the indexer logits kernel (imported lazily because it is
+    # GPU-only) without gradients over each token's pool range [pool base, pool base plus eligible
+    # pools) with 32-bit bounds; if there are none, a single column of negative infinity. Selection:
+    # in replay mode, wraps a pool-to-token conversion function with the replay manager's top-k
+    # function (recording or replaying), gets token indices for the top-k pools, and appends the tail
+    # tokens and pads, where a "shortcut" flag marks queries whose visible length is within top-k
+    # (so they attend to everything); otherwise one fused helper selects the pools, expands them to
+    # tokens, appends the tail, and pads. Returns an integer tensor of token indices with a singleton
+    # head axis inserted at dim 1 (tokens, 1, selected count).
     num_tokens = index_q.shape[0]
     device = index_q.device
     token_ids = torch.arange(num_tokens, device=device)

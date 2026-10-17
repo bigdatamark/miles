@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Launcher script (typer command line app) for GRPO training of DeepSeek-V3.2 (sparse attention
+# model) with Megatron for training and SGLang for rollout, on DAPO math data with AIME eval.
+# Supports optional precision variants: block-quant FP8 rollout, MXFP8 rollout (Blackwell
+# hardware), MXFP8 training, and optional train/inference mismatch correction (MIS) config.
+# Supports a single-node layout (half the GPUs train, half serve rollout) or a multi-node layout.
+# Commands: full-train, prepare, prepare-megatron-ckpt, train. The module-level constants list
+# layer-name fragments kept in high precision when converting to MXFP8 (one set for Hugging Face
+# weight names, one for Megatron module names). Importing has no side effects besides creating the
+# app and a default run id.
 from dataclasses import dataclass
 from typing import Literal
 
@@ -17,6 +27,17 @@ DEFAULT_MXFP8_EXTRA_HIGH_PRECISION_LAYERS_MEGATRON = (
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC]
+    # Command line options extending the shared train configuration (node count, output dir,
+    # backend creation). Key fields: mode (debug_minimal shortens responses to 100 tokens, saves
+    # every 2 steps and disables eval); from_bf16_ckpt (download an already-bf16 checkpoint into the
+    # "-bf16" directory instead of casting); use_single_node (split one node into trainer and
+    # rollout halves); num_gpus_per_node / actor_num_nodes / actor_num_gpus_per_node /
+    # rollout_num_gpus (None means derived or unset); hardware ("auto" is resolved to a concrete
+    # GPU type); directory fields; num_rollout, rollout_batch_size, n_samples_per_prompt,
+    # global_batch_size; no_save (skip checkpoint saving); rollout_mxfp8 / rollout_fp8 /
+    # train_mxfp8 / fp8_param_gather (precision options; fp8_param_gather is not implemented);
+    # enable_mis and tis_use_rs (train/inference mismatch correction and its rejection-sampling flag).
     mode: Literal["normal", "debug_minimal"] = "normal"
     run_id: str = command_utils.create_run_id()
     model_org: str = "deepseek-ai"
@@ -48,6 +69,12 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     tis_use_rs: bool = True
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Resolves the hardware type (auto-detected when "auto") and fills GPUs per node from a
+        # per-hardware table when unset. With use_single_node, forces one actor node and gives half
+        # of the node's GPUs to training and half to rollout (integer division).
+        # Raises assertion errors if both fp8 and mxfp8 rollout are requested, or if MXFP8 rollout or
+        # training is requested on H100/H200 hardware (no native MXFP8).
         self.hardware = command_utils.resolve_hardware(self)
         self.num_gpus_per_node = self.num_gpus_per_node or command_utils.NUM_GPUS_OF_HARDWARE[self.hardware]
         if self.use_single_node:
@@ -62,6 +89,9 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
 
 def _prepare_download(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Creates model and data directories, downloads the Hugging Face model
+    # (into the model directory, using a "-bf16" suffixed folder when from_bf16_ckpt is set, else
+    # the plain model name), then downloads the DAPO math and AIME 2024 datasets. Runs shell commands.
     U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.model_dir} {args.data_dir}")
     if args.from_bf16_ckpt:
@@ -77,6 +107,8 @@ def _prepare_download(args: ScriptArgs):
 
 
 def _prepare_bf16_ckpt(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Unless the checkpoint was downloaded as bf16, casts the fp8 model to
+    # bf16 into a "-bf16" folder under the model directory. No-op when from_bf16_ckpt is set.
     U = args.create_backend()
     if not args.from_bf16_ckpt:
         U.fp8_cast_bf16(
@@ -86,6 +118,10 @@ def _prepare_bf16_ckpt(args: ScriptArgs):
 
 
 def _prepare_mxfp8_ckpt(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Only when rollout_mxfp8 is set, runs the Hugging Face to MXFP8 conversion
+    # tool on the bf16 checkpoint, saving to a "-MXFP8" folder. If the user extra args do not already
+    # name the high-precision layers option, appends the default list of Hugging Face layer-name
+    # fragments to keep in high precision. Runs the tool as a GPU command.
     U = args.create_backend()
     if args.rollout_mxfp8:
         extra_args = args.extra_args
@@ -101,6 +137,9 @@ def _prepare_mxfp8_ckpt(args: ScriptArgs):
 
 
 def _prepare_fp8_ckpt(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Only when rollout_fp8 is set, runs the Hugging Face to FP8 conversion tool
+    # on the bf16 checkpoint with block quantization (block size 128 by 128), saving to a "-FP8"
+    # folder under the model directory. Runs as a GPU command.
     """Convert BF16 checkpoint to block-quant FP8 (for sglang rollout, no MXFP8)."""
     U = args.create_backend()
     if args.rollout_fp8:
@@ -113,6 +152,11 @@ def _prepare_fp8_ckpt(args: ScriptArgs):
 
 
 def _prepare_megatron_ckpt(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Converts the bf16 checkpoint to a Megatron distributed checkpoint in the
+    # model directory (shared folder so multi-node training can read it). Single-node mode converts
+    # on the actor GPUs with default parallelism. Otherwise runs a multi-node conversion on the actor
+    # nodes with tensor parallel 4, expert parallel 16, pipeline 6, last pipeline stage 13 layers,
+    # expert-tensor parallel 1.
 
     U = args.create_backend()
     if args.use_single_node:
@@ -152,6 +196,12 @@ def _prepare_megatron_ckpt(args: ScriptArgs):
 
 
 def _prepare_cmd(args: ScriptArgs) -> dict[str, str]:
+    # [FUNCTION DOC] HELPER: Returns the per-role pre-launch commands as a mapping. Empty in single-node
+    # mode. Otherwise the "trainer" entry joins two rsync copies (Megatron distributed checkpoint and
+    # the rollout Hugging Face checkpoint, whose name gets "-MXFP8" or "-FP8" suffix according to the
+    # rollout precision) from the model directory to the local model directory, run in sequence.
+    # KNOWN ISSUE: the rollout precision suffix is chosen from rollout flags only, so train_mxfp8
+    # without rollout_mxfp8 copies the plain name while the training function points at the MXFP8 one.
     if args.use_single_node:
         return {}
 
@@ -174,6 +224,29 @@ def _prepare_cmd(args: ScriptArgs) -> dict[str, str]:
 
 
 def _execute_train(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Builds the training argument string and submits the job.
+    # Checkpoint: hf checkpoint is the MXFP8 folder if either rollout or training MXFP8 is on, else
+    # FP8 folder if rollout fp8, else plain; reference load is the Megatron distributed folder; load
+    # path under the output directory; saving (every 20 steps, or 2 in debug mode) unless no_save.
+    # Rollout: DAPO math, deepscaler reward, shuffled, chat template, response length 100 (debug) or
+    # 8192, temperature 1, balanced data. Eval (only non-debug and enabled): AIME every 20 steps, 16
+    # samples, length 16384, top-p 1. Perf: full uniform recompute, dynamic batch size, 32768 tokens
+    # per GPU, padding multiple 4096, log-prob chunk 1024. GRPO with zero kl/entropy coefficients.
+    # Adam optimizer at 1e-6. Optimizer CPU offload with precision-aware optimizer is used except for
+    # MXFP8 training with fp8 param gather. MXFP8 training (Blackwell GPUs only) adds transformer-engine
+    # mxfp8 flags; with H100/H200 etc. the training MXFP8 block is skipped silently (no else).
+    # Parallelism by hardware (Blackwell and Hopper types accepted; anything else raises not
+    # implemented): single node uses tensor and expert parallel equal to actor GPUs per node;
+    # multi node uses tensor 2, pipeline 4, last stage 13 layers, expert 16. SGLang uses sparse
+    # attention backend, flashmla sparse decode and prefill, bf16 kv cache, page size 64, memory
+    # fraction 0.8, engine size 2 (single node) or 8 with data-parallel attention; MXFP8 rollout adds
+    # flashinfer backends and a precision config pseudo-file keeping some projections in bf16; the
+    # non-MXFP8 path picks the triton moe runner on H100/H200 else flashinfer. With enable_mis, adds
+    # a pseudo-file config with truncated token-level importance sampling and a custom weight function.
+    # Environment variables set force MLA for sparse attention, disable prefill dense threshold and
+    # disable NVSHMEM over NCCL. Submits via the backend with the per-role copy commands.
+    # Raises not implemented error for fp8 param gather and for unsupported hardware.
+    # KNOWN ISSUE: the lines after the fp8 param gather raise (extra flags) are unreachable dead code.
     U = args.create_backend()
     ref_load_path = f"{args.model_dir}/{args.model_name}_torch_dist"
     load_save_path = f"{args.output_dir}/{args.run_id}/checkpoints"
@@ -459,6 +532,8 @@ tis_batch_normalize: true
 @app.command()
 @command_utils.dataclass_cli
 def full_train(args: ScriptArgs):
+    # [FUNCTION DOC] Command "full-train": download, bf16 cast, MXFP8 conversion, FP8 conversion,
+    # Megatron conversion, then training, in order (conversions that are not requested are no-ops).
     """Full pipeline: download, cast, convert, copy, train."""
     _prepare_download(args)
     _prepare_bf16_ckpt(args)
@@ -471,6 +546,7 @@ def full_train(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Command "prepare": same preparation steps as full-train but without training.
     """Download model/data and convert to Megatron checkpoints (run on head node)."""
     _prepare_download(args)
     _prepare_bf16_ckpt(args)
@@ -482,18 +558,21 @@ def prepare(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def prepare_megatron_ckpt(args: ScriptArgs):
+    # [FUNCTION DOC] Command "prepare-megatron-ckpt": only the bf16-to-Megatron checkpoint conversion.
     _prepare_megatron_ckpt(args)
 
 
 @app.command()
 @command_utils.dataclass_cli
 def train(args: ScriptArgs):
+    # [FUNCTION DOC] Command "train": runs training only; assumes all preparation has been done.
     """Run training only (assumes prepare is done)."""
     _execute_train(args)
 
 
 @app.callback()
 def _callback() -> None:
+    # [FUNCTION DOC] HELPER: Empty typer callback so commands stay sub-commands. Does nothing.
     pass
 
 

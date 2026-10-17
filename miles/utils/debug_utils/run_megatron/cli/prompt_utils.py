@@ -1,3 +1,7 @@
+# [MODULE DOC] Produces the prompt token ids fed to the standalone Megatron worker: builds raw text
+# (deterministic arithmetic text, file contents or user text), optionally wraps it in a chat
+# template, tokenizes it with the checkpoint's tokenizer, truncates to the sequence length, and
+# writes the ids to a temporary json file for the worker to read.
 from __future__ import annotations
 
 import dataclasses
@@ -9,6 +13,9 @@ from typing import Literal
 
 @dataclasses.dataclass(frozen=True)
 class PromptConfig:
+    # [CLASS DOC] Immutable prompt options: mode (math, file or text; default math), text (used in
+    # text mode), file (used in file mode), seq_length (number of tokens wanted, default 137) and
+    # apply_chat_template (wrap the text as a single user message, default off).
     mode: Literal["math", "file", "text"] = "math"
     text: str | None = None
     file: Path | None = None
@@ -21,6 +28,15 @@ def generate_token_ids(
     prompt: PromptConfig,
     tokenizer_path: Path,
 ) -> list[int]:
+    # [FUNCTION DOC] Keyword-only inputs: prompt options and tokenizer location. Resolves the raw
+    # text per mode (may raise a value error for a missing file/text or unknown mode), loads the
+    # tokenizer with remote code trusted (imports the tokenizer loader and transformers lazily),
+    # optionally renders the text as one user message through the chat template without
+    # tokenizing, then encodes with the tokenizer's default settings (special tokens added by
+    # default). Raises a value error if fewer tokens than the sequence length result; otherwise
+    # returns the first seq_length token ids.
+    # KNOWN ISSUE: the docstring says math mode is "padded/truncated", but no padding happens;
+    # short results raise an error and longer ones are truncated.
     """Generate token IDs for Megatron standalone forward/backward.
 
     Three modes:
@@ -55,12 +71,18 @@ def generate_token_ids(
 
 
 def write_token_ids_to_tmpfile(token_ids: list[int]) -> Path:
+    # [FUNCTION DOC] Writes the ids as a json array to a new temporary file (name prefix
+    # run_megatron_token_ids_, suffix .json) in the system temp directory, which is not deleted
+    # automatically (side effect: leaves a file). Returns its path.
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, prefix="run_megatron_token_ids_") as tmp:
         json.dump(token_ids, tmp)
     return Path(tmp.name)
 
 
 def _resolve_raw_text(prompt: PromptConfig) -> str:
+    # [FUNCTION DOC] HELPER: Math mode: the arithmetic text sized to sixteen characters per wanted
+    # token. File mode: the file's full text (value error if no file given). Text mode: the given
+    # text (value error if none). Any other mode raises a value error.
     if prompt.mode == "math":
         return _build_math_sequence(target_char_length=prompt.seq_length * 16)
     elif prompt.mode == "file":
@@ -76,6 +98,10 @@ def _resolve_raw_text(prompt: PromptConfig) -> str:
 
 
 def _build_math_sequence(target_char_length: int) -> str:
+    # [FUNCTION DOC] HELPER: Appends segments of the form "a+b=sum, " starting at a=1, b=1; b
+    # increases by one each time and, after passing 100, wraps to 1 while a increases by one.
+    # Stops once the total length reaches the target (the last segment may overshoot) and returns
+    # the concatenation.
     """Build "1+1=2, 1+2=3, ..." until reaching target_char_length characters."""
     parts: list[str] = []
     total_len: int = 0

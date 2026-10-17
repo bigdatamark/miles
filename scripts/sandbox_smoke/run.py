@@ -1,3 +1,10 @@
+# [MODULE DOC] Command-line driver for a smoke test of one combination of connector (harbor or
+# openenv), sandbox backend, agent and benchmark against the real sandbox platform. Holds a
+# benchmark table (currently only Terminal-Bench-2 with a lazily cloned task checkout), a connector
+# table mapping names to runner functions, and a main function that runs one trial, prints the
+# result and returns a process exit code: zero when the trial scored a perfect reward and
+# reported a submitted exit status, one otherwise. The special agent name "golden" means run the
+# task's own reference solution and needs no model endpoint.
 """Golden smoke of one (connector, backend, agent, benchmark) combination on the real sandbox API.
 
 PASS iff the verifier returns reward 1.0. What a run proves, the axes,
@@ -27,6 +34,9 @@ GOLDEN = "golden"
 
 @dataclass(frozen=True)
 class Benchmark:
+    # [CLASS DOC] Immutable description of a benchmark: a zero-argument callable returning the
+    # directory that holds its task folders (resolved lazily because it may fetch on first use),
+    # and the name of the task instance used by default for a smoke run.
     tasks_dir: Callable[[], Path]  # resolved lazily: may fetch on first use
     smoke_task: str  # the instance a smoke run uses when --task is not given
 
@@ -35,6 +45,14 @@ _TB2_REPO = "https://github.com/laude-institute/terminal-bench-2.git"
 
 
 def _tb2_tasks_dir() -> Path:
+    # [FUNCTION DOC] HELPER: Returns the Terminal-Bench-2 tasks directory. If the TB2_TASKS_DIR
+    # environment variable is set and non-blank (after trimming) it is returned as is, unchecked.
+    # Otherwise uses a cache directory under the user's home cache folder; if the cache does not
+    # contain the sentinel task folder, prints a message, creates the parent directory, removes any
+    # leftovers at the cache and scratch paths, makes a depth-1 git clone of the public repository
+    # into a scratch sibling directory (subprocess; network; raises on failure via the check flag),
+    # and renames it into place so an interrupted clone never leaves a half cache. Returns the
+    # cache path.
     """A Terminal-Bench-2 checkout: TB2_TASKS_DIR if set, else a cached shallow clone.
 
     TB2 task directories are native Harbor tasks (instruction.md, task.toml
@@ -65,6 +83,16 @@ BENCHMARKS: dict[str, Benchmark] = {
 
 
 async def _run_harbor(tasks_dir: Path, task: str, *, backend: str, agent: str, base_url: str) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Async connector that runs one harbor trial. Inputs: tasks directory,
+    # task instance name, sandbox backend name, agent name, and the model endpoint base url.
+    # Output: the result mapping returned by the harbor agent function's run entry (expected to
+    # carry reward and exit status). Side effects: prepends the repo root and the harbor example
+    # directory to the import path; imports harbor and the example agent module (raising a system
+    # exit with an explanatory message pointing at the readme if either import fails); maps the
+    # golden agent name to harbor's solution-executing agent named oracle; sets the tasks-dir and
+    # environment-type environment variables, and the trial timeout variable to 1200 seconds only
+    # if not already set. The call passes an empty prompt and empty request kwargs, and metadata
+    # with the instance id and agent name.
     """One trial through examples/experimental/harbor/harbor_agent_function."""
     sys.path.insert(0, str(REPO))  # for miles.rollout.agentic; no PYTHONPATH needed
     sys.path.insert(0, str(REPO / "examples" / "experimental" / "harbor"))
@@ -90,6 +118,10 @@ async def _run_harbor(tasks_dir: Path, task: str, *, backend: str, agent: str, b
 
 
 def _run_openenv(tasks_dir: Path, task: str, *, backend: str, agent: str, base_url: str) -> Any:
+    # [FUNCTION DOC] HELPER: Placeholder connector for openenv with the same signature as the
+    # harbor runner. Always raises a not-implemented error (the golden episode lives elsewhere).
+    # KNOWN ISSUE: unlike the harbor runner this one is a plain function, not a coroutine, so main
+    # would fail if it ever returned a value; today it raises before that, so the odd shape is hidden.
     raise NotImplementedError(
         "the openenv connector is not wired into this driver yet; its golden episode "
         "lives in examples/experimental/openenv/scan_golden.py until then"
@@ -104,6 +136,14 @@ CONNECTORS: dict[str, Callable[..., Any]] = {
 
 
 def main(argv: list[str] | None = None) -> int:
+    # [FUNCTION DOC] Parses arguments (the given list, or the process arguments when none) and runs
+    # one smoke trial. Options: connector (required), backend (required), agent (default golden),
+    # benchmark (default tb2), base url (required for any non-golden agent, else a placeholder
+    # invalid URL is used), optional task override and tasks-dir override. Reports a usage error
+    # (exit by the parser) when a real agent has no base url. Prints a header line, runs the
+    # selected connector inside a fresh event loop, prints the result, then decides: PASS (returns
+    # 0) only if the reward is exactly 1.0 and the exit status equals Submitted, else prints FAIL
+    # with details and returns 1. A missing reward counts as 0.0.
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--connector", required=True, choices=sorted(CONNECTORS))
     parser.add_argument(

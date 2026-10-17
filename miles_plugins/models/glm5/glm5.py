@@ -1,3 +1,13 @@
+# [MODULE DOC] In-repo implementation of deepseek-sparse multi-latent attention (as used by GLM-5 and
+# DeepSeek-V3.2) on packed (THD) sequences for Megatron. Contains: layer-number helpers for optional
+# cross-layer sharing of top-k picks (only some "computing" layers run the indexer; "skip" layers reuse
+# the latest computing layer's picks via a per-microbatch holder attached to the packed sequence
+# parameters); a submodule spec dataclass including the indexer projections; the attention base class
+# (rotary setup, output projection, sharing bookkeeping, forward that computes absorbed queries /
+# keys, indexer top-k selection and sparse attention); the self-attention subclass that builds the
+# projections and implements the query/key/value/indexer computation; and the spec builder that
+# reads indexer settings from the Hugging Face config and validates pipeline splits. Context
+# parallelism is handled by gathering keys and slicing queries.
 import copy
 import math
 from dataclasses import dataclass
@@ -35,6 +45,8 @@ _INDEXER_SUBMODULE_NAMES = ("wq_b", "wk", "k_norm", "weights_proj")
 
 
 def is_skip_topk_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> bool:
+    # [FUNCTION DOC] HELPER: Pure arithmetic: true when max(layer number minus offset, 0) is not a
+    # multiple of the frequency (layer numbers are one-based).
     """Whether the (1-indexed) Megatron ``layer_number`` reuses a previous layer's top-k.
 
     Mirrors ``glm-train-prod``'s ``_get_skip_topk_flags``: a layer *computes* its
@@ -45,6 +57,10 @@ def is_skip_topk_layer(layer_number: int, skip_topk_offset: int, topk_freq: int)
 
 
 def source_compute_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> int:
+    # [FUNCTION DOC] HELPER: Walks downward from the given layer number until reaching a layer that is
+    # not a skip layer, and returns it. With a skip layer that has no computing layer below, the walk
+    # would continue to non-positive numbers; layer numbers at or below the offset are always
+    # computing, so it terminates.
     """The computing layer whose ``topk_indices`` a skip layer reuses."""
     layer = layer_number
     while is_skip_topk_layer(layer, skip_topk_offset, topk_freq):
@@ -54,6 +70,9 @@ def source_compute_layer(layer_number: int, skip_topk_offset: int, topk_freq: in
 
 @dataclass
 class DSASelfAttentionSubmodules:
+    # [CLASS DOC] HELPER: Dataclass of module specs (all default none) for the attention layer: the
+    # standard multi-latent-attention projections, norms, core attention and output projection, plus
+    # four indexer pieces: query up projection, key projection, key norm, and per-head weight projection.
     """Submodules for the MLA self-attention layer."""
 
     linear_q_down_proj: ModuleSpec | type = None
@@ -73,6 +92,11 @@ class DSASelfAttentionSubmodules:
 
 
 class DSAMultiLatentAttention(Attention):
+    # [CLASS DOC] Base attention class. Builds rotary embedding (plain or yarn), the output projection,
+    # and the sharing schedule; its forward runs absorbed-query sparse attention over packed sequences
+    # using top-k picks from the indexer (computed here or reused from an earlier layer). Subclass
+    # supplies the tensor computation and the remaining projections. The core-attention submodule is
+    # not built here.
     """Multi-Latent Attention layer abstract class.
 
     This layer only contains common modules required for the "self attn" and
@@ -93,6 +117,19 @@ class DSAMultiLatentAttention(Attention):
         pg_collection=None,
         name: str | None = None,
     ) -> None:
+        # [FUNCTION DOC] Calls the Megatron base constructor, then sets: query projection size
+        # (value head dim times heads), query head dim (nope plus rope dims), key/value hidden sizes,
+        # whether up-projection recompute is on (selective recompute with the mla up projection module),
+        # the softmax scale (yarn mscale squared over the square root of query head dim), a rotary
+        # embedding by the config's rope type (plain or yarn; anything else raises a value error), and
+        # the row-parallel output projection (skip bias add). The number of selected keys is fixed at
+        # 2048, the top-k backend must be torch or flashinfer (value error otherwise), and the module is
+        # registered with the indexer replay manager using layer number minus one as stream index.
+        # Sharing: frequency (default 1) and skip offset (default 0) read from config, sharing enabled
+        # when frequency is above one, skip flag from the layer helper, and the source computing layer
+        # (own layer number when sharing is off). Unused arguments: is_mtp_layer, model_comm_pgs.
+        # KNOWN ISSUE: the top-k count is hard coded to 2048 rather than read from the config (the
+        # Hugging Face index top-k value is not used on this path).
 
         super().__init__(
             config=config,
@@ -209,6 +246,26 @@ class DSAMultiLatentAttention(Attention):
         router_token_masks=None,
         loss_mask=None,
     ):
+        # [FUNCTION DOC] Input hidden states (sequence, batch, hidden); packed sequence parameters are
+        # required in practice (cumulative lengths are read). Asserts no external rotary embedding,
+        # attention bias, or flash-decoding cos/sin are passed; other arguments are ignored. Steps:
+        # (1) get absorbed query, shared key, value up-projection weights, and the indexer query, key,
+        # per-head weights from the subclass. (2) Choose top-k picks. A nested helper scores queries in
+        # blocks of 8192 (whole sequence when replay is enabled, since replay records one tensor per
+        # layer), calling the indexer kernel with start/end key bounds as 32-bit integers and the
+        # replay-wrapped top-k function; it also computes softmax of the selected scores, but only the
+        # picks are used afterwards; returns scores and picks with a head axis inserted. With sharing
+        # enabled: fetch or create the per-microbatch holder dictionary on the packed sequence
+        # parameters object; a skip layer reads its source layer's picks (raises an assertion error with
+        # a descriptive message if absent, e.g. across pipeline stages); a computing layer computes
+        # causal key ranges from the cumulative query lengths, scatters the ranges across the context
+        # parallel group, squeezes the key's head axis, selects top-k, and stores picks in the holder
+        # under its layer number. Without sharing every layer computes picks the same way. (3) Sparse
+        # attention over the absorbed latent dimension (kv lora rank as value dim) with the picks and
+        # the softmax scale, then expands through the value up-projection by a per-head contraction and
+        # flattens heads. (4) If up-projection recompute is on, registers the output for recompute and
+        # clears the checkpoint handle (asserting it exists). (5) Output projection. Returns
+        # (output, bias).
         """Forward pass for multi-latent attention"""
         assert rotary_pos_emb is None, "Rotary position embeddings should not be passed into MLA."
         assert attention_bias is None, "Attention bias should not be passed into MLA."
@@ -232,6 +289,11 @@ class DSAMultiLatentAttention(Attention):
         )
 
         def fused_select_topk(index_q, index_k, w, starts, ends, block_size=8192):
+            # [FUNCTION DOC] HELPER: Processes queries in consecutive blocks (block size defaults to
+            # 8192; forced to the full length when replay is enabled), converting start/end bounds to
+            # 32-bit, calling the indexer kernel for each block, applying softmax to the returned
+            # selected scores, and concatenating over blocks. Returns (scores, picks) where picks get
+            # an inserted head axis at dim 1.
             seq_len = index_q.shape[0]
             # replay records one topk tensor per layer-forward; don't split it
             if indexer_replay_manager.enabled:
@@ -326,6 +388,11 @@ class DSAMultiLatentAttention(Attention):
 
 
 class DSAMLASelfAttention(DSAMultiLatentAttention):
+    # [CLASS DOC] Self-attention variant: builds the low-rank query down/up projections, the combined
+    # key/value down projection and its up projection (whose weights are absorbed into queries and the
+    # output), and the indexer (query, key, key layer norm, per-head weights). Down projections are
+    # duplicated across tensor parallel ranks. Skip layers in a sharing schedule drop their indexer
+    # modules.
     """MLA Self-attention layer class
 
     Self-attention layer takes input with size [s, b, h]
@@ -345,6 +412,19 @@ class DSAMLASelfAttention(DSAMultiLatentAttention):
         pg_collection=None,
         name: str | None = None,
     ):
+        # [FUNCTION DOC] Calls the base constructor with self attention. Builds, bias-free: query down
+        # projection (hidden to q lora rank) and key/value down projection (hidden to kv lora rank plus
+        # rope dim): for the Transformer-Engine plain linear they are set to the duplicated parallel
+        # mode, for column-parallel kinds output gather is off, and any other module kind raises a value
+        # error; query up projection (q lora rank to heads times query head dim) and key/value up
+        # projection (kv lora rank to heads times (nope plus value dims)), column parallel without
+        # gather; query and key/value layernorms. Indexer modules: query projection (q lora rank to
+        # index heads times index head dim, flagged to skip gathering), key projection (hidden to index
+        # head dim), key layer norm (temporarily forces the config normalization to layer norm,
+        # asserting it was RMS norm, with fixed epsilon 1e-6, then restores it), and weight projection
+        # (hidden to index heads, flagged to skip gathering); all indexer linears are duplicated. If
+        # this is a skip layer, deletes the four indexer modules so parameters match checkpoints.
+        # The loop variable reuses the name parameter name but only after it was consumed.
         super().__init__(
             config=config,
             submodules=submodules,
@@ -521,6 +601,32 @@ class DSAMLASelfAttention(DSAMultiLatentAttention):
         *,
         inference_params=None,
     ):
+        # [FUNCTION DOC] Computes the attention inputs for packed sequences. Requires a 3-dimensional
+        # hidden state and packed sequence parameters (assertions). Returns (query, key, value
+        # up-projection weight per head, index query, index key, head weights); the last three index
+        # items are none on skip layers. Steps: rotary table from the rotary module (packed mode).
+        # Down projections: query (squeezed) and key/value (gathered over the sequence-parallel group
+        # if enabled) split into the compressed latent and the rope part; the key/value layernorm
+        # module is applied (an identity in the standard spec). Query up projection to heads, split
+        # into nope and rope parts. The key/value up weight is split per head into key-nope and value
+        # parts; the query nope part is "absorbed" by contracting with the key-nope weights, giving
+        # queries in the latent space. The latent is RMS-normalized in float32 using the fused layernorm
+        # weight of the up projection (this is the real key/value norm), then rope part and latent are
+        # gathered across the context-parallel group. Rotary is applied with an inner helper (see
+        # below) to query rope (local) and key rope (gathered); query = absorbed nope plus rope, key =
+        # latent plus rope, both contiguous. Indexer (non-skip layers only, everything detached from the
+        # attention graph where noted): the normalized query latent is recomputed from the detached
+        # unnormalized latent with the up projection's fused norm weight (plus one if zero-centered
+        # gamma), then projected to index queries (gathered over sequence parallel if on); index keys
+        # come from the detached hidden states, layer-normalized in float32, cast to bfloat16, gathered
+        # over sequence parallel and context parallel, with a singleton head axis; head weights are
+        # computed in float32 with the router-gating function, scaled by heads to the minus half and
+        # index head dim to the minus half, then gathered over sequence parallel. Rotary on the indexer
+        # uses one of two layouts depending on the interleave flag: interleaved places rope dims last,
+        # otherwise first (the DeepSeek V3.2 convention, non-interleaved).
+        # The key_value_states, position_ids, inference context and inference params arguments are
+        # unused. The key/value layernorm module applied early is an identity in the standard spec; the
+        # real normalization happens later with the fused weight.
         """
         Derives `query`, `key` and `value` tensors from `hidden_states`.
         """
@@ -587,6 +693,13 @@ class DSAMLASelfAttention(DSAMultiLatentAttention):
         )
 
         def fuse_rope(q, cu_seqlens, gathered=False, interleaved=True):
+            # [FUNCTION DOC] HELPER: Applies rotary embedding on packed sequences with the apex fused
+            # kernel (imported lazily; import error if apex is missing) using the enclosing rotary
+            # table. If interleaved, first de-interleaves the channels: even-indexed channels followed
+            # by odd-indexed channels. If the input is already the full gathered sequence, applies
+            # directly. Otherwise (local context-parallel slice): repeats the tensor cp-size times along
+            # the sequence to span the global packed length, applies, and returns only this rank's
+            # slice. Returns the rotated tensor (de-interleaved layout when interleaving was requested).
             # worse precision than apex.
             # from megatron.core.extensions.transformer_engine import fused_apply_rotary_pos_emb_thd
             from apex.transformer.functional import fused_apply_rotary_pos_emb_thd
@@ -699,29 +812,42 @@ class DSAMLASelfAttention(DSAMultiLatentAttention):
         return query, key, w_vc, index_query, index_key, head_weights
 
     def get_query_key_value_tensors(self):
+        # [FUNCTION DOC] Placeholder that does nothing and returns nothing; the absorbed variant above
+        # is used instead.
         pass
 
     def backward_dw(self) -> NoReturn:
+        # [FUNCTION DOC] Triggers deferred weight-gradient computation for key/value, query and output
+        # projections in that order. Returns nothing.
+        # KNOWN ISSUE: annotated as never returning, but it returns normally.
         """Execute weight update operations"""
         self._backward_kv_proj()
         self._backward_q_proj()
         self._backward_output_proj()
 
     def _backward_kv_proj(self):
+        # [FUNCTION DOC] HELPER: Deferred weight-gradient step for the key/value up then down projection.
         """Update weights for KV projection layers"""
         self.linear_kv_up_proj.backward_dw()
         self.linear_kv_down_proj.backward_dw()
 
     def _backward_q_proj(self):
+        # [FUNCTION DOC] HELPER: Deferred weight-gradient step for the query down then up projection.
         """Update weights for Q projection layers"""
         self.linear_q_down_proj.backward_dw()
         self.linear_q_up_proj.backward_dw()
 
     def _backward_output_proj(self):
+        # [FUNCTION DOC] HELPER: Deferred weight-gradient step for the output projection.
         """Update weights for output projection layer"""
         self.linear_proj.backward_dw()
 
     def set_for_recompute_input_layernorm(self):
+        # [FUNCTION DOC] Prepares for fp8 recompute of the input layernorm: when a query lora rank is
+        # set, flags the query down projection, always flags the key/value down projection and the
+        # output projection, to save their original (pre-quantization) input. Raises a value error
+        # naming the required Transformer-Engine version if any of those modules lacks the attribute.
+        # Mutates module attributes.
         """Set the attention layer for recompute input_layernorm. Only needed for fp8."""
         if self.config.q_lora_rank is not None:
             if hasattr(self.linear_q_down_proj, "save_original_input"):
@@ -745,6 +871,17 @@ class DSAMLASelfAttention(DSAMultiLatentAttention):
 
 
 def get_glm5_spec(args, config, vp_stage):
+    # [FUNCTION DOC] Spec builder. Loads the Hugging Face config from the checkpoint path and writes
+    # onto the Megatron config: index head count, index head dim, interleave flag (default false), and
+    # sharing schedule (frequency default 1, skip offset default 0; falsy values become the defaults).
+    # Builds Megatron's decoder block spec with Transformer Engine (passing the virtual pipeline stage
+    # when given). With sharing on (frequency above one): for the first local layer of this stage,
+    # raises an assertion error with a descriptive message if it is a skip layer (since picks cannot
+    # cross pipeline boundaries). Then creates the attention module spec for the self-attention class
+    # with causal mask, the top-k backend from args, and submodules from the Transformer-Engine spec
+    # provider (identity ops for the layernorms and the unused value up projection; layernorm fused
+    # into the column-parallel up projections). Replaces the self-attention spec in a deep copy of each
+    # layer spec built for this stage and returns the block spec.
     hf_config = load_hf_config(args.hf_checkpoint)
     config.index_num_attention_heads = hf_config.index_n_heads
     config.index_head_dim = hf_config.index_head_dim

@@ -1,3 +1,6 @@
+# [MODULE DOC] Rule: within each inference-engine weight checksum event, every engine must report
+# exactly the same checksums as engine 0. Exposes only the check function.
+
 from collections.abc import Iterable
 
 from miles.utils.audit_utils.event_analyzer.rules.checksum_compare import ChecksumMismatchIssue, compare_flat_dicts
@@ -7,6 +10,8 @@ __all__ = ["check"]
 
 
 def check(events: list[Event]) -> list[ChecksumMismatchIssue]:
+    # [FUNCTION DOC] Walks the events in order, considers only inference-engine weight checksum
+    # events, and collects the mismatches of each one. Returns the combined list.
     """Check: all engines of one rollout must hold exactly the same weights."""
     issues: list[ChecksumMismatchIssue] = []
     for event in events:
@@ -16,6 +21,9 @@ def check(events: list[Event]) -> list[ChecksumMismatchIssue]:
 
 
 def _check_one_rollout(event: InferenceEngineWeightChecksumEvent) -> Iterable[ChecksumMismatchIssue]:
+    # [FUNCTION DOC] HELPER: Generator. Yields nothing if fewer than two engines are recorded.
+    # Otherwise diffs engine 0's checksum mapping against each later engine's, labelling sides
+    # "rollout_<id>/engine_<n>".
     engines = event.engine_checksums
     if len(engines) < 2:
         return

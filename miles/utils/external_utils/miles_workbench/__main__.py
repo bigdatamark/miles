@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Command line interface of the workbench (run as a module). Defines a typer application with the
+# commands install, exec, stop, uninstall and collect-diagnosis; each command builds a typed
+# arguments model and calls the matching action. The namespace and release options reject empty
+# values. The main function configures message-only logging to standard error and runs the app.
 from __future__ import annotations
 
 import logging
@@ -26,6 +31,8 @@ app = typer.Typer(
 
 
 def _non_empty(value: str) -> str:
+    # [FUNCTION DOC] HELPER: Option callback that raises a bad-parameter error for an empty string
+    # (usually a dangling flag) and otherwise returns the value unchanged.
     if not value:
         raise typer.BadParameter("names a kubernetes object, so an empty value can only be a dangling flag")
     return value
@@ -49,6 +56,11 @@ def install_command(
     skip_preflight: Annotated[bool, typer.Option(help="Install without checking permissions first")] = False,
     timeout: Annotated[int, typer.Option(help="Seconds to wait for the workbench pod to become ready")] = 600,
 ) -> None:
+    # [FUNCTION DOC] Install command. Options: namespace (required), release (default workbench),
+    # rbac and lws toggles (default on), dry run (default off), repeatable values files and raw
+    # helm set overrides (stored as tuples, empty if absent), skip-preflight (default off) and a
+    # readiness timeout in seconds (default 600). Builds the install arguments and runs the install
+    # action.
     args = InstallArgs(
         namespace=namespace,
         release=release,
@@ -73,6 +85,8 @@ def exec_command(
     release: Release = DEFAULT_RELEASE,
     command: Annotated[list[str] | None, typer.Argument(help="Command to run, bash by default")] = None,
 ) -> None:
+    # [FUNCTION DOC] Exec command: runs the optional trailing command (default bash) inside the
+    # workbench pod of the release; unknown options are passed through as part of the command.
     args = ExecArgs(namespace=namespace, release=release, command=tuple(command or ()))
     exec_shell(args)
 
@@ -88,11 +102,15 @@ def stop_command(
         str | None, typer.Option(help="Which instance of that deployment to stop, when it was deployed in instances")
     ] = None,
 ) -> None:
+    # [FUNCTION DOC] Stop command: uninstalls the release of one run. The release name is derived
+    # from the run id, deploy component (default all) and optional deploy instance id.
     uninstall(ReleaseArgs(namespace=namespace, release=run_release_name(run_id, deploy_component, deploy_instance_id)))
 
 
 @app.command(name="uninstall", help="helm uninstall the release, keeping the namespace")
 def uninstall_command(namespace: Namespace, release: Release = DEFAULT_RELEASE) -> None:
+    # [FUNCTION DOC] Uninstall command: removes the helm release (default workbench), keeping the
+    # namespace.
     uninstall(ReleaseArgs(namespace=namespace, release=release))
 
 
@@ -102,11 +120,16 @@ def diagnosis_command(
     output_dir: Annotated[Path | None, typer.Option(help="Directory the diagnosis directory is created in")] = None,
     run_dir: Annotated[Path | None, typer.Option(help="Run directory whose latest verdict to copy")] = None,
 ) -> None:
+    # [FUNCTION DOC] Collect-diagnosis command: gathers pod logs, descriptions and events of the
+    # namespace into a new directory under the output directory (default current working
+    # directory); an optional run directory selects which run's latest verdict is copied.
     args = DiagnosisArgs(namespace=namespace, output_dir=output_dir or Path.cwd(), run_dir=run_dir)
     collect_diagnosis_command(args)
 
 
 def main() -> None:
+    # [FUNCTION DOC] Configures root logging at info level, message text only, to standard error
+    # (forcing replacement of existing handlers), then runs the command line app.
     logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr, force=True)
     app()
 

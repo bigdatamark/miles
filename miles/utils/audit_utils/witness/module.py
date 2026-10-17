@@ -1,3 +1,11 @@
+# [MODULE DOC] Megatron-side witness implementation. A witness is a small embedding table (one
+# scalar row per witness id) that is added to hidden states with a numerically zero forward and a
+# gradient that flows to the embedding rows whenever the associated sample takes part in
+# backward. After a train step, rows whose weight became nonzero reveal which samples' data was
+# consumed. Each model chunk gets a head and a tail witness. This module installs the witnesses,
+# logs their nonzero rows as events, and clears stale rows in both the parameter and the
+# distributed optimizer state (main weights and Adam moments). Requires Megatron and torch.
+
 import logging
 from collections.abc import Sequence
 from types import SimpleNamespace
@@ -29,6 +37,10 @@ def install_witness(
     buffer_size: int,
     sequence_parallel: bool = False,
 ) -> None:
+    # [FUNCTION DOC] Attaches two witness modules to the model as attributes named
+    # local_head_witness and local_tail_witness, each a fresh witness table with the given buffer
+    # size and sequence-parallel flag (keyword-only, default false). Mutates the model (they
+    # become registered submodules and parameters).
     model.local_head_witness = _DataWitness(buffer_size=buffer_size, sequence_parallel=sequence_parallel)
     model.local_tail_witness = _DataWitness(buffer_size=buffer_size, sequence_parallel=sequence_parallel)
 
@@ -39,6 +51,13 @@ def witness_dump_and_clear_stale(
     witness_info: WitnessInfo,
     optimizer: torch.optim.Optimizer,
 ) -> None:
+    # [FUNCTION DOC] Keyword-only inputs: the list of model chunks, the allocation info (uses only
+    # its stale ids) and the optimizer. For each chunk, unwraps to the module owning the witnesses
+    # (asserts both witness attributes exist) and logs a snapshot event per witness with instance
+    # id "pp<pipeline rank>_chunk<index>." plus the attribute name with its witness suffix
+    # removed (so "local_head" or "local_tail"). Afterwards clears the stale rows in every
+    # witness, including optimizer state. Side effects: event log writes, in-place parameter and
+    # optimizer state mutation.
     """Log nonzero witness param rows, then clear stale ring buffer entries."""
     pp_rank = get_parallel_state().pp.rank
 
@@ -62,12 +81,17 @@ def witness_dump_and_clear_stale(
 
 
 class _DataWitness(nn.Module):
+    # [CLASS DOC] HELPER: Module owning one embedding table with buffer-size rows of dimension 1,
+    # initialized to zeros and tagged as a witness parameter via an attribute on the weight. Its
+    # forward adds a numerically zero but differentiable term to hidden states.
     def __init__(
         self,
         buffer_size: int,
         *,
         sequence_parallel: bool = False,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Stores the buffer size and sequence-parallel flag, creates the
+        # zero-initialized embedding and marks its weight with the witness-parameter flag.
         super().__init__()
         self.buffer_size = buffer_size
         self._sequence_parallel = sequence_parallel
@@ -76,6 +100,14 @@ class _DataWitness(nn.Module):
         nn.init.zeros_(self.witness.weight)
 
     def forward(self, witness_ids: Tensor, hidden_states: Tensor) -> Tensor:
+        # [FUNCTION DOC] Inputs: integer witness ids shaped batch by sequence, and hidden states
+        # shaped sequence by batch by hidden (sequence-first, Megatron layout). Looks up the
+        # embedding (batch, sequence, 1), subtracts its detached copy so the value is bitwise
+        # zero while the gradient with respect to the embedding is kept, transposes to sequence
+        # first, and when sequence parallelism is on scatters along the sequence to this rank's
+        # slice. Returns the hidden states with this term broadcast-added over the hidden
+        # dimension by the custom absolute-gradient add. The output equals the hidden states
+        # numerically.
         w = self.witness(witness_ids)  # [b, s, 1]
         out = w - w.detach()  # forward: bitwise 0, backward: d/dw = I
 
@@ -86,6 +118,12 @@ class _DataWitness(nn.Module):
         return _abs_broadcast_add(hidden_states, out)
 
     def sharded_state_dict(self, prefix: str = "", sharded_offsets: tuple = (), metadata: object = None) -> dict:
+        # [FUNCTION DOC] Megatron distributed-checkpoint hook. Builds the sharded state mapping by
+        # delegating to Megatron's default helper, but with the prefix stripped of trailing dots
+        # and suffixed with "_pp<pipeline rank>." so each pipeline stage gets a unique key. A
+        # simple namespace wrapping this module's plain state-dict function is passed so the
+        # default helper does not call back into this method. The tensor-parallel group comes from
+        # the parallel state. Returns the sharded state mapping.
         pp_rank = get_parallel_state().pp.rank
         # Embed PP rank in the checkpoint key so each pipeline stage has a unique
         # key (e.g. local_head_witness_pp0.witness.weight vs _pp1.witness.weight).
@@ -106,10 +144,13 @@ class _DataWitness(nn.Module):
 
 
 def _abs_broadcast_add(hidden_states: Tensor, addend: Tensor) -> Tensor:
+    # [FUNCTION DOC] HELPER: Applies the custom autograd function that broadcast-adds the addend
+    # to the hidden states.
     return _AbsBroadcastAdd.apply(hidden_states, addend)
 
 
 class _AbsBroadcastAdd(torch.autograd.Function):
+    # [CLASS DOC] HELPER: Custom autograd function; see docstring for the gradient rule.
     """Broadcast-add a low-dim addend to a high-dim tensor, using abs-reduced gradient for the addend.
 
     Forward: ``hidden_states + addend`` (standard broadcast).
@@ -124,6 +165,8 @@ class _AbsBroadcastAdd(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx: torch.autograd.function.FunctionCtx, hidden_states: Tensor, addend: Tensor) -> Tensor:
+        # [FUNCTION DOC] Asserts the addend's last dimension is 1 and that all leading dimensions
+        # of both tensors match. Returns the broadcast sum. Saves nothing on the context.
         assert addend.shape[-1] == 1, f"addend last dim must be 1, got {addend.shape}"
         assert hidden_states.shape[:-1] == addend.shape[:-1], (
             f"hidden_states and addend must match on all dims except last, "
@@ -133,6 +176,9 @@ class _AbsBroadcastAdd(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: torch.autograd.function.FunctionCtx, grad: Tensor) -> tuple[Tensor, Tensor]:
+        # [FUNCTION DOC] Returns the incoming gradient unchanged for the hidden states, and for
+        # the addend the sum of absolute values of the gradient over the last dimension (kept as a
+        # dimension of size one), so mixed-sign gradients cannot cancel to zero.
         grad_addend = grad.abs().sum(dim=-1, keepdim=True)
         return grad, grad_addend
 
@@ -146,10 +192,15 @@ _WITNESS_ATTRS = ("local_head_witness", "local_tail_witness")
 
 
 def _has_any_witness(module: nn.Module) -> bool:
+    # [FUNCTION DOC] HELPER: True if the module has at least one of the two witness attributes.
     return any(hasattr(module, attr) for attr in _WITNESS_ATTRS)
 
 
 def _unwrap_to_witness_owner(chunk: nn.Module) -> nn.Module:
+    # [FUNCTION DOC] HELPER: Starts at the chunk's wrapped module (so the chunk must have one) and
+    # keeps descending through successive wrapped-module attributes until a module with a witness
+    # attribute is found or there is no further wrapped module. Returns the last module reached,
+    # which may lack witnesses; callers assert.
     """Navigate through wrapping layers (DDP → Float16Module → GPTModel) to find the module with witness attrs."""
     inner = chunk.module
     while not _has_any_witness(inner) and hasattr(inner, "module"):
@@ -163,6 +214,9 @@ def _clear_witness_stale_rows(
     stale_ids: list[int],
     optimizer: torch.optim.Optimizer,
 ) -> None:
+    # [FUNCTION DOC] HELPER: No-op when there are no stale ids. Otherwise, for every witness in
+    # every chunk, builds a long tensor of the stale ids on the witness weight's device and zeroes
+    # those rows in the parameter and optimizer state.
     if not stale_ids:
         return
 
@@ -173,6 +227,8 @@ def _clear_witness_stale_rows(
 
 
 def _get_all_witnesses_in_model(model_chunks: Sequence[nn.Module]) -> list[_DataWitness]:
+    # [FUNCTION DOC] HELPER: Collects the head and tail witness of each chunk (after unwrapping),
+    # chunk by chunk, asserting each attribute exists. Returns the flat list.
     witnesses: list[_DataWitness] = []
     for chunk in model_chunks:
         inner = _unwrap_to_witness_owner(chunk)
@@ -183,6 +239,9 @@ def _get_all_witnesses_in_model(model_chunks: Sequence[nn.Module]) -> list[_Data
 
 
 def _zero_witness_rows(*, witness: _DataWitness, idx: Tensor, optimizer: torch.optim.Optimizer) -> None:
+    # [FUNCTION DOC] HELPER: Zeroes the given rows of the witness weight in place, then for every
+    # inner optimizer (a chained optimizer is expanded) asserts it is a distributed optimizer
+    # (otherwise unsupported) and zeroes the matching rows in its state.
     model_weight = witness.witness.weight
     model_weight.data[idx] = 0.0
 
@@ -195,12 +254,25 @@ def _zero_witness_rows(*, witness: _DataWitness, idx: Tensor, optimizer: torch.o
 
 
 def _iter_inner_optimizers(optimizer: torch.optim.Optimizer) -> list[torch.optim.Optimizer]:
+    # [FUNCTION DOC] HELPER: Returns a list of the chained optimizers when given a chained
+    # optimizer, else a one-element list with the optimizer itself. (Despite the iter name it
+    # returns a list.)
     if isinstance(optimizer, ChainedOptimizer):
         return list(optimizer.chained_optimizers)
     return [optimizer]
 
 
 def _zero_rows_in_distributed_optimizer(*, optimizer: DistributedOptimizer, model_param: Tensor, idx: Tensor) -> None:
+    # [FUNCTION DOC] HELPER: Zeroes the given witness rows in one distributed optimizer's fp32 main
+    # weights and Adam first/second moments. Asserts: precision-aware optimizer mode is off,
+    # CPU offload is off, and the optimizer kind is Adam. Returns silently if this optimizer or
+    # rank owns no shard of the parameter. Asserts the parameter's last dimension is 1, which
+    # makes flat shard offsets equal row ids. Finds this rank's flat range of the parameter,
+    # keeps only the ids falling inside it (converted to shard-local offsets) and returns if none.
+    # Locates the main shard through the group index map and asserts its size equals the range
+    # size, then zeroes the local rows. If the optimizer has no state entry for the shard: asserts
+    # the whole state is empty (never stepped) and returns; otherwise zeroes the exp_avg and
+    # exp_avg_sq rows, asserting those keys exist.
     assert not optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
     assert not optimizer.config.optimizer_cpu_offload, "HybridDeviceOptimizer state layout is not supported"
     assert optimizer.config.optimizer == "adam", f"unsupported optimizer kernel: {optimizer.config.optimizer}"
@@ -240,6 +312,12 @@ def _record_and_log_witness_param(
     instance_id: str,
     stale_ids: list[int],
 ) -> None:
+    # [FUNCTION DOC] HELPER: Finds the rows that are nonzero in the witness weight and logs them.
+    # Uses the optimizer's fp32 main parameter when the weight has one attached, otherwise the
+    # weight itself. The nonzero row ids are the indices of nonzero entries after dropping the
+    # trailing dimension. Logs a witness snapshot event with the instance id, those ids and the
+    # given stale ids through the global event logger (raises if not initialized), with console
+    # printing disabled.
     model_weight = witness.witness.weight
     main_param = getattr(model_weight, "main_param", None)
     check_weight = main_param.data if main_param is not None else model_weight.data

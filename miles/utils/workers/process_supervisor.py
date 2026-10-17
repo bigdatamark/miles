@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Container init-style supervisor, run as a module with a command line: starts several copies of
+# one command (using torch elastic's multiprocessing launcher), gives each its index through an
+# environment variable, ties their lifetimes together (first failure tears down all others and
+# determines the exit code), and forwards termination signals to them. Usage is the options, then
+# a double-dash separator, then the supervised command.
 from __future__ import annotations
 
 import argparse
@@ -22,6 +28,10 @@ _SUPERVISED_SUBPROCESS_NAME = "miles_supervised_subprocess"
 
 
 def main(argv: list[str] | None = None) -> int:
+    # [FUNCTION DOC]
+    # Program entry. Uses the process command-line arguments when none are given, parses them,
+    # configures root logging at info level with a supervisor-tagged format, and runs the
+    # supervision. Returns the supervisor's exit code.
     argv = sys.argv[1:] if argv is None else argv
     args, command = _parse_args(argv)
 
@@ -38,6 +48,11 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
+    # [FUNCTION DOC] HELPER: Split the arguments at the first double-dash: the part before is parsed
+    # as options, the part after is the supervised command. Calls the parser's error exit (usage
+    # message and process exit status 2) if the separator is missing, the command is empty, the
+    # subprocess count is below one, or the grace period is not finite or is negative. Returns the
+    # parsed options and the command list.
     parser = _build_parser()
     if "--" not in argv:
         parser.parse_args(argv)
@@ -57,6 +72,10 @@ def _parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    # [FUNCTION DOC] HELPER: Build the option parser: a required integer count of subprocesses and
+    # an optional float grace period in seconds (default 20) before remaining subprocesses are
+    # force-killed after a forwarded signal. The program name is derived from the module spec when
+    # available.
     spec = sys.modules[__name__].__spec__
 
     parser = argparse.ArgumentParser(
@@ -84,6 +103,18 @@ def supervise(
     num_subprocesses: int,
     termination_grace_period_seconds: float = _DEFAULT_TERMINATION_GRACE_PERIOD_SECONDS,
 ) -> int:
+    # [FUNCTION DOC]
+    # Run the command as the given number of subprocess copies and block until they finish.
+    # Raises a value error if the count is below one. Side effect: sets the environment variable
+    # that tells torch elastic to handle terminate and interrupt signals. Starts the copies with
+    # each one's index in its environment, all output teed with a rank prefix per line. If a
+    # signal arrives while spawning, returns 128 plus the signal number and leaves cleanup to the
+    # container's pid namespace. If a signal arrives while waiting, further signals are only
+    # reported, the signal is forwarded to all copies, which get the grace period before being
+    # force-killed, and 128 plus the signal number is returned. On any other failure of the
+    # supervisor, all copies are terminated with the grace period and the error is re-raised.
+    # Otherwise returns zero if all copies succeeded or the converted exit code of the first
+    # failure.
     if num_subprocesses < 1:
         raise ValueError(f"num_subprocesses must be at least 1, got {num_subprocesses}")
 
@@ -124,16 +155,25 @@ def supervise(
 
 
 def _stop_reacting_to_forwarded_signals() -> None:
+    # [FUNCTION DOC] HELPER: Replace the handlers of the forwarded signals (terminate, interrupt)
+    # with one that only prints a notice, so repeated signals during teardown do not interrupt it.
     for forwarded in _FORWARDED_SIGNALS:
         signal.signal(forwarded, _report_signal_received_during_teardown)
 
 
 def _report_signal_received_during_teardown(signum: int, frame: FrameType | None) -> None:
+    # [FUNCTION DOC] HELPER: Signal handler used during teardown: writes a one-line notice naming
+    # the received signal directly to the standard error file descriptor (a raw write, safe in a
+    # handler). Ignores the frame argument.
     notice = f"[process_supervisor] Received {signal.Signals(signum).name} while already tearing down\n"
     os.write(sys.stderr.fileno(), notice.encode())
 
 
 def _exit_code_from_result(result: RunProcsResult) -> int:
+    # [FUNCTION DOC] HELPER: Map the launcher result to an exit code: zero when nothing failed.
+    # Otherwise logs a warning per failure in index order, then returns the converted exit code of
+    # the first failure in the result's own iteration order (not necessarily the lowest index; it
+    # is the first to be recorded).
     if not result.is_failed():
         return 0
 
@@ -145,6 +185,8 @@ def _exit_code_from_result(result: RunProcsResult) -> int:
 
 
 def _exit_code_from_wait_result(wait_result: int) -> int:
+    # [FUNCTION DOC] HELPER: Convert a wait status to a shell-style exit code: a negative value
+    # (death by signal) becomes 128 plus the signal number, any other value is returned as is.
     return 128 - wait_result if wait_result < 0 else wait_result
 
 

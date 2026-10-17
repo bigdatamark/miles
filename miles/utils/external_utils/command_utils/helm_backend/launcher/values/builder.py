@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Turns a list of worker specs plus a launch plan into the typed run values of the miles run helm
+# chart. Specs are bucketed by category into three sections (static workers, inference engines,
+# trainer engines); each becomes a pool entry. Also computes static cell addresses, the object names
+# of chart-owned objects, and the optional colocate pairing configuration.
 from __future__ import annotations
 
 from miles.utils.external_utils.colocate_pairing.config import PairingConfig
@@ -30,10 +35,24 @@ _COLOCATE_PAIRING_COMPONENT = "colocate-pairing"
 
 
 def build_values(specs: list[BaseWorkerSpec], plan: LaunchPlan) -> MilesRunChartValues:
+    # [FUNCTION DOC] Public entry point. Builds the run section from the specs and plan and wraps it
+    # in the chart values, attaching the plan's extra manifests (or none when that list is empty).
+    # Raises assertion errors for inconsistent input (see the run-values builder).
     return MilesRunChartValues(run=_build_run_values(specs, plan), extra_manifests=plan.extra_manifests or None)
 
 
 def _build_run_values(specs: list[BaseWorkerSpec], plan: LaunchPlan) -> RunValues:
+    # [FUNCTION DOC] HELPER: Builds the run values. Steps: (1) assert the orchestrator command and
+    # state file are either both set or both unset; (2) drop specs with zero cells; (3) for serve
+    # specs assert the worker ports fit; (4) compute static cell addresses; (5) compute the colocate
+    # pairing config (only when colocating with inference pools present) and a mapping from pool
+    # id to pairing layout; (6) for each spec build a pool entry placed in the section of its
+    # category, asserting that restart stamps and service account names appear only in the static
+    # workers section (other templates would ignore them); (7) assemble run values: run id, state
+    # file and launch record (state file none when empty), object names, orchestrator section with
+    # its rendered restart stamp, auto-uninstall disabled only for releases without an orchestrator
+    # command, the three entry lists, environment copy (none when empty), mooncake section when a
+    # mooncake plan exists, and colocate config. Raises assertion errors on violated invariants.
     assert bool(plan.orchestrator_command) == bool(plan.state_file), (
         "The orchestration script and the exit file it writes come together: a release carries both, or it carries "
         "neither and is a deployment of workers that outlives any one run"
@@ -86,12 +105,18 @@ def _build_run_values(specs: list[BaseWorkerSpec], plan: LaunchPlan) -> RunValue
 
 
 def _pairing_config(specs: list[BaseWorkerSpec], plan: LaunchPlan) -> PairingConfig | None:
+    # [FUNCTION DOC] HELPER: Returns the colocate pairing config, or none when the plan is not
+    # colocating or no spec belongs to the inference engines section; else delegates to the colocate
+    # module.
     if not plan.colocate or not any(SECTION_OF_CATEGORY[spec.category] == INFERENCE_ENGINES_SECTION for spec in specs):
         return None
     return pairing_config(specs, plan)
 
 
 def _object_names(release: str) -> ObjectNames:
+    # [FUNCTION DOC] HELPER: Computes the names of chart-owned objects for the release: orchestrator,
+    # read and read-delete platform accounts, mooncake master, colocate pairing controller, and the
+    # uninstall job and its manifest.
     return ObjectNames(
         orchestrator=naming.component_name(release, naming.ORCHESTRATOR_COMPONENT),
         platform_read=naming.platform_account_name(release=release, access=PlatformAccess.READ),
@@ -104,10 +129,14 @@ def _object_names(release: str) -> ObjectNames:
 
 
 def _deployed_specs(specs: list[BaseWorkerSpec]) -> list[BaseWorkerSpec]:
+    # [FUNCTION DOC] HELPER: Keeps only specs that have at least one cell, preserving order.
     return [spec for spec in specs if spec.scheduling.num_cells > 0]
 
 
 def _compute_addresses(specs: list[BaseWorkerSpec], release: str) -> dict[str, dict[str, NamedHostAndPorts]]:
+    # [FUNCTION DOC] HELPER: For static-workers-section specs only, returns a nested mapping from
+    # pool name to a mapping from cell id (derived from pool id and cell index) to that cell's
+    # static host and named ports, for every cell index below the spec's cell count.
     return {
         spec.name: {
             compute_cell_id(pool_id=spec.name, cell_index=cell_index): static_cell_addrs(
@@ -121,6 +150,11 @@ def _compute_addresses(specs: list[BaseWorkerSpec], release: str) -> dict[str, d
 
 
 def _assert_worker_ports_fit(spec: ServeWorkerSpec) -> None:
+    # [FUNCTION DOC] HELPER: Asserts that the consecutive rpc ports used by the workers of one pod
+    # (starting at the rpc static port, one per worker) do not overlap any other named port range
+    # (static port through static port plus its consecutive count). Raises an assertion error naming
+    # the spec and the colliding port otherwise. Raises a stop-iteration error if the spec has no
+    # rpc-named port.
     workers_per_pod = spec.scheduling.workers_per_pod()
     rpc_port = next(port.static_port for port in spec.port_infos if port.name == RPC_PORT_NAME)
     for port in spec.port_infos:

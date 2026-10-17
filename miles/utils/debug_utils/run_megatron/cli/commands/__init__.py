@@ -1,3 +1,8 @@
+# [PACKAGE DOC] Defines the shared typer application (with pretty exception rendering turned off,
+# so errors show as plain tracebacks) and registers the commands from the run, compare and
+# run_and_compare modules on it. The args module holds the dataclasses describing each command's
+# options. The module docstring below mentions a show-model-args command, which is registered by
+# the run module.
 """CLI commands for run_megatron.
 
 Usage:

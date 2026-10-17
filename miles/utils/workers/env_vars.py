@@ -1,3 +1,8 @@
+# [MODULE DOC] HELPER:
+# Names of the environment variables through which the platform tells a worker process who and
+# where it is: its subprocess index under the supervisor, cell index, pod index, base GPU id, and
+# the Kubernetes namespace and release. The identity tuple groups the three index variables that
+# identify a process within the deployment (subprocess, cell, pod).
 from __future__ import annotations
 
 SUBPROCESS_INDEX_ENV_VAR = "MILES_SUPERVISOR_SUBPROCESS_INDEX"

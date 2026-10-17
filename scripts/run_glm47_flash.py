@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Launcher script (single command, run through typer) for GRPO training of GLM-4.7-Flash with
+# Megatron training and SGLang rollout colocated on the same GPUs, on DAPO math with optional AIME
+# eval. The single command first prepares (download model and datasets, convert checkpoint to a
+# Megatron distributed one) and then trains. Rollout uses EAGLE speculative decoding and rollout
+# routing replay; the engine size defaults depend on hardware because the model has 20 attention
+# heads.
 from dataclasses import dataclass
 from typing import Literal
 
@@ -8,6 +15,13 @@ from miles.utils.external_utils import command_utils
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC]
+    # Command line options extending the shared train configuration (num_nodes, output dir, backend
+    # creation). Fields: mode (debug_minimal saves every 2 steps, response length 100, no eval), run
+    # id, Hugging Face org/name, Megatron model type, GPUs per node (None means derived from
+    # hardware), hardware (auto, H200, B200), rollout GPUs per engine (None means derived: 2 on B200
+    # else 1), optional SGLang attention backend name, eval switch (on), extra raw args, and
+    # data/model/Megatron directories.
     mode: Literal["normal", "debug_minimal"] = "normal"
     run_id: str = command_utils.create_run_id()
     model_org: str = "zai-org"
@@ -24,11 +38,17 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     megatron_path: str = "/root/Megatron-LM"
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Resolves hardware and fills GPUs per node from a per-hardware table when unset.
         self.hardware = command_utils.resolve_hardware(self)
         self.num_gpus_per_node = self.num_gpus_per_node or command_utils.NUM_GPUS_OF_HARDWARE[self.hardware]
 
 
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Creates model/data directories, downloads the Hugging Face model, downloads the
+    # DAPO math and AIME 2024 datasets, then converts the model to a Megatron distributed checkpoint
+    # in the model directory (single-node conversion with default parallelism, using all GPUs per
+    # node). Side effects: shell commands and downloads through the backend.
     U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.model_dir} {args.data_dir}")
     U.exec_command_cpu(
@@ -48,6 +68,20 @@ def prepare(args: ScriptArgs):
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Builds the training arguments and submits the job. Checkpoint: hf checkpoint from
+    # the model directory, reference load from the distributed folder, load/save under the output
+    # directory run folder, every 2 steps (debug) or 20. Rollout: DAPO math, deepscaler reward, chat
+    # template, shuffled, 3000 rollouts, 32 prompts x 8 samples, global batch 256, temperature 1,
+    # response length 100 (debug) or 8192. Eval (non-debug and enabled): AIME every 20 steps, 16
+    # samples, length 16384, temperature 0.6, top-p 0.95. Parallelism: tensor 4 with sequence
+    # parallel, pipeline 1, context 1, expert 8, expert-tensor 1; full uniform recompute; dynamic
+    # batch 32768 tokens per GPU. GRPO with kl loss flag on but zero coefficients, asymmetric clip.
+    # Adam 1e-6 with CPU offload and precision-aware optimizer. SGLang: engine GPUs from the option or
+    # 2 on B200 else 1 (rollout tensor size must divide the 20 attention heads), memory fraction 0.7,
+    # EAGLE speculative decoding (2 steps, top-k 1, 3 draft tokens), rollout routing replay; the
+    # attention backend flag is added unless unset or "default"; on B200 with an unset, default or
+    # flashinfer backend the flashinfer MLA ragged option is disabled. Misc: dropouts off, fp32 grad
+    # accumulation, flash attention, colocate, fault tolerance. Submits via the backend.
     U = args.create_backend()
     ref_load_path = f"{args.model_dir}/{args.model_name}_torch_dist"
     load_save_path = f"{args.output_dir}/{args.run_id}/checkpoints"
@@ -185,6 +219,7 @@ def execute(args: ScriptArgs):
 
 @command_utils.dataclass_cli
 def main(args: ScriptArgs):
+    # [FUNCTION DOC] Command line entry point: runs prepare, then execute (training).
     prepare(args)
     execute(args)
 

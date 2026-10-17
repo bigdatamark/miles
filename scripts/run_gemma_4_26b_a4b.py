@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Launcher script (typer command line app) for GRPO training of the Gemma-4 26B-A4B instruction
+# model (mixture of experts) with Megatron training and SGLang rollout, colocated on the same GPUs.
+# Uses the Hugging Face to Megatron bridge, so the Hugging Face checkpoint is loaded directly for
+# both the policy and the reference (no offline conversion). Training data is DAPO math with a
+# Gemma-specific math reward; optional AIME eval. Commands: full-train (download then train),
+# prepare (download only), train. Importing has no side effects besides creating the app and a
+# default run id.
 """
 Gemma-4 26B-A4B-it MoE GRPO training (single-node 8x H200).
 
@@ -22,6 +30,12 @@ app = typer.Typer()
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC]
+    # Command line options extending the shared train configuration (num_nodes, output dir, backend
+    # creation). Fields: mode ("debug_minimal" shortens responses to 256 tokens, saves every 2 steps,
+    # disables eval), run id, Hugging Face org/name and Megatron model type, GPUs per node (None means
+    # derived from hardware), enable_eval (off by default), number of rollouts (3000), extra raw args,
+    # data/model/Megatron directories, hardware (auto-resolved).
     mode: Literal["normal", "debug_minimal"] = "normal"
     run_id: str = command_utils.create_run_id()
     model_org: str = "google"
@@ -37,6 +51,9 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     hardware: Literal["auto", "H200", "H100", "B200"] = "auto"
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Resolves hardware, fills GPUs per node from a per-hardware table when unset, and forces
+        # debug_minimal mode when running on exactly one node (overriding any user-chosen mode).
         self.hardware = command_utils.resolve_hardware(self)
         self.num_gpus_per_node = self.num_gpus_per_node or command_utils.NUM_GPUS_OF_HARDWARE[self.hardware]
         if self.num_nodes == 1:
@@ -44,6 +61,8 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
 
 def _prepare_download(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Creates model/data directories, downloads the Hugging Face model into the
+    # model directory, downloads the DAPO math dataset, and the AIME 2024 dataset only if eval is enabled.
     U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.model_dir} {args.data_dir}")
     U.exec_command_cpu(
@@ -55,6 +74,20 @@ def _prepare_download(args: ScriptArgs):
 
 
 def _execute_train(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Builds the training argument string and submits the job (no per-role copy
+    # commands). Checkpoint: the same Hugging Face folder is used for hf checkpoint and reference load,
+    # with the bridge conversion mode; load/save under the output directory run folder, save every 2
+    # steps (debug) or 20. Rollout: DAPO math, Gemma math reward, chat template, shuffled, balanced,
+    # batch 32 prompts x 8 samples, global batch 256, temperature 1, response length 256 (debug) or
+    # 8192. Eval (non-debug and enabled): AIME every 20 steps, 16 samples, length 16384, top-p 1.
+    # Parallelism: tensor 4 with sequence parallel, pipeline 1, context 1, expert 8, expert-tensor 1;
+    # full uniform recompute; dynamic batch with 1024 tokens per GPU. GRPO with kl loss flag on but
+    # zero coefficient, zero entropy coefficient, asymmetric clip. Adam 1e-6. SGLang: 4 GPUs per
+    # engine, memory fraction 0.55, triton attention (head dimension 512 exceeds the flash limit) and
+    # triton moe, custom all-reduce, cuda graph, overlap schedule and radix cache disabled, no
+    # offloading of train or rollout, and rollout routing replay. Misc: dropouts off, fp32 gradient
+    # accumulation, no gradient accumulation fusion, no nan check, unfused attention, bshd layout,
+    # colocate, actor nodes = total nodes. Submits via the backend.
     U = args.create_backend()
     ckpt = f"{args.model_dir}/{args.model_name}"
     load_save_path = f"{args.output_dir}/{args.run_id}/checkpoints"
@@ -180,6 +213,7 @@ def _execute_train(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def full_train(args: ScriptArgs):
+    # [FUNCTION DOC] Command "full-train": downloads the model and data, then trains.
     """Download model/data, then train."""
     _prepare_download(args)
     _execute_train(args)
@@ -188,6 +222,7 @@ def full_train(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Command "prepare": downloads the model and data only.
     """Download model and data."""
     _prepare_download(args)
 
@@ -195,12 +230,14 @@ def prepare(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def train(args: ScriptArgs):
+    # [FUNCTION DOC] Command "train": training only; assumes data and model are downloaded.
     """Run training only (assumes data is prepared)."""
     _execute_train(args)
 
 
 @app.callback()
 def _callback() -> None:
+    # [FUNCTION DOC] HELPER: Empty typer callback so commands stay sub-commands. Does nothing.
     pass
 
 

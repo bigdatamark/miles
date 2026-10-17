@@ -1,3 +1,7 @@
+# [MODULE DOC] The run and show-model-args commands. A run: resolves the Megatron path, generates
+# prompt token ids and writes them to a temporary file, builds the worker argument string and the
+# dumper environment variables, and executes torchrun through a shell. show-model-args prints the
+# model argument string for a model type.
 """``run`` and ``show-model-args`` CLI commands."""
 
 from pathlib import Path
@@ -25,12 +29,25 @@ from miles.utils.typer_utils import dataclass_cli
 
 
 def register(app: typer.Typer) -> None:
+    # [FUNCTION DOC] HELPER: Adds the run command and the show-model-args command to the given
+    # typer app.
     """Register ``run`` and ``show-model-args`` commands on *app*."""
     app.command()(run)
     app.command(name="show-model-args")(show_model_args)
 
 
 def run_impl(args: RunArgs) -> None:
+    # [FUNCTION DOC] Steps: (1) build the parallel configuration from the run args; if a routing
+    # replay dump path is set and the configuration uses more than one process, raise a value
+    # error. (2) Resolve the Megatron path. (3) Generate prompt token ids using the HuggingFace
+    # checkpoint's tokenizer according to the prompt options, write them to a temporary file
+    # (printing its path and count). (4) Pack the worker script options and render the worker
+    # argument string with parallel layout, sequence parallel flag, sequence length, batch size and
+    # extra args. (5) Build the dumper environment (output directory, backward flag, filter) and
+    # turn it into a chain of export statements with single-quoted values (no escaping of quotes
+    # inside values). (6) Build the torchrun command and run exports plus command in one shell
+    # invocation; a failing worker surfaces as an error from the shell runner. Finally prints the
+    # output directory.
     """Core run logic, called by both ``run`` command and ``run_and_compare``."""
     parallel: ParallelConfig = ParallelConfig.from_run_args(args)
 
@@ -90,6 +107,8 @@ def run_impl(args: RunArgs) -> None:
 
 @dataclass_cli(env_var_prefix="")
 def run(args: RunArgs) -> None:
+    # [FUNCTION DOC] The run command: options from the dataclass without an environment variable
+    # prefix; delegates to the shared run routine.
     """Launch torchrun to run Megatron standalone forward (or forward+backward)."""
     run_impl(args)
 
@@ -97,5 +116,7 @@ def run(args: RunArgs) -> None:
 def show_model_args(
     model_type: Annotated[str, typer.Option(help="Model type matching scripts/models/{model_type}.py")],
 ) -> None:
+    # [FUNCTION DOC] The show-model-args command: prints what the model-args loader returns for the
+    # given model type.
     """Show the MODEL_ARGS for a given model type (debug helper)."""
     print(load_model_args(model_type))

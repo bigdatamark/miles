@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Launcher script (typer command line app) for GRPO training with LoRA adapters of GLM-5.2 (744B
+# total / 40B active, mixture of experts with latent attention and sparse attention with cross-layer
+# index sharing) or its 5-layer prune, on a single node, through the Megatron bridge conversion mode
+# (Hugging Face checkpoint loaded directly) with SGLang rollout colocated on the same GPUs. Same
+# structure as the GLM-5.1 LoRA launcher, plus an optional FP8 rollout mode in which SGLang serves a
+# separate pre-existing FP8 checkpoint through a generated engine config file while the policy stays
+# bf16 and LoRA adapters still sync every step. Commands: prepare, train, full-train. Environment
+# variables read at train time: expert-LoRA kill switch, an ignored layer-subset option that only
+# warns, and an optimizer CPU offload kill switch.
 """
 GLM-5.2 744B-A40B GRPO LoRA training script (Megatron-Bridge / bridge mode).
 
@@ -66,6 +76,13 @@ _MEGATRON_MODEL_TYPE = {
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC]
+    # Command line options extending the shared train configuration. Same fields as the GLM-5.1 LoRA
+    # launcher (run id, model name defaulting to the 5-layer prune, task gsm8k or dapo-math, paths,
+    # DSA kernel backend, routing replay, GPUs per node default 4, LoRA hyperparameters, rollout
+    # sizes with zero meaning per-task default, dynamic sampling off, rollout engine options, wandb
+    # switch, extra args) plus fp8_rollout_checkpoint: the FP8 checkpoint that SGLang serves in FP8
+    # rollout mode (defaults to the hf checkpoint path with an "_fp8" suffix).
     run_id: str = command_utils.create_run_id()
     model_name: Literal[
         "GLM-5.2",
@@ -127,6 +144,11 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     extra_args: str = ""
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Fills defaults: hf checkpoint becomes model directory plus model name if unset; when FP8
+        # rollout is on and no FP8 checkpoint is given, it becomes the hf checkpoint with "_fp8"
+        # appended; response length becomes 4096 for dapo-math else 512 when zero; the sequence window
+        # becomes 8192 for dapo-math when zero.
         if self.hf_checkpoint is None:
             self.hf_checkpoint = f"{self.model_dir}/{self.model_name}"
         if self.fp8_rollout and self.fp8_rollout_checkpoint is None:
@@ -138,10 +160,15 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
     @property
     def megatron_model_type(self) -> str:
+        # [FUNCTION DOC] Property: Megatron model type key (a LoRA variant) looked up from the model name.
         return _MEGATRON_MODEL_TYPE[self.model_name]
 
 
 def _get_parallel_config(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: Returns the space-terminated parallelism flags for a single node: tensor
+    # and expert parallel size both equal to GPUs per node, sequence parallel, pipeline 1, context 1,
+    # expert-tensor 1, micro batch 1, and the query layout flag: packed "thd" for the tilelang
+    # backend, "bshd" for the megatron backend. Matches the existing docstring.
     """Single-node MoE layout: TP = EP = num_gpus_per_node, DP1 (mirrors run_glm5_744b_a40b).
 
     The DSA kernel backend dictates the query layout; both forbid --use-dynamic-batch-size,
@@ -159,6 +186,8 @@ def _get_parallel_config(args: ScriptArgs) -> str:
 
 
 def _download_dataset(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Downloads the dataset of the task into the data directory (GSM8K or
+    # DAPO math) via the backend.
     U = args.create_backend()
     match args.task:
         case "gsm8k":
@@ -168,6 +197,9 @@ def _download_dataset(args: ScriptArgs):
 
 
 def _prepare_download(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Creates the data and model directories, downloads the Hugging Face repo
+    # for the model name (from the module table) into the model directory, then downloads the task
+    # dataset. The FP8 rollout checkpoint is never downloaded by this script.
     U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.data_dir} {args.model_dir}")
     repo = _HF_REPO.get(args.model_name)
@@ -177,6 +209,28 @@ def _prepare_download(args: ScriptArgs):
 
 
 def _train(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Builds the training argument string and submits the job. Same as the
+    # GLM-5.1 LoRA launcher: prints a summary; reads the environment variables for expert-LoRA kill
+    # switch ("0" gives attention-only adapters by excluding expert projection modules), the layer
+    # subset variable (only warns), and optimizer offload kill switch; emits LoRA, rollout, GRPO (zero
+    # kl/entropy, asymmetric clip), routing replay, Adam at 1e-5 with optional CPU offload, parallel
+    # flags, SGLang flags (data-parallel attention, sparse attention backends, LoRA rank and backend,
+    # triton moe, shared-experts fusion off), per-step checkpoint saving into the run folder under the
+    # save directory, misc flags, optional wandb args, and optional sequence length flags.
+    # Differences: the FP8 engine configuration applies only when FP8 rollout is on AND the model is the
+    # full GLM-5.2 (engine size min(8, GPUs), decode backend flashmla_kv, cuda graph batch 256, FP8 KV
+    # cache); otherwise engine size and decode backend (flashmla_sparse, graph 64) follow the options.
+    # When FP8 rollout is on (any model), creates the run folder if needed and writes a small engine
+    # configuration file there (one default server group of regular workers on all GPUs per node,
+    # model path set to the FP8 checkpoint, weight updates kept on so the per-step adapter sync still
+    # reaches the engine) and adds a flag pointing SGLang to it. Environment variables passed to the
+    # job: indexer rope style 0 (interleaved) and forced MLA for sparse attention.
+    # KNOWN ISSUE: an internal always-true flag makes the alternative SGLang branch dead code.
+    # KNOWN ISSUE: for a pruned model with FP8 rollout, the engine configuration file still serves
+    # the FP8 checkpoint, but the engine flags use the non-FP8 shape (the FP8-specific flags are gated
+    # on the full model only).
+    # KNOWN ISSUE: the module docstring says the 3 indexer modules are excluded by default from the
+    # target modules, but the default pattern is "all-linear" and no such exclusion is emitted.
     U = args.create_backend()
     print(
         f"[run] GLM-5.2 LoRA: model={args.model_name} (megatron_model_type={args.megatron_model_type}), dsa-backend={args.dsa_attention_backend}, r3={args.use_r3}, {args.num_gpus_per_node} GPUs, rollout tp={args.rollout_num_gpus_per_engine}"
@@ -320,6 +374,7 @@ def _train(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Command "prepare": downloads the model and dataset (run once per node).
     """Download the model checkpoint (for a known HF repo) and the task dataset (gsm8k or dapo-math). Run once per node before training."""
     _prepare_download(args)
 
@@ -327,6 +382,7 @@ def prepare(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def train(args: ScriptArgs):
+    # [FUNCTION DOC] Command "train": LoRA training only; assumes the dataset is already downloaded.
     """Run GRPO LoRA training (assumes the dataset is already prepared)."""
     _train(args)
 
@@ -334,6 +390,7 @@ def train(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def full_train(args: ScriptArgs):
+    # [FUNCTION DOC] Command "full-train": download then LoRA training.
     """Download the model checkpoint + dataset, then run GRPO LoRA training."""
     _prepare_download(args)
     _train(args)
@@ -341,6 +398,7 @@ def full_train(args: ScriptArgs):
 
 @app.callback()
 def _callback() -> None:
+    # [FUNCTION DOC] HELPER: Empty typer callback so commands stay sub-commands. Does nothing.
     pass
 
 

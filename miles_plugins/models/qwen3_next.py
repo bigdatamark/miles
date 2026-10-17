@@ -1,3 +1,6 @@
+# [MODULE DOC] Qwen3-Next model plugin for Megatron: swaps the linear-attention layers of the stock
+# GPT decoder block spec for the head-sharded Gated DeltaNet layer using Qwen3-Next's fused HF
+# projection layout (combined qkvz and ba projections). Full-attention layers are left as built.
 import copy
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
@@ -11,10 +14,16 @@ from miles_plugins.models.qwen3_5 import Attention as _Qwen3_5Attention
 
 
 class Qwen3NextGatedDeltaNet(GatedDeltaNet):
+    # [CLASS DOC] Gated DeltaNet with Qwen3-Next's two fused projections, both laid out group-major
+    # per key head: in_proj_qkvz (per key group: q/k/v block then the z gate block) and in_proj_ba
+    # (per key group: beta logits then decay input for that group's value heads).
     """Qwen3-Next GDN: HF fuses ``in_proj_qkvz`` and ``in_proj_ba``, both group-major per key head, so the
     projections stay fused and are split here."""
 
     def _build_projections(self):
+        # [FUNCTION DOC] HELPER: create head-sharded in_proj_qkvz (hidden to local key groups times
+        # group qkv width plus group value width) and in_proj_ba (hidden to twice the local value
+        # head count).
         hidden, local = self.config.hidden_size, self.local
         self.in_proj_qkvz = self.sharded_linear(
             "in_proj_qkvz", hidden, local.num_k_heads * (local.group_qkv_dim + local.group_value_dim)
@@ -22,6 +31,12 @@ class Qwen3NextGatedDeltaNet(GatedDeltaNet):
         self.in_proj_ba = self.sharded_linear("in_proj_ba", hidden, 2 * local.num_v_heads)
 
     def project(self, x):
+        # [FUNCTION DOC] Apply the fused projections and split per key group. in_proj_qkvz output is
+        # viewed as batch, sequence, local key groups, rest; split into the group qkv part and the
+        # group z (gate) part. in_proj_ba output is viewed the same way and split into two equal
+        # parts of value-heads-per-key-head: beta logits and decay input. Returns Projections with
+        # each part flattened over the group axis to batch, sequence, features: qkv stays
+        # group-major (as the default convolution expects), gate, beta logits, decay.
         batch, seq_len, _ = x.shape
         local = self.local
         qkv, z = (
@@ -43,10 +58,20 @@ class Qwen3NextGatedDeltaNet(GatedDeltaNet):
 
 
 class Attention(_Qwen3_5Attention):
+    # [CLASS DOC] Qwen3-Next self-attention layer: identical to the Qwen3.5 one except that it
+    # builds the Qwen3-Next fused-projection GDN as its core.
     core_cls = Qwen3NextGatedDeltaNet
 
 
 def get_qwen3_next_spec(args, config, vp_stage):
+    # [FUNCTION DOC] Build the block spec for this pipeline stage, like the Qwen3.5 version but
+    # reading layer types from the top-level HF config (no text sub-config handling). Mutates the
+    # Megatron config: dense models (no experts) get an all-zero MoE layer frequency list. Gets the
+    # stock GPT decoder block spec (Transformer Engine, optional virtual stage), asserts no custom
+    # pipeline layout, computes this stage's layer count and global offset, loads the HF config
+    # (trusting remote code), derives layer types if absent (every fourth layer by default is full
+    # attention), and replaces the self-attention of each linear-attention layer (on a deep copy of
+    # its spec) with the Attention above, passing args. Returns the modified block spec.
     # always use the moe path
     if not args.num_experts:
         config.moe_layer_freq = [0] * config.num_layers

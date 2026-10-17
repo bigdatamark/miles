@@ -1,3 +1,14 @@
+# [MODULE DOC] HELPER: Test agent that drives a session server through its Anthropic Messages
+# endpoint for per-model verification. The agent performs three rounds, each a forced tool-use
+# request (calling the weather tool) followed by a tool-result message and a no-tool text request,
+# giving six requests in total. Along the way it can insert an intermediate system message before
+# the third round when the route and model support it, and it varies the shape of user content and
+# tool results (string vs list). After the rounds it fetches the session snapshot and checks the
+# canonical OpenAI-style records (paths, token-prefix continuity, replayed assistant messages, role
+# sequence, tool calls, and the message tree). The module also provides the generate entry point
+# that wraps the base agentic generate, then verifies TITO samples and the metadata/events the
+# agent returned. Unsupported: MiniMax TITO models. Uses the shared tools, prompts and
+# verification helpers from the session verify agent module.
 """Six-turn Anthropic Messages agent for per-model session verification."""
 
 from __future__ import annotations
@@ -58,17 +69,24 @@ _INTERMEDIATE_SYSTEM_EXPECTATIONS = frozenset({"required", "forbidden"})
 
 
 def _assert_supported_tito_model(tito_model: str) -> None:
+    # [FUNCTION DOC] HELPER: Raises an assertion error (naming the model) if the model identifier
+    # is one of the two MiniMax TITO types; returns nothing otherwise.
     assert (
         tito_model not in _MINIMAX_TITO_MODELS
     ), f"Anthropic session verification does not support tito_model={tito_model!r}"
 
 
 def _verify_intermediate_system(tito_model: str, *, route_supports: bool) -> bool:
+    # [FUNCTION DOC] HELPER: Returns true only if the server route reports support and the model's
+    # fixed-template append roles include the system role. No errors.
     """Require both the live route decision and the TITO append capability."""
     return route_supports and "system" in fixed_template_append_roles(tito_model)
 
 
 def _assert_intermediate_system_expectation(expectation: str, *, actual: bool) -> None:
+    # [FUNCTION DOC] HELPER: Checks that the expectation string is "required" or "forbidden"
+    # (assertion error otherwise), and that the actual capability flag is true exactly when the
+    # expectation is "required" (assertion error with both values otherwise).
     assert (
         expectation in _INTERMEDIATE_SYSTEM_EXPECTATIONS
     ), f"invalid Anthropic intermediate-system expectation: {expectation!r}"
@@ -80,6 +98,12 @@ def _assert_intermediate_system_expectation(expectation: str, *, actual: bool) -
 
 
 def _build_payload(request_kwargs: dict, metadata: dict, messages: list[dict], *, tool_choice: dict) -> dict:
+    # [FUNCTION DOC] HELPER: Builds a non-streaming Anthropic Messages request body: model taken
+    # from the metadata, max tokens from the request kwargs (required, key error if missing), the
+    # fixed system prompt, a shallow copy of the message list, the converted tool definitions and
+    # the given tool choice. Copies temperature, top_p and top_k from the request kwargs when
+    # present and not null, and maps a stop value (a single string or a list) to the stop
+    # sequences list.
     payload = {
         "model": metadata["anthropic_model"],
         "max_tokens": request_kwargs["max_tokens"],
@@ -99,6 +123,10 @@ def _build_payload(request_kwargs: dict, metadata: dict, messages: list[dict], *
 
 
 def _build_tool_result(tool_use: dict, turn_index: int) -> dict:
+    # [FUNCTION DOC] HELPER: Builds the tool-result content block answering a tool-use block. The
+    # text is the mock tool result chosen cyclically by turn index. Turn 1 wraps it as a list with
+    # one text block; turn 2 replaces it by the fixed "service unavailable" recovery text; other
+    # turns (0) use the plain string. The block references the tool use's id.
     result_text = MOCK_TOOL_RESULTS[turn_index % len(MOCK_TOOL_RESULTS)]
     content = [{"type": "text", "text": result_text}] if turn_index == 1 else result_text
     if turn_index == 2:
@@ -118,6 +146,12 @@ async def _post_complete(
     label: str,
     assert_response: Callable[[dict], object],
 ) -> dict:
+    # [FUNCTION DOC] HELPER: Posts the payload as JSON to the URL using the async client and
+    # returns the parsed JSON body once the response validator passes. Asserts status 200 on every
+    # attempt (assertion error with label, status and text; not retried). If the validator raises
+    # an assertion error, the request is re-sent, up to 8 retries (9 attempts), after which the
+    # last validation error propagates (this tolerates incomplete model turns). The trailing
+    # final raise is unreachable in practice.
     for attempt in range(_MAX_ANTHROPIC_INCOMPLETE_TURN_RETRIES + 1):
         response = await client.post(url, json=payload)
         assert response.status_code == 200, f"{label} failed ({response.status_code}): {response.text}"
@@ -133,6 +167,9 @@ async def _post_complete(
 
 
 def _expected_driver_events(*, include_system: bool) -> list[str]:
+    # [FUNCTION DOC] HELPER: Returns the expected ordered list of driver event names: for each of
+    # three rounds, tool use, the round's tool-result kind, then text; with a system event placed
+    # before round 3's events (index 2) when include_system is true.
     events = []
     for turn_index, result_event in enumerate(_TOOL_RESULT_EVENTS):
         if turn_index == 2 and include_system:
@@ -143,6 +180,21 @@ def _expected_driver_events(*, include_system: bool) -> list[str]:
 
 @_journal_verifier_assertions("anthropic_session_verify_agent.run_agent")
 async def run_agent(base_url, prompt, request_kwargs, metadata, **kwargs):
+    # [FUNCTION DOC] HELPER: The agent body run against a session URL (the prompt and extra
+    # keywords are unused; prompts come from the module's fixed list). Wrapped by a decorator that
+    # journals verifier assertion failures. Steps: read the tito model and system-expectation from
+    # metadata and assert the model is supported; open an async HTTP client (180 s timeout); fetch
+    # the server health endpoint (the session URL minus its session path suffix), assert 200 and a
+    # real boolean flag for Anthropic intermediate-system support; decide whether to include a
+    # system turn and assert it matches the expectation. For each of three user prompts: before
+    # round 3 optionally append the system reminder message and event; append the user message
+    # (round 3 uses list-form content); post a forced weather-tool request, validate it has
+    # exactly one tool use, record it; append the assistant content, then a user message with the
+    # tool result; post a no-tool request, validate a complete text answer, append the assistant
+    # reply. Finally GET the session URL (assert 200) and check the canonical records. Returns a
+    # mapping describing what happened: endpoint "anthropic", the event list, request count (6),
+    # tool use and tool result counts, text turn count (3), result kind counts (2 string, 1 list)
+    # and whether a system turn was used.
     """Run three tool-use/result/text cycles and verify their canonical records."""
     tito_model = metadata["tito_model"]
     _assert_supported_tito_model(tito_model)
@@ -226,6 +278,9 @@ async def run_agent(base_url, prompt, request_kwargs, metadata, **kwargs):
 
 
 def _assert_anthropic_tool_response(body: dict) -> list[dict]:
+    # [FUNCTION DOC] HELPER: Asserts the response is an assistant message that stopped for tool
+    # use, contains exactly one tool-use block, that block is for the weather tool and has an
+    # object input. Returns the list of tool-use blocks (one element). Assertion errors otherwise.
     assert body["type"] == "message"
     assert body["role"] == "assistant"
     assert body["stop_reason"] == "tool_use"
@@ -237,6 +292,8 @@ def _assert_anthropic_tool_response(body: dict) -> list[dict]:
 
 
 def _assert_anthropic_text_response(body: dict) -> None:
+    # [FUNCTION DOC] HELPER: Asserts the response is an assistant message that ended its turn
+    # normally, has no tool-use block and has at least one non-empty text block.
     assert body["type"] == "message"
     assert body["role"] == "assistant"
     assert body["stop_reason"] == "end_turn"
@@ -245,6 +302,9 @@ def _assert_anthropic_text_response(body: dict) -> None:
 
 
 def _assert_canonical_tool_calls(record: dict, tool_uses: list[dict]) -> None:
+    # [FUNCTION DOC] HELPER: Checks that the stored canonical response of a record has tool calls
+    # with exactly the same set of ids as the Anthropic tool uses, and for each id the function
+    # name equals the tool-use name and the JSON-decoded arguments equal the tool-use input.
     tool_calls = record["response"]["choices"][0]["message"]["tool_calls"]
     calls_by_id = {tool_call["id"]: tool_call for tool_call in tool_calls}
     assert set(calls_by_id) == {tool_use["id"] for tool_use in tool_uses}
@@ -255,6 +315,21 @@ def _assert_canonical_tool_calls(record: dict, tool_uses: list[dict]) -> None:
 
 
 def _assert_canonical_records(snapshot: dict, tool_uses_per_turn: list[list[dict]], *, include_system: bool) -> None:
+    # [FUNCTION DOC] HELPER: Validates the session snapshot (mapping with records and metadata)
+    # after the six requests. Checks: exactly six records, each on the chat-completions path with
+    # non-empty input ids; token continuity: for each consecutive pair, the next request's input
+    # ids match the previous request's input ids plus its generated token ids (taken from the
+    # output token logprob entries, second element of each) except for the last max-trim-tokens
+    # tokens; the assistant messages replayed in each later request match, under the loose
+    # tool-call message matcher, the assistant messages stored in earlier records, same count and
+    # order; the role sequence of each request's messages (leading system, then user messages,
+    # with an optional system before round 3, assistant and one tool message per tool use after
+    # earlier rounds) for both tool and text requests; the tool request's canonical tool calls
+    # match the tool uses; the text response has non-empty content and no tool calls. Finally
+    # checks the message tree in metadata: node ids and response ids unique, the records' response
+    # ids map to nodes forming a single chain (each parent is the previous node, root has none),
+    # that chain appears as a leaf entry, and the accumulated token ids equal the last record's
+    # input ids plus its generated ids. Assertion errors on any mismatch.
     records = snapshot["records"]
     assert len(records) == _REQUEST_COUNT
     for record in records:
@@ -321,6 +396,19 @@ def _assert_canonical_records(snapshot: dict, tool_uses_per_turn: list[list[dict
 
 @_journal_verifier_assertions("anthropic_session_verify_agent.generate")
 async def generate(input: GenerateFnInput) -> GenerateFnOutput:
+    # [FUNCTION DOC] HELPER: Generate function for the rollout framework (decorated to journal
+    # verifier assertions). Reads tito_model and the intermediate-system expectation from the
+    # args, asserts the model is supported, stores the Anthropic model name (the HF checkpoint),
+    # the tito model and the expectation in the sample metadata (mutating the input sample), then
+    # runs the base agentic generate (which runs the agent above). Normalizes the output to a
+    # list of samples, collects each sample's driver events, runs the shared TITO sample
+    # verification with the model's allowed append roles, and raises assertion errors if: not
+    # exactly one linear sample; the intermediate-system result is missing or not a boolean; it
+    # disagrees with the expectation; a system turn was used though the model cannot append system
+    # messages; a sample lacks the "anthropic" endpoint metadata; events differ from the expected
+    # list; any of the counters (6 requests, 3 tool uses, 3 results, 3 text turns, 2 string
+    # results, 1 list result) differs; or the leaf path node id list is not a list of six. Logs an
+    # info line and returns the base output.
     """Run the Anthropic agent, check hard TITO mismatches, and write metrics."""
     tito_model = input.args.tito_model
     _assert_supported_tito_model(tito_model)
@@ -373,6 +461,10 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
 
 
 def _add_arguments(parser):
+    # [FUNCTION DOC] HELPER: Argument registration hook attached to the generate function: first
+    # registers the underlying session-verify generate's arguments, then adds a required
+    # command-line option for the intermediate-system expectation with choices "forbidden" and
+    # "required".
     _session_verify_generate.add_arguments(parser)
     parser.add_argument(
         "--anthropic-intermediate-system-expectation",

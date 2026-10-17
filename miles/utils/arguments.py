@@ -1,3 +1,17 @@
+# [MODULE DOC] Central command-line argument definition, parsing and validation for Miles
+# training and serving entry points. Layers: (1) a provider factory that returns a function adding
+# all Miles option groups (cluster, train, rollout, fault tolerance, data, eval, algorithm,
+# distillation, trackers, router, debug, session, reward model, CI and others) to a parser that
+# already carries the backend's own options (Megatron, FSDP or torchtitan); (2) the parse entry
+# point, which chooses the backend by a pre-scan of the command line, parses, loads the Hugging
+# Face config for model-derived values, and then runs the validation function; (3) the validation
+# function, a long sequence of consistency checks and derived-value computations that mutates the
+# parsed namespace in place (derived defaults, batch size arithmetic, offload settings, rollout
+# function paths, evaluation datasets, deployment component rules and so on). Most validation
+# failures are assertion errors or value errors that name the offending flags. Environment
+# variables read include MILES_USE_LEGACY_ROLLOUT_V1 (via a helper), PROMETHEUS_PORT, the launcher
+# report variable and the CI record directory variable.
+
 import argparse
 import json
 import logging
@@ -56,6 +70,13 @@ FULLY_ASYNC_ROLLOUT_PATH = "miles.rollout.fully_async_rollout.FullyAsyncRolloutF
 
 
 def resolve_rollout_function_paths(args) -> tuple[str, str]:
+    # [FUNCTION DOC] Computes the rollout function path and the eval function path from the parsed
+    # arguments (read only). The standard rollout path is the legacy v1 function when the legacy
+    # environment switch is on, else the class-based inference rollout. The rollout path is the
+    # user-supplied path or the standard one, and is then forced to the fully async rollout class
+    # when the fully-async flag is set (overriding any user path). The eval path is the user eval
+    # path or, if unset, the final rollout path (so it inherits the fully async override).
+    # Returns the pair (rollout path, eval path).
     """The (rollout, eval) function paths the arguments select."""
     if use_legacy_rollout_v1():
         standard_path = "miles.rollout.sglang_rollout.generate_rollout"
@@ -70,6 +91,20 @@ def resolve_rollout_function_paths(args) -> tuple[str, str]:
 
 
 def _resolve_rollout_functions(args) -> None:
+    # [FUNCTION DOC] HELPER: Mutates the parsed arguments to settle the rollout and eval function
+    # paths and eval-related flags. Steps: (1) if the rollout path equals the fully async class
+    # path, logs, turns on fully-async and clears the path (the flag is the real selection).
+    # (2) Raises a value error when partial rollout with masking of off-policy tokens is used
+    # without the legacy rollout switch. (3) When fully-async is on, asserts: the legacy switch is
+    # off; multi-LoRA is off; no rollout function path remains; no colocation; no partial
+    # rollout; the pause generation mode is not abort; no recompute of logprobs via prefill; and
+    # no all-samples process path. (4) Remembers the user's eval path, then stores the resolved
+    # rollout and eval paths on the arguments. (5) Determines whether the eval backend is a
+    # checkpoint-based eval function, only when the user explicitly gave an eval path (an
+    # inherited path is skipped so custom rollout modules are not imported on the driver).
+    # (6) Asserts a dedicated eval GPU fleet is not combined with a checkpoint eval backend nor
+    # with external rollout engines. (7) Sets the eval-uses-snapshots flag to true when the eval
+    # GPU count is positive or a checkpoint eval backend is used.
     if args.rollout_function_path == FULLY_ASYNC_ROLLOUT_PATH:
         # The selection --fully-async makes, so enable the mode: as a plugin path it would
         # skip the checks below and train.py's async-driver guard. A subclass passes the flag.
@@ -119,6 +154,14 @@ def _resolve_rollout_functions(args) -> None:
 
 
 def reset_arg(parser, name, **kwargs):
+    # [FUNCTION DOC] Looks through the parser's registered actions for one whose option strings
+    # contain the name. If found, only its default is replaced (when the keyword options contain
+    # a default; all other keyword options, such as type or help, are ignored in that case) and
+    # the search stops. If no action has the name, the argument is added to the parser with the
+    # given keyword options. Mutates the parser; relies on a private parser attribute holding the
+    # actions.
+    # KNOWN ISSUE: the docstring lists a default parameter, but the function takes arbitrary
+    # keyword options and silently ignores everything but the default when the argument exists.
     """
     Reset the default value of a Megatron argument.
     :param parser: The argument parser.
@@ -139,10 +182,29 @@ _DEFAULT_FT_API_SERVER_PORT = 18080
 
 
 def get_miles_extra_args_provider(add_custom_arguments=None):
+    # [FUNCTION DOC] Factory. Input: an optional function taking and returning a parser that adds
+    # user-defined options. Returns the function that adds all Miles options to a parser (suitable
+    # as the extra-arguments provider of the backend parsers). The nested group functions below
+    # each take a parser, register options on it, and return it; they have no other effects.
     def add_miles_arguments(parser):
+        # [FUNCTION DOC] Sets the default entry to "train", then applies, in this order: the
+        # user-supplied custom option function first (so Miles options cannot be overwritten by it
+        # accidentally, and its options exist when later groups are built), then the groups run
+        # uuid, cluster, train, rollout, fault tolerance, data, eval, algorithm, on-policy
+        # distillation, wandb, mlflow, tensorboard, prometheus, dashboard (an external helper),
+        # router, debug, sglang (external helper), lora (external helper), session, network, reward
+        # model, rollout buffer, MTP training, prefill-decode disaggregation, CI, custom Megatron
+        # plugins and user-provided-function options. Finally it registers the custom config path
+        # and the Megatron config path options (through the reset helper), sets defaults for the
+        # trainer id (the actor role) and trainer model id (none), and sets the padded vocab size
+        # option with default none. Returns the parser. The user-provided-function group parses
+        # the command line partially, so all options it depends on must already be registered.
         parser.set_defaults(entry="train")
 
         def add_run_uuid_arguments(parser):
+            # [FUNCTION DOC] Registers the run-uuid option (string, default none; documented as
+            # exactly the configured number of lowercase hex characters, auto-generated when unset;
+            # generation and validation happen later in validation).
             parser.add_argument(
                 "--run-uuid",
                 type=str,
@@ -158,6 +220,19 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
 
         # Ray
         def add_cluster_arguments(parser):
+            # [FUNCTION DOC] Registers cluster and resource options: cluster backend (ray or
+            # kubernetes), worker communication backend (unset means the backend's default),
+            # deploy component (all, trainer, inference, primary) and deploy instance id, the
+            # expected number of engine cells to wait for, trainer controller addresses and the
+            # inference controller address, node and GPU counts for actor and critic, rollout GPU
+            # counts and GPUs per engine, GPUs per node, colocation and the offload family (offload,
+            # offload train/rollout as tri-state toggles, offload levels, disk offload target,
+            # directory, chunk size, optimizer-state streaming to disk with its moment dtype,
+            # clearing quantized weight workspaces) and the colocation memory peak device. Also
+            # resets the defaults of the distributed backend (nccl) and the distributed timeout
+            # (10 minutes) options inherited from Megatron.
+            # KNOWN ISSUE: the help text of the critic node count and critic GPUs per node options
+            # says "training actor" (copied from the actor options).
             parser.add_argument(
                 "--cluster-backend",
                 type=str,
@@ -425,6 +500,18 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             return parser
 
         def add_train_arguments(parser):
+            # [FUNCTION DOC] Registers training options: train backend (megatron, fsdp or
+            # torchtitan; default megatron), qkv layout (thd or bshd), linear attention backend,
+            # true-on-policy mode and recompute-logprobs-via-prefill switches, extra training
+            # environment variables (a JSON object text, default empty object), memory margin
+            # (default 1 GiB), debug switches that skip the weight update or the optimizer,
+            # rematerialization of parameters from master weights with its checking switch,
+            # Megatron-to-HF conversion mode (raw or bridge), DSA attention backend, extra
+            # high-precision layer patterns for HF and Megatron names, custom model provider path,
+            # loss recomputation, log-prob chunk size, independent data-parallel replicas,
+            # delayed data split by data parallel, all-gather context parallel, the low-memory
+            # resume switch (via reset helper) and the peak TFLOPs for MFU reporting. The two
+            # delay-split and allgather-cp options have no help text.
             parser.add_argument(
                 "--train-backend",
                 type=str,
@@ -610,6 +697,21 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
 
         # rollout
         def add_rollout_arguments(parser):
+            # [FUNCTION DOC] Registers rollout options: Hugging Face checkpoint and model name;
+            # rollout function path and the fully-async switch; sampling parameters (temperature,
+            # top-p, top-k, top logprobs count) that are sent per request and never used as engine
+            # launch arguments; maximum context, prompt and response lengths; special token
+            # skipping, stop strings and stop token ids; shuffle and seed; object store backend and
+            # Mooncake settings; over-sampling batch size, dynamic sampling filter, submission
+            # granularity; partial rollout and off-policy masking; fully async tuning (maximum
+            # staleness, concurrent samples, data buffer capacity factor, unused samples handler,
+            # custom data buffer); custom generate, rollout log and eval rollout log function
+            # paths; buffer filter path; weight update settings (buffer size, interval, pause
+            # generation mode, transfer mode among broadcast, packed broadcast, peer-to-peer and
+            # disk delta, disk directories, delta encoding and checksum, post-write hook, peer-to-
+            # peer worker count and timeout); keeping an old actor; rollout data postprocess path;
+            # pinning the rollout manager to the head node; and external engine options
+            # (addresses, router PD mode, custom engine provider path).
             parser.add_argument(
                 "--hf-checkpoint",
                 type=str,
@@ -1127,6 +1229,13 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             return parser
 
         def add_fault_tolerance_arguments(parser):
+            # [FUNCTION DOC] Registers fault tolerance options: the master switch, the component
+            # list (rollout and or train; default rollout when omitted), rollout health check
+            # options (interval 30 s, timeout 30 s, first wait 0 s, failure threshold 1) through a
+            # config helper, API server host (default loopback) and port (unset resolves later to
+            # 18080 under fault tolerance and 0 otherwise), the mini controller enable toggle
+            # (tri-state, default unset), its poll interval (10 s) and resume delay (10 s), and the
+            # trainer heartbeat checker options (helper defaults).
             parser.add_argument(
                 "--use-fault-tolerance",
                 action="store_true",
@@ -1189,6 +1298,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
 
         # data
         def add_data_arguments(parser):
+            # [FUNCTION DOC] Registers data and batching options: number of rollouts and epochs,
+            # debug exit after N rollouts, a flag to disable the global rollout dataset (stored
+            # inverted under the global-dataset name), data source class path, prompt data path,
+            # chat template switches and kwargs (JSON text), custom chat template path, dataset
+            # keys (input, label, multimodal mapping as JSON, metadata, tools), starting rollout
+            # id, rollout batch size, samples per prompt, global batch size and micro batch size
+            # (through the reset helper, defaults none and 1), steps per rollout, data balancing
+            # (token based or FLOPs based), partial final train step, dynamic batch size with its
+            # per-GPU token limits for training and log-prob computation.
             # dataset
             # TODO: maybe add an num_epoch and calculate the num_rollout from buffer
             parser.add_argument(
@@ -1386,6 +1504,13 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             return parser
 
         def add_eval_arguments(parser):
+            # [FUNCTION DOC] Registers evaluation options: eval function path (unset falls back to
+            # the rollout function), eval interval (default reset to none), eval prompt data (name
+            # and path pairs), eval config file or inline base64 text (overrides the prompt data),
+            # skip-eval-before-train, per-eval overrides of dataset keys and sampling parameters
+            # (all default none), samples per eval prompt, a dedicated eval GPU fleet (GPU count
+            # default 0, GPUs per engine default 1, snapshot staging directory, maximum in-flight
+            # evals default 2, overflow policy backpressure or skip, snapshots to keep default 2).
             parser.add_argument(
                 "--eval-function-path",
                 type=str,
@@ -1509,6 +1634,19 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             return parser
 
         def add_algo_arguments(parser):
+            # [FUNCTION DOC] Registers algorithm and checkpoint options: reference model
+            # checkpoint and step; load, save, save interval, async save, no-save-optim, seed
+            # (1234), gradient clip (1.0), per-token loss and learning rate (1e-6) through the
+            # reset helper; HF save path, save trigger sentinel, post-save hook; critic options
+            # (critic-only warmup steps, load, save, learning rate, warmup iterations); PPO clip
+            # ranges and dual-clip bound, value clip; KL coefficients and loss type; loss type
+            # (policy, sft, custom or score centering) and custom loss path; score-centering
+            # options; advantage estimator (grpo, gspo, reinforce++ variants, ppo), flags to
+            # disable advantage computation, std normalization and reward normalization (stored
+            # inverted); entropy handling; rollout logprob usage; mismatch metrics; optimizer reset;
+            # skipping the forward-only actor pass; truncated importance sampling (TIS) options and
+            # custom function paths; routing and indexer replay switches; and off-policy sequence
+            # masking (OPSM).
             parser.add_argument(
                 "--ref-load",
                 type=str,
@@ -1830,6 +1968,11 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             return parser
 
         def add_on_policy_distillation_arguments(parser):
+            # [FUNCTION DOC] Registers on-policy distillation (OPD) options: the enable switch,
+            # type (sglang teacher server or megatron teacher model), KL coefficient (1.0),
+            # top-k log-prob count (0 means sampled-token), top-k token set strategy and reward
+            # weight mode, per-position token ids switch, multi-teacher URL routing map
+            # (name=url entries) with its metadata key, teacher checkpoint path and step.
             """Add on-policy distillation (OPD) related arguments.
 
             OPD is orthogonal to advantage estimators and can be applied on top of
@@ -1932,6 +2075,9 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             return parser
 
         def add_router_arguments(parser):
+            # [FUNCTION DOC] Registers router options: the Miles-router switch, its timeout, maximum
+            # connections and health-check failure threshold (default 3), then the SGLang router's
+            # own command-line options with a router prefix and without host and port.
             parser.add_argument(
                 "--use-miles-router",
                 action="store_true",
@@ -1961,6 +2107,11 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
 
         # wandb
         def add_wandb_arguments(parser):
+            # [FUNCTION DOC] Registers Weights and Biases options (enable, mode, directory, key,
+            # host, team, group, project through the reset helper, run id), a flag to disable the
+            # random run name suffix (stored inverted as the suffix toggle, default on), a flag to
+            # always use the train step as step metric, and logging switches for multi-turn
+            # rollouts, pass rate, reward category key and correct samples.
             # wandb parameters
             parser.add_argument("--use-wandb", action="store_true", default=False)
             parser.add_argument(
@@ -2033,6 +2184,8 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
 
         # mlflow
         def add_mlflow_arguments(parser):
+            # [FUNCTION DOC] Registers MLflow options: enable switch, tracking URI, experiment name
+            # (default "miles"), run name (documented to default to the wandb group) and run id.
             parser.add_argument("--use-mlflow", action="store_true", default=False)
             parser.add_argument(
                 "--mlflow-tracking-uri",
@@ -2057,6 +2210,9 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
 
         # tensorboard
         def add_tensorboard_arguments(parser):
+            # [FUNCTION DOC] Registers TensorBoard options: enable switch, project name (documented
+            # as the log directory, defaulting to the TensorBoard directory environment variable)
+            # and experiment name.
             # tb_project_name, tb_experiment_name
             parser.add_argument("--use-tensorboard", action="store_true", default=False)
             parser.add_argument(
@@ -2071,6 +2227,10 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
 
         # prometheus
         def add_prometheus_arguments(parser):
+            # [FUNCTION DOC] Registers Prometheus options: enable switch, metrics port (default read
+            # at registration time from the PROMETHEUS_PORT environment variable, else 9090; a
+            # non-integer value raises a value error at that point) and a run name label
+            # (documented to default to the wandb group).
             parser.add_argument("--use-prometheus", action="store_true", default=False)
             parser.add_argument(
                 "--prometheus-port",
@@ -2092,6 +2252,18 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
 
         # debug
         def add_debug_arguments(parser):
+            # [FUNCTION DOC] Registers debugging, profiling and test-harness options: saving and
+            # loading of rollout, trajectory and train data (path templates with a rollout id
+            # placeholder), load subsample ratio, rollout-only and train-only modes, audit event data
+            # path, dump details, the sglang dumper family (enable, directory, per-phase key=value
+            # configs, source patcher configs), memory snapshot and profiling settings, weight
+            # update equality checks (selector all/target/draft, skip list, quantization error
+            # allowance), local weight checksums, the event analyzer, witness (enable, buffer size
+            # default 1048576), fault injection test actions (JSON text or file path), CI rollout
+            # data injection (path template, start id, minimum match ratio default 0.9), the
+            # launcher environment report path (default from the launcher report environment
+            # variable at registration time) and its re-record interval (3600 s), and two
+            # debug-only numerics switches (unified fused log-prob, deterministic collectives).
             parser.add_argument(
                 "--save-debug-rollout-data",
                 type=str,
@@ -2365,11 +2537,16 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             return parser
 
         def add_network_arguments(parser):
+            # [FUNCTION DOC] Registers an HTTP proxy option (string) and a switch for distributed
+            # HTTP posting.
             parser.add_argument("--http-proxy", type=str, default=None)
             parser.add_argument("--use-distributed-post", action="store_true", default=False)
             return parser
 
         def add_reward_model_arguments(parser):
+            # [FUNCTION DOC] Registers reward model options: type, reward key (and eval variant),
+            # group-level reward model switch, remote URL, custom reward function path, custom
+            # reward post-process path and custom samples-to-train-data conversion path.
             parser.add_argument(
                 "--rm-type",
                 type=str,
@@ -2431,6 +2608,11 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             return parser
 
         def add_rollout_buffer_arguments(parser):
+            # [FUNCTION DOC] Registers rollout buffer and sample processing options: buffer URL,
+            # trajectory fetch retry count (-1 unlimited), minimum batch collection ratio (1),
+            # task type ("math"), loss mask type (qwen, qwen3, distill_qwen; default qwen), data
+            # padding multiplier (128), sample filter path, all-samples process path, a switch to
+            # disable trimming of samples and a switch for dynamic global batch size.
             parser.add_argument(
                 "--rollout-buffer-url",
                 type=str,
@@ -2505,6 +2687,10 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             return parser
 
         def add_custom_megatron_plugins_arguments(parser):
+            # [FUNCTION DOC] Imports (lazily, so the plugin package is only needed here) and calls
+            # the DeepSeek V4 and DSA argument adders from the plugins package, then registers three
+            # custom Megatron hook paths (init, before log-prob, before train step), each default
+            # none. The import error is not caught, so a missing plugin package breaks parsing.
             """
             Add custom Megatron plugins arguments.
             This is a placeholder for any additional arguments that might be needed.
@@ -2532,6 +2718,8 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             return parser
 
         def add_mtp_training_arguments(parser):
+            # [FUNCTION DOC] Resets (or adds) the MTP layer count (default none) and loss scaling
+            # factor (default 0.2) options and registers the enable-MTP-training switch.
             """Add MTP training specific arguments."""
             reset_arg(parser, "--mtp-num-layers", type=int, default=None)
             reset_arg(parser, "--mtp-loss-scaling-factor", type=float, default=0.2)
@@ -2545,6 +2733,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             return parser
 
         def add_prefill_decode_disaggregation_arguments(parser):
+            # [FUNCTION DOC] Registers the number of prefill servers option (default none).
             parser.add_argument(
                 "--prefill-num-servers",
                 type=int,
@@ -2554,6 +2743,10 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             return parser
 
         def add_ci_arguments(parser):
+            # [FUNCTION DOC] Registers continuous-integration options: the CI test switch, a
+            # tolerated TITO special-token mismatch rate (default 0.0), switches disabling the KL,
+            # logprobs and weight-update checkers, metric checker key, threshold and expected count,
+            # gradient norm save and load paths, and model hash save and check switches.
             parser.add_argument(
                 "--ci-test",
                 action="store_true",
@@ -2613,6 +2806,12 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             return parser
 
         def add_session_arguments(parser):
+            # [FUNCTION DOC] Registers session server options: the enable option (optional value:
+            # bare flag means true and "v1" or "v2" select the server version; default false),
+            # worker count (32), bind address, external host, base port, the TITO tokenizer model
+            # (choices from the tokenizer type enumeration, default "default"), the session message
+            # matcher (default "strict"), and the v2 sample picker and postprocessor hook paths with
+            # their default dotted paths.
             parser.add_argument(
                 "--use-session-server",
                 nargs="?",
@@ -2702,6 +2901,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             return parser
 
         def add_user_provided_function_arguments(parser):
+            # [FUNCTION DOC] Lets user-provided functions register their own options. Does a
+            # partial parse of the real command line, with required options relaxed and help
+            # suppressed; if that exits (parse failure), returns the parser untouched. Builds the
+            # list of candidate function paths: the custom inference engine provider path, and, when
+            # the legacy rollout switch is off, additionally the resolved rollout function path and
+            # the custom generate function path (placed first). Each path is loaded; load failures
+            # (module not found or value error) are skipped silently, and an empty or missing path
+            # yields nothing. If the loaded object has a callable add-arguments attribute, it is
+            # called with the parser. Returns the parser.
             try:
                 with with_relax_parser_required_args(parser), with_suppressed_parser_help(parser):
                     args_partial, _ = parser.parse_known_args()
@@ -2788,6 +2996,29 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
 
 
 def parse_args(add_custom_arguments=None, entry="train", preprocess_args=None):
+    # [FUNCTION DOC] Main entry point. Inputs: an optional function adding user options to the
+    # parser, the entry name (asserted to be "train" or "serve"), and an optional callback that
+    # receives the parsed namespace for preprocessing before validation. Steps: configure the
+    # logger for the main process; build the Miles option provider; pre-scan for the train backend.
+    # Megatron backend: parse with Megatron's parser using the provider; set compress-ratios and
+    # rollout indexer stream count to none; if an HF checkpoint is given, load its config, store
+    # the compress ratios, run the HF-versus-args consistency check, and for DSA-style models store
+    # the indexer rope interleave flag from the text config and compute the indexer top-k stream
+    # count as the number of hidden layers minus the number of KDA layers; set rank 0 and world
+    # size to nodes times GPUs per node; apply Megatron's default-argument setter. FSDP or
+    # torchtitan backend: load args through the backend loader, set rank 0 and the same world
+    # size, set the layer count from the HF config when a checkpoint is given, and for FSDP assert
+    # context parallelism is 1. Then: set the CI metrics-capture flag from the presence of the CI
+    # record directory environment variable, store the entry, call the preprocess callback if any,
+    # run Miles validation, then backend specific validation (Megatron: validate, force variable
+    # sequence lengths, switch the allgather MoE dispatcher to alltoall with a log message, and
+    # assert the first/last decoder pipeline layer counts are unset when the pipeline size is 1;
+    # torchtitan: its validator; FSDP: hybrid shard and kernel backend validators), and finally
+    # validate the SGLang arguments. Returns the namespace. Side effects: logging, imports of
+    # backend modules, and reading the command line.
+    # KNOWN ISSUE: for the Megatron backend, the rank, world size and layer-count assignments occur
+    # before Miles validation, which can later rewrite the world size for independent data
+    # parallel replicas.
     assert entry in ("train", "serve"), f"unknown entry {entry!r}"
     # Users may call `parse_args` very early, thus we ensure logger is configured here
     configure_logger_raw("main")
@@ -2882,6 +3113,11 @@ def parse_args(add_custom_arguments=None, entry="train", preprocess_args=None):
 
 
 def parse_args_train_backend():
+    # [FUNCTION DOC] Determines the train backend before the real parse. Raises a plain exception
+    # if the deprecated MILES_BACKEND environment variable is set at all. Builds a throwaway
+    # parser with only the Miles options, does a tolerant parse of the real command line
+    # (unknown options ignored; this may exit on bad Miles option values or print help), and
+    # returns the train backend value (default megatron).
     if os.environ.get("MILES_BACKEND") is not None:
         raise Exception("`MILES_BACKEND` is deprecated, please use --train-backend directly.")
 
@@ -2892,6 +3128,18 @@ def parse_args_train_backend():
 
 
 def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
+    # [FUNCTION DOC] HELPER: Builds the evaluation dataset configs and normalizes the eval prompt
+    # data argument. If an eval config is given (file or inline base64, resolved by the file
+    # argument helper, parsed with OmegaConf with interpolation resolved): the root must be a
+    # mapping (value error otherwise); the eval section is the "eval" key if present, else the
+    # root, and must be a mapping; defaults come from its "defaults" entry; datasets come from its
+    # "datasets" entry via the list-normalizing helper and must be non-empty (value error). Else,
+    # if eval prompt data is given: a single value is treated as the path of a dataset named
+    # "aime" (legacy, logged); the list must have an even length of name and path pairs (value
+    # error otherwise). Otherwise there are no datasets. The dataset configs are then built by the
+    # shared builder using the args and the defaults. Side effect: the eval prompt data argument
+    # is rewritten to the flattened name, path list of the built datasets, or none if there are
+    # none. Returns the built list.
     """
     Build evaluation dataset configurations from either --eval-config or --eval-prompt-data.
     """
@@ -2935,6 +3183,8 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 
 def _compute_rollout_external(args: argparse.Namespace) -> bool:
+    # [FUNCTION DOC] HELPER: True if the run uses externally launched rollout engines, i.e. the
+    # external engine addresses or the custom inference engine provider path is set.
     return args.rollout_external_engine_addrs is not None or args.custom_inference_engine_provider_path is not None
 
 
@@ -2943,6 +3193,9 @@ _STATIC_EXTERNAL_ENGINE_PROVIDER_PATH = "miles.ray.rollout.external_engine_provi
 
 
 def _compute_custom_inference_engine_provider_path(args: argparse.Namespace) -> str:
+    # [FUNCTION DOC] HELPER: Returns the user-given provider path if set; else the static external
+    # engine provider path when external engine addresses are given; else the backend's own
+    # provider path.
     if (path := args.custom_inference_engine_provider_path) is not None:
         return path
     if args.rollout_external_engine_addrs is not None:
@@ -2954,6 +3207,15 @@ _DEPLOY_INSTANCE_ID_PATTERN = re.compile(DNS_LABEL_PATTERN)
 
 
 def _validate_deploy_component(args: argparse.Namespace) -> None:
+    # [FUNCTION DOC] HELPER: Validates deployment-split rules (assertions with explanatory
+    # messages). Converts the deploy component to its enumeration (value error if unknown), then
+    # runs the instance id, static address, registration and single engine source checks. For a
+    # non-split component (everything in one launch) it stops there. For a split component it
+    # asserts: the cluster backend is Kubernetes, or Ray together with the RPC worker
+    # communication backend; colocation is off; if the component carries the orchestration script,
+    # trainer controller addresses are given and validated; for the trainer component, exactly one
+    # trainer is deployed and, on the Ray backend, debug-rollout-only is off; for any component
+    # other than inference, the shared object store is checked; finally the watched-cells check.
     component = DeployComponent(args.deploy_component)
 
     _validate_deploy_instance_id(args, component=component)
@@ -2996,6 +3258,10 @@ def _validate_deploy_component(args: argparse.Namespace) -> None:
 
 
 def _validate_deploy_instance_id(args: argparse.Namespace, *, component: DeployComponent) -> None:
+    # [FUNCTION DOC] HELPER: No-op when no instance id is given. Otherwise asserts the component
+    # accepts an instance id (only components deployed more than once do). For the inference
+    # component additionally asserts the id fully matches the DNS label pattern and does not
+    # exceed the maximum instance id length (it becomes part of Kubernetes names).
     if (instance_id := args.deploy_instance_id) is None:
         return
 
@@ -3020,6 +3286,9 @@ def _validate_deploy_instance_id(args: argparse.Namespace, *, component: DeployC
 
 
 def _validate_single_deployed_trainer(args: argparse.Namespace) -> None:
+    # [FUNCTION DOC] HELPER: Resolves the Megatron config and asserts: exactly one trainer is
+    # described; the critic option is off (a critic is a separate trainer); that trainer's role is
+    # not critic; and the deploy instance id, if given, equals that trainer's id.
     trainers = resolve_megatron_config(args).trainers
     assert len(trainers) == 1, (
         f"--deploy-component trainer deploys one trainer and its arguments describe {len(trainers)} "
@@ -3043,6 +3312,8 @@ def _validate_single_deployed_trainer(args: argparse.Namespace) -> None:
 
 
 def _validate_static_addrs_external_launch(args: argparse.Namespace, *, component: DeployComponent) -> None:
+    # [FUNCTION DOC] HELPER: Asserts trainer controller addresses are only given when the component
+    # carries the orchestration script, and not when the component itself deploys the trainer.
     assert component.deploys_orchestration_script() or args.trainer_controller_addrs is None, (
         f"--trainer-controller-addrs describes the trainer side the orchestration script drives, but "
         f"--deploy-component {component.value} carries no orchestration script, so nothing here would call those "
@@ -3054,6 +3325,11 @@ def _validate_static_addrs_external_launch(args: argparse.Namespace, *, componen
 
 
 def _validate_registration(args: argparse.Namespace, *, component: DeployComponent) -> None:
+    # [FUNCTION DOC] HELPER: If the expected cell count is set, asserts the component is primary
+    # and the count is at least 1. For the inference component asserts that an instance id and an
+    # inference controller address are given and that the address parses as host and port (the
+    # parser raises on malformed input). For every other component asserts the controller address
+    # is not given.
     if (init_expected := args.init_expected_num_cells) is not None:
         assert component is DeployComponent.PRIMARY, (
             f"--init-expected-num-cells needs --deploy-component {DeployComponent.PRIMARY.value}, not "
@@ -3081,6 +3357,9 @@ def _validate_registration(args: argparse.Namespace, *, component: DeployCompone
 
 
 def _validate_single_engine_source(args: argparse.Namespace, *, component: DeployComponent) -> None:
+    # [FUNCTION DOC] HELPER: Only for the primary component (others return immediately): asserts
+    # no external engine addresses are given and that the custom provider path is unset or equals
+    # the backend provider path, because engines register into the primary instead.
     if component is not DeployComponent.PRIMARY:
         return
 
@@ -3095,6 +3374,10 @@ def _validate_single_engine_source(args: argparse.Namespace, *, component: Deplo
 
 
 def _validate_watched_cells_deployed_locally(args: argparse.Namespace, *, component: DeployComponent) -> None:
+    # [FUNCTION DOC] HELPER: For components without the orchestration script, asserts that the
+    # fault tolerance components contain nothing but "train" (rollout cells cannot be handled by
+    # this launch). For components with it, asserts the API server port is zero (falsy), since it
+    # watches cells it does not deploy.
     if not component.deploys_orchestration_script():
         unservable = sorted(set(args.ft_components) - {"train"})
         assert not unservable, (
@@ -3110,10 +3393,17 @@ def _validate_watched_cells_deployed_locally(args: argparse.Namespace, *, compon
 
 
 def _validate_trainer_controller_addrs(args: argparse.Namespace) -> None:
+    # [FUNCTION DOC] HELPER: Validates the trainer controller addresses by calling the address
+    # resolver for the computed trainer ids, discarding the result; it raises on malformed or
+    # missing addresses.
     external_trainer_controller_addrs(args, trainer_ids=compute_trainer_ids(args))
 
 
 def _validate_shared_object_store(args: argparse.Namespace, *, component: DeployComponent) -> None:
+    # [FUNCTION DOC] HELPER: Asserts the object store backend is Mooncake (shared by all
+    # deployments). Components that carry the orchestration script stop there (they host the
+    # master). Others must supply Mooncake init kwargs containing the master address key with a
+    # string value that contains a colon (host:port).
     assert ObjectStoreBackend(args.object_store_backend) == ObjectStoreBackend.MOONCAKE, (
         f"--deploy-component {component.value} needs --object-store-backend "
         f"{ObjectStoreBackend.MOONCAKE.value}, shared by every deployment of the run"
@@ -3134,6 +3424,9 @@ _FT_DEFAULT_COMPONENTS: list[str] = ["rollout"]
 
 
 def _resolve_ft_components(args: argparse.Namespace) -> list[str]:
+    # [FUNCTION DOC] HELPER: Without fault tolerance returns an empty list (warning if components
+    # were given anyway). With it, returns a copy of the given components or, if unset, a copy of
+    # the default (rollout only).
     if not args.use_fault_tolerance:
         if args.ft_components is not None:
             logger.warning("--ft-components is ignored without --use-fault-tolerance")
@@ -3144,6 +3437,14 @@ def _resolve_ft_components(args: argparse.Namespace) -> list[str]:
 
 
 def _validate_rematerialize_param_from_master_weight(args):
+    # [FUNCTION DOC] HELPER: Validates (and may reset) the parameter rematerialization option. No-op
+    # if off. If debug-train-only is on, silently turns the option off (weights are never updated)
+    # and returns. Otherwise asserts: Megatron backend; no LoRA; the optimizer is not disabled; no
+    # independent data parallel; colocation with train offload; offload target is cpu; distributed
+    # optimizer on; no kept old actor; precision-aware optimizer only together with optimizer CPU
+    # offload; no overlapped parameter gather; advantages and returns are computed; no critic-only
+    # steps. On success sets the disable-param-buffers-cpu-backup flag, and in CI test mode also
+    # turns on the rematerialization check option. Mutates args.
     if not args.rematerialize_param_from_master_weight:
         return
     if args.debug_train_only:
@@ -3187,18 +3488,25 @@ def _validate_rematerialize_param_from_master_weight(args):
 
 
 def _resolve_api_server_port(args: argparse.Namespace) -> int:
+    # [FUNCTION DOC] HELPER: Returns the explicit port if set (including 0); else 18080 when any
+    # fault tolerance component is enabled; else 0 (disabled).
     if (port := args.api_server_port) is not None:
         return port
     return _DEFAULT_FT_API_SERVER_PORT if args.ft_components else 0
 
 
 def _resolve_mini_ft_controller_enable(args: argparse.Namespace) -> bool:
+    # [FUNCTION DOC] HELPER: Returns the explicit toggle if set; else true when fault tolerance
+    # components are non-empty and the API server port is non-zero.
     if (enable := args.mini_ft_controller_enable) is not None:
         return enable
     return bool(args.ft_components) and args.api_server_port != 0
 
 
 def _resolve_run_uuid(args: argparse.Namespace) -> str:
+    # [FUNCTION DOC] HELPER: If a run uuid is given, returns it after the validator (which raises
+    # on a bad format). Otherwise asserts the deploy component is not a split one (split parts
+    # need a shared, explicit uuid) and generates a fresh uuid.
     if (given := args.run_uuid) is not None:
         return validate_run_uuid(given)
 

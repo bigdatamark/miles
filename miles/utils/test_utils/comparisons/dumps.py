@@ -1,3 +1,6 @@
+# [MODULE DOC] HELPER: Compares two tensor-dump trees (baseline vs target) by running the external
+# comparator on each matching leaf directory, and defines shared skip/allow regex constants for
+# model-input tensors.
 from pathlib import Path
 
 from miles.utils.test_utils.comparisons.comparators import run_comparator
@@ -20,6 +23,15 @@ def compare_dumps(
     grouping_skip_keys: list[str] | None = None,
     extra_args: list[str] | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Asserts that the dumps under the baseline and target directories
+    # agree. The dump roots are each directory joined with a fixed "dumps" folder and the optional
+    # phase subdirectory. Asserts both roots exist, that the baseline has at least one tensor
+    # dump file anywhere below it, and that the sets of leaf directories (directories directly
+    # containing such files, relative to the root) are identical. Then runs the comparator once
+    # per leaf (passing thresholds, allow patterns, grouping skip keys and extra args through) and
+    # collects leaves whose return code is nonzero; asserts none failed (message lists the failing
+    # leaves and the per-leaf report file location). Prints a pass line with the leaf count.
+    # Raises assertion errors only; spawns subprocesses.
     subdir = phase_subdir or ""
     baseline_root = Path(baseline_dir) / "dumps" / subdir
     target_root = Path(target_dir) / "dumps" / subdir
@@ -63,5 +75,8 @@ def compare_dumps(
 
 
 def _find_leaf_dump_dirs(root: Path) -> list[str]:
+    # [FUNCTION DOC] HELPER: Recursively finds every tensor dump file (extension pt) under the
+    # root and returns the sorted, de-duplicated list of their parent directories as strings
+    # relative to the root (the root itself appears as a single dot).
     leaves: set[str] = {str(p.parent.relative_to(root)) for p in root.rglob("*.pt")}
     return sorted(leaves)

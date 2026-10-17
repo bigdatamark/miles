@@ -1,3 +1,8 @@
+# [MODULE DOC] Launcher for supervised fine-tuning of Qwen3-4B-Base (1 node) or Qwen3-235B-A22B (4
+# nodes) on the OpenHermes parquet file, using the Megatron backend in train-only mode with the
+# asynchronous training entry script and no rollout engine. Per-model differences live in a frozen
+# recipe table (module-level lookup keyed by model name). No prepare step. Entry points are
+# execute and the typer-wrapped main.
 """Qwen3 SFT training script.
 
 =====================
@@ -41,6 +46,9 @@ _MODEL_NAMES = Literal["Qwen3-4B-Base", "Qwen3-235B-A22B"]
 
 @dataclass(frozen=True)
 class _Recipe:
+    # [CLASS DOC] HELPER: Immutable per-model SFT recipe: Megatron model type, actor node count,
+    # tensor parallel size, expert parallel size, Adam second-moment beta, whether the optimizer is
+    # CPU-offloaded, and whether the launcher must ssh other hosts into the ray cluster.
     megatron_model_type: str
     actor_num_nodes: int
     tensor_model_parallel_size: int
@@ -59,6 +67,10 @@ _RECIPES: dict[str, _Recipe] = {
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC] Command-line configuration extending the shared train config. Fields: run id,
+    # model name (4B base or 235B), GPUs per node (8), join_ray_workers (on; applies only to
+    # recipes needing ssh workers), extra raw args and data, model and Megatron directories. The
+    # recipe is exposed by a read-only property.
     run_id: str = command_utils.create_run_id()
     model_name: _MODEL_NAMES = "Qwen3-4B-Base"
     num_gpus_per_node: int = 8
@@ -70,10 +82,26 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
     @property
     def recipe(self) -> _Recipe:
+        # [FUNCTION DOC] Property: looks up the recipe for the model name.
         return _RECIPES[self.model_name]
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Builds the SFT argument string and submits the job with the asynchronous train
+    # script and an environment variable enabling expandable CUDA allocator segments.
+    # Checkpoints: HF and torch_dist reference under the model dir; load and save in the
+    # checkpoints folder under the output dir, save every 1000 steps. Data: the SFT rollout
+    # function generates samples from the OpenHermes parquet (messages key, no chat template
+    # flag because the rollout function renders messages and the loss mask itself), shuffled,
+    # 3 epochs, rollout and global batch size 128, sft loss with per-token loss, advantage and
+    # return computation disabled, train-only debug mode (no generation engine). Parallelism: recipe
+    # tensor and expert sizes, sequence parallel, other sizes 1, full recompute, dynamic batch with
+    # 9216 tokens per GPU. Optimizer: adam lr 1e-5 with cosine decay to 1e-6 and 10 percent warmup,
+    # beta2 from the recipe, optional CPU offload flags. Misc: dropout off, fp32 allreduce, flash
+    # attention, actor nodes from the recipe, GPUs per node.
+    # Ray workers are joined over ssh only when both the recipe and the join flag say so; in that
+    # case the MASTER_ADDR environment variable must be set (else a key error is raised) and the
+    # optional MLP_WORKER_0_HOST variable names the head host.
     U = args.create_backend()
     ckpt_args = (
         f"--hf-checkpoint {args.model_dir}/{args.model_name} "
@@ -175,6 +203,7 @@ def execute(args: ScriptArgs):
 
 @command_utils.dataclass_cli
 def main(args: ScriptArgs):
+    # [FUNCTION DOC] Command-line entry point; just calls execute (no prepare step).
     execute(args)
 
 

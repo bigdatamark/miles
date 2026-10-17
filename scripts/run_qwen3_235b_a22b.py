@@ -1,3 +1,11 @@
+# [MODULE DOC] Launcher script for GSPO training of Qwen3-235B-A22B on a 16-node (128 GPU) cluster.
+# The command line is built as grouped blocks of flag strings (checkpoint, rollout, eval, perf,
+# algorithm, optimizer, sglang, misc) that are concatenated and handed to the shared command_utils
+# backend, which owns ray startup and job submission. Training is not colocated: 8 actor nodes of 8
+# GPUs run Megatron while 64 separate GPUs serve rollout engines of 32 GPUs each. There is no prepare
+# step; the FP8 and BF16 torch_dist checkpoints and datasets must already exist under the model and
+# data directories. Needs the MASTER_ADDR environment variable. Entry points are the execute function
+# and the typer-wrapped main function.
 """Qwen3-235B-A22B GSPO training script.
 
 =====================
@@ -38,6 +46,13 @@ from miles.utils.external_utils import command_utils
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC] Command-line configuration for this launcher, extending the shared train config
+    # (which supplies output directory, node count and backend creation). Fields: run id (generated
+    # once at import time), model name and Megatron model type, GPUs per node (8), actor nodes (8),
+    # rollout GPUs (64), rollout_fp8 (use the FP8 HF checkpoint for rollout, default on),
+    # enable_eval (turn periodic AIME eval on, default off), join_ray_workers (ssh worker hosts into
+    # ray, default on), ray hostfile path, number of rollouts (3000), extra raw argument string
+    # appended at the end, and data, model and Megatron checkout directories. No derived values.
     run_id: str = command_utils.create_run_id()
     model_name: str = "Qwen3-235B-A22B"
     megatron_model_type: str = "qwen3-235B-A22B"
@@ -56,6 +71,25 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Builds the full training argument string and submits the training job.
+    # Input: the script args. Output: none. Raises an assertion error if MASTER_ADDR is unset.
+    # Side effects: creates the backend; execute_train starts ray and submits the job; when
+    # join_ray_workers is on, a callback run before job submission ssh-es into each host of the
+    # hostfile to join it to the ray cluster using MASTER_ADDR as head address and the
+    # MLP_WORKER_0_HOST environment variable as head host (may be unset, giving none).
+    # Choices: the HF checkpoint is the model directory with an FP8 suffix when rollout_fp8, else the
+    # plain one; the reference model is the torch_dist directory; load and save both use the
+    # checkpoints folder under the output directory (no run id), saved every 20 steps.
+    # Rollout: dapo-math-17k, deepscaler reward, batch 8 prompts x 8 samples, max response 8192,
+    # temperature 1, global batch 64. Eval args (AIME, 16 samples, max 16384, top-p 1) are always
+    # added, but the eval interval of 20 only when enable_eval is set. Parallelism: TP4, PP4, CP2,
+    # EP16, expert TP1, last pipeline stage 22 layers, full uniform recompute, dynamic batch with
+    # 16384 tokens per GPU. Algorithm: gspo with zero kl and entropy coefficients, clip 4e-4.
+    # Optimizer: adam lr 1e-6 constant, CPU offloaded optimizer. SGLang: 32 GPUs per engine,
+    # DP-attention size 4, EP 32, deepep a2a, explicit CUDA graph batch sizes 1,2,4,8 then 16..256
+    # in steps of 8. Misc: dropout off, fp32 grad allreduce, flash attention, 4 GiB weight update
+    # buffer, node and GPU counts. The extra args string is appended last.
+    # KNOWN ISSUE: the kl loss flag is commented out, so the kl coefficient and type are inert.
     U = args.create_backend()
     master_addr = os.environ.get("MASTER_ADDR")
     assert master_addr, "MASTER_ADDR is not set. Please set it to the master node address."
@@ -199,6 +233,8 @@ def execute(args: ScriptArgs):
 
 @command_utils.dataclass_cli
 def main(args: ScriptArgs):
+    # [FUNCTION DOC] Command-line entry point (parsed into script args by the dataclass cli
+    # decorator); just calls execute. No prepare step exists for this script.
     execute(args)
 
 

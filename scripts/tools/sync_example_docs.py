@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Tool that mirrors every README under the examples directory (except experimental
+# ones) into generated Markdown pages under the docs examples folder, and regenerates the Examples
+# tab of the docs navigation JSON file. Pipeline: discover READMEs; read the index README for
+# one-line descriptions and the registry of listed directories; convert each README (mask code
+# regions, extract the title, drop comments and excluded blocks, rewrite images, links, details
+# blocks, void tags, unknown tags and braces for the strict MDX parser, restore code); render a
+# page with front matter; build the navigation entries. The main function either writes changed
+# files and deletes stale pages, or in check mode only reports drift. Module-level constants hold
+# paths, GitHub base URLs, the allowed HTML tag set, void tag set, section directories and the
+# compiled regular expressions used by the converters.
 """Mirror the README files under examples/ into the Examples tab of the docs site.
 
 examples/ is the single source of truth. Every README.md outside examples/experimental/
@@ -124,10 +134,17 @@ FENCE = re.compile(r"^\s*(```+|~~~+)")
 
 
 class SyncError(Exception):
+    # [CLASS DOC] Error raised for any problem with the sources that the user must fix (missing
+    # index or title, unlisted directory, bad description, slug collision, broken link, missing
+    # navigation tab). The main function catches it, prints it and exits with status one.
     pass
 
 
 def discover_pages():
+    # [FUNCTION DOC] Finds every README file under the examples directory (sorted recursive
+    # search), skipping any whose directory path includes an experimental or bytecode-cache
+    # component. Returns a mapping from the slash-joined directory path relative to examples (empty
+    # string for the root) to the README file path. Reads the filesystem only.
     """Map each mirrored directory (relative to examples/, "" for the root) to its README."""
     pages = {}
     for readme in sorted(EXAMPLES.rglob("README.md")):
@@ -140,20 +157,34 @@ def discover_pages():
 
 
 def slug_for(rel_dir):
+    # [FUNCTION DOC] Maps a relative example directory to its page slug: the root becomes "index";
+    # otherwise each path component is lower-cased with underscores turned into dashes, joined by
+    # slashes.
     if not rel_dir:
         return "index"
     return "/".join(part.replace("_", "-").lower() for part in rel_dir.split("/"))
 
 
 def site_url(rel_dir):
+    # [FUNCTION DOC] Returns the docs site URL path of a directory's page: the examples root path
+    # for the root, else the examples path followed by the slug.
     return "/examples" if not rel_dir else f"/examples/{slug_for(rel_dir)}"
 
 
 def repo_dir_of(rel_dir):
+    # [FUNCTION DOC] Returns the repository-relative path of an example directory: the examples
+    # folder itself for the root, else examples joined with the relative directory.
     return "examples" if not rel_dir else f"examples/{rel_dir}"
 
 
 def parse_index(index_readme):
+    # [FUNCTION DOC] Scans the index README line by line. A line matching the bullet pattern (bold
+    # link followed by a colon and description) or, failing that, the section-heading link pattern
+    # registers a directory: the link target is stripped of any fragment and trailing slash,
+    # joined under examples and normalized; targets that do not stay inside examples are skipped.
+    # The directory (relative to examples) is added to the registered set, and for bullets its
+    # description is stored (insertion order equals bullet order). Returns the descriptions mapping
+    # and the registered set.
     """Read examples/README.md, the registry for every mirrored page.
 
     Returns (descriptions, registered): one-line descriptions keyed by directory in
@@ -179,6 +210,12 @@ def parse_index(index_readme):
 
 
 def first_sentence(text):
+    # [FUNCTION DOC] Extracts the first sentence of the first prose paragraph. Skips fenced code and
+    # heading lines; collects stripped non-blank lines until a blank line ends the first paragraph;
+    # joins them with spaces, replaces markdown links by their text (or target if the text is
+    # empty), deletes emphasis, code and underscore characters, then returns the text up to the
+    # first sentence-ending punctuation followed by whitespace or end (or the whole paragraph if
+    # none), trimmed. Returns an empty string when there is no prose.
     """First prose sentence of a README, used when the index has no bullet for a page."""
     body = []
     in_fence = False
@@ -200,10 +237,19 @@ def first_sentence(text):
 
 
 def mask_code(text):
+    # [FUNCTION DOC] Hides regions that must not be rewritten behind numbered placeholders (a null
+    # character, the index, a null character). Order: fenced code blocks found line by line (a
+    # block closes on a line that starts with the same fence marker; an unclosed block runs to the
+    # end of text), then display math between double dollar signs (may span lines), then inline
+    # code spans (may wrap a line but not cross a blank line), then single-line inline math. Returns
+    # the masked text and the list of stashed chunks in placeholder order. Pure function.
+    # KNOWN ISSUE: the fence-closing check only requires the line to start with the opening marker,
+    # so a longer closing fence or trailing text still closes it.
     """Replace fenced blocks, inline code and display math with placeholders."""
     stash = []
 
     def keep(chunk):
+        # [FUNCTION DOC] HELPER: Appends the chunk to the stash and returns its placeholder string.
         stash.append(chunk)
         return f"\x00{len(stash) - 1}\x00"
 
@@ -238,6 +284,9 @@ def mask_code(text):
 
 
 def unmask_code(text, stash):
+    # [FUNCTION DOC] Restores the stashed chunks in place of their placeholders. Repeats the
+    # substitution while any placeholder marker character remains, since stashed chunks may
+    # themselves contain placeholders. Returns the restored text.
     # A stashed chunk can itself contain a placeholder (inline math around a code
     # span, say), so expand until none remain.
     while "\x00" in text:
@@ -246,6 +295,15 @@ def unmask_code(text, stash):
 
 
 def resolve_link(href, cur_dir, mirrored, broken):
+    # [FUNCTION DOC] Decides the replacement for a link target found in the README of directory
+    # cur_dir. Returns none (keep unchanged) for empty targets, pure fragments, absolute paths and
+    # URLs with a scheme, and for links that escape the repository (those are also appended to the
+    # broken list with a message). Otherwise the target is joined to the README's directory and
+    # normalized; a path to a mirrored directory (or its README) becomes the site page URL with the
+    # fragment kept; a docs source Markdown/MDX file becomes its published path (dropping an
+    # index suffix); an existing directory becomes a GitHub tree URL; an existing image file a
+    # GitHub raw URL (fragment dropped); any other existing file a GitHub blob URL; a missing
+    # target is appended to the broken list and none is returned. Reads the filesystem.
     """Rewrite a repo-relative href to a site page or a GitHub URL. None keeps it as is."""
     if not href or href.startswith(("#", "/")) or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", href):
         return None
@@ -278,9 +336,17 @@ def resolve_link(href, cur_dir, mirrored, broken):
 
 
 def convert_img_tags(text, cur_dir, mirrored, broken):
+    # [FUNCTION DOC] Replaces each HTML image tag with a markdown image on its own paragraph, using
+    # the tag's alt text and its source resolved with the link resolver (original source kept when
+    # unresolved); width and other attributes are dropped. Afterwards removes all paragraph
+    # open/close tags (replaced by a newline), blanks whitespace-only lines, and collapses runs of
+    # three or more newlines into two. Returns the new text; may add to the broken list.
     """<img src=... alt=...> is not self-closing in most READMEs; markdown carries it fine."""
 
     def replace(match):
+        # [FUNCTION DOC] HELPER: Substitution callback for one image tag: parses its quoted
+        # attributes (lower-cased names; either quote style), resolves the source, and returns the
+        # markdown image surrounded by blank lines.
         attrs = dict()
         for m in ATTR.finditer(match.group(1)):
             key = (m.group(1) or m.group(3)).lower()
@@ -299,9 +365,15 @@ def convert_img_tags(text, cur_dir, mirrored, broken):
 
 
 def convert_details_blocks(text):
+    # [FUNCTION DOC] Rewrites every details block into an Accordion component block, with the
+    # summary text (default "Details") as title and the stripped inner content as the body.
+    # Returns the new text.
     """A <details> block renders empty on the docs site; Mintlify's Accordion keeps it."""
 
     def replace(match):
+        # [FUNCTION DOC] HELPER: Substitution callback for one details block: cleans the summary
+        # (removes emphasis, code, underscore, brace characters and any tags, trims, turns double
+        # quotes into single quotes) to form the title and wraps the inner content.
         summary, inner = match.group(1) or "Details", match.group(2)
         # Braces would be escaped to \{ later and render literally inside the attribute.
         title = re.sub(r"[*`_{}]|<[^>]+>", "", summary).strip().replace('"', "'")
@@ -311,9 +383,15 @@ def convert_details_blocks(text):
 
 
 def escape_html(text):
+    # [FUNCTION DOC] Makes tag-like text safe for MDX. For each tag match: a tag whose lower-cased
+    # name is not in the allowed set gets its opening angle bracket replaced by an escaped entity
+    # (so it renders as text); an allowed void tag that is neither self-closed nor a closing tag
+    # is rewritten as self-closed with its attributes right-trimmed; everything else is unchanged.
+    # Returns the new text.
     """Self-close void tags; escape anything that is a model token rather than markup."""
 
     def replace(match):
+        # [FUNCTION DOC] HELPER: Substitution callback for one tag; applies the rules above.
         closing, name, attrs, self_closed = match.groups()
         if name.lower() not in HTML_TAGS:
             return "&lt;" + match.group(0)[1:]
@@ -325,6 +403,14 @@ def escape_html(text):
 
 
 def convert(readme_text, rel_dir, mirrored, broken):
+    # [FUNCTION DOC] Converts one README into a page title and MDX-safe body. Steps in order:
+    # remove docs-excluded blocks; mask code regions; find the first line starting with a level-1
+    # heading marker, take it as the title (unmasked) and delete it (raises a sync error if none);
+    # strip HTML comments; convert image tags; rewrite markdown image links and then link
+    # (outer-link pattern handles one nested image) targets through the link resolver, keeping
+    # titles; convert details blocks; escape HTML; escape curly braces with a backslash; collapse
+    # three or more newlines; restore code; strip leading and trailing newlines. Returns the title
+    # and body. May add messages to the broken list.
     readme_text = EXCLUDE_BLOCK.sub("", readme_text)
     # Mask before anything else, including the title scan: a "# comment" inside a
     # fenced block must not be mistaken for the page's level-1 heading.
@@ -345,7 +431,11 @@ def convert(readme_text, rel_dir, mirrored, broken):
     body = convert_img_tags(body, rel_dir, mirrored, broken)
 
     def rewrite(bang):
+        # [FUNCTION DOC] HELPER: Builds a substitution callback for links; the argument is the
+        # prefix ("!" for images, empty for plain links) that is re-emitted before the bracketed text.
         def replace(match):
+            # [FUNCTION DOC] HELPER: Rebuilds one link with its resolved target (or the original)
+            # and the optional title hint.
             text, href, hint = match.groups()
             resolved = resolve_link(href, rel_dir, mirrored, broken)
             return f"{bang}[{text}]({resolved or href}{hint or ''})"
@@ -363,6 +453,10 @@ def convert(readme_text, rel_dir, mirrored, broken):
 
 
 def render_page(title, description, rel_dir, body):
+    # [FUNCTION DOC] Produces the full text of a generated page: front matter with the title and
+    # description as quoted strings (non-ASCII kept), a sidebar title of "Overview" for the root and
+    # section directories only, a comment naming the source README and the generator, then the body
+    # and a final newline.
     source = f"{repo_dir_of(rel_dir)}/README.md"
     # Tab and section landing pages keep their full title (h1 / SEO) but show a short,
     # uniform "Overview" label in the sidebar (see the convention in docs/README.md).
@@ -380,6 +474,14 @@ def render_page(title, description, rel_dir, body):
 
 
 def build_pages():
+    # [FUNCTION DOC] Builds every generated page in memory. Raises a sync error when the root
+    # README is missing, when mirrored directories are not registered in the index (message lists
+    # them), when a page has no description (index bullet, else the README's first sentence), when a
+    # description exceeds 160 characters, on a slug collision, or when any link is broken (message
+    # lists sorted unique entries). When the description came from the first sentence and the
+    # converted body starts with the identical sentence (after stripping markdown), that leading
+    # sentence is removed from the body to avoid duplication. Returns the pages mapping, a mapping
+    # from output path to page text, and the list of directories in bullet order.
     pages = discover_pages()
     if "" not in pages:
         raise SyncError("examples/README.md is missing; it is the source of the Examples index page")
@@ -432,6 +534,11 @@ def build_pages():
 
 
 def build_navigation(pages, bullet_order):
+    # [FUNCTION DOC] Builds the list of navigation entries for the Examples tab. Directories are
+    # sorted by rank in bullet order (unlisted ones last, then alphabetically); the root is
+    # skipped; those under infra_features go to the infra list, others to recipes. Result: the
+    # index page, a Recipes group, and, if any infra pages exist, an Infra Features group with the
+    # infra landing page first then the rest.
     """Examples tab, mirroring the directory layout: top-level recipes, then infra_features.
 
     Sidebar order follows the bullet order in examples/README.md — the index README owns
@@ -458,6 +565,8 @@ def build_navigation(pages, bullet_order):
 
 
 def examples_tab(config):
+    # [FUNCTION DOC] Returns the tab object named Examples from the navigation tabs of the parsed
+    # docs config; raises a sync error if there is none.
     for tab in config["navigation"]["tabs"]:
         if tab.get("tab") == "Examples":
             return tab
@@ -465,10 +574,21 @@ def examples_tab(config):
 
 
 def render_docs_json(config):
+    # [FUNCTION DOC] Serializes the docs config to JSON text with one-space indentation, non-ASCII
+    # characters kept, and a trailing newline.
     return json.dumps(config, indent=1, ensure_ascii=False) + "\n"
 
 
 def main():
+    # [FUNCTION DOC] Command-line entry point returning a process exit code. Option: a check flag.
+    # Builds pages (a sync error is printed to standard error as an error line and returns 1),
+    # loads the docs JSON, replaces the Examples tab's pages with the new navigation and removes its
+    # old groups key, renders the JSON. Computes stale generated pages (existing files under the
+    # output directory not produced now), changed pages (missing or different content) and whether
+    # the JSON changed. In check mode: prints each problem to standard error with a hint to rerun
+    # the tool and returns 1 if any, else 0, writing nothing. Otherwise: deletes stale pages,
+    # writes all pages (creating directories), rewrites the JSON if changed, prints removed/wrote
+    # lines for each, and returns 0.
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--check", action="store_true", help="fail instead of writing when something is stale")
     args = parser.parse_args()

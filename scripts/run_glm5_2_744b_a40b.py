@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Launcher script (typer command line app) for GRPO training of GLM-5.2 (744B total / 40B active
+# parameters; mixture of experts with latent attention and sparse attention using cross-layer index
+# sharing) or its 5-layer prune, with Megatron training and SGLang rollout colocated on all GPUs, on
+# DAPO math. Commands: full-train (download, validate, optional FP8 cast, Megatron conversion, train),
+# prepare (same without training) and train. Supports FP8 block-quantized rollout checkpoint, DeepEP,
+# EAGLE speculative decoding, prefill/decode disaggregated rollout, two SGLang engine recipes, optional
+# optimizer offload, and a hardware-dependent parallel layout (single-node test, 16+ nodes of 4 GPUs,
+# or 16+ nodes otherwise). Important model-specific constraint: with sparse-attention index sharing,
+# every pipeline stage must start on a layer that computes its own index, which dictates the
+# first/last pipeline stage layer counts used throughout.
 """
 GLM-5.2 744B-A40B Training Script
 
@@ -68,6 +79,15 @@ app = typer.Typer()
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC]
+    # Command line options extending the shared train configuration (num_nodes, output dir, backend
+    # creation). Fields: mode (debug_minimal gives response length 100 and no eval), run id, Hugging
+    # Face org/name (name is "GLM-5.2" or "GLM-5.2_5layer"; org derived), Megatron model type (derived
+    # for pruned names), GPUs per node (None derived from hardware), fp8_rollout, use_deepep (SGLang)
+    # and megatron_use_deepep, eval switch, MTP switch, enable_pd (prefill/decode disaggregation, on by
+    # default), optimizer offload, sglang_config ("low-latency" or "balanced", see inline comment),
+    # rollout sizes (3000 rollouts, 8 prompts x 8 samples, global batch 64), extra raw args,
+    # directories (model_local_dir is the destination of the trainer copy step), hardware.
     mode: Literal["normal", "debug_minimal"] = "normal"
     run_id: str = command_utils.create_run_id()
     model_org: str = "zai-org"
@@ -97,6 +117,13 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     hardware: Literal["auto", "H200", "B200", "GB300"] = "auto"
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Resolves hardware and GPUs per node. On GB300, asserts Megatron DeepEP is off (known failure).
+        # If SGLang DeepEP is off, forces Megatron DeepEP off. On a single node, disables prefill/decode
+        # disaggregation and forces debug_minimal mode. For the "balanced" recipe, asserts no
+        # disaggregation and that GPUs per node is divisible by 4. If the model name has a layer-count
+        # suffix, sets the Megatron model type to the pruned variant. Sets the org to zai-org for the
+        # full model or Pinaster for the 5-layer model; any other name raises a not implemented error.
         self.hardware = command_utils.resolve_hardware(self)
         self.num_gpus_per_node = self.num_gpus_per_node or command_utils.NUM_GPUS_OF_HARDWARE[self.hardware]
         if self.hardware == "GB300":
@@ -124,10 +151,17 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
 
 def _is_pruned(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: True when the model name contains a number followed by "layer".
     return re.search(r"(\d+)layer", args.model_name) is not None
 
 
 def _validate_glm_checkpoint(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Reads the downloaded checkpoint's config file in the model directory.
+    # Raises file-not-found if missing. Expected layer count is 78 for the full model or the number in
+    # the name for pruned ones (other names raise not implemented). Raises a runtime error unless the
+    # config has the native sparse-attention MoE model type, architecture list with the single causal
+    # LM class, and the expected layer count; also raises if the config has a custom class mapping entry
+    # (meaning the checkpoint is a non-native variant to be updated).
     """Validate the basic native GLM-5.2 config fields."""
     config_path = Path(args.model_dir) / args.model_name / "config.json"
     if not config_path.exists():
@@ -158,6 +192,10 @@ def _validate_glm_checkpoint(args: ScriptArgs):
 
 
 def _convert_to_fp8(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Idempotent FP8 cast. Skips (printing a notice) if the "_fp8" output folder
+    # already contains the safetensors index file. Otherwise runs the Hugging Face to FP8 tool as a GPU
+    # command with block quantization 128 by 128 and 16 workers, from the model folder to the output
+    # folder. The policy side stays bf16.
     """Convert HF checkpoint to FP8 (block quantization). Megatron still uses bf16."""
     U = args.create_backend()
     src = f"{args.model_dir}/{args.model_name}"
@@ -175,6 +213,8 @@ def _convert_to_fp8(args: ScriptArgs):
 
 
 def _prepare_download(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Creates model/data directories, downloads the Hugging Face model into the
+    # model directory and the DAPO math dataset into the data directory.
     U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.model_dir} {args.data_dir}")
     U.exec_command_cpu(
@@ -184,6 +224,12 @@ def _prepare_download(args: ScriptArgs):
 
 
 def _prepare_megatron_ckpt(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Converts the Hugging Face checkpoint to a Megatron distributed checkpoint
+    # in the model directory. Tensor and expert-tensor parallel always 1. For pruned models with at most
+    # 5 layers: single GPU, single node, pipeline 1, expert 1 (avoids the converter's automatic
+    # pipeline bump that would split onto a layer that skips index computation). Otherwise a multi-node
+    # job across all nodes with pipeline 4, expert = total GPUs / 4, and 18 / 20 layers on the first /
+    # last pipeline stages. The distributed format is parallelism-agnostic on load.
     U = args.create_backend()
     extra_args = "--tensor-model-parallel-size 1 " "--expert-tensor-parallel-size 1 "
     num_gpus_per_node = args.num_gpus_per_node
@@ -224,6 +270,9 @@ def _prepare_megatron_ckpt(args: ScriptArgs):
 
 
 def _prepare_cmd(args: ScriptArgs) -> dict[str, str]:
+    # [FUNCTION DOC] HELPER: Returns a mapping with a "trainer" entry joining, in sequence, rsync copies
+    # of the Megatron distributed checkpoint and the rollout Hugging Face folder ("_fp8" suffixed when
+    # FP8 rollout) from the shared model directory to the local model directory.
     hf_name = f"{args.model_name}_fp8" if args.fp8_rollout else args.model_name
     copies = [
         command_utils.rsync_cmd(
@@ -236,6 +285,35 @@ def _prepare_cmd(args: ScriptArgs) -> dict[str, str]:
 
 
 def _execute_train(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Builds the training argument string and submits the job.
+    # Checkpoint: hf checkpoint from the local model directory (FP8 folder when FP8 rollout), reference
+    # load from local distributed folder, load/save under the output directory every 20 steps.
+    # Rollout: DAPO math, deepscaler reward, chat template, shuffled, response length 100 (debug) or
+    # 32768, temperature 1, sizes from options. Eval (non-debug and enabled): every 20 steps, top-p 1
+    # (no eval dataset is passed here). Parallelism by cluster: one node (test) tensor 4, sequence
+    # parallel, expert = GPUs; 16+ nodes of 4 GPUs: tensor 8, pipeline 4 (18/20 edge layers), expert 16;
+    # 16+ nodes otherwise: tensor 4, pipeline 8 (14/16 edge layers), context 8, expert 32; anything else
+    # raises not implemented. Then full uniform recompute, dynamic batch (2048 tokens per GPU for
+    # pruned models else 8192), padding multiple 1024, log-prob chunk 16384. GRPO with zero kl/entropy,
+    # asymmetric clip, truncated importance sampling bounds 0.5 to 2.0. Adam 1e-6, CPU offload group if
+    # enabled. SGLang engine size: with disaggregation, decode batch 8 and 16 GPUs (under 16 nodes) or
+    # 64; without, decode batch 32 and 4 GPUs (balanced) or min(8, GPUs per node). Memory fraction 0.70
+    # on a single node else 0.85 (values justified by inline measurements), expert parallel = engine
+    # size, consistent-hashing router; disaggregation adds data-parallel attention, dense TP 1, DP LM
+    # head and one prefill server; the balanced recipe adds data-parallel attention; DeepEP all-to-all
+    # for balanced or FP8+DeepEP (with auto mode for FP8); MTP adds EAGLE (balanced 1 step/2 draft
+    # tokens, low-latency 5/6) with the sparse attention draft backend; FP8 KV cache, flashmla decode and
+    # sparse prefill backends, page size 64, cuda graph and running-request limits, 3600 s watchdog; on
+    # B200/GB300 for non-balanced non-FP8-DeepEP runs, the moe backend is flashinfer routed (FP8) or
+    # triton (bf16). Environment variables: DeepEP dispatch token limit (64 with disaggregation else
+    # 256), forced MLA, indexer rope style 0, NVSHMEM over NCCL disabled. Misc: dropouts off, fp32
+    # accumulation, flash attention, all-gather context-parallel split, 2 GiB weight buffer, colocate,
+    # rematerialize parameters from master weights, Megatron DeepEP with flex dispatcher or all-to-all
+    # dispatcher. Submits via the backend with the per-role copy commands.
+    # KNOWN ISSUE: the code comment "need to comment this when using model with MLA" sits beside a
+    # flash attention flag for an MLA model (stale comment).
+    # KNOWN ISSUE: eval is enabled via interval/top-p only; no eval prompt data flag is provided, so
+    # eval relies on extra args or defaults.
     U = args.create_backend()
     load_save_path = f"{args.output_dir}/{args.run_id}/checkpoints"
     hf_name = f"{args.model_name}_fp8" if args.fp8_rollout else args.model_name
@@ -481,6 +559,10 @@ def _execute_train(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def full_train(args: ScriptArgs):
+    # [FUNCTION DOC] Command "full-train": download, validate checkpoint, optional FP8 cast, Megatron
+    # conversion, then training.
+    # KNOWN ISSUE: the module docstring says the model-local-dir default is the local data folder, but
+    # the actual default equals the shared model directory.
     """Full pipeline: download, convert, copy, train."""
     _prepare_download(args)
     _validate_glm_checkpoint(args)
@@ -493,6 +575,7 @@ def full_train(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Command "prepare": same as full-train but without training (run on head node).
     """Download model/data and convert to megatron checkpoint (run on head node)."""
     _prepare_download(args)
     _validate_glm_checkpoint(args)
@@ -504,12 +587,14 @@ def prepare(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def train(args: ScriptArgs):
+    # [FUNCTION DOC] Command "train": training only; assumes preparation is done.
     """Run training only (assumes data is prepared)."""
     _execute_train(args)
 
 
 @app.callback()
 def _callback() -> None:
+    # [FUNCTION DOC] HELPER: Empty typer callback so commands stay sub-commands. Does nothing.
     pass
 
 

@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Submits a ray job and follows it. Two lifetimes: "independent" shells out to the ray job submit
+# command (job keeps running if the launcher dies; the command streams logs and waits), and
+# "launcher" uses the job submission client, tails logs, and stops the job when the launcher
+# finishes or is interrupted (terminate/interrupt signals are intercepted and turned into a clean
+# stop and an exit status of 128 plus the signal number).
 import asyncio
 import json
 import os
@@ -17,6 +23,14 @@ from miles.utils.external_utils.command_utils.common import run_shell_command as
 def run_ray_job(
     *, entrypoint: str, runtime_env: dict, job_lifetime: Literal["independent", "launcher"] = "independent"
 ) -> None:
+    # [FUNCTION DOC] Runs an entrypoint command as a ray job and blocks until it finishes. Independent
+    # lifetime: runs a shell command that disables proxying for loopback, forces unbuffered output,
+    # and invokes ray job submit with the dashboard address (loopback port 8265 unless the ray
+    # address environment variable is set, in which case the address option is omitted), the runtime
+    # environment passed as quoted json, and the entrypoint. Launcher lifetime: uses the address from
+    # the environment (default same loopback dashboard) and the launcher-owned job path. Any other
+    # lifetime raises a value error. The entrypoint is interpolated into a shell command unquoted in
+    # the independent case.
     """Submit and follow a job; launcher-owned jobs stop when the launcher exits."""
     if job_lifetime == "independent":
         exec_command_cpu(
@@ -35,6 +49,11 @@ def run_ray_job(
 
 
 def _run_launcher_owned_job(*, address: str, entrypoint: str, runtime_env: dict) -> None:
+    # [FUNCTION DOC] HELPER: Adds unbuffered output to the runtime environment's variables (without
+    # mutating the argument). Temporarily extends the lower-case no-proxy environment variable with
+    # the existing value (falling back to the upper-case one) plus loopback and localhost so the
+    # dashboard is reached directly; runs the async submit-and-stop routine with a fresh unique
+    # submission id; then restores the variable (deleting it if it was unset before).
     runtime_env = {**runtime_env, "env_vars": {**runtime_env.get("env_vars", {}), "PYTHONUNBUFFERED": "1"}}
     previous_no_proxy = os.environ.get("no_proxy")
     os.environ["no_proxy"] = ",".join(
@@ -57,11 +76,20 @@ def _run_launcher_owned_job(*, address: str, entrypoint: str, runtime_env: dict)
 
 
 async def _run_and_stop_job(address: str, submission_id: str, entrypoint: str, runtime_env: dict) -> None:
+    # [FUNCTION DOC] HELPER: Installs handlers for interrupt and terminate that record the signal
+    # number and set an async stop event. Submits the job, prints a submission message, follows it
+    # until it ends or a stop is requested; in all cases (finally) runs the ray command line job stop
+    # (waits for a terminal status; check enabled, 45 second timeout, so a failure or timeout
+    # raises). Afterwards: if a signal was received raises a system exit with 128 plus the signal;
+    # else fetches the status and raises a runtime error including the job message unless it
+    # succeeded. Previous signal handlers are always restored.
     loop = asyncio.get_running_loop()
     stop_requested = asyncio.Event()
     stop_signal = None
 
     def request_stop(signum, frame):
+        # [FUNCTION DOC] HELPER: Signal handler; remembers the signal and thread-safely sets the
+        # stop event on the event loop.
         nonlocal stop_signal
         stop_signal = signum
         loop.call_soon_threadsafe(stop_requested.set)
@@ -93,7 +121,12 @@ async def _run_and_stop_job(address: str, submission_id: str, entrypoint: str, r
 
 
 async def _follow_job(client: JobSubmissionClient, submission_id: str, stop_requested: asyncio.Event) -> None:
+    # [FUNCTION DOC] HELPER: Runs a log-tailing task and a stop-waiting task concurrently, returns
+    # when the first completes (re-raising its exception if any), and always cancels both tasks and
+    # awaits them, swallowing cancellation.
     async def print_logs():
+        # [FUNCTION DOC] HELPER: Streams the job's log chunks to standard output unbuffered, with no
+        # added newlines, until the stream ends.
         async for chunk in client.tail_job_logs(submission_id):
             print(chunk, end="", flush=True)
 

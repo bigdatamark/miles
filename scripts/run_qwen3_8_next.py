@@ -1,3 +1,8 @@
+# [MODULE DOC] Launcher for short GRPO smoke/validation runs of the Qwen3.8-Flash-Next hybrid model
+# (full model on 32 GPUs, or a 4-layer reduced variant on 4 or 8 GPUs) with the Megatron backend,
+# colocated SGLang rollout and training state offloaded to disk. Exposes a typer app with a single
+# train command; there is no prepare step, so the HF checkpoint and the converted torch_dist
+# reference checkpoint must exist. Imports the command utilities under the short alias U.
 """Qwen3.8-Flash-Next DAPO training on an already-running ray cluster (MILES_SCRIPT_EXTERNAL_RAY=1).
 
 python scripts/run_qwen3_8_next.py train --num-nodes 8 --num-gpus-per-node 4
@@ -22,6 +27,12 @@ _MODEL_REGISTRY = {
 
 @dataclass
 class ScriptArgs(U.ExecuteTrainConfig):
+    # [CLASS DOC] Command-line configuration extending the shared train config. Fields: model name
+    # (full or 4-layer variant), nodes (8) and GPUs per node (4), run id, optional HF checkpoint
+    # path, directories (models, converted checkpoints, datasets, saves, train offload, Megatron
+    # checkout), rollout count (5) and max response length (4096), check_weight_update_equal
+    # (on), enable_r3 (routing replay, off), skip_saving (on; no checkpoint load/save flags) and
+    # extra raw args.
     model_name: Literal["Qwen3.8-Flash-Next", "Qwen3.8-Flash-Next-4layer"] = "Qwen3.8-Flash-Next"
     num_nodes: int = 8
     num_gpus_per_node: int = 4
@@ -41,11 +52,35 @@ class ScriptArgs(U.ExecuteTrainConfig):
     extra_args: str = ""
 
     def __post_init__(self):
+        # [FUNCTION DOC] Defaults the HF checkpoint path to the model directory plus model name.
         if self.hf_checkpoint is None:
             self.hf_checkpoint = f"{self.model_dir}/{self.model_name}"
 
 
 def _train(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Builds the training argument string and environment variables and
+    # submits the job through the backend. Raises an assertion error when the total GPU count
+    # (nodes x GPUs per node) does not match the validated layout: exactly 32 for the full model
+    # (pipeline parallel 8, engine of 8 GPUs) or 4 or 8 for the 4-layer model (pipeline parallel 2,
+    # engine of 4 GPUs). Tensor parallel is 2, context parallel 1, expert parallel is total GPUs
+    # divided by pipeline size, sglang tp and ep both equal the engine size.
+    # Checkpoints: HF checkpoint and reference load from the converted dir keyed by the Megatron
+    # model type; unless skip_saving, also load/save a per-run folder every 10 steps without
+    # optimizer or rng state. Rollout: dapo-math-17k, math reward, thinking-mode chat template
+    # kwargs, 4 prompts x 8 samples, temperature 0.8, one step per rollout. Algorithm: grpo with
+    # zero kl/entropy coefficients, clip 0.2/0.28; adam lr 1e-6. Perf: full recompute, micro batch
+    # 1, 8192 tokens per GPU. SGLang: flashinfer linear attention prefill, triton moe runner,
+    # chunked prefill 8192, radix cache off, router health check thresholds. Misc: 1 GiB weight
+    # update buffer, offload training state to disk under the offload dir, memory fraction 0.7,
+    # colocate, a fixed internal model name, thd qkv format, flashqla linear attention, a custom
+    # model provider path, long health-check and distributed timeouts; optional weight-update
+    # equality check (skipping visual and ple embedding modules) and routing replay.
+    # Environment for the job: health-check timeout, multimem all-gather disabled, the caller's
+    # python path, a single inductor compile thread (works around a deadlock with the memory
+    # saver preload), and the triton and inductor cache dirs when set in the caller's environment
+    # (needed because the ray runtime environment replaces the actor environment).
+    # KNOWN ISSUE: the module docstring says the script targets an external ray cluster, but this
+    # function does nothing to enforce or configure that.
     megatron_model_type = _MODEL_REGISTRY[args.model_name]
 
     ckpt_args = (
@@ -191,6 +226,7 @@ def _train(args: ScriptArgs):
 @app.command()
 @U.dataclass_cli
 def train(args: ScriptArgs):
+    # [FUNCTION DOC] The only command: submits the training job via the train helper.
     _train(args)
 
 

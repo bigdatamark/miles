@@ -1,3 +1,7 @@
+# [MODULE DOC] Builds the strings used to launch the Megatron worker: the full torchrun shell
+# command, the worker's argument string (Megatron flags plus script flags plus user extras), and
+# the dumper environment variables. All outputs are plain strings or mappings; nothing is run
+# here and values are not shell-quoted.
 """Build torchrun command and worker arguments."""
 
 from pathlib import Path
@@ -14,6 +18,11 @@ def build_torchrun_cmd(
     nproc: int,
     worker_args: str,
 ) -> str:
+    # [FUNCTION DOC] Returns one shell command string: sets the Python path to the Megatron path
+    # in front of the existing one, sets the device max connections variable to 1, runs torchrun
+    # with the given processes per node on the worker module, followed by the model arguments
+    # loaded for the model type (may raise from the loader), dropout flags set to zero for hidden
+    # and attention dropout, and the given worker argument string.
     """Build the full shell command to launch the worker via torchrun."""
     worker_module: str = "miles.utils.debug_utils.run_megatron.worker.main"
 
@@ -38,6 +47,10 @@ def build_worker_args(
     script_args: WorkerScriptArgs,
     extra_args: str,
 ) -> str:
+    # [FUNCTION DOC] Routing replay is considered in use when the script args have either a dump
+    # or a load path. Returns a space-joined string of: Megatron flags (see the flags helper), the
+    # script flags produced by the bridge from the script args, and the user's extra args when
+    # non-empty (appended last, so they come last on the command line).
     """Build the worker argument string.
 
     Megatron-native flags come from declarative tables in
@@ -68,6 +81,10 @@ def build_dumper_env(
     run_backward: bool,
     dumper_filter: str,
 ) -> dict[str, str]:
+    # [FUNCTION DOC] Returns a mapping of dumper environment variables: enable set to "1", the
+    # dump directory set to the output directory, experiment name "standalone" (this is why
+    # comparisons read the "standalone" subdirectory). Adds the filter variable only if the filter
+    # is non-empty, and the model-gradient dump flag "1" only when running backward.
     """Build DUMPER_* environment variables for the worker."""
     env: dict[str, str] = {
         "DUMPER_ENABLE": "1",
@@ -89,6 +106,12 @@ def _build_megatron_flags(
     batch_size: int,
     use_routing_replay: bool,
 ) -> str:
+    # [FUNCTION DOC] HELPER: Returns space-joined flags. Valued flags (always emitted unless the
+    # value is none): tensor, pipeline, context, expert (effective) and expert-tensor parallel
+    # sizes, sequence length, micro batch size and global batch size (both set to the batch size,
+    # so one micro batch per step). Boolean flags emitted when true: sequence parallel (per
+    # argument), bf16 (always), no gradient accumulation fusion (always), routing replay (per
+    # argument).
     """Build Megatron-native CLI flags from declarative tables."""
     key_value_args: list[tuple[str, object | None]] = [
         ("--tensor-model-parallel-size", parallel.tp),

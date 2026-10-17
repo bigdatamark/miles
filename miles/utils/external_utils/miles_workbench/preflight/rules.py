@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Static tables for preflight checks (no functions). Constants: helm managed-by label value; chart
+# family names (workbench and run charts); leader worker set api group, resource, controller
+# namespace and deployment; a kubectl jsonpath for the Available condition; the namespaced object
+# kinds scanned for foreign objects; error text markers meaning a resource type is not served;
+# objects the cluster creates itself; the prefix of helm release record secrets. Rule tables map a
+# resource (optionally with a subresource) to the verbs required: rules for the chart install, for
+# the service account, for rbac objects, and for the day-to-day workflow (pods, exec, logs,
+# stateful sets).
 from __future__ import annotations
 
 from miles.utils.external_utils.miles_workbench.naming import CHART_NAME

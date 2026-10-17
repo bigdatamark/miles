@@ -1,3 +1,9 @@
+# [MODULE DOC] Command-line integration for deepseek sparse attention (DSA). Defines the two option
+# groups (implementation choice: in-repo kernels versus Megatron-native; top-k backend: torch or
+# flashinfer) and a normalization step that, for the Megatron-native choice, validates compatibility and
+# rewrites the argument namespace (spec, indexer sizes from the Hugging Face config, CP communication
+# type, indexer loss coefficient) so Megatron's own config validation accepts it. Constants name the
+# two (module, function) spec providers.
 """Select the raw DSA implementation before Megatron validates its config."""
 
 from argparse import ArgumentParser, Namespace
@@ -7,6 +13,10 @@ MEGATRON_DSA_SPEC = ("miles_plugins.models.glm5.megatron_spec", "get_dsa_spec")
 
 
 def add_dsa_arguments(parser: ArgumentParser) -> ArgumentParser:
+    # [FUNCTION DOC] Mutates the parser: sets the default for the context-parallel communication type
+    # to none (so omitted can be told from explicit), and adds a "deepseek-sparse-attention" group with
+    # two options: the implementation choice (miles or megatron, default miles) and the top-k backend
+    # (torch or flashinfer, default torch). Returns the same parser.
     # Distinguish an omitted Megatron CP setting from an explicit incompatible choice.
     parser.set_defaults(cp_comm_type=None)
     group = parser.add_argument_group(title="deepseek-sparse-attention")
@@ -31,6 +41,16 @@ def add_dsa_arguments(parser: ArgumentParser) -> ArgumentParser:
 
 
 def normalize_dsa_args(args: Namespace, hf_config) -> None:
+    # [FUNCTION DOC] No-op unless the implementation is megatron. Otherwise validates, raising value
+    # errors: the Megatron-to-HF mode (default raw) must be raw; the spec must be one of the two known
+    # shared specs (or empty is rejected); the HF model type must be deepseek_v32 or glm_moe_dsa; and
+    # with context parallel size above one the all-gather CP flag must be off. CP comm type: if unset,
+    # set to a list with all-gather; if set, every entry must be all-gather. Then mutates args: spec set
+    # to the Megatron spec provider, the attention variant set to dsa, experimental features on, top-k
+    # backend copied, indexer heads / head dim / top-k from the HF config, rope-interleave flag from HF
+    # (default false, stored under two names), top-k frequency (default 1, treating falsy as 1) and
+    # skip offset (default 0), Hadamard rotation off, key norm epsilon 1e-6 and fp32, and indexer loss
+    # coefficient defaulting to 0.0 when unset, raising if negative.
     """Map the shared Miles DSA spec and HF indexer conventions to native Megatron."""
     if args.dsa_impl != "megatron":
         return

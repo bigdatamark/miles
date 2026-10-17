@@ -1,3 +1,8 @@
+# [MODULE DOC] Entry points that read the recorded audit events from a directory and run every
+# analysis rule over them (cross-replica weight checksum, inference-engine weight checksum
+# consistency, witness data accounting). Events are first partitioned by model id so each model
+# is checked independently. Issues are plain rule-specific records collected into one list.
+
 """Centralized event analyzer that reads events and runs all rules."""
 
 import logging
@@ -18,6 +23,11 @@ logger = logging.getLogger(__name__)
 
 
 def run_analysis_from_args(args: Namespace) -> None:
+    # [FUNCTION DOC] Argument-driven wrapper. Does nothing unless the enable-event-analyzer
+    # attribute is truthy and the save-debug-event-data attribute (the event directory) is set
+    # (missing attributes count as off). Otherwise runs the analysis on that directory, always
+    # logging the elapsed wall time at info level (even on failure), and raises a value error
+    # embedding the issue list if any issue was found, so the run stops fast.
     if not getattr(args, "enable_event_analyzer", False):
         return
 
@@ -37,6 +47,9 @@ def run_analysis_from_args(args: Namespace) -> None:
 
 
 def run_analysis(event_dir: Path) -> list[Any]:
+    # [FUNCTION DOC] Reads all events from the directory (via the event logger reader), returns an
+    # empty list if there are none, else the concatenated issues from checking each per-model
+    # partition of the events. Reads files; no other side effects.
     events = read_events(event_dir)
     if not events:
         return []
@@ -45,6 +58,9 @@ def run_analysis(event_dir: Path) -> list[Any]:
 
 
 def _check_one_model_id(events: list[Any]) -> list[Any]:
+    # [FUNCTION DOC] HELPER: Runs the three rule checks on one model's events and concatenates
+    # their issues in this order: cross-replica checksum, inference-engine checksum consistency,
+    # witness.
     return [
         *cross_replica_weight_checksum.check(events),
         *inference_engine_weight_checksum_consistency.check(events),
@@ -53,6 +69,10 @@ def _check_one_model_id(events: list[Any]) -> list[Any]:
 
 
 def _partition_by_model_id(events: list[Any]) -> list[list[Any]]:
+    # [FUNCTION DOC] HELPER: Splits events by model id. If no event carries a model id, returns a
+    # single partition with all events. Otherwise returns one partition per distinct model id, in
+    # sorted id order, each containing the events of that model plus all events with no model id
+    # (those are shared across partitions), preserving the original event order.
     model_ids = {model_id for event in events if (model_id := _compute_model_id(event)) is not None}
     if not model_ids:
         return [events]
@@ -63,5 +83,8 @@ def _partition_by_model_id(events: list[Any]) -> list[list[Any]]:
 
 
 def _compute_model_id(event: Any) -> str | None:
+    # [FUNCTION DOC] HELPER: Returns the model id of the event's source when the source is a
+    # training-process or trainer-controller identity (which may itself be None); returns None
+    # for every other kind of source.
     source = event.source
     return source.model_id if isinstance(source, (TrainProcessIdentity, TrainerControllerProcessIdentity)) else None

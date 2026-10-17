@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Launcher script (typer command line app) for GRPO training with LoRA adapters of GLM-5.1
+# (744B total / 40B active, mixture of experts with latent attention and sparse attention) or its
+# 6-layer prune, on a single node, with the Megatron bridge conversion mode (the Hugging Face
+# checkpoint is loaded directly, no offline conversion) and SGLang rollout colocated on the same
+# GPUs. Tasks: gsm8k or DAPO math. Commands: prepare (download model for known repos plus dataset),
+# train, full-train. Several behaviors are controlled by environment variables read at train time:
+# an expert-LoRA kill switch, an ignored layer-subset option that only warns, and an optimizer CPU
+# offload kill switch. Module tables map the model name to Hugging Face repo and Megatron model type.
 """
 GLM-5.1 744B-A40B GRPO LoRA training script (Megatron-Bridge / bridge mode).
 
@@ -57,6 +66,17 @@ _MEGATRON_MODEL_TYPE = {
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC]
+    # Command line options extending the shared train configuration. Fields: run id, model name (full
+    # or 6-layer, default 6-layer), task (gsm8k default, or dapo-math), optional explicit hf checkpoint
+    # (derived in post-init), directories (save dir default is a personal checkpoints path), DSA
+    # attention kernel backend (tilelang default or megatron), routing replay switch, GPUs per node
+    # (default 4; this launcher always uses one actor node), LoRA hyperparameters (rank 16, alpha 32,
+    # dropout 0, target module pattern, base-weight CPU backup on, shared-outer expert adapters on),
+    # rollout sizes (1 rollout, 4 prompts x 4 samples, global batch 16, response length 0 meaning
+    # per-task default, sequence window 0 meaning per-task default), dynamic sampling off with its
+    # over-sampling size, rollout engine options (2 GPUs per engine, memory fraction 0.5, LoRA backend
+    # triton, FP8 rollout checkpoint switch), wandb switch, extra raw args.
     run_id: str = command_utils.create_run_id()
     model_name: Literal[
         "GLM-5.1",
@@ -116,6 +136,10 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     extra_args: str = ""
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Fills defaults: hf checkpoint becomes model directory plus model name if unset; response
+        # length becomes 4096 for dapo-math else 512 when zero; the sequence window becomes 8192 for
+        # dapo-math when zero (it stays zero, meaning not emitted, for gsm8k).
         if self.hf_checkpoint is None:
             self.hf_checkpoint = f"{self.model_dir}/{self.model_name}"
         if self.rollout_max_response_len == 0:
@@ -125,10 +149,16 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
     @property
     def megatron_model_type(self) -> str:
+        # [FUNCTION DOC] Property: Megatron model type key (a LoRA variant) looked up from the model name.
         return _MEGATRON_MODEL_TYPE[self.model_name]
 
 
 def _get_parallel_config(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: Returns the space-terminated parallelism flags for a single node: tensor
+    # and expert parallel size both equal to GPUs per node, sequence parallel, pipeline 1, context 1,
+    # expert-tensor 1, micro batch 1 (dynamic batching is not allowed with either kernel backend), and
+    # the query layout flag: packed "thd" for the tilelang backend, "bshd" for the megatron backend.
+    # The existing docstring is consistent with this.
     """Single-node MoE layout: TP = EP = num_gpus_per_node, DP1 (mirrors run_glm5_744b_a40b).
 
     The DSA kernel backend dictates the query layout; both forbid --use-dynamic-batch-size,
@@ -146,6 +176,8 @@ def _get_parallel_config(args: ScriptArgs) -> str:
 
 
 def _download_dataset(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Downloads the dataset of the task into the data directory (GSM8K or
+    # DAPO math) via the backend.
     U = args.create_backend()
     match args.task:
         case "gsm8k":
@@ -155,6 +187,10 @@ def _download_dataset(args: ScriptArgs):
 
 
 def _prepare_download(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Creates the data and model directories, downloads the Hugging Face repo
+    # for the model name (from the module table; every allowed name has one) into the model directory,
+    # then downloads the task dataset. Note the model goes to model dir plus model name, while training
+    # reads the explicit hf checkpoint if given.
     U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.data_dir} {args.model_dir}")
     repo = _HF_REPO.get(args.model_name)
@@ -164,6 +200,33 @@ def _prepare_download(args: ScriptArgs):
 
 
 def _train(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Builds the training argument string and submits the job. Prints a summary
+    # line. Reads three environment variables at call time: a switch that when set to "0" drops the
+    # expert projections from LoRA (attention-only adapters, excluding gate/up/down projection modules
+    # and not emitting the shared-outer flag); a layer-subset variable that, if non-empty, only prints
+    # a warning because that feature is disabled; and an optimizer offload switch ("0" disables).
+    # Args: checkpoint (hf checkpoint, bridge mode, DSA backend); LoRA (rank, alpha, dropout, quoted
+    # target modules, shared-outer experts if expert LoRA kept, no gradient accumulation fusion, base
+    # CPU backup if enabled); rollout (math reward, chat template, shuffled, sizes and length from
+    # options, temperature 1, global batch; data file and key by task; optional over-sampling with
+    # nonzero-reward-std filter); GRPO with zero kl/entropy and asymmetric clip; optional routing
+    # replay; Adam at 1e-5 (not 1e-6) with CPU offload group unless disabled; parallel flags;
+    # SGLang: 2-GPU engine per option, or min(8, GPUs) when FP8 rollout; data-parallel attention with
+    # expert and data size equal to engine size; sparse attention backend with decode backend
+    # flashmla_kv (FP8) or flashmla_sparse and prefill flashmla_sparse, page 64, FP8 KV cache when FP8
+    # rollout, cuda graph batch 256 (FP8) or 64, 512 running requests, chunked prefill 2048 per engine
+    # GPU, 3600 s watchdog, triton moe, no shared-experts fusion, LoRA rank and backend; save every
+    # step to the run folder under the save directory; misc flags (dropouts off, fp32 accumulation,
+    # flash attention, per-token loss, one actor node, colocate); optional wandb args; optional
+    # sequence length and max rollout context when the window is positive. Environment variables
+    # passed to the job: indexer rope style 0 (interleaved) and forced MLA for sparse attention.
+    # KNOWN ISSUE: an internal always-true flag makes the alternative SGLang branch (smaller flag set
+    # with reasoning and tool-call parsers) and the guarded no-fusion condition dead code.
+    # KNOWN ISSUE: the module docstring says the 3 indexer modules are excluded by default from the
+    # target modules, but the default target pattern here is "all-linear" and no exclusion is emitted
+    # except in the attention-only mode (which excludes expert projections instead).
+    # KNOWN ISSUE: the FP8 rollout switch does not change the hf checkpoint; the user must point to
+    # the pre-converted checkpoint via the explicit hf checkpoint option.
     U = args.create_backend()
     print(
         f"[run] GLM-5.1 LoRA: model={args.model_name} (megatron_model_type={args.megatron_model_type}), dsa-backend={args.dsa_attention_backend}, r3={args.use_r3}, {args.num_gpus_per_node} GPUs, rollout tp={args.rollout_num_gpus_per_engine}"
@@ -289,6 +352,7 @@ def _train(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Command "prepare": downloads the model and dataset (run once per node).
     """Download the model checkpoint (for a known HF repo) and the task dataset (gsm8k or dapo-math). Run once per node before training."""
     _prepare_download(args)
 
@@ -296,6 +360,7 @@ def prepare(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def train(args: ScriptArgs):
+    # [FUNCTION DOC] Command "train": LoRA training only; assumes the dataset is already downloaded.
     """Run GRPO LoRA training (assumes the dataset is already prepared)."""
     _train(args)
 
@@ -303,6 +368,7 @@ def train(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def full_train(args: ScriptArgs):
+    # [FUNCTION DOC] Command "full-train": download then LoRA training.
     """Download the model checkpoint + dataset, then run GRPO LoRA training."""
     _prepare_download(args)
     _train(args)
@@ -310,6 +376,7 @@ def full_train(args: ScriptArgs):
 
 @app.callback()
 def _callback() -> None:
+    # [FUNCTION DOC] HELPER: Empty typer callback so commands stay sub-commands. Does nothing.
     pass
 
 

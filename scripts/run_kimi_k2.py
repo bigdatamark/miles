@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Launcher script (single command, run through typer) for full-parameter GRPO training of Kimi-K2
+# (Instruct or Thinking), Megatron plus SGLang colocated on a 32-node by 8-GPU cluster, on DAPO math
+# with optional AIME eval. Training only: the Megatron distributed checkpoint and Hugging Face
+# checkpoint must already exist, and the ray cluster is expected to be already joined (the launcher
+# is meant to be run in the external-ray mode). Both variants share one recipe, expressed through a
+# frozen per-model table of differences (checkpoint folder names, response length, eval samples,
+# truncated importance sampling, Megatron DeepEP).
 """Kimi-K2 full-parameter GRPO training script.
 
 =====================
@@ -40,6 +48,11 @@ _MODEL_NAMES = Literal["Kimi-K2-Instruct", "Kimi-K2-Thinking"]
 
 @dataclass(frozen=True)
 class _Recipe:
+    # [CLASS DOC] HELPER: Immutable record of the per-variant differences. Fields: Megatron model type
+    # name, Hugging Face checkpoint folder name, converted-checkpoint folder prefix (suffix
+    # "_torch_dist" is added by the launcher), maximum response length for rollout and eval, number
+    # of samples per eval prompt, whether truncated importance sampling is on, and whether Megatron
+    # uses DeepEP for MoE dispatch.
     megatron_model_type: str
     hf_checkpoint: str
     torch_dist_name: str
@@ -73,6 +86,11 @@ _RECIPES: dict[str, _Recipe] = {
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC]
+    # Command line options extending the shared train configuration (output dir, backend creation).
+    # Fields: run id, model name (Instruct or Thinking), node count (overridden default 32), GPUs per
+    # node (8), eval switch (on), save switch (on), number of rollouts (100), extra raw args, data and
+    # model directories, Megatron checkout path. The recipe property gives the per-model table entry.
     run_id: str = command_utils.create_run_id()
     model_name: _MODEL_NAMES = "Kimi-K2-Instruct"
     num_nodes: int = 32
@@ -87,10 +105,29 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
     @property
     def recipe(self) -> _Recipe:
+        # [FUNCTION DOC] Property: the per-model recipe record looked up by the model name.
         return _RECIPES[self.model_name]
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Builds the training argument string and submits the job. Checkpoint: hf checkpoint
+    # and reference load (converted folder) from the model directory per the recipe; the load path is
+    # the output directory's checkpoints folder (always given, even when not saving); saving to the same
+    # folder every 20 steps only if save is on. Rollout: DAPO math, math reward, chat template,
+    # shuffled, 128 prompts x 8 samples with 256 prompts over-sampled and filtered to those with
+    # nonzero reward standard deviation, response length from the recipe, temperature 1, 4 optimizer
+    # steps per rollout, balanced data. Eval (if enabled): AIME 2024 every 20 steps with the recipe's
+    # sample count and response length, top-p 1. Parallelism: tensor 8 with sequence parallel,
+    # pipeline 8, context 4, expert 32, expert-tensor 1, last pipeline stage 5 layers; full uniform
+    # recompute, dynamic batch 16384 tokens per GPU. GRPO with kl loss on at zero coefficient, zero
+    # entropy, asymmetric clip, and truncated importance sampling per recipe. Adam 1e-6 with CPU offload
+    # group. SGLang: 16-GPU engines, memory fraction 0.7, data-parallel attention size 8, dense TP 1,
+    # DP LM head, expert parallel 16, server concurrency 1024. Misc: dropouts off, fp32 accumulation,
+    # flash attention, optional Megatron DeepEP with flex dispatcher per recipe (overrides all-to-all),
+    # colocate, 2 GiB weight update buffer, actor nodes and GPUs from options. Submits via the backend
+    # with the recipe's Megatron model type and no extra environment variables or copy commands.
+    # KNOWN ISSUE: the "need to comment this when using model with MLA" note sits beside a flash
+    # attention flag although the model uses latent attention (stale comment).
     U = args.create_backend()
     recipe = args.recipe
 
@@ -227,6 +264,7 @@ def execute(args: ScriptArgs):
 
 @command_utils.dataclass_cli
 def main(args: ScriptArgs):
+    # [FUNCTION DOC] Command line entry point: runs execute with the parsed options.
     execute(args)
 
 

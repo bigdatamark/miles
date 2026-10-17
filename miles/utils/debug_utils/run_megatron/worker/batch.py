@@ -1,3 +1,6 @@
+# [MODULE DOC] Builds the single input batch for the standalone Megatron worker from a list of
+# token ids (replicated across the batch dimension, optionally sliced for context parallelism,
+# with next-token labels) and provides the cross-entropy loss used by the pipeline schedule.
 """Input batch preparation and loss function for standalone Megatron forward/backward."""
 
 from types import SimpleNamespace
@@ -14,6 +17,18 @@ def prepare_batch(
     cp_size: int = 1,
     device: str | torch.device = "cuda",
 ) -> dict[str, torch.Tensor]:
+    # [FUNCTION DOC] Keyword-only inputs: token id list, batch size, this rank's context-parallel
+    # rank and size (defaults 0 and 1), device (default cuda). Creates long tensors for the token
+    # ids and for positions 0..length-1 on the device and keeps an unsliced copy of the tokens.
+    # When the context-parallel size exceeds 1, slices tokens and positions for this rank with the
+    # shared context-parallel slicer (imported lazily; padding value 0, "bshd" layout, maximum
+    # length equal to the sequence length, using a minimal stand-in for parallel state). Adds a
+    # leading batch dimension and expands it to the batch size as views (rows share memory, no
+    # copies). Labels come from the label builder. Returns a mapping with input ids, position ids,
+    # labels, the unsliced global input ids and an attention mask entry that is always none (the
+    # model builds its own causal mask).
+    # KNOWN ISSUE: the docstring describes an explicit causal attention mask of shape batch x 1 x
+    # length x length, but the code returns none for it.
     """Build the batch dict for Megatron forward from pre-tokenized token IDs.
 
     Returns a dict containing:
@@ -70,6 +85,12 @@ def _build_labels(
     global_input_ids: torch.Tensor,
     cp_size: int,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Context parallel size above 1: a position is valid when it is less
+    # than the global length minus one; its label is the global token at position plus one (valid
+    # positions) gathered from the global ids, invalid positions gather index 0 and are then
+    # overwritten with -100. Otherwise (no context parallelism): labels are the input ids shifted
+    # left by one with a final column of -100. The ignore value is -100 in both cases. The input
+    # ids argument is only used in the non-parallel branch.
     """Build next-token prediction labels, handling CP zigzag slicing.
 
     With CP>1, each rank sees non-contiguous positions (zigzag pattern).
@@ -95,6 +116,11 @@ def loss_func(
     labels: torch.Tensor,
     output_tensor: torch.Tensor,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
+    # [FUNCTION DOC] Loss callback for the schedule (called with labels bound first, then the model
+    # output). Converts the output to float32, flattens logits to rows of vocabulary size and
+    # labels to a vector, and computes mean cross entropy ignoring label -100. Returns (loss, a
+    # mapping with the detached loss under the loss key). If all labels are ignored the mean is
+    # not a number.
     """Cross-entropy loss for forward-backward pipeline schedule.
 
     Uses ignore_index=-100 to handle CP-aware label masking.

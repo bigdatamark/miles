@@ -1,3 +1,10 @@
+# [MODULE DOC] Packaging script for the miles distribution (version 0.1.2, Python 3.10 or newer).
+# Installs the miles and miles_plugins packages plus dashboard static files, with base
+# requirements read from the requirements text file and optional extras for fsdp, mlflow,
+# dashboard, e2b and modal. Replaces the wheel builder with a custom subclass so wheels are marked
+# as platform-specific (non-pure) and tagged with the interpreter version, a matching ABI tag and
+# a platform tag derived from the operating system and CPU architecture. Executing this module
+# runs the setup call immediately (no main guard).
 import sys
 import platform
 
@@ -6,6 +13,10 @@ from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 
 
 def _get_platform_tag():
+    # [FUNCTION DOC] HELPER: Returns the wheel platform tag. Non-Linux systems give the lower-cased
+    # system name. On Linux: x86-64 (either spelling) gives the manylinux1 x86-64 tag, aarch64 or
+    # arm64 gives the manylinux2014 aarch64 tag, and any other machine gives a generic linux tag
+    # with the lower-cased machine name.
     if platform.system() != "Linux":
         return platform.system().lower()
 
@@ -18,17 +29,26 @@ def _get_platform_tag():
 
 
 def _fetch_requirements(path):
+    # [FUNCTION DOC] HELPER: Reads the requirements file at the path (relative to the current
+    # working directory, so the build must run from the repo root) and returns the stripped lines
+    # that are non-blank and do not start with a hash; inline comments are not removed.
     with open(path) as fd:
         return [r.strip() for r in fd.readlines() if r.strip() and not r.startswith("#")]
 
 
 # Custom wheel class to modify the wheel name
 class bdist_wheel(_bdist_wheel):
+    # [CLASS DOC] Wheel builder subclass that forces platform-specific wheel naming: the wheel is
+    # marked non-pure and its tag triple is computed locally instead of by the base class.
     def finalize_options(self):
+        # [FUNCTION DOC] Runs the base class finalization, then marks the wheel as not pure.
         _bdist_wheel.finalize_options(self)
         self.root_is_pure = False
 
     def get_tag(self):
+        # [FUNCTION DOC] Returns the (python tag, ABI tag, platform tag) triple: the python tag is
+        # the interpreter prefix with major and minor version digits, the ABI tag is identical to
+        # it, and the platform tag comes from the platform helper.
         python_version = f"cp{sys.version_info.major}{sys.version_info.minor}"
         abi_tag = f"{python_version}"
         platform_tag = _get_platform_tag()

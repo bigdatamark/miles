@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Command-line entry point that verifies a model family's token-in-token-out (TITO)
+# session handling end to end: it prefixes the user's arguments with a fixed set of default
+# flags from the session-verify invariant table, parses them with the project's canonical argument
+# parser (plus session-verify extras), prints a configuration summary and the driver schedule, and
+# runs the session verification pipeline (rollout engine plus router in rollout-only debug mode).
+# Returns exit code 0 on pass and 1 on any failure. Needs GPUs and a model.
 """CLI: run the multi-role TITO session-server verifier against a real model.
 
 Boots the miles rollout pipeline (sglang + miles-router) under
@@ -61,6 +67,12 @@ from miles.utils.test_utils.session_verify_runner import (
 
 
 def _with_session_verify_defaults(argv: list[str]) -> list[str]:
+    # [FUNCTION DOC] HELPER: Returns a new argument list made of default flags followed by the given
+    # arguments (so user flags come later and win). Defaults come from the invariant table: prompt
+    # data, input key, rollout count, rollout batch size, max response length, temperature, global
+    # batch size, reward type, custom generate and agent function paths, session-server option,
+    # train backend and sglang expert-parallel size (numbers converted to text); plus the boolean
+    # switches debug-rollout-only, ci-test and colocate, each added only if its table value is true.
     defaults = [
         "--prompt-data",
         SESSION_VERIFY_INVARIANT_ARGS["prompt_data"],
@@ -96,6 +108,11 @@ def _with_session_verify_defaults(argv: list[str]) -> list[str]:
 
 
 def _print_action_table(allowed_roles: list[str], *, cycles: int) -> None:
+    # [FUNCTION DOC] HELPER: Prints to standard output the numbered driver schedule chosen for the
+    # allowed roles and cycle count (after the initial completion), then the per-sample events
+    # required (rollback always; append user, system, assistant only when that role is allowed) and
+    # the cross-sample requirement that at least one sample emits a tool call. May propagate the
+    # value error raised by schedule selection.
     schedule = select_schedule(allowed_roles, cycles=cycles)
     print("Driver schedule (after initial completion):")
     for i, action in enumerate(schedule, 1):
@@ -116,6 +133,14 @@ def _print_action_table(allowed_roles: list[str], *, cycles: int) -> None:
 
 
 def main() -> int:
+    # [FUNCTION DOC] Entry point returning the exit code. Configures info-level logging, rewrites
+    # the process argument list in place to prepend the defaults, parses it with the canonical
+    # parser plus session-verify extras, resolves the family's allowed append roles (before any GPU
+    # work, so an unsupported family fails early), prints a configuration summary, validates that a
+    # schedule can be built (a value error prints a FAIL verdict to standard error and returns 1),
+    # prints the action table, then runs the session verification. Any exception from the run
+    # prints a FAIL verdict with the exception type and message to standard error and returns 1;
+    # otherwise prints a PASS verdict and returns 0.
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",

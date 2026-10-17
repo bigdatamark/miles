@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Ray-cluster implementation of the command backend. Training is launched by starting (or reusing) a
+# ray head on the local node, optionally starting a mooncake master, running prepare commands on all
+# nodes, and submitting the training script as a ray job with a computed runtime environment.
 import os
 import shlex
 
@@ -25,7 +29,21 @@ from miles.utils.external_utils.ray_job import run_ray_job
 
 
 class RayCommandBackend(BaseCommandBackend):
+    # [CLASS DOC] Command backend for ray clusters. Implements the train hook and the gpu and
+    # multi-node command hooks of the base backend.
     def _execute_train_inner(self, *, request: ExecuteTrainRequest, config: ExecuteTrainConfig) -> None:
+        # [FUNCTION DOC] Launches training on ray. Asserts the request carries no extra manifests
+        # (a ray launch installs no release). Steps: read the external-ray flag from the environment
+        # and the master address (default loopback); resolve the mooncake master port unless
+        # mooncake is external; clean up processes of a previous run; unless ray is external, start
+        # a ray head on this node with the given master address, gpu count and no usage stats, with
+        # unbuffered output; start a local mooncake master if a port was resolved; run each prepare
+        # command on all nodes; call the before-submit hook if any; build the runtime environment
+        # variables (training variables plus ray-specific ones) and set python path to include
+        # megatron and sources; unless job submission is disabled through the environment flag
+        # (default enabled), run the ray job with a command running the quoted train script with
+        # model arguments and train arguments. When the job lifetime is tied to the launcher and ray
+        # is not external, force-stop ray afterwards (also on failure).
         assert not request.extra_manifests, (
             "extra_manifests are objects a helm release installs beside the run, and a ray launch installs no "
             "release; launch onto kubernetes, or start what they describe yourself"
@@ -72,6 +90,9 @@ class RayCommandBackend(BaseCommandBackend):
                     self.exec_command_cpu("ray stop --force")
 
     def _resolve_mooncake_master_port(self, train_args: str) -> int | None:
+        # [FUNCTION DOC] HELPER: Splits the train arguments shell-style; returns none unless the
+        # effective object store backend flag is mooncake, else the mooncake master port derived
+        # from the arguments.
         train_argv = shlex.split(train_args)
         if ArgvManipulator.get_effective(train_argv, OBJECT_STORE_BACKEND_FLAG) != MOONCAKE_BACKEND_NAME:
             return None
@@ -81,6 +102,8 @@ class RayCommandBackend(BaseCommandBackend):
     def _exec_command_gpu_inner(
         self, cmd: str, capture_output: bool = False, num_gpus_per_node: int | None = None
     ) -> str | None:
+        # [FUNCTION DOC] HELPER: Runs the shell command locally, returning output if captured.
+        # KNOWN ISSUE: the gpus per node argument is accepted but unused.
         return run_shell_command(cmd, capture_output=capture_output)
 
     def _exec_command_multi_node_inner(
@@ -90,9 +113,18 @@ class RayCommandBackend(BaseCommandBackend):
         num_nodes: int | None = None,
         num_gpus_per_node: int | None = None,
     ) -> list[str | None]:
+        # [FUNCTION DOC] HELPER: Runs the command on every (or the first num_nodes) alive ray node
+        # and returns per-node outputs.
+        # KNOWN ISSUE: the gpus per node argument is accepted but unused.
         return exec_command_all_ray_nodes(cmd, capture_output=capture_output, num_nodes=num_nodes)
 
     def _clean_up_previous_run(self, external_ray: bool) -> None:
+        # [FUNCTION DOC] HELPER: Runs one shell command line that force-kills leftover sglang, ray
+        # (only when ray is not external; also stops ray), miles and redis processes, with short
+        # sleeps between kill rounds, and always ends successfully. Generic python processes are
+        # deliberately not killed (would kill the launching script).
+        # KNOWN ISSUE: the miles kill and the ray kill are repeated twice in the command, and the
+        # comments mention a to-do about whether the kill is needed.
         self.exec_command_cpu(
             "pkill -9 sglang; "
             "sleep 3; "
@@ -111,12 +143,20 @@ class RayCommandBackend(BaseCommandBackend):
         )
 
     def _check_has_nvlink(self) -> bool:
+        # [FUNCTION DOC] HELPER: Runs a gpu topology query and counts nvlink link tokens in the
+        # output; true if the count is greater than zero. Fails with a type or value error if the
+        # output is empty or not captured.
         output = self.exec_command_gpu(
             "nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l", capture_output=True
         )
         return int(output) > 0
 
     def _ray_env_vars(self, master_addr: str) -> dict[str, str]:
+        # [FUNCTION DOC] HELPER: Environment for the ray job. NVLS enable: the existing environment
+        # value if set and non-empty, otherwise "1" or "0" depending on the nvlink probe (probe is
+        # only run when needed). Copies the socket interface, debug and debug file variables of nccl
+        # and gloo when present. Sets the no-proxy list to loopback plus the master address and
+        # the master address variable needed by distributed training.
         return {
             # a get() default is evaluated eagerly, which would probe even when already decided
             "NCCL_NVLS_ENABLE": os.environ.get("NCCL_NVLS_ENABLE") or str(int(self._check_has_nvlink())),

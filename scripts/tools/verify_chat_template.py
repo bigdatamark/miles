@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Command-line tool that checks whether a chat template is append-only after the last
+# user message, i.e. rendering a longer conversation extends the rendering of the shorter one.
+# Two modes: a raw template-string check (template from a local file or a HuggingFace model) and a
+# check through a registered token-in-token-out (TITO) tokenizer family, which also determines
+# which message roles may be appended. Runs the shared set of mock trajectories filtered by
+# allowed append roles and thinking mode, prints per-case pass/fail lines and a verdict, and
+# returns exit code 0 on pass or 1 on any failure. Network access to HuggingFace may occur.
 """One-click verification: is a chat template append-only after last user message?
 
 The shared CLI trajectory matrix covers tool, user, and system appends.
@@ -35,6 +42,8 @@ from miles.utils.chat_template_utils.tito_tokenizer import VALID_APPEND_ROLES, T
 
 
 def _load_template_from_file(path: str) -> str:
+    # [FUNCTION DOC] HELPER: Reads and returns the full text of the template file at the path
+    # (raises the usual file errors if unreadable).
     with open(path) as f:
         return f.read()
 
@@ -42,6 +51,9 @@ def _load_template_from_file(path: str) -> str:
 def _load_template_from_model(
     model_id: str,
 ) -> tuple[str, str]:
+    # [FUNCTION DOC] HELPER: Loads the raw chat template string of a HuggingFace model (import is
+    # deferred to call time to avoid loading it otherwise). Returns the template and a description
+    # string naming the model.
     """Load the raw HuggingFace chat template for a model."""
     from miles.utils.chat_template_utils.template import load_hf_chat_template
 
@@ -49,6 +61,21 @@ def _load_template_from_model(
 
 
 def main() -> int:
+    # [FUNCTION DOC] Command-line entry point; returns the process exit code.
+    # Options: template path, model id or path, tito-model family (needs the model), thinking
+    # filter (off, on, both; default on) and extra chat-template kwargs as a JSON object. Usage
+    # errors (neither model nor template; tito without model) exit through the parser.
+    # Template resolution: in TITO mode the allowed append roles come from the family's fixed
+    # template; the fixed template path and its default kwargs are resolved (user-supplied kwargs
+    # win, and each auto-set key is printed), the tokenizer is loaded with the given template or the
+    # fixed one (remote code trusted), and a source description is chosen (override, fixed, hugging
+    # face, or encoder). Otherwise the allowed roles are all valid append roles and the template
+    # text comes from the file or from the model. Then it selects cases by roles and thinking
+    # (off means only non-thinking, on only thinking, both means no filter), prints a summary header,
+    # runs a global coverage check and prints any (thinking, roles) combinations with no
+    # trajectory, runs the checks (through the TITO tokenizer or on the raw template), prints one
+    # line per case (first line of the error truncated to 80 characters) and totals, and prints a
+    # PASS or FAIL verdict worded for the mode. Returns 1 if any case failed, else 0.
     parser = argparse.ArgumentParser(
         description="Verify that a chat template is append-only after last user message.",
         formatter_class=argparse.RawDescriptionHelpFormatter,

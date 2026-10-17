@@ -1,3 +1,9 @@
+# [MODULE DOC] The three built-in message matchers (strict, loose tool call, role and content
+# only), a registry of them by alias, a wrapper enforcing the matcher contract (plain boolean
+# result, no exceptions), a resolver from a selector string (alias or dotted import path) to a
+# wrapped matcher, and a validator that a new message list is an append-only extension of a
+# stored one. A matcher takes the stored message and the replayed message and returns a boolean.
+
 """Built-in message matchers, selector resolution, and append-only validation."""
 
 from __future__ import annotations
@@ -19,6 +25,12 @@ from miles.utils.chat_template_utils.message_matcher_hub.utils import (
 
 
 def strict_message_matches(stored: dict[str, Any], new: dict[str, Any]) -> bool:
+    # [FUNCTION DOC] For each template-relevant key (role, content, reasoning content, tool calls)
+    # in that order, normalizes both values (None, empty string and empty list all become None);
+    # for tool calls additionally drops the wire-only keys from each call dictionary. Returns
+    # false at the first key whose normalized values differ by ordinary equality, else true.
+    # Missing keys count as None. Other keys are ignored. Deeply nested values may raise a
+    # recursion error (the loose matcher catches that).
     """Compare only the fields that affect chat-template tokenization.
 
     External client libraries (e.g. litellm) may inject extra keys like
@@ -39,6 +51,10 @@ def strict_message_matches(stored: dict[str, Any], new: dict[str, Any]) -> bool:
 
 
 def _arguments_match(stored: Any, replayed: Any) -> bool:
+    # [FUNCTION DOC] HELPER: Normalizes both tool-call arguments to the canonical JSON-object
+    # form. If either is not a valid JSON object, falls back to strict raw structural comparison
+    # of the originals; otherwise compares the canonical forms (so key order and number spelling
+    # such as 1 versus 1.0 are ignored, but string versus number is not).
     stored_normalized = _normalize_json_object(stored)
     replayed_normalized = _normalize_json_object(replayed)
     if stored_normalized is _INVALID_JSON_OBJECT or replayed_normalized is _INVALID_JSON_OBJECT:
@@ -47,6 +63,9 @@ def _arguments_match(stored: Any, replayed: Any) -> bool:
 
 
 def _functions_match(stored: Any, replayed: Any) -> bool:
+    # [FUNCTION DOC] HELPER: If either side is not a dictionary, uses raw structural comparison.
+    # Otherwise the key sets must be equal; the arguments value is compared with the lenient
+    # arguments rule and every other value by ordinary equality.
     if not isinstance(stored, dict) or not isinstance(replayed, dict):
         return _raw_values_match(stored, replayed)
     if stored.keys() != replayed.keys():
@@ -61,6 +80,10 @@ def _functions_match(stored: Any, replayed: Any) -> bool:
 
 
 def _tool_call_matches(stored: Any, replayed: Any) -> bool:
+    # [FUNCTION DOC] HELPER: If either side is not a dictionary, uses raw structural comparison.
+    # Otherwise drops the wire-only keys from both, requires equal remaining key sets, compares
+    # the function entry with the function rule and every other entry (id, type, unknown
+    # extension fields) by ordinary equality.
     if not isinstance(stored, dict) or not isinstance(replayed, dict):
         return _raw_values_match(stored, replayed)
     stored_projected = {key: value for key, value in stored.items() if key not in _WIRE_ONLY_TOOL_CALL_KEYS}
@@ -77,6 +100,12 @@ def _tool_call_matches(stored: Any, replayed: Any) -> bool:
 
 
 def loose_tool_call_message_matches(stored: dict[str, Any], replayed: dict[str, Any]) -> bool:
+    # [FUNCTION DOC] Returns true right away if the strict matcher accepts (a recursion error
+    # inside it is swallowed and falls through). Otherwise requires the normalized role, content
+    # and reasoning content to be equal, then compares the normalized tool-call values: if either
+    # is not a list, uses raw structural comparison of the two; else requires equal length and
+    # every pair of calls to match under the tool-call rule (position-wise, so order matters).
+    # Returns false on any difference.
     """Match strict messages plus equivalent JSON-object tool arguments.
 
     Compatibility superset of ``strict_message_matches``: anything strict
@@ -104,6 +133,8 @@ def loose_tool_call_message_matches(stored: dict[str, Any], replayed: dict[str, 
 
 
 def role_content_only_message_matches(stored: dict[str, Any], replayed: dict[str, Any]) -> bool:
+    # [FUNCTION DOC] True when the normalized role and the normalized content are equal (empty
+    # values collapse to None); all other keys are ignored.
     """Compare only role and content using the strict matcher's empty-value rule.
 
     High-risk field projection: every other message field — including whole
@@ -121,10 +152,17 @@ _BUILTIN_MESSAGE_MATCHERS: dict[str, SessionMessageMatcher] = {
 
 
 class SessionMessageMatcherError(Exception):
+    # [CLASS DOC] Plain exception type signalling a broken matcher configuration (see docstring);
+    # carries only a message.
     """Raised when a configured matcher throws or returns a non-bool value."""
 
 
 def _validated(matcher: SessionMessageMatcher) -> SessionMessageMatcher:
+    # [FUNCTION DOC] HELPER: Returns a wrapper (metadata preserved, original reachable through the
+    # wrapped attribute) that calls the matcher with stored and replayed messages. Any ordinary
+    # exception from the matcher is re-raised as the matcher error (chained). A result whose exact
+    # type is not a boolean (even a truthy value or an integer-like boolean subclass) raises the
+    # matcher error naming the type. Otherwise returns the boolean.
     """Enforce the matcher contract at runtime: exact bool, no exceptions.
 
     A truthy non-bool or a raised exception is a configuration error, never a
@@ -135,6 +173,7 @@ def _validated(matcher: SessionMessageMatcher) -> SessionMessageMatcher:
 
     @functools.wraps(matcher)
     def validated(stored: dict[str, Any], replayed: dict[str, Any]) -> bool:
+        # [FUNCTION DOC] HELPER: The contract-checking wrapper described for the factory.
         try:
             result = matcher(stored, replayed)
         except Exception as exc:
@@ -147,6 +186,15 @@ def _validated(matcher: SessionMessageMatcher) -> SessionMessageMatcher:
 
 
 def resolve_session_message_matcher(selector: str) -> SessionMessageMatcher:
+    # [FUNCTION DOC] Maps a selector to a contract-checked matcher. An exact built-in alias
+    # (strict, loose_tool_call, role_content_only) returns the wrapped built-in. Otherwise the
+    # selector must be a non-empty string containing a dot, else a value error lists the aliases
+    # and gives an example. A dotted path is loaded through the shared function registry loader
+    # (imported lazily here to avoid pulling in heavy dependencies; the function must be
+    # synchronous) and wrapped; any failure while importing or loading is converted into a value
+    # error that repeats the guidance and the underlying message (chained).
+    # KNOWN ISSUE: the alias lookup runs before the string type check, so an unhashable selector
+    # raises a type error rather than the intended value error.
     """Resolve an exact built-in alias or a synchronous dotted import path.
 
     Every result carries the runtime contract check (``_validated``); the
@@ -178,6 +226,14 @@ def assert_messages_append_only_with_allowed_role(
     *,
     message_matcher: SessionMessageMatcher | None = None,
 ) -> None:
+    # [FUNCTION DOC] Validation only; returns nothing. Passes immediately when there are no stored
+    # messages. Uses the given matcher, defaulting to the strict one. Raises a value error (with
+    # the two lists attached as extra arguments) if the new list is shorter than the stored one.
+    # Each stored message must match the new message at the same index; on the first mismatch
+    # raises a value error naming the index, both roles and a mapping of the template-relevant
+    # keys whose raw values differ (each shown as the first 200 characters of its text form).
+    # Every message beyond the stored prefix must have a role in the allowed collection, else a
+    # value error names its index and role.
     """Assert *new_messages* is an append-only extension of *stored_messages*.
 
     The stored prefix must match pairwise under *message_matcher* (defaults

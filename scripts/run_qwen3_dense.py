@@ -1,3 +1,8 @@
+# [MODULE DOC] Launcher for colocated GRPO training of the Qwen3 dense model family. Per-variant
+# differences live in a frozen recipe table keyed by model name (module-level lookup); the
+# script-args dataclass picks a recipe through a read-only property. There is no prepare step;
+# the converted torch_dist checkpoint and datasets must exist. Entry points are execute and the
+# typer-wrapped main.
 """Qwen3 / Qwen3.5 / Qwen3.6 / Qwen3.8 dense GRPO training script.
 
 =====================
@@ -53,6 +58,10 @@ _MODEL_NAMES = Literal[
 
 @dataclass(frozen=True)
 class _Recipe:
+    # [CLASS DOC] HELPER: Immutable per-model recipe: Megatron model type, tensor parallel size,
+    # dynamic-batch token budget per GPU, GPUs per rollout engine, SGLang static memory fraction,
+    # whether the optimizer is CPU-offloaded, default rollout count (3000), extra raw SGLang flag
+    # string (empty) and whether to enable the dashboard and dump details (off).
     megatron_model_type: str
     tensor_model_parallel_size: int
     max_tokens_per_gpu: int
@@ -90,6 +99,10 @@ _RECIPES: dict[str, _Recipe] = {
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC] Command-line configuration extending the shared train config. Fields: run id,
+    # model name (one of the seven supported variants), GPUs per node (8), cuda_visible_devices
+    # (empty means unrestricted), enable_eval (on), save (write checkpoints, on), num_rollout (zero
+    # means use the recipe default), extra raw args and data, model and Megatron directories.
     run_id: str = command_utils.create_run_id()
     model_name: _MODEL_NAMES = "Qwen3-4B"
     num_gpus_per_node: int = 8
@@ -104,10 +117,25 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
     @property
     def recipe(self) -> _Recipe:
+        # [FUNCTION DOC] Property: looks up the recipe for the model name in the module table.
         return _RECIPES[self.model_name]
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Builds the training argument string for the chosen recipe and submits the
+    # colocated job. Side effect: when cuda_visible_devices is given, it is exported into this
+    # process's environment (so that ray reads it when starting its head).
+    # Checkpoints: HF dir and reference torch_dist dir under the model dir; load from the
+    # checkpoints folder under the output dir; if save is on, save there every 20 steps.
+    # Rollout: dapo-math-17k, deepscaler reward, rollout count from args or the recipe, 32 prompts
+    # x 8 samples, max response 8192, temperature 1, global batch 256. Eval (when enabled): AIME
+    # every 20, 16 samples, max 16384, top-p 1. Parallelism: recipe tensor size with sequence
+    # parallel, all other sizes 1, full recompute, dynamic batch with the recipe token budget.
+    # Algorithm: grpo with kl loss (zero coefficient), clip 0.2/0.28. Optimizer: adam lr 1e-6,
+    # plus CPU offload flags when the recipe asks. SGLang: engine size and memory fraction from the
+    # recipe plus its extra flags. Misc: dropout off, fp32 allreduce, flash attention, colocate,
+    # node and GPU counts; for recipes with the dashboard flag also the dashboard flag and a dump
+    # details folder under the output dir.
     U = args.create_backend()
     if args.cuda_visible_devices:
         # exported rather than passed along: ray reads it when it starts the head
@@ -229,6 +257,7 @@ def execute(args: ScriptArgs):
 
 @command_utils.dataclass_cli
 def main(args: ScriptArgs):
+    # [FUNCTION DOC] Command-line entry point; just calls execute (no prepare step).
     execute(args)
 
 

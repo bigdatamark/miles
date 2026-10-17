@@ -1,3 +1,6 @@
+# [MODULE DOC] Prints, for each input position, the top-k most probable next tokens with their
+# probabilities, one rank at a time (ranks take turns using barriers so output is not
+# interleaved). Used for eyeballing forward-pass outputs.
 """Top-K prediction printing for debugging forward pass outputs."""
 
 import sys
@@ -15,6 +18,13 @@ def print_top_k(
     top_k: int,
     tokenizer_path: Path,
 ) -> None:
+    # [FUNCTION DOC] Keyword-only inputs: logits (batch x positions x vocabulary), input ids, k and
+    # tokenizer location. Loads the tokenizer with remote code trusted (lazy import). The padding
+    # id is the tokenizer's pad id, or the end-of-sequence id when the pad id is missing or zero,
+    # then prints the predictions for all ranks. Must be called by every rank, since it uses
+    # barriers.
+    # KNOWN ISSUE: a pad id of zero is treated as missing because of truthiness, so the
+    # end-of-sequence id is used instead.
     """Load tokenizer and print top-k predictions across all ranks."""
     from miles.utils.processing_utils import load_tokenizer
 
@@ -38,6 +48,10 @@ def _print_top_predictions_all_ranks(
     tokenizer: object,
     pad_token_id: int | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Gets rank and world size (0 and 1 if not distributed). Rank 0 prints
+    # a banner with k and world size. Then for each rank in order: everyone synchronizes at a
+    # barrier (when distributed); the matching rank prints its predictions and flushes. A final
+    # barrier follows. Output of different ranks is therefore ordered by rank.
     """Print top-k predictions from all ranks sequentially (rank 0 first, then rank 1, etc.)."""
     rank, world_size = _get_dist_info()
 
@@ -72,6 +86,12 @@ def _print_top_predictions_for_rank(
     rank: int,
     pad_token_id: int | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Prints a header with the rank and local sequence length. For each
+    # batch row (with a "Batch n" line when the batch has more than one row) and each position
+    # (skipping positions whose input token equals the padding id when one is known): softmax over
+    # the vocabulary, top-k probabilities and indices, then one line with the zero-padded position,
+    # the input token's decoded text in quotes, an arrow, and comma-separated decoded predictions
+    # each followed by its probability with three decimals.
     """Print top-k predictions for this rank, one line per position."""
     batch_size: int = logits.shape[0]
     seq_length: int = logits.shape[1]
@@ -99,10 +119,14 @@ def _print_top_predictions_for_rank(
 
 
 def _decode_token(tokenizer: object, *, token_id: int) -> str:
+    # [FUNCTION DOC] HELPER: Decodes a single token id with the tokenizer, or, if no tokenizer is
+    # given, returns the letter t followed by the id.
     return tokenizer.decode([token_id]) if tokenizer else f"t{token_id}"
 
 
 def _get_dist_info() -> tuple[int, int]:
+    # [FUNCTION DOC] HELPER: Returns (rank, world size) from torch distributed, or (0, 1) when it
+    # is not initialized.
     """Return (rank, world_size), defaulting to (0, 1) if not initialized."""
     if dist.is_initialized():
         return dist.get_rank(), dist.get_world_size()
@@ -110,5 +134,7 @@ def _get_dist_info() -> tuple[int, int]:
 
 
 def _maybe_barrier() -> None:
+    # [FUNCTION DOC] HELPER: Blocks until all ranks arrive, only when torch distributed is
+    # initialized; otherwise does nothing.
     if dist.is_initialized():
         dist.barrier()

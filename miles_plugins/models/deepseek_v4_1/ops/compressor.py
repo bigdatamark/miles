@@ -1,3 +1,7 @@
+# [MODULE DOC] Key/value compressor for DeepSeek-V4.1 attention layers with compression ratio 1 or 2.
+# Unlike the V4 compressor it has no overlap, position bias, rotary or quantization inside: those
+# are applied by the caller. Ratio 1 is a plain projection plus norm; ratio 2 is a learned
+# softmax-gated weighted sum over consecutive pairs of tokens.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,7 +12,14 @@ from miles_plugins.models.deepseek_v4.ops.norm import RMSNorm
 
 
 class DeepSeekV41Compressor(nn.Module):
+    # [CLASS DOC] Holds a bias-free bfloat16 key/value projection from hidden size to head dim, a gate
+    # projection of the same shape (only for ratio 2), and an RMS norm over head dim whose scale is
+    # kept in float32. Works on sequence-major tensors (sequence, batch, channels).
     def __init__(self, config: TransformerConfig, head_dim: int, compress_ratio: int):
+        # [FUNCTION DOC] Asserts the ratio is 1 or 2. Creates the projections (gate only when ratio
+        # is above one) and the norm using the config's hidden size and layer-norm epsilon. The
+        # parameters are created in bfloat16 with default initialization; checkpoint loading is
+        # expected to overwrite them.
         super().__init__()
         assert compress_ratio in (1, 2)
         self.compress_ratio = compress_ratio
@@ -21,6 +32,13 @@ class DeepSeekV41Compressor(nn.Module):
         mark_keep_in_fp32(self.norm.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] Input sequence, batch, hidden. Ratio 1: projects with the key/value weight
+        # and applies the norm; output has the same sequence length. Ratio 2: truncates the sequence
+        # to a multiple of the ratio (dropping any trailing token), upcasts to float32, computes the
+        # key/value and gate projections in float32 (weights upcast), reshapes into groups of
+        # ratio, takes a weighted sum over the ratio axis with softmax of the gate over that axis,
+        # casts to bfloat16 and applies the norm. Output is groups, batch, head dim. No rotary,
+        # quantization or position information is applied here.
         seqlen, bsz, _ = x.shape
         ratio = self.compress_ratio
         if ratio == 1:

@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Low-level ray command helpers: run a shell command on every alive ray node (as ray tasks pinned
+# to nodes) and start a local mooncake master process with readiness checking and failure
+# diagnostics.
 import logging
 import shlex
 from collections.abc import Callable
@@ -22,12 +26,22 @@ logger = logging.getLogger(__name__)
 
 @ray.remote(num_cpus=0.001)
 def _exec_command_on_node(cmd: str, capture_output: bool) -> str | None:
+    # [FUNCTION DOC] HELPER: Ray remote task (uses a tiny cpu fraction) that runs a shell command on
+    # the node it is scheduled on, after unsetting the visible cuda devices variable. Returns the
+    # captured output if requested.
     return run_shell_command(f"unset CUDA_VISIBLE_DEVICES; {cmd}", capture_output=capture_output)
 
 
 def exec_command_all_ray_nodes(
     cmd: str, capture_output: bool = False, num_nodes: int | None = None
 ) -> list[str | None]:
+    # [FUNCTION DOC] Connects to the running ray cluster (auto address), lists alive nodes sorted
+    # with the current node first and then by address, asserts at least one exists, and if num_nodes
+    # is given asserts enough nodes and keeps the first num_nodes. The first node's address is the
+    # master address. For each node (rank = position) substitutes placeholders in the command (node
+    # rank, node count, master address, node ip) and runs it as a task with hard node affinity.
+    # Returns the outputs in node order (blocking). Always shuts ray down at the end (side effect
+    # on the caller's ray connection).
     ray.init(address="auto")
     try:
         current_ip = get_current_node_ip()
@@ -73,6 +87,13 @@ def start_mooncake_master(
     log_path: str | Path = MOONCAKE_MASTER_LOG_PATH,
     run_command: Callable[[str], str | None] | None = None,
 ) -> None:
+    # [FUNCTION DOC] Starts a mooncake master on the local machine. If a tcp server already answers
+    # on loopback at the rpc port, logs and returns. Otherwise runs (via the given command runner,
+    # default the shell runner) a command that kills any previous master on that port and launches
+    # the master detached with the rpc and metrics ports, redirecting output to the log file. Waits
+    # up to the timeout (seconds) for the port to be ready. On a runtime error from the wait, kills
+    # the master again, reads the last 100 log lines (or a placeholder for empty or unreadable
+    # logs) and raises a runtime error including them, chained to the original error.
     host = "127.0.0.1"
     if _is_tcp_server_ready(host, rpc_port):
         logger.info(f"Mooncake master is already ready at {host}:{rpc_port}")

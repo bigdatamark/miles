@@ -1,3 +1,8 @@
+# [MODULE DOC] Mixture-of-experts routing replay for the standalone worker, built on the shared
+# routing replay manager. A baseline run records the top expert indices of every replay object and
+# saves them to one file named rank0_<manager filename> in the dump directory; a target run loads
+# that file and slices each tensor for its own context-parallel (zigzag) and sequence-parallel
+# layout. Only a single-process baseline is supported.
 """Routing replay stage management for standalone Megatron worker.
 
 Only single-rank (nproc=1) baselines are supported: save always writes
@@ -14,6 +19,8 @@ from miles.utils.replay_base import routing_replay_manager
 
 
 class _ParallelRanks(NamedTuple):
+    # [CLASS DOC] HELPER: Record of context-parallel size and rank and tensor-parallel size and
+    # rank of the current process.
     cp_size: int
     cp_rank: int
     tp_size: int
@@ -21,6 +28,10 @@ class _ParallelRanks(NamedTuple):
 
 
 def setup_replay_before_model(script: WorkerScriptArgs) -> None:
+    # [FUNCTION DOC] Mutates the global routing replay manager. If a dump path is set: enables the
+    # manager and sets its stage to "record". Else if a load path is set: enables it and sets the
+    # stage to "replay_forward". If both are set the dump path wins. If neither, does nothing.
+    # Prints which mode was chosen.
     """Enable replay manager and set stage BEFORE model construction.
 
     Must be called before ``get_model()`` so that ``register_to_module``
@@ -46,6 +57,11 @@ def load_replay_data(
     rank: int,
     sequence_parallel: bool = False,
 ) -> None:
+    # [FUNCTION DOC] Does nothing when no load path is configured. Otherwise lists files in the
+    # load directory matching "*_<manager filename>" in sorted order; raises a value error unless
+    # exactly one is found (the message lists the names found). Then loads it into the manager's
+    # replays with this rank and the sequence-parallel flag (default false). Mutates the manager's
+    # replay objects.
     """Load routing replay data from rank 0's file with CP/SP slicing."""
     if not script.routing_replay_load_path:
         return
@@ -63,6 +79,11 @@ def load_replay_data(
 
 
 def save_replay_data(script: WorkerScriptArgs, *, rank: int) -> None:
+    # [FUNCTION DOC] Does nothing when no dump path is configured. Otherwise asserts the rank is
+    # zero, creates the dump directory, collects each replay's recorded list of top-index tensors
+    # from the manager, asserts that at least one entry was recorded in total, and saves the list
+    # (one list per replay) with the torch serializer to rank0_<manager filename> in the directory.
+    # Prints entry and replay counts.
     """Save recorded routing replay data to disk (rank 0 only)."""
     if not script.routing_replay_dump_path:
         return
@@ -83,10 +104,15 @@ def save_replay_data(script: WorkerScriptArgs, *, rank: int) -> None:
 
 
 def _replay_file_path(*, base_dir: Path) -> Path:
+    # [FUNCTION DOC] HELPER: Path of the saved replay file: the directory joined with the name
+    # "rank0_" followed by the manager's file name.
     return base_dir / f"rank0_{routing_replay_manager.filename}"
 
 
 def _get_parallel_ranks() -> _ParallelRanks:
+    # [FUNCTION DOC] HELPER: Imports Megatron and the parallel-state getter lazily. If Megatron's
+    # model-parallel state is not initialized, returns size 1 and rank 0 for both context and
+    # tensor parallelism; otherwise returns the sizes and ranks from the parallel state.
     """Return parallel ranks, defaulting to 1/0 if mpu is not initialized."""
     from megatron.core import mpu
 
@@ -110,6 +136,15 @@ def _load_replay(
     rank: int,
     sequence_parallel: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Loads the saved list of per-replay tensor lists (full deserialization
+    # allowed). Raises a value error if its length differs from the number of replay objects in
+    # the manager. Sequence-parallel slicing applies only if the flag is set, the manager says
+    # routing happens in a sequence-parallel region, and tensor-parallel size exceeds 1. For each
+    # replay and its saved tensors: when context-parallel size exceeds 1, converts each tensor
+    # from natural order to this rank's zigzag slice along dimension 0; when sequence-parallel
+    # slicing applies, takes this tensor-parallel rank's contiguous chunk along dimension 0. Sets
+    # the replay's index list to the result and resets its forward and backward indices to 0.
+    # Rank 0 prints per-replay shapes before and after and a final summary.
     """Load replay from rank 0's file with CP zigzag slicing and SP slicing."""
     saved_replays: list[list[torch.Tensor]] = torch.load(replay_file, weights_only=False)
 
@@ -156,6 +191,9 @@ def _load_replay(
 
 
 def _sp_slice(tensor: torch.Tensor, *, tp_size: int, tp_rank: int) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Asserts the first dimension is divisible by the tensor-parallel size,
+    # then returns the contiguous chunk of length (size divided by tp size) belonging to the rank
+    # (a view).
     """Slice tensor along dim=0 for sequence parallelism."""
     seqlen: int = tensor.size(0)
     assert seqlen % tp_size == 0, f"seqlen {seqlen} not divisible by tp_size {tp_size}"

@@ -1,3 +1,7 @@
+# [MODULE DOC] Launcher for colocated GRPO training of Qwen3.5-35B-A3B with multi-token-prediction
+# (MTP) training and EAGLE-style speculative decoding in SGLang, on H200 or B300 nodes with the
+# Megatron backend. Defines the script args, prepare (download, convert to Megatron torch_dist),
+# execute (build grouped flags and submit) and main (prepare then execute).
 from dataclasses import dataclass
 from typing import Literal
 
@@ -8,6 +12,13 @@ from miles.utils.external_utils import command_utils
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC] Command-line configuration extending the shared train config. Fields: mode
+    # (normal or debug_minimal with tiny sizes), run id, model name, Megatron model type, GPUs per
+    # node (derived from hardware if unset), hardware (auto, H200, B300), enable_eval (off),
+    # extra raw args, directories, enable_spec (speculative decoding, on), enable_spec_v2 (on),
+    # enable_r3 (rollout routing replay, off), parallelism preset (tensor 2 x context 2, or tensor
+    # 1; both with expert parallel 8), max response length (16384), and optional SGLang expert
+    # parallel size and max running requests (unset omits the flag).
     mode: Literal["normal", "debug_minimal"] = "normal"
     run_id: str = command_utils.create_run_id()
     model_name: str = "Qwen3.5-35B-A3B"
@@ -30,11 +41,16 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     sglang_max_running_requests: int | None = None
 
     def __post_init__(self):
+        # [FUNCTION DOC] Resolves hardware (auto detects) and defaults GPUs per node from a
+        # per-hardware table when not given. Mutates self.
         self.hardware = command_utils.resolve_hardware(self)
         self.num_gpus_per_node = self.num_gpus_per_node or command_utils.NUM_GPUS_OF_HARDWARE[self.hardware]
 
 
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Creates model and data directories, downloads the HF model and the
+    # dapo-math-17k and aime-2024 datasets, then converts the HF checkpoint to Megatron torch_dist
+    # format in the model directory (backend shell commands; network, disk and GPU side effects).
     U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.model_dir} {args.data_dir}")
     U.exec_command_cpu(f"hf download Qwen/{args.model_name} --local-dir {args.model_dir}/{args.model_name}")
@@ -52,6 +68,25 @@ def prepare(args: ScriptArgs):
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Builds the training argument string and submits the colocated job. Sets the
+    # environment variable enabling speculative decoding v2 to one or zero according to the flag.
+    # Checkpoints: HF dir, reference load from the torch_dist dir, load/save in a per-run folder,
+    # save interval 2 in debug else 20. Rollout: dapo-math-17k, deepscaler reward; debug uses 64
+    # rollouts, 8 prompts x 2 samples, response 100, global batch 16; normal uses 3000 rollouts,
+    # 32 x 8, configured response length, global batch 256. Eval (AIME, 16 samples, every 20) only
+    # outside debug and when enabled. Parallelism: tensor and context sizes from the preset
+    # (tp2-cp2 or tp1 with context 1), sequence parallel, expert parallel always 8, full recompute,
+    # dynamic batch with 8192 tokens per GPU, log-prob chunk size 4096. Algorithm: grpo with kl loss
+    # (zero coefficient), clip 0.2/0.28. Optimizer: adam lr 1e-6 with CPU offload. SGLang: 8 GPUs
+    # per engine, memory fraction 0.7, fixed CUDA graph batch list up to 256, optional EP size and
+    # max running requests, optional routing replay, on B300 the cutlass moe runner and trtllm
+    # attention, and with speculative decoding an EAGLE setup (2 steps, top-k 1, 3 draft tokens)
+    # plus an extra-buffer mamba radix cache strategy when v2 is on. MTP training: one layer, loss
+    # scale 0.2. Misc: dropout off, fp32 allreduce, attention backend auto on B300 else flash, flex
+    # token dispatcher, node/GPU counts, colocate.
+    # KNOWN ISSUE: the B300 comment says triton backends are needed, but the code selects
+    # flashinfer cutlass and trtllm attention; the expert-parallel size is fixed at 8 regardless of
+    # GPUs per node; the parallelism preset name tp2-cp2-ep8 claims EP8 for tp1-ep8 too.
     U = args.create_backend()
     ref_load_path = f"{args.model_dir}/{args.model_name}_torch_dist"
     load_save_path = f"{args.output_dir}/{args.run_id}/checkpoints"
@@ -201,6 +236,7 @@ def execute(args: ScriptArgs):
 
 @command_utils.dataclass_cli
 def main(args: ScriptArgs):
+    # [FUNCTION DOC] Command-line entry point: runs prepare, then execute.
     prepare(args)
     execute(args)
 

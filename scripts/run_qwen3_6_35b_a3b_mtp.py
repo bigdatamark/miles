@@ -1,3 +1,8 @@
+# [MODULE DOC] Launcher for short colocated smoke-test RL runs of Qwen3.6-35B-A3B with MTP training
+# and EAGLE speculative decoding on a single H200 node, where every parallel dimension (tensor,
+# expert, context, pipeline, expert tensor) is a command-line knob. Defines script args, prepare
+# (idempotent download then checkpoint conversion), execute (build flags, submit) and main
+# (optionally skips prepare). No checkpoint is saved by design.
 """Parametrized Qwen3.6-35B-A3B MTP RL training launcher (8xH200).
 
 Supports arbitrary (TP, EP, CP, PP, ETP) combinations so multiple
@@ -14,6 +19,14 @@ from miles.utils.external_utils import command_utils
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC] Command-line configuration extending the shared train config. Fields: mode
+    # (default debug_minimal; read nowhere in this file), run id (unused in flags), model name,
+    # Megatron model type, GPUs per node (derived), hardware (auto or H200), enable_eval (off),
+    # extra raw args, directories; parallel sizes tp 1, ep 8, cp 1, pp 1, etp 1; training knobs
+    # (10 rollouts, 8192 max tokens per GPU, 8 prompts x 2 samples, global batch 16, response
+    # length 1024); optional SGLang EP size (defaults to GPUs per node), recompute switch (on) and
+    # skip_prepare switch.
+    # KNOWN ISSUE: the mode and run id fields are never used by execute.
     mode: Literal["normal", "debug_minimal"] = "debug_minimal"
     run_id: str = command_utils.create_run_id()
     model_name: str = "Qwen3.6-35B-A3B"
@@ -47,11 +60,17 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     skip_prepare: bool = False
 
     def __post_init__(self):
+        # [FUNCTION DOC] Resolves hardware (auto detects) and defaults GPUs per node from the
+        # hardware table when not given. Mutates self.
         self.hardware = command_utils.resolve_hardware(self)
         self.num_gpus_per_node = self.num_gpus_per_node or command_utils.NUM_GPUS_OF_HARDWARE[self.hardware]
 
 
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Creates model and data directories, then downloads the HF model, the
+    # dapo-math-17k and the aime-2024 datasets only if their target paths do not already exist
+    # (shell test-or-download commands, so symlinked cluster copies are reused), and finally
+    # converts the HF checkpoint to Megatron torch_dist format in the model directory.
     U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.model_dir} {args.data_dir}")
     # model path is a symlink to /cluster_public; skip download if already present
@@ -80,6 +99,20 @@ def prepare(args: ScriptArgs):
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Builds the training argument string and submits the colocated job with the
+    # speculative-decoding v2 environment variable set to one.
+    # Checkpoints: only HF dir and reference load (torch_dist) are passed; no save or load flags,
+    # deliberately, so no checkpoint is written. Rollout: dapo-math-17k, deepscaler reward, sizes
+    # from args. Eval only if enabled: AIME with one sample, interval 1000, max 4096 tokens. SGLang
+    # EP size is the arg or the GPUs per node. Recompute flags (full, uniform, 1 layer) only when
+    # recompute is on. Parallel flags come straight from the args, with sequence parallel always
+    # on; dynamic batch with configured tokens per GPU. Algorithm: grpo with kl loss (zero
+    # coefficient). Optimizer: adam lr 1e-6 with CPU offload. SGLang: engine size equals GPUs per
+    # node, memory fraction 0.7, graph batch sizes up to 128, EAGLE speculative decoding (2 steps,
+    # top-k 1, 3 draft tokens), max running requests 256, extra-buffer mamba radix cache. MTP
+    # training: one layer, loss scale 0.2. Misc: dropout off, fp32 allreduce, flash attention, flex
+    # token dispatcher, node/GPU counts, colocate. No wandb arguments.
+    # KNOWN ISSUE: sequence parallel is always passed even when tensor parallel is 1.
     U = args.create_backend()
     ref_load_path = f"{args.model_dir}/{args.model_name}_torch_dist"
 
@@ -211,6 +244,8 @@ def execute(args: ScriptArgs):
 
 @command_utils.dataclass_cli
 def main(args: ScriptArgs):
+    # [FUNCTION DOC] Command-line entry point: runs prepare unless skip_prepare is set, then
+    # execute.
     if not args.skip_prepare:
         prepare(args)
     execute(args)

@@ -1,3 +1,8 @@
+# [MODULE DOC] Compares per-token logprobs saved by two runs. Each run directory holds files named
+# rank_<n>.json, each with a list (per batch) of entries giving validity, global position, token
+# id and logprob. Entries are merged across ranks (first occurrence wins, valid entries only),
+# aligned by (batch index, global position), and summarized by absolute differences. Passing is
+# decided on the mean absolute difference. Reports are printed to standard output.
 """Compare per-token logprobs between baseline and target runs."""
 
 from __future__ import annotations
@@ -11,6 +16,8 @@ from typing import Any
 
 @dataclass
 class _PositionLogprob:
+    # [CLASS DOC] HELPER: One token's record: position in the full sequence, token id, log
+    # probability.
     global_position: int
     token_id: int
     logprob: float
@@ -18,6 +25,11 @@ class _PositionLogprob:
 
 @dataclass
 class _CompareResult:
+    # [CLASS DOC] HELPER: Summary of a comparison: pass flag, number of compared positions, the
+    # maximum absolute difference with its sequence position, both logprobs there and the token
+    # id (taken from the baseline), mean / median / 95th / 99th percentile absolute differences,
+    # mean logprob of each side, the threshold used, and the list of per-position differences
+    # (excluded from the printed representation).
     passed: bool
     num_positions: int
     max_abs_diff: float
@@ -41,6 +53,11 @@ def compare_logprobs(
     target_dir: Path,
     threshold: float = 1e-3,
 ) -> bool:
+    # [FUNCTION DOC] Keyword-only inputs: baseline and target directories, threshold (default
+    # 0.001) on the mean absolute difference. Loads and merges both directories. If either side
+    # has no valid entries, prints a warning and returns true (counts as a pass, so a run that
+    # produced no logprobs does not fail the comparison). Otherwise computes the comparison,
+    # prints the report and returns whether the mean difference is within the threshold.
     """Compare logprob JSON files between baseline and target.
 
     Returns True if the comparison passes (mean abs diff <= threshold).
@@ -66,6 +83,12 @@ def compare_logprobs(
 
 
 def _load_and_merge(directory: Path) -> dict[tuple[int, int], _PositionLogprob]:
+    # [FUNCTION DOC] HELPER: Reads every file matching rank_*.json in the directory in sorted name
+    # order (warns and returns an empty mapping if none). Each file's logprob_entries field is a
+    # list over batches of lists of entry mappings. Entries not marked valid are skipped. Returns
+    # a mapping from (batch index, global position) to a position record; if several ranks supply
+    # the same key, the first one read is kept. A malformed file raises the usual json or key
+    # error.
     """Load all rank JSON files and merge by (batch_index, global_position).
 
     TP ranks produce identical logprobs (runtime_gather_output=True), so we deduplicate.
@@ -104,6 +127,13 @@ def _compute_comparison(
     target_entries: dict[tuple[int, int], _PositionLogprob],
     threshold: float,
 ) -> _CompareResult:
+    # [FUNCTION DOC] HELPER: Considers only keys present on both sides, in sorted order. With none
+    # in common, returns a passing result with zero positions, zero statistics and -1 for the
+    # position and token id. Otherwise computes the absolute logprob difference per key, tracks
+    # the first key with the strictly largest difference, and fills the result: pass iff the mean
+    # difference is at most the threshold; median via standard median; 95th and 99th percentiles
+    # taken as the sorted element at index floor(count times 0.95 or 0.99); mean logprobs of each
+    # side over the common keys; worst-case token id taken from the baseline entry.
     common_keys = sorted(set(baseline_entries.keys()) & set(target_entries.keys()))
 
     if not common_keys:
@@ -170,6 +200,11 @@ def _compute_comparison(
 
 
 def _print_report(result: _CompareResult) -> None:
+    # [FUNCTION DOC] HELPER: Prints a framed text report to standard output (flushed): pass/fail
+    # status, positions compared, threshold, max / mean (with a note whether it is within the
+    # threshold) / median / 95th / 99th percentile differences in scientific notation, the worst
+    # position with token id and both logprobs (only if any positions were compared), and the mean
+    # logprob of each side.
     status = "PASSED" if result.passed else "FAILED"
     print(f"\n{'=' * 70}", flush=True)
     print(f"Logprob Comparison: {status}", flush=True)

@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Legacy (v1) function-style facade of command_utils. Re-exports commonly used helpers and exposes
+# module-level functions (execute train, run commands on cpu/gpu/all nodes, convert checkpoints,
+# rsync, start ray workers, download datasets, cast fp8 to bf16, check nvlink) that each create a
+# ray command backend on the fly and delegate to it. Only the ray cluster backend is supported;
+# anything else is rejected with an assertion error pointing to the newer backend API.
 from __future__ import annotations
 
 import os
@@ -59,6 +65,10 @@ __all__ = [
 
 @dataclass
 class ExecuteTrainConfig:
+    # [CLASS DOC] Legacy train configuration: cuda core dump flag (default off), node count
+    # (default from the scheduler job node count environment variable, else 1), extra environment
+    # variable text (default empty), output directory (default a shared data directory) and a
+    # keyword-only external mooncake flag. Converted field by field to the current config type.
     cuda_core_dump: bool = False
     num_nodes: int = field(default_factory=lambda: int(os.environ.get("SLURM_JOB_NUM_NODES", "1")))
     extra_env_vars: str = ""
@@ -77,6 +87,11 @@ def execute_train(
     megatron_path: str = "/root/Megatron-LM",
     job_lifetime: Literal["independent", "launcher"] = "independent",
 ) -> None:
+    # [FUNCTION DOC] Runs a training job through the ray backend. Uses a default config if none is
+    # given, converts it to the current config type, creates the backend (asserting ray), and
+    # forwards all arguments: train argument text, gpus per node, megatron model type, script name,
+    # optional hook run before the ray job is submitted, extra environment mapping, megatron path
+    # and job lifetime (independent of, or tied to, the launcher). Side effects: processes, ray.
     if config is None:
         config = ExecuteTrainConfig()
     current_config = _to_current_config(config)
@@ -94,14 +109,20 @@ def execute_train(
 
 
 def exec_command_cpu(cmd: str, capture_output: bool = False) -> str | None:
+    # [FUNCTION DOC] Runs a shell command on the local machine via the ray backend; returns its
+    # captured output when requested, else none.
     return _create_ray_backend().exec_command_cpu(cmd, capture_output=capture_output)
 
 
 def exec_command_gpu(cmd: str, capture_output: bool = False) -> str | None:
+    # [FUNCTION DOC] Runs a shell command in a gpu context via the ray backend; returns captured
+    # output when requested, else none.
     return _create_ray_backend().exec_command_gpu(cmd, capture_output=capture_output)
 
 
 def exec_command_multi_node(cmd: str, capture_output: bool = False, num_nodes: int | None = None) -> list[str | None]:
+    # [FUNCTION DOC] Runs a shell command on each of the first num_nodes nodes (all when none) via
+    # the ray backend; returns a list of per-node outputs (none entries when not captured).
     return _create_ray_backend().exec_command_multi_node(cmd, capture_output=capture_output, num_nodes=num_nodes)
 
 
@@ -116,6 +137,9 @@ def convert_checkpoint(
     hf_checkpoint: str | None = None,
     megatron_path: str = "/root/Megatron-LM",
 ) -> None:
+    # [FUNCTION DOC] Converts a checkpoint via the ray backend; forwards all arguments unchanged
+    # (model name, megatron model type, gpus per node, multinode flag, node count, extra argument
+    # text, destination directory, optional hf checkpoint, megatron path).
     _create_ray_backend().convert_checkpoint(
         model_name=model_name,
         megatron_model_type=megatron_model_type,
@@ -130,6 +154,8 @@ def convert_checkpoint(
 
 
 def rsync_simple(path_src: str, path_dst: str, num_nodes: int | None = None) -> None:
+    # [FUNCTION DOC] Runs an rsync command (built by the common helper) on the nodes via the
+    # multi-node executor to sync source to destination.
     _create_ray_backend().exec_command_multi_node(rsync_cmd(path_src=path_src, path_dst=path_dst), num_nodes=num_nodes)
 
 
@@ -139,6 +165,8 @@ def ssh_start_ray_workers(
     hostfile: str = "/root/mpi_rack_hostfile",
     head_host: str | None = None,
 ) -> None:
+    # [FUNCTION DOC] Starts ray workers over ssh via the ray backend, using the hostfile (default
+    # path given), master address, gpus per node and optional head host.
     _create_ray_backend().ssh_start_ray_workers(
         master_addr=master_addr,
         num_gpus_per_node=num_gpus_per_node,
@@ -148,18 +176,26 @@ def ssh_start_ray_workers(
 
 
 def hf_download_dataset(full_name: str, data_dir: str = "/root/datasets") -> None:
+    # [FUNCTION DOC] Downloads a dataset by its full hub name into the data directory via the ray
+    # backend.
     _create_ray_backend().hf_download_dataset(full_name=full_name, data_dir=data_dir)
 
 
 def fp8_cast_bf16(path_src: str, path_dst: str) -> None:
+    # [FUNCTION DOC] Casts an fp8 checkpoint at the source path to bf16 at the destination path via
+    # the ray backend.
     _create_ray_backend().fp8_cast_bf16(path_src=path_src, path_dst=path_dst)
 
 
 def check_has_nvlink() -> bool:
+    # [FUNCTION DOC] Returns whether the machine has nvlink connections, using the backend's private
+    # probe (runs a gpu topology query).
     return _create_ray_backend()._check_has_nvlink()
 
 
 def _to_current_config(config: ExecuteTrainConfig) -> _CurrentExecuteTrainConfig:
+    # [FUNCTION DOC] HELPER: Copies the five legacy config fields to the current config type; the
+    # current type's other fields keep their defaults.
     return _CurrentExecuteTrainConfig(
         cuda_core_dump=config.cuda_core_dump,
         external_mooncake=config.external_mooncake,
@@ -170,6 +206,9 @@ def _to_current_config(config: ExecuteTrainConfig) -> _CurrentExecuteTrainConfig
 
 
 def _create_ray_backend(config: _CurrentExecuteTrainConfig | None = None) -> RayCommandBackend:
+    # [FUNCTION DOC] HELPER: Creates the backend from the config (a default current config if none).
+    # Asserts the configured cluster backend is ray (the legacy API cannot express other launches)
+    # and that the created backend is a ray command backend.
     if config is None:
         config = _CurrentExecuteTrainConfig()
     assert config.cluster_backend is ClusterBackend.RAY, (

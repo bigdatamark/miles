@@ -1,3 +1,10 @@
+# [MODULE DOC] Hyper-connection (multi-stream residual) modules for Qwen3.8-Next, filling the
+# hyper-connection slots of Megatron's layer specs. The hidden state carries n residual streams
+# concatenated along the feature dim (width n times hidden). Per layer, a low-rank gate reads the
+# streams (normalised per stream) and averages them into the sublayer input; after the sublayer the
+# output is injected back into every stream with per-stream weights. Fused kernels live in the miles
+# hyper-connection kernel module. Contains: the per-layer connection, the model-level head
+# contraction, and a variant that first applies the per-layer-embedding (PLE) increment.
 """Qwen3.8-Next hyper-connections for Megatron's HC ModuleSpec slots.
 
 Differs from Megatron's mHC (DeepSeek-V4): per-stream per-feature low-rank read
@@ -22,6 +29,13 @@ from miles_plugins.models.qwen3_8_next.ops.ple import Qwen38NextPLE, current_ple
 
 
 class Qwen38NextHyperConnection(MegatronModule):
+    # [CLASS DOC] Per-layer hyper-connection for an attention or MLP slot. Parameters (all in the
+    # config's parameter dtype and tagged sequence-parallel so their gradients are reduced across
+    # TP): a norm weight over the wide dim (zeros), a down projection (low rank by wide) and an up
+    # projection (wide by low rank) forming the low-rank read gate, and, if use_combine, a block
+    # inject weight (streams by wide). Wide is stream count times hidden size; low rank comes from
+    # the config's Qwen3.8-Next HC low-rank setting. When use_combine is false the module is
+    # read-only (no inject weight, set to None) and its forward asserts.
     """Per-layer HC filling the attention/MLP spec slots. Params replicated across TP
     (sequence_parallel attr set); kept bf16 to match sglang."""
 
@@ -32,6 +46,11 @@ class Qwen38NextHyperConnection(MegatronModule):
         hc_count: int | None = None,
         use_combine: bool = True,
     ):
+        # [FUNCTION DOC] Stores layer number, stream count n (hc_count if given, else the config's
+        # residual stream count), hidden size, layer-norm epsilon, and use_combine. Creates the
+        # parameters described on the class (norm weight zeros; the others uninitialised), tags them
+        # sequence-parallel per config, then (without gradient tracking) fills the down, up and
+        # inject weights with Xavier uniform initialisation.
         super().__init__(config)
         self.layer_number = layer_number
         self.n = hc_count if hc_count is not None else config.num_residual_streams
@@ -69,6 +88,13 @@ class Qwen38NextHyperConnection(MegatronModule):
         mhc_recompute_manager=None,
         output_slot=None,
     ) -> tuple[Tensor, Tensor | None, Tensor, Tensor]:
+        # [FUNCTION DOC] Read step. Input hidden_states: sequence, batch, streams times hidden.
+        # Calls the fused mix-and-inject kernel with the norm weight, down / up weights, inject
+        # weight, stream count and epsilon, obtaining the aggregated (stream-averaged, gated) sublayer
+        # input and the per-stream post weights. Returns a 4-tuple: aggregated, None (no residual
+        # mixing matrix), post weights, and the unchanged input as the residual.
+        # Raises not-implemented error if the mHC recompute manager or output slot is given; asserts
+        # that the module was built with use_combine.
         """Returns (aggregated, h_res=None, h_post, residual)."""
         if mhc_recompute_manager is not None or output_slot is not None:
             raise NotImplementedError(
@@ -98,6 +124,14 @@ class Qwen38NextHyperConnection(MegatronModule):
         fused: bool,
         manager=None,
     ) -> Tensor:
+        # [FUNCTION DOC] Write step: inject the sublayer output into every stream. Inputs: h_res
+        # (must be None; asserted), the original residual streams, post weights from the read step,
+        # the sublayer output (a plain tensor or a pair of output and bias), dropout probability,
+        # training flag, and a fused flag and manager. The fused flag is accepted but unused; a
+        # non-None manager raises not-implemented error. Steps: split output / bias; add the bias
+        # (broadcast over the last dim) if present; apply dropout to the output if probability is
+        # positive and training (note: dropout is functional with default behaviour, no RNG tracker);
+        # return the fused combine of residual, output, post weights and stream count.
         """``X'_c = X_c + a_c * (y + bias)``, dropout applied to the injection."""
         assert h_res is None, "Qwen3.8-Next hyper-connection has no residual mixing matrix"
         if manager is not None:
@@ -116,10 +150,17 @@ class Qwen38NextHyperConnection(MegatronModule):
 
 
 class Qwen38NextHCHeadContraction(MegatronModule):
+    # [CLASS DOC] Model-level contraction applied before the output head: reduces the n residual
+    # streams (feature width n times hidden) to a single hidden-size stream with the same gated-mean
+    # read as the per-layer connection, but without an inject weight. Parameters: norm weight, down
+    # and up weights (same shapes and init as the per-layer module), tagged sequence-parallel.
     """Model-level output contraction [s,b,n*C]->[s,b,C]: same gated mean as the
     per-layer HC (per-stream RMS) -- NOT interchangeable with DSv4's built-in."""
 
     def __init__(self, config: TransformerConfig, hc_count: int | None = None):
+        # [FUNCTION DOC] Stores stream count (hc_count or the config's residual stream count),
+        # hidden size and epsilon; creates the norm / down / up parameters, tags them
+        # sequence-parallel per config, and Xavier-uniform initialises down and up (no gradient).
         super().__init__(config)
         self.n = hc_count if hc_count is not None else config.num_residual_streams
         self.hidden_size = config.hidden_size
@@ -140,6 +181,8 @@ class Qwen38NextHCHeadContraction(MegatronModule):
             torch.nn.init.xavier_uniform_(self.input_mix_weight_up)
 
     def forward(self, hidden_states: Tensor) -> Tensor:
+        # [FUNCTION DOC] Run the fused mix kernel without an inject weight and return only the mixed
+        # (aggregated) tensor of shape sequence, batch, hidden; the post weights are discarded.
         mixed, _ = hc_mix_inject(
             hidden_states,
             self.hc_norm_weight,
@@ -153,10 +196,19 @@ class Qwen38NextHCHeadContraction(MegatronModule):
 
 
 class Qwen38NextPLEHyperConnection(Qwen38NextHyperConnection):
+    # [CLASS DOC] Hyper-connection for the attention slot of the layer that hosts per-layer
+    # embeddings (PLE). Before the normal read it adds the PLE increment (computed from the
+    # published n-gram ids side channel) to the hidden states. Under sequence parallelism the
+    # hidden states are all-gathered to full length for the PLE computation and the local slice is
+    # taken back afterwards. Under activation recompute a first-in-first-out queue of published
+    # batches is kept per module (created lazily).
     """Attention-site HC for the PLE layer: applies the PLE increment (full-seq
     under SP) before the read."""
 
     def __init__(self, config: TransformerConfig, layer_number: int, **kwargs):
+        # [FUNCTION DOC] Runs the base constructor (extra keyword arguments pass through), looks up
+        # the tensor-parallel group (falling back to none if parallel state is not initialised, e.g.
+        # in shape audits), and creates the PLE module for this layer with that group.
         super().__init__(config, layer_number, **kwargs)
 
         tp_group = None
@@ -167,6 +219,12 @@ class Qwen38NextPLEHyperConnection(Qwen38NextHyperConnection):
         self.ple = Qwen38NextPLE(config, layer_number=layer_number, tp_group=tp_group)
 
     def _resolve_ple_batch(self):
+        # [FUNCTION DOC] HELPER: return the (n-gram ids, cumulative sequence lengths) pair for this
+        # forward. Lazily creates the recompute queue. If currently inside a checkpointed region
+        # with gradients enabled (the recompute pass), pops the oldest queued batch (raises a runtime
+        # error if empty, meaning the original pass did not enqueue or order diverged). Otherwise
+        # reads the currently published batch; if inside checkpointing (the original pass with no
+        # grad), also appends it to the queue for later recompute.
         """The published batch, made safe under activation recompute.
 
         The recompute pass runs in backward, after the side channel was cleared or
@@ -191,6 +249,12 @@ class Qwen38NextPLEHyperConnection(Qwen38NextHyperConnection):
         return batch
 
     def _apply_ple(self, hidden_states, ngram_ids, cu_seqlens):
+        # [FUNCTION DOC] HELPER: add the PLE increment to hidden_states (sequence, batch, features).
+        # ngram_ids may be 3-dimensional (batch, sequence, heads), in which case its batch and
+        # sequence must match the hidden states (else runtime error) and it is transposed to
+        # sequence-first; both ids and states are flattened to rows over sequence times batch, the
+        # PLE module is called with the rows and cumulative lengths, its output must match the
+        # flattened state's shape (asserted), and it is added to the hidden states. Returns the sum.
         seq, batch = hidden_states.shape[0], hidden_states.shape[1]
         if ngram_ids.dim() == 3:
             if ngram_ids.shape[:2] != (batch, seq):
@@ -216,6 +280,11 @@ class Qwen38NextPLEHyperConnection(Qwen38NextHyperConnection):
         mhc_recompute_manager=None,
         output_slot=None,
     ) -> tuple[Tensor, Tensor | None, Tensor, Tensor]:
+        # [FUNCTION DOC] Resolve the PLE batch, add the PLE increment to the hidden states (with
+        # the all-gather / local-slice dance when sequence parallelism is enabled and TP size > 1,
+        # without gradient to the gathered input's output grad being TP-reduced), then delegate to
+        # the base read step with the same recompute manager and output slot arguments (which will
+        # raise if either is set). Returns the base 4-tuple.
         ngram_ids, cu_seqlens = self._resolve_ple_batch()
 
         sp_size = 1

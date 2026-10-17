@@ -1,3 +1,9 @@
+# [MODULE DOC] Plans and executes a row exchange among context-parallel ranks so that causal-attention
+# scoring work is balanced. A plan is a pure function of the global sequence lengths (computed
+# identically on every rank on the host, with row index tensors generated on the device). Execution
+# uses asynchronous all-to-all collectives with uneven splits; no autograd flows through them, so all
+# tensors sent and results returned must be detached. Contains the plan record, the planner, helpers
+# that cut sequences into chunk pieces and cost them, an exchange handle, and a no-op local variant.
 """Balance causal per-row work across contiguous context-parallel ranks.
 
 Every sequence is cut into 2 * cp chunks and rank r scores chunks 2r and 2 * cp - 1 - 2r, pairing an
@@ -17,6 +23,10 @@ from torch import Tensor
 
 @dataclass(frozen=True)
 class RowBalancePlan:
+    # [CLASS DOC] Immutable record of one rank's view of an exchange: indices of local rows to send
+    # (ordered by destination rank, then ascending stream position), per-rank send counts and receive
+    # counts (tuples of length cp size), and the global stream positions of the rows this rank will
+    # receive and score, in received order (sources by ascending rank, ascending position within each).
     """This rank's side of a balanced exchange; every field is identical in meaning on all ranks.
 
     Attributes:
@@ -33,10 +43,14 @@ class RowBalancePlan:
 
     @property
     def num_scored(self) -> int:
+        # [FUNCTION DOC] Property: total number of rows this rank receives, the sum of receive counts.
         return sum(self.output_splits)
 
 
 def scoring_rank_of_chunk(chunk: int, cp_size: int) -> int:
+    # [FUNCTION DOC] Pure arithmetic mapping from a chunk index (0 to twice cp size minus one) to the
+    # rank scoring it: even chunks go to half the index; odd chunks go to cp size minus one minus half
+    # the index (integer division). Returns the rank.
     """Chunk 2r goes to rank r and chunk 2r + 1 to rank cp - 1 - r: an early chunk pairs with a late one.
 
     This is Miles' zigzag layout with the ranks relabeled so that each rank keeps its own first chunk.
@@ -54,6 +68,14 @@ def plan_causal_row_balance(
     device: torch.device | str,
     min_gain: float = 0.1,
 ) -> RowBalancePlan | None:
+    # [FUNCTION DOC] Memoized planner (cache of 32 entries keyed on all arguments, so sequence lengths
+    # must be a hashable tuple). Validates that no length is negative and that the total divides
+    # evenly by cp size (raises a value error otherwise); each rank owns total / cp size contiguous
+    # rows. Cuts every sequence into pieces, and returns nothing if balancing does not reduce the
+    # maximum per-rank cost by at least the minimum gain fraction (default 0.1). Otherwise builds this
+    # rank's plan. Device is used only for generating the index tensors.
+    # KNOWN ISSUE: taking the minimum of an empty sequence-length tuple raises a plain error rather
+    # than the documented validation error.
     """The balanced exchange for a stream of ``seq_lens`` split contiguously over ``cp_size`` ranks.
 
     ``seq_lens`` must tile the whole stream, padding included, and the stream must split evenly
@@ -77,6 +99,9 @@ def plan_causal_row_balance(
 
 @dataclass(frozen=True)
 class _Piece:
+    # [CLASS DOC] HELPER: Immutable record of a contiguous run of stream rows lying inside one
+    # sequence chunk and one owner rank: global start, row count, offset of the first row within its
+    # sequence, owner rank (holds the rows initially), and scorer rank (scores them after exchange).
     """Stream rows ``[start, start + rows)``, held by ``owner`` and scored by ``scorer``.
 
     ``offset`` is where the piece starts inside its own sequence.
@@ -90,6 +115,10 @@ class _Piece:
 
 
 def _pieces(seq_lens, cp_size: int, rank_rows: int) -> list[_Piece]:
+    # [FUNCTION DOC] HELPER: For each sequence in order, splits it into twice cp size chunks with
+    # boundaries at ceiling of chunk index times length over chunk count; empty chunks produce nothing.
+    # Each chunk is further cut at rank-ownership boundaries (owner is stream position divided by rows
+    # per rank). The scorer of every piece is that of its chunk. Returns pieces in stream order.
     """Every sequence's 2 * cp chunks in stream order, cut where a rank's rows end.
 
     Chunk c of a sequence of n rows holds offsets [ceil(c n / 2cp), ceil((c + 1) n / 2cp)), so it is
@@ -112,6 +141,10 @@ def _pieces(seq_lens, cp_size: int, rank_rows: int) -> list[_Piece]:
 
 
 def _worth_balancing(pieces: list[_Piece], cp_size: int, min_gain: float) -> bool:
+    # [FUNCTION DOC] HELPER: Costs each piece as the sum over its rows of (offset in sequence plus
+    # one), the number of causal keys, and accumulates it per owner (current layout) and per scorer
+    # (balanced layout). Returns true when the busiest scorer's cost is at most (1 minus min gain)
+    # times the busiest owner's cost.
     """Whether scoring each piece on its scorer cuts the busiest rank's causal cost by ``min_gain``."""
     contiguous, balanced = [0] * cp_size, [0] * cp_size
     for piece in pieces:
@@ -125,6 +158,11 @@ def _worth_balancing(pieces: list[_Piece], cp_size: int, min_gain: float) -> boo
 def _plan_for_rank(
     pieces: list[_Piece], *, cp_rank: int, cp_size: int, rank_rows: int, device: torch.device | str
 ) -> RowBalancePlan:
+    # [FUNCTION DOC] HELPER: Builds this rank's plan. Sent pieces are those owned by this rank, stably
+    # sorted by scorer so each destination's rows keep ascending position; received pieces are those
+    # scored by this rank, in stream order (hence grouped by ascending owner). Send and receive counts
+    # per rank are the summed row counts. Send row indices are local (stream position minus this
+    # rank's first row); scored positions are global. Index tensors are expanded on the given device.
     # sorted() is stable: rows bound for one rank keep ascending position, the order the receiver expects
     sent = sorted((piece for piece in pieces if piece.owner == cp_rank), key=lambda piece: piece.scorer)
     received = [piece for piece in pieces if piece.scorer == cp_rank]
@@ -142,10 +180,16 @@ def _plan_for_rank(
 
 
 def _ceil_div(numerator: int, denominator: int) -> int:
+    # [FUNCTION DOC] HELPER: Integer division rounding up (via negated floor division).
     return -(-numerator // denominator)
 
 
 def _concat_ranges(starts: list[int], lengths: list[int], device: torch.device | str) -> Tensor:
+    # [FUNCTION DOC] HELPER: Returns a 64-bit integer vector concatenating consecutive integer ranges,
+    # one per (start, length) pair. Only a small two-row table (start minus exclusive prefix sum of
+    # lengths, and lengths) is moved to the device (pinned and copied asynchronously for cuda); the
+    # per-element values are produced on device by repeating each base by its length and adding a
+    # running index. With no ranges the result is empty.
     """``cat([arange(s, s + n) for s, n in zip(starts, lengths)])``, expanded on ``device``.
 
     Only the per-range table crosses to the device; the rows are generated there.
@@ -160,9 +204,13 @@ def _concat_ranges(starts: list[int], lengths: list[int], device: torch.device |
 
 
 class RowExchange:
+    # [CLASS DOC] Handle for an in-flight exchange started by the send function: holds the plan, the
+    # cp group, the receive buffers (one per sent tensor, filled asynchronously) and the pending
+    # communication handles.
     """One balanced exchange: rows in flight to this rank's scorer, and the way back for results."""
 
     def __init__(self, plan: RowBalancePlan, cp_group: dist.ProcessGroup, received: list[Tensor], works: list):
+        # [FUNCTION DOC] Stores the arguments; no communication.
         self.plan = plan
         self._cp_group = cp_group
         self._received = received
@@ -170,9 +218,13 @@ class RowExchange:
 
     @property
     def scored_positions(self) -> Tensor:
+        # [FUNCTION DOC] Property: global stream positions of the received rows, from the plan.
         return self.plan.scored_positions
 
     def wait(self) -> list[Tensor]:
+        # [FUNCTION DOC] Blocks until all pending communication handles complete (then forgets them,
+        # so repeated calls are cheap) and returns the receive buffers, one per sent tensor, each
+        # with one row per scored position.
         """The sent tensors' rows at ``plan.scored_positions``, in that order."""
         for work in self._works:
             work.wait()
@@ -180,6 +232,12 @@ class RowExchange:
         return self._received
 
     def return_to_owners(self, results: Tensor, *, dim: int = 0) -> Tensor:
+        # [FUNCTION DOC] Reverse exchange. Raises a value error if results carry gradients. First waits
+        # for the forward exchange. Moves the row axis to the front, makes it contiguous, asserts the
+        # row count equals the number of scored rows, then runs a synchronous uneven all-to-all with
+        # send and receive counts swapped relative to the forward exchange. Received rows arrive in send
+        # order, so they are scattered back into local row order using the plan's send indices. Returns
+        # a contiguous tensor with the row axis restored at the given dim and one row per local row.
         """Per-row results for the scored rows (along ``dim``) back to the local row order."""
         if results.requires_grad:
             raise ValueError("the row exchange carries no autograd; return detached results")
@@ -201,20 +259,30 @@ class RowExchange:
 
 
 class LocalRows:
+    # [CLASS DOC] Same interface as the exchange handle but with no communication: the stored tensors
+    # and positions are used as is.
     """``RowExchange`` without the exchange: this rank scores its own rows, already in local order."""
 
     def __init__(self, tensors: list[Tensor], scored_positions: Tensor):
+        # [FUNCTION DOC] Stores the tensors and the scored positions; no copying.
         self.scored_positions = scored_positions
         self._tensors = tensors
 
     def wait(self) -> list[Tensor]:
+        # [FUNCTION DOC] Returns the stored tensors immediately.
         return self._tensors
 
     def return_to_owners(self, results: Tensor, *, dim: int = 0) -> Tensor:
+        # [FUNCTION DOC] Identity: returns the results unchanged; the dim argument is ignored.
         return results
 
 
 def send_rows_to_scorers(tensors: list[Tensor], plan: RowBalancePlan, cp_group: dist.ProcessGroup) -> RowExchange:
+    # [FUNCTION DOC] Starts one asynchronous uneven all-to-all per tensor. Each tensor must not
+    # require gradients (value error otherwise) and must have one row per planned send row
+    # (assertion). Rows are gathered in send order, and a receive buffer sized to the number of scored
+    # rows (same trailing shape and dtype) is allocated per tensor. Returns the exchange handle holding
+    # the buffers and pending handles; the caller must wait on it before reading the buffers.
     """Start sending each tensor's local rows (dim 0) to the ranks that score them."""
     for rows in tensors:
         if rows.requires_grad:

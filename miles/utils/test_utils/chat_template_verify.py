@@ -1,3 +1,12 @@
+# [MODULE DOC] HELPER: Verification toolkit for the append-only chat-template invariant, shared by
+# the command-line verifier and tests. Layers: (1) text-level checks that a prefix render of the
+# first N messages is a prefix of the full render, raising or returning result objects; (2) a
+# catalogue of test cases built from mock trajectories (each trajectory expanded at each of its
+# pretokenize positions) with selection by allowed append roles and thinking mode, naming helpers
+# and a coverage report; (3) batch runners over the catalogue; (4) token-level verification through
+# a TITO tokenizer instance, checking that merging the encoded prefix with the appendix and
+# decoding reproduces the full render exactly. Pure computation apart from tokenizer and template
+# calls; no I/O.
 """Verify that a chat template satisfies the append-only invariant.
 
 The append-only invariant means: rendering the first N messages (without
@@ -32,6 +41,10 @@ def simulate_pretokenized_path(
     tools: list[dict] | None = None,
     **template_kwargs,
 ) -> str:
+    # [FUNCTION DOC] Renders the first N messages without a generation prompt and all messages
+    # with a generation prompt (same tools and extra template keyword arguments), and returns the
+    # full render if the first render is a string prefix of it. Raises a value error showing the
+    # lengths and the last 200 characters of both sides at the divergence point otherwise.
     """Simulate the pretokenized incremental path at text level.
 
     1. Render first N messages (no generation prompt) -> prefix_text
@@ -72,6 +85,8 @@ def get_standard_result(
     tools: list[dict] | None = None,
     **template_kwargs,
 ) -> str:
+    # [FUNCTION DOC] Returns the reference rendering: the template applied to all messages with a
+    # generation prompt, with the given tools and extra template keyword arguments.
     """Standard path: render all messages with generation prompt."""
     return apply_chat_template_from_str(
         chat_template,
@@ -83,6 +98,10 @@ def get_standard_result(
 
 
 def assert_pretokenized_equals_standard(chat_template, messages, pretokenized_num_message, tools=None, **kwargs):
+    # [FUNCTION DOC] Test assertion: computes the standard render and the simulated incremental
+    # render and raises an assertion error if they are not equal. The incremental path itself may
+    # raise a value error on a prefix mismatch. Note both calls receive the same message list
+    # object (no copying), so a template that mutates messages could affect the second call.
     """Assert pretokenized incremental path produces same text as standard full render."""
     standard = get_standard_result(chat_template, messages, tools=tools, **kwargs)
     pretokenized = simulate_pretokenized_path(chat_template, messages, pretokenized_num_message, tools=tools, **kwargs)
@@ -96,6 +115,8 @@ def assert_pretokenized_equals_standard(chat_template, messages, pretokenized_nu
 
 @dataclass
 class VerifyResult:
+    # [CLASS DOC] Outcome of one verification case: the case name, a pass flag and an optional
+    # error message (absent on success).
     """Result of a single append-only verification case."""
 
     case_name: str
@@ -111,6 +132,12 @@ def verify_append_only(
     case_name: str = "",
     **template_kwargs,
 ) -> VerifyResult:
+    # [FUNCTION DOC] Non-raising text-level check. Renders the standard result and the simulated
+    # incremental result, each on its own deep copy of the messages (so template mutation cannot
+    # leak), and returns a failed result with a fixed message when they differ. A value error
+    # from the incremental path (prefix mismatch) becomes a failed result carrying that text;
+    # any other exception becomes a failed result of the form exception type name, colon, message.
+    # Otherwise returns a passed result.
     """Check that the template satisfies the append-only invariant.
 
     Returns a ``VerifyResult`` instead of raising, making it suitable for
@@ -174,6 +201,9 @@ from miles.utils.test_utils.mock_trajectories import (  # noqa: E402
 
 
 def _short_name(cls: type) -> str:
+    # [FUNCTION DOC] HELPER: Converts a trajectory class name to a snake-case case label: removes
+    # every "Trajectory" substring, inserts an underscore before each capital letter except the
+    # first character, and lowercases.
     name = cls.__name__.replace("Trajectory", "")
     return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
 
@@ -205,6 +235,10 @@ _TRAJECTORIES: list[type] = [
 
 @dataclass(frozen=True)
 class CaseSpec:
+    # [CLASS DOC] Immutable description of one verification case: its name (short trajectory name
+    # plus the pretokenize position), the trajectory class it came from, the number of leading
+    # messages to pretokenize, the tool definitions (or none), the set of non-assistant roles that
+    # appear after the first assistant message, and whether any assistant carries reasoning.
     """One verify case with classification metadata copied from its trajectory."""
 
     case_name: str
@@ -216,6 +250,8 @@ class CaseSpec:
 
 
 def _expand(traj_cls: type) -> list[CaseSpec]:
+    # [FUNCTION DOC] HELPER: Builds one case per pretokenize position of the trajectory class,
+    # named short name, "-N", position, copying the class's tools, append roles and thinking flag.
     """Expand one trajectory into one CaseSpec per PRETOKENIZE_POSITIONS value."""
     short = _short_name(traj_cls)
     return [
@@ -241,6 +277,9 @@ def select_cases(
     allowed_append_roles: Iterable[str],
     is_thinking: bool | None = None,
 ) -> list[CaseSpec]:
+    # [FUNCTION DOC] Filters the module-level case catalogue, preserving its order: keeps cases
+    # whose append roles are a subset of the allowed roles and, if the thinking filter is not
+    # none, whose thinking flag equals it. Returns a new list.
     """Select trajectory cases by append-role surface and (optionally) thinking flag.
 
     A case is included iff ``case.append_roles`` is a subset of
@@ -262,6 +301,9 @@ def select_cases(
 
 
 def enable_thinking_variants(thinking: str) -> list[dict]:
+    # [FUNCTION DOC] Maps a thinking mode to the list of extra-template-argument mappings to run:
+    # "off" gives one empty mapping, "on" one mapping enabling thinking, "both" two mappings
+    # (enabled then disabled). Raises a value error for any other mode.
     """Return the list of ``enable_thinking`` kwarg variants to apply per case.
 
     * ``"off"`` → ``[{}]`` (no ``enable_thinking`` kwarg).
@@ -281,6 +323,9 @@ def enable_thinking_variants(thinking: str) -> list[dict]:
 
 
 def format_case_id(case: CaseSpec, kwargs: dict) -> str:
+    # [FUNCTION DOC] Builds a label: the case name alone for empty kwargs; otherwise the case name
+    # followed by dash-joined parts, one per key in sorted order, where a boolean value gives
+    # key_on or key_off and any other value gives key=value.
     """Human-readable label for a ``(case, template_kwargs)`` tuple.
 
     Used for both CLI ``VerifyResult.case_name`` and pytest test ids so the
@@ -303,6 +348,9 @@ def format_case_id(case: CaseSpec, kwargs: dict) -> str:
 
 @dataclass
 class CoverageReport:
+    # [CLASS DOC] Result of the coverage check: a mapping from (thinking flag, sorted tuple of
+    # extra append roles) to the names of the cases in that bucket, and the list of keys with no
+    # case.
     """Coverage of cases across ``(is_thinking, append_roles \\ {tool})``.
 
     ``covered`` maps each combination to the case names that fall in it;
@@ -319,6 +367,11 @@ def check_coverage(
     *,
     role_universe: set[str] | None = None,
 ) -> CoverageReport:
+    # [FUNCTION DOC] Defaults: the full case catalogue and role universe of user and system.
+    # Builds every subset of the sorted role universe (as sorted tuples) crossed with thinking
+    # false/true, as empty buckets; places each case in the bucket keyed by its thinking flag and
+    # its append roles minus the tool role (sorted tuple), ignoring cases whose key is not a
+    # bucket (roles outside the universe); returns the buckets and the keys of empty buckets.
     """Enumerate ``thinking × append-role-subset`` combinations and report gaps.
 
     Used as a sanity check that every meaningful append-role and thinking
@@ -357,6 +410,12 @@ def run_all_checks(
     thinking: str = "off",
     extra_template_kwargs: dict | None = None,
 ) -> list[VerifyResult]:
+    # [FUNCTION DOC] Runs the text-level check over the filtered catalogue. Defaults the allowed
+    # roles to the maximal set; raises a value error for an unknown thinking mode. Thinking
+    # filter: off selects non-thinking cases, on thinking cases, both all. For every selected
+    # case and every thinking variant, merges the variant with the extra kwargs (extra wins on
+    # key conflict) and appends the non-raising check result run on a deep copy of the trajectory
+    # messages, named by the case id. Returns the results in case then variant order.
     """Run verification cases filtered by *allowed_append_roles* and *thinking*.
 
     ``allowed_append_roles`` is the role surface the template may append after
@@ -428,6 +487,20 @@ def verify_append_only_via_tito_instance(
     case_name: str = "",
     **template_kwargs,
 ) -> VerifyResult:
+    # [FUNCTION DOC] Token-level check with an existing TITO tokenizer and an underlying
+    # tokenizer. Never raises: any exception becomes a failed result of type name and message.
+    # Steps: find the end M of the maximal run of non-assistant messages starting at the
+    # pretokenize position N; fail with an explanatory error if that run is empty (message N is
+    # an assistant). Deep-copy the first N messages (prefix) and the first M messages (full).
+    # Obtain the TITO's default template arguments for the tools; render the prefix without and
+    # the full list with a generation prompt using the TITO. Encode the prefix text without
+    # special tokens and strip trailing token ids that the TITO declares as trailing (simulating
+    # where the model stops). Merge tokens using the TITO with prefix, full and stripped ids,
+    # decode, and compare with the full render: pass if equal, else fail with the index of the
+    # first differing character and about 60 characters of context before and after, expected vs
+    # actual.
+    # KNOWN ISSUE: the extra template keyword arguments of this function are accepted but never
+    # used here; the TITO instance must already carry them.
     """Decode-roundtrip verify with a pre-built TITO instance.
 
     Asserts ``decode(tito.merge_tokens(prefix_msgs, full_msgs, encode(prefix_text)))
@@ -511,6 +584,10 @@ def verify_append_only_via_tito(
     case_name: str = "",
     **template_kwargs,
 ) -> VerifyResult:
+    # [FUNCTION DOC] Builds a TITO tokenizer for the registered model family via the factory,
+    # passing a copy of the extra template kwargs as chat template kwargs (local import), then
+    # delegates to the instance-based check with the same messages, position, tools, case name
+    # and kwargs, returning its result.
     """Decode-roundtrip verify, building TITO from the registered family.
 
     Matches the production wiring at ``miles/rollout/session/sessions.py:35`` —
@@ -543,6 +620,13 @@ def run_all_checks_via_tito(
     thinking: str = "off",
     extra_template_kwargs: dict | None = None,
 ) -> list[VerifyResult]:
+    # [FUNCTION DOC] Token-level batch runner. Raises a value error for an unknown thinking mode.
+    # Coerces a string model name to the TITO type enum, looks up the tokenizer class's fixed
+    # template and selects cases by its allowed append roles and the thinking filter. Skips cases
+    # whose pretokenize position is at or past the end of the messages or lands on an assistant
+    # message (empty appendix). For each remaining case and thinking variant, merges variant and
+    # extra kwargs (extra wins), builds a fresh TITO and appends the roundtrip result for a deep
+    # copy of the messages. Returns the results in order.
     """Same shape as :func:`run_all_checks` but routes through TITO + tokenizer.
 
     Per-case TITO rebuild: each (case, ``enable_thinking`` variant) gets a fresh

@@ -1,3 +1,19 @@
+# [MODULE DOC] Disk (NVMe) streaming of the Megatron distributed optimizer's fp32 main parameters
+# and Adam moments, plus a variant for Muon. Layout: parameters of a distributed optimizer are
+# grouped into "buckets" (by DDP buffer bucket, then split by an element-count limit); each bucket
+# has one preallocated file with three segments (main params, first moment, second moment), each
+# parameter's slice aligned to 4096 bytes. The tensors' GPU storage is freed (resized to zero)
+# whenever they are not in use. The optimizer step fetches one bucket at a time, applies a fused
+# Adam step with gradients taken from the DDP gradient buffer (clipped with the chain's total
+# norm), copies updated mains into the DDP parameter buffer, and writes the bucket back.
+# Disk I/O goes through a pinned host staging buffer with vectored positional reads / writes;
+# casts between GPU and disk dtype happen on the GPU. Natively fp32 parameters stay on the GPU
+# with an ordinary Adam. Checkpointing copies the bucket files plus a JSON manifest (same topology
+# resume only). Entry points: setup_optimizer_state_streaming (patches each distributed optimizer in
+# a chain via bound replacement methods), and setup_muon_state_on_disk (replaces the chunked state
+# offloader class so its host buffers are file-backed mappings).
+# Limitations enforced by asserts: no fp8 / MXFP8 parameters, no precision-aware optimizer, no CPU
+# offload, no FSDP, no loss scaling, no zero-count logging, no separate grad-norm groups.
 """NVMe streaming of Megatron's DistributedOptimizer state.
 
 The fp32 main params and Adam moments live in per-bucket files on node-local NVMe
@@ -66,20 +82,31 @@ IO_ALIGN = 4096
 
 
 class _Entry(NamedTuple):
+    # [CLASS DOC] HELPER: one streamed parameter. Fields: the model (low-precision) parameter, its
+    # fp32 main parameter shard owned by this rank, and the optimizer parameter-group index.
     model_param: torch.nn.Parameter
     main_param: torch.Tensor
     group_index: int
 
 
 def _align(nbytes: int) -> int:
+    # [FUNCTION DOC] HELPER: round a byte count up to the next multiple of the I/O alignment (4096).
     return (nbytes + IO_ALIGN - 1) // IO_ALIGN * IO_ALIGN
 
 
 def _resize(tensor: torch.Tensor, numel: int) -> None:
+    # [FUNCTION DOC] HELPER: resize the tensor's underlying storage in place to hold numel elements
+    # of its element size. Zero frees the device memory while the tensor object (shape, dtype) stays
+    # alive; a positive size re-allocates uninitialised memory. Mutates the storage.
     tensor.untyped_storage().resize_(numel * tensor.element_size())
 
 
 def _reserve(fd: int, nbytes: int) -> None:
+    # [FUNCTION DOC] HELPER: make the file behind the descriptor nbytes long with blocks actually
+    # allocated (posix fallocate from offset zero), so a full disk raises an out-of-space error now.
+    # If the filesystem reports the operation as unsupported or invalid, falls back to truncating
+    # to the size (sparse file, so a later write could fail at first touch). Other OS errors
+    # propagate.
     """Reserve blocks up front, so a full filesystem fails here as ENOSPC.
 
     Sizing a file with ftruncate alone leaves it sparse: the mapping succeeds and the
@@ -94,12 +121,19 @@ def _reserve(fd: int, nbytes: int) -> None:
 
 
 def _allocate_file(path: str, nbytes: int) -> int:
+    # [FUNCTION DOC] HELPER: open (creating if needed) a read-write file with mode 0600 and
+    # close-on-exec, reserve nbytes of disk space, and return the open descriptor (the caller owns
+    # it). Existing contents are not truncated.
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
     _reserve(fd, nbytes)
     return fd
 
 
 def _rw_full(op, fd: int, offset: int, buf) -> None:
+    # [FUNCTION DOC] HELPER: perform a complete positional vectored read or write. op is the
+    # positional vectored read or write function of the os module; buf is any buffer (viewed as raw
+    # bytes). Loops, advancing the file offset and buffer position, until all bytes are transferred;
+    # raises an OS error if a call transfers zero or fewer bytes (short transfer).
     mv = memoryview(buf).cast("B")
     done = 0
     while done < len(mv):
@@ -110,6 +144,12 @@ def _rw_full(op, fd: int, offset: int, buf) -> None:
 
 
 def _disk_backed_like(tensor: torch.Tensor, directory: str) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: create a CPU tensor with the same dtype and shape as the input whose
+    # storage is a shared memory-mapped file in the given directory. Steps: make a unique temp file
+    # (.bin suffix), reserve max(size in bytes, 1) bytes, close the descriptor, map the file as shared
+    # storage, then unlink the path (the mapping keeps it alive, so it shows up in disk usage but not
+    # in directory listings). The result has contiguous strides, uninitialised contents (whatever
+    # the file held: zeros), and a marker attribute identifying it as disk backed.
     nbytes = max(tensor.numel() * tensor.element_size(), 1)
     fd, path = tempfile.mkstemp(dir=directory, suffix=".bin")
     try:
@@ -124,6 +164,7 @@ def _disk_backed_like(tensor: torch.Tensor, directory: str) -> torch.Tensor:
 
 
 def _is_disk_backed(tensor: torch.Tensor) -> bool:
+    # [FUNCTION DOC] HELPER: true if the tensor carries the disk-backed marker attribute.
     return getattr(tensor, "_miles_disk_backed", False)
 
 
@@ -132,6 +173,9 @@ _libc = ctypes.CDLL(None, use_errno=True)
 
 
 def _flush_mapping(tensor: torch.Tensor) -> int:
+    # [FUNCTION DOC] HELPER: synchronously flush the tensor's whole mapped storage to disk through
+    # the C library's memory-sync call (synchronous mode). Returns the storage size in bytes;
+    # raises an OS error carrying the C errno if the call fails.
     """msync one file-backed buffer, returning the bytes it covered.
 
     Checkpointing calls os.fsync on its own files, which waits on the kernel's writeback
@@ -147,6 +191,12 @@ def _flush_mapping(tensor: torch.Tensor) -> int:
 
 
 def plan_buckets(entries_by_ddp_bucket: dict, limit: int = BUCKET_NUMEL_LIMIT) -> list[list[_Entry]]:
+    # [FUNCTION DOC] Split entries into streaming buckets. Input: mapping from a DDP-bucket key to a
+    # list of entries; keys are visited in sorted order. Within a key, entries are appended in order
+    # to the current bucket; once the running element count reaches or exceeds the limit (default
+    # 200 million) the bucket is closed, so a bucket can overshoot by its last entry. At the end of
+    # each key the partial bucket is closed too, so buckets never span DDP buckets. Returns a list
+    # of entry lists.
     planned, current, numel = [], [], 0
     for _, entries in sorted(entries_by_ddp_bucket.items(), key=lambda kv: kv[0]):
         for entry in entries:
@@ -162,12 +212,20 @@ def plan_buckets(entries_by_ddp_bucket: dict, limit: int = BUCKET_NUMEL_LIMIT) -
 
 
 class _Stager:
+    # [CLASS DOC] HELPER: moves tensor data between GPU memory and a bucket file through one pinned
+    # host buffer (chunked) and a lazily created matching device byte buffer used for dtype casts.
     def __init__(self, nbytes: int):
+        # [FUNCTION DOC] HELPER: allocate the pinned host byte buffer of nbytes (requires CUDA) and
+        # keep a numpy view of it for file I/O; the device buffer is not created yet.
         self._buf = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
         self._bytes = self._buf.numpy()
         self._device_buf = None
 
     def _device_staging(self, dtype: torch.dtype, numel: int, like: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: return a view of numel elements of the given dtype over the device
+        # byte buffer (same byte size as the host buffer), allocating it on the device of the like
+        # tensor, or re-allocating if that device differs. Used to cast on the GPU and move
+        # same-dtype bytes, which is far faster than a cross-dtype host copy.
         # A cross-dtype copy between GPU and pinned host memory does not take the DMA
         # path: casting on the device first and moving same-dtype bytes is ~40x faster
         # for bf16 and ~100x for fp8.
@@ -177,6 +235,14 @@ class _Stager:
         return self._device_buf[: numel * dtype.itemsize].view(dtype)
 
     def transfer(self, fd: int, offset: int, tensor: torch.Tensor, dtype: torch.dtype, *, to_disk: bool) -> int:
+        # [FUNCTION DOC] Copy a whole tensor to or from the file region starting at the byte offset,
+        # stored in the on-disk dtype given (the tensor must be viewable as flat, i.e. contiguous
+        # storage). Processes in chunks of as many elements as fit in the host buffer. Writing:
+        # copy chunk to the host buffer (casting on the device first when the dtypes differ), then
+        # positional write. Reading: positional read into the host buffer, then copy into the tensor
+        # (via the device byte buffer plus a device-side cast when dtypes differ). Mutates the tensor
+        # when reading, the file when writing. Returns the number of bytes transferred
+        # (tensor elements times on-disk element size).
         flat = tensor.view(-1)
         cast = dtype != flat.dtype
         chunk = self._buf.numel() // dtype.itemsize
@@ -207,7 +273,16 @@ class _Stager:
 
 
 class _Bucket:
+    # [CLASS DOC] HELPER: one streaming bucket: a list of entries, the Adam optimizer covering
+    # exactly their main params, and one preallocated file holding three segments laid out one
+    # after another (main, first moment, second moment), each entry's slice padded to 4096 bytes.
+    # Tracks whether moments exist on disk yet. The file descriptor stays open for the object's
+    # lifetime and is never closed explicitly (released at process exit).
     def __init__(self, path: str, entries: list[_Entry], adam, stager: _Stager, dtypes: dict):
+        # [FUNCTION DOC] HELPER: record the arguments (dtypes maps segment name to its on-disk
+        # dtype), the sorted distinct group indices, the total element count, and per-segment byte
+        # offsets of each entry; total file size is the sum of aligned sizes; allocates the file
+        # (reserving the space, so out-of-space errors surface here); moments start as not ready.
         self.path, self.entries, self.adam, self.dtypes = path, entries, adam, dtypes
         self._stager = stager
         self.group_indices = sorted({e.group_index for e in entries})
@@ -225,11 +300,17 @@ class _Bucket:
         self.moments_ready = False
 
     def _tensors(self, segment: str):
+        # [FUNCTION DOC] HELPER: generator of (tensor, file offset) for every entry in a segment:
+        # the main param itself for "main", otherwise the Adam state tensor of that name for the main
+        # param (raises a key error if the moments do not exist yet).
         for index, entry in enumerate(self.entries):
             tensor = entry.main_param if segment == "main" else self.adam.state[entry.main_param][segment]
             yield tensor, self.offsets[segment][index]
 
     def _move(self, segments, *, to_disk: bool) -> int:
+        # [FUNCTION DOC] HELPER: transfer the listed segments for all entries. Loading first grows
+        # each tensor's storage to full size, then reads; writing writes, then frees the tensor's
+        # storage (size zero). Returns total bytes moved.
         moved = 0
         for segment in segments:
             for tensor, offset in self._tensors(segment):
@@ -241,18 +322,30 @@ class _Bucket:
         return moved
 
     def fetch(self) -> int:
+        # [FUNCTION DOC] Load this bucket onto the GPU: all three segments if the moments already
+        # exist on disk, otherwise only the main params (the first step creates fresh zero moments).
+        # Returns bytes read.
         return self._move(SEGMENTS if self.moments_ready else SEGMENTS[:1], to_disk=False)
 
     def flush(self, segments=SEGMENTS) -> int:
+        # [FUNCTION DOC] Write the given segments (default all) to disk and free their GPU storage.
+        # Marks moments as ready if they already were or if all three segments were written.
+        # Returns bytes written.
         moved = self._move(segments, to_disk=True)
         self.moments_ready = self.moments_ready or tuple(segments) == SEGMENTS
         return moved
 
     def materialize_main(self) -> None:
+        # [FUNCTION DOC] Allocate full-size (uninitialised) GPU storage for every main param of the
+        # bucket without reading the file, so the caller can fill it.
         for tensor, _ in self._tensors("main"):
             _resize(tensor, tensor.numel())
 
     def allocate_moments(self) -> None:
+        # [FUNCTION DOC] Create the two Adam moment tensors for each main param in the optimizer
+        # state (only if absent), shaped like the main param but with their storage freed
+        # immediately, and mark moments ready so the next fetch reads them from disk. Used after
+        # loading a checkpoint.
         for entry in self.entries:
             state = self.adam.state.setdefault(entry.main_param, {})
             for segment in SEGMENTS[1:]:
@@ -263,6 +356,13 @@ class _Bucket:
 
 
 class NVMeOptimizerStateStore:
+    # [CLASS DOC] Owns the disk-resident optimizer state of one distributed optimizer: the buckets,
+    # the shared pinned stager, the GPU-resident Adam for natively fp32 params, and the pending
+    # total grad norm. Class counter _next_uid gives each store a unique id so the chained dense and
+    # expert optimizers (which may share an instance id) get distinct directories. Public surface
+    # used by Megatron's checkpoint hooks and the patches: step, refresh_main_from_model_params,
+    # save_to, load_from; plus grads_for_norm, record_grad_norm and
+    # initialize_main_from_model_params.
     _next_uid = 0
 
     def __init__(
@@ -273,6 +373,16 @@ class NVMeOptimizerStateStore:
         moment_dtype: str = "fp32",
         allow_fresh_state: bool = False,
     ):
+        # [FUNCTION DOC] Inputs: the distributed optimizer, the root directory, the pinned staging
+        # chunk size in MiB, the moment on-disk dtype name (a key of the dtype table; default fp32;
+        # main params are always fp32), and whether a checkpoint without streamed state may be loaded
+        # as a fresh state. Asserts (failing with messages) that: the precision-aware optimizer,
+        # CPU offload, optimizer-state offload, FSDP, fp8 params, MXFP8 param all-gather reuse, loss
+        # scaling and zero-count logging are all off, and the moment dtype name is known. Warns for
+        # one-byte moment dtypes. Takes a unique id, derives the store directory
+        # (rank and optimizer instance based), deletes and recreates it, and registers an at-exit
+        # deletion. Creates the stager, the buckets, the resident-fp32 Adam, and asserts no
+        # separate grad-norm groups. Logs bucket count and total size.
         self.dist_opt = distrib_optimizer
         self._allow_fresh_state = allow_fresh_state
         self.uid = NVMeOptimizerStateStore._next_uid
@@ -332,6 +442,8 @@ class NVMeOptimizerStateStore:
 
     @property
     def relative_dir(self) -> str:
+        # [FUNCTION DOC] Property: relative path "rank<global rank, 5 digits>/opt<instance>_<uid>",
+        # shared by the scratch directory and checkpoint directories.
         """This store's location under any base directory -- scratch or checkpoint.
 
         ``uid`` is what disambiguates the chained dense and expert optimizers, which can
@@ -340,6 +452,12 @@ class NVMeOptimizerStateStore:
         return os.path.join(f"rank{self._rank:05d}", f"opt{self._instance}_{self.uid}")
 
     def _build_buckets(self) -> list[_Bucket]:
+        # [FUNCTION DOC] HELPER: walk the optimizer's low-precision parameter groups together with
+        # their fp32 main shards (strictly paired), asserting each main shard exists and is fp32,
+        # and group entries by the DDP buffer bucket key of the model param. Plan buckets from that
+        # grouping; for each, collect main params per group index, build its Adam, and create a
+        # bucket with file named bucket<index, 5 digits>.bin in the store directory. Returns the
+        # buckets in order.
         by_ddp_bucket: dict[tuple, list[_Entry]] = {}
         groups = zip(self.dist_opt.model_float16_groups, self.dist_opt.shard_fp32_from_float16_groups, strict=True)
         for group_index, (model_group, main_group) in enumerate(groups):
@@ -358,6 +476,10 @@ class NVMeOptimizerStateStore:
         return buckets
 
     def _build_fp32_optimizer(self):
+        # [FUNCTION DOC] HELPER: for the optimizer's natively-fp32 parameters (their own shard
+        # groups, which stay on the GPU), build one Adam over the non-empty groups. Returns the
+        # sorted list of group indices and the Adam, or an empty list and none if there are no such
+        # params. Logs their total size, as a warning above 256 MB, otherwise info.
         params: dict[int, list[torch.Tensor]] = {}
         total_bytes = 0
         for group_index, (model_group, shard_group) in enumerate(
@@ -375,6 +497,10 @@ class NVMeOptimizerStateStore:
         return sorted(params), self._adam_for(params)
 
     def _adam_for(self, params_by_group: dict[int, list[torch.Tensor]]):
+        # [FUNCTION DOC] HELPER: construct Megatron's fused Adam over the given params per group
+        # index. Each group copies every hyper-parameter of the same-index group of the wrapped
+        # base optimizer (everything but the parameter list) and substitutes the given params;
+        # decoupled (AdamW-style) weight decay follows the config. Groups are ordered by index.
         from megatron.core.optimizer import Adam
 
         master_groups = self.dist_opt.optimizer.param_groups
@@ -386,6 +512,9 @@ class NVMeOptimizerStateStore:
         return Adam(groups, adam_w_mode=self.dist_opt.config.decoupled_weight_decay)
 
     def _sync_lr_wd(self, adam, group_indices) -> None:
+        # [FUNCTION DOC] HELPER: copy the current learning rate and weight decay (which the
+        # scheduler updates only on the base optimizer's groups) into the corresponding groups of a
+        # streaming Adam; the two lists are paired strictly by position.
         master_groups = self.dist_opt.optimizer.param_groups
         for group, group_index in zip(adam.param_groups, group_indices, strict=True):
             group["lr"] = master_groups[group_index]["lr"]
@@ -398,6 +527,10 @@ class NVMeOptimizerStateStore:
     # quantize_param_shard() is a DP collective over the whole fp8 param set and cannot be
     # split per bucket; __init__ rejects fp8 params instead.
     def _copy_main_to_model_params(self, entries: list[_Entry]) -> None:
+        # [FUNCTION DOC] HELPER: publish updated fp32 mains into the DDP parameter buffer, per
+        # bucket. For each entry: find its world range inside its DDP bucket (asserted to match the
+        # main's element count), locate that bucket's flat parameter data, and copy the main (casting
+        # to the buffer dtype) into the slice. fp8 params are unsupported here (rejected earlier).
         dist_opt = self.dist_opt
         for entry in entries:
             param_range_map = dist_opt._get_model_param_range_map(entry.model_param)
@@ -408,6 +541,8 @@ class NVMeOptimizerStateStore:
             param_data.view(-1)[world_range.start : world_range.end].copy_(entry.main_param)
 
     def _assert_no_separate_grad_norm_group(self) -> None:
+        # [FUNCTION DOC] HELPER: assert that none of the streamed main params belongs to a separate
+        # grad-norm group (their clipping would read main grads that exist only inside step).
         from megatron.core.optimizer.optimizer import _get_param_grad_norm_group, _is_separate_grad_norm_group
 
         for bucket in self.buckets:
@@ -419,12 +554,20 @@ class NVMeOptimizerStateStore:
                 )
 
     def _model_grad_shard(self, entry: _Entry) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: view (no copy) of this rank's slice, from the model param's range
+        # map, of the flattened reduced gradient buffer attached to the model parameter.
         """This rank's slice of the reduced gradient in the DDP grad buffer, in its buffer dtype."""
         param_range = self.dist_opt._get_model_param_range_map(entry.model_param)["param"]
         return entry.model_param.main_grad.view(-1)[param_range.start : param_range.end]
 
     @torch.no_grad()
     def grads_for_norm(self) -> list[torch.Tensor]:
+        # [FUNCTION DOC] Compute the local L2 norm over all streamed gradient shards, applying the
+        # same filter Megatron uses on main params: skip shared params, tensor-parallel duplicates
+        # (using the optimizer's TP and expert-TP groups if present) and witness params. Sums the
+        # squared fp32 vector norms on the current CUDA device, takes the square root and returns it
+        # as a one-element list of a one-element fp32 tensor, which Megatron's norm routine squares
+        # back and adds to other gradients' contributions. Runs without gradient tracking.
         """The local L2 norm of the streamed gradients, as a one-element fp32 tensor.
 
         Megatron's get_grad_norm_fp32 squares and sums it with the other grads it is given, so
@@ -452,20 +595,35 @@ class NVMeOptimizerStateStore:
         return [sum_sq.sqrt().reshape(1)]
 
     def record_grad_norm(self, grad_norm) -> None:
+        # [FUNCTION DOC] Store the chain's total gradient norm for the next step call (consumed and
+        # reset by step).
         """The total norm the chain clips with, as Megatron returns it; set before every step."""
         self._grad_norm = grad_norm
 
     def _attach_grads(self, entries: list[_Entry]) -> None:
+        # [FUNCTION DOC] HELPER: set each main param's gradient to its model grad shard converted to
+        # fp32 (a copy when the buffer is lower precision; when the buffer is already fp32 the
+        # conversion returns the same memory, so later in-place clipping scales the DDP buffer).
         for entry in entries:
             entry.main_param.grad = self._model_grad_shard(entry).float()
 
     @staticmethod
     def _detach_grads(entries: list[_Entry]) -> None:
+        # [FUNCTION DOC] HELPER: static; clear the gradient of every entry's main param.
         for entry in entries:
             entry.main_param.grad = None
 
     @torch.no_grad()
     def step(self) -> bool:
+        # [FUNCTION DOC] Run one optimizer step over all buckets, streaming each through the GPU.
+        # Takes (and clears) the recorded total grad norm; asserts it exists if clipping is enabled
+        # (positive clip value in the config). Per bucket, in order: fetch from disk; sync learning
+        # rate and weight decay; attach fp32 grads; if clipping, scale grads in place by the standard
+        # clip routine using the recorded total norm and clip value; run the bucket's Adam step;
+        # clear grads; copy updated mains into the DDP param buffer; write all segments back and
+        # free GPU storage. Then step the resident-fp32 Adam (after syncing lr and wd) if present.
+        # Logs bucket count, GB read and written, and elapsed seconds. Always returns true (the
+        # update is considered successful). No gradient tracking.
         from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32
 
         started = time.monotonic()
@@ -495,6 +653,11 @@ class NVMeOptimizerStateStore:
 
     @torch.no_grad()
     def initialize_main_from_model_params(self) -> int:
+        # [FUNCTION DOC] Fill the on-disk main params from the current model params. Per bucket:
+        # allocate GPU storage for mains, copy each entry's slice of the flattened model param (this
+        # rank's range, asserted to match the main's element count) into the fp32 main, write only
+        # the main segment (freeing GPU storage), force data to stable storage (data sync), and
+        # advise the OS to drop cached pages of the main segment region. Returns total bytes written.
         dist_opt = self.dist_opt
         written = 0
         for bucket in self.buckets:
@@ -511,6 +674,10 @@ class NVMeOptimizerStateStore:
 
     @torch.no_grad()
     def refresh_main_from_model_params(self, copy_fn) -> None:
+        # [FUNCTION DOC] Let an external routine rewrite the main params. Allocates GPU storage for
+        # mains of every bucket, calls copy_fn (a no-argument callable, expected to copy model
+        # params into the main params), then writes each bucket's main segment back and frees GPU
+        # storage. Moments are untouched.
         for bucket in self.buckets:
             bucket.materialize_main()
         copy_fn()
@@ -519,6 +686,13 @@ class NVMeOptimizerStateStore:
 
     @torch.no_grad()
     def save_to(self, base_dir: str) -> None:
+        # [FUNCTION DOC] Save this store under the checkpoint base directory plus the relative
+        # directory (created if needed). Writes a manifest (JSON) with the per-segment dtype names
+        # and, per bucket: element count, per-entry element counts, per-group Adam step counters
+        # (zero if absent), and file name. Copies every bucket file verbatim next to it; if the
+        # resident-fp32 Adam exists, saves its state dict as a torch file named
+        # fp32_resident_optimizer.pt; writes the manifest last. Logs. Buckets must be flushed (not
+        # in the middle of a step), as the files are copied as they are.
         dirpath = os.path.join(base_dir, self.relative_dir)
         os.makedirs(dirpath, exist_ok=True)
         manifest = {
@@ -543,6 +717,15 @@ class NVMeOptimizerStateStore:
 
     @torch.no_grad()
     def load_from(self, base_dir: str) -> bool:
+        # [FUNCTION DOC] Restore state saved by save_to. If the store directory is missing: asserts
+        # that fresh state is allowed (failing with an explanatory message otherwise), else logs a
+        # warning and returns false. Otherwise reads the manifest (dtypes default to all fp32 for
+        # older manifests) and asserts that the saved dtypes equal the current ones and the bucket
+        # counts match; for each bucket (strictly paired) asserts the element counts match, copies
+        # the saved file over the bucket file, restores nonzero step counters into the Adam groups,
+        # and allocates (empty) moment tensors so the next fetch loads them. If a resident-fp32 Adam
+        # exists and its saved state file exists, loads it (if the file is missing it silently stays
+        # fresh). Logs and returns true.
         """Restore this store from a checkpoint base, or report that there is nothing there.
 
         Returns False only under --no-load-optim, which is what makes a pre-streaming
@@ -588,6 +771,14 @@ class NVMeOptimizerStateStore:
 
 
 def setup_optimizer_state_streaming(args, optimizer) -> None:
+    # [FUNCTION DOC] Enable disk streaming for a chained Megatron optimizer. Reads from args: the
+    # offload directory, staging chunk size (MB), moment dtype name, and the no-load-optimizer flag
+    # (which allows starting from a fresh state). Purges this rank's state directory first. For each
+    # chained sub-optimizer: asserts it is a distributed optimizer (message names the flag), skips
+    # stub optimizers, asserts main-param initialization was deferred; creates a store, fills the
+    # on-disk mains from the model params (logging GB written) and binds the store into the
+    # optimizer. Finally wraps the chain's grad-norm getter so every store sees the total norm.
+    # Must run before the checkpoint load.
     """Give every DistributedOptimizer in ``optimizer``'s chain a store and route it there.
 
     Must run before load_checkpoint: Megatron constructs stable fp32 main-param handles with
@@ -626,6 +817,14 @@ def setup_optimizer_state_streaming(args, optimizer) -> None:
 
 
 def setup_muon_state_on_disk(args) -> None:
+    # [FUNCTION DOC] Make Muon's chunked optimizer-state offloader keep its host buffers in
+    # file-backed mappings. Returns immediately if the offloader class was already replaced.
+    # Otherwise purges this rank's state directory, creates a subclass of the offloader whose
+    # buffer allocator returns a disk-backed tensor (reusing a tensor that already is disk backed,
+    # tracking total disk bytes), whose step additionally logs the file-backed size in GB, and whose
+    # checkpoint synchronisation, after the parent's, flushes every disk-backed state and master
+    # buffer to disk and logs the flushed GB. Rebinds the class name in both the defining module and
+    # the consuming optimizer module (needed because the latter imported the name directly).
     """Back the chunked offloader's host buffers with files, for Muon's optimizer state.
 
     Must run before the optimizer is built, which is when the offloader is constructed.
@@ -639,10 +838,16 @@ def setup_muon_state_on_disk(args) -> None:
     rank_dir = _purge_rank_dir(_state_dir_root(args))
 
     class DiskOptimizerStateOffloader(base):
+        # [CLASS DOC] Offloader subclass with file-backed host buffers. Class attributes: the
+        # directory for the mapping files (this rank's state directory) and a running total of
+        # disk-backed bytes allocated (class-level initial value zero, updated per instance).
         state_dir = rank_dir
         _disk_bytes = 0
 
         def _new_cpu_buffer(self, tensor: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+            # [FUNCTION DOC] HELPER: allocator override. Returns the tensor itself if it is already
+            # disk backed (avoids copying the whole state on every adopt call); otherwise creates a
+            # disk-backed tensor like it in the state directory and adds its byte size to the total.
             # adopt_cpu_optimizer_state reallocates every non-pinned CPU tensor it finds in
             # optimizer.state, and ours never report pinned, so each checkpoint would otherwise
             # copy the whole state into fresh mappings.
@@ -653,10 +858,14 @@ def setup_muon_state_on_disk(args) -> None:
             return buffer
 
         def step(self) -> None:  # type: ignore[override]
+            # [FUNCTION DOC] Run the parent's step, then log the disk-backed total in GB.
             super().step()
             logger.info(f"Muon disk state step: {self._disk_bytes / 1024**3:.2f} GB file-backed")
 
         def synchronize_for_checkpoint(self) -> None:  # type: ignore[override]
+            # [FUNCTION DOC] Run the parent's synchronisation (which may offload master weights and
+            # so add mappings), then synchronously flush every disk-backed CPU state tensor and every
+            # disk-backed master tensor, and log the flushed total in GB.
             # After super(), because it offloads the master weights and so can add mappings.
             super().synchronize_for_checkpoint()
             flushed = 0
@@ -672,10 +881,15 @@ def setup_muon_state_on_disk(args) -> None:
 
 
 def _state_dir_root(args) -> str:
+    # [FUNCTION DOC] HELPER: the optimizer-state subdirectory (named optimizer_state) under the
+    # configured offload training disk directory.
     return os.path.join(args.offload_train_disk_dir, "optimizer_state")
 
 
 def _purge_rank_dir(dir_root: str) -> str:
+    # [FUNCTION DOC] HELPER: delete (ignoring errors) and recreate the directory
+    # "rank<global rank, 5 digits>" under the root; returns its path. Requires the distributed
+    # process group to be initialised for the rank. Side effect: deletes stale state on disk.
     """Drop everything this rank left behind, before any store claims its own path.
 
     A store only removes the exact path it is about to use, so state written under a
@@ -693,10 +907,14 @@ def _purge_rank_dir(dir_root: str) -> str:
 
 
 def _record_grad_norm_into(optimizer, stores: list[NVMeOptimizerStateStore]) -> None:
+    # [FUNCTION DOC] HELPER: replace the chained optimizer's grad-norm getter (on the instance)
+    # with a wrapper that calls the original, hands the result to every store, and returns it.
     """Hand the norm the chain clips with to every store, which applies the clip itself."""
     chain_get_grad_norm = optimizer.get_grad_norm
 
     def get_grad_norm(self):
+        # [FUNCTION DOC] HELPER: bound replacement; calls the saved original getter (self unused),
+        # records its result in every store and returns it.
         grad_norm = chain_get_grad_norm()
         for store in stores:
             store.record_grad_norm(grad_norm)
@@ -706,12 +924,20 @@ def _record_grad_norm_into(optimizer, stores: list[NVMeOptimizerStateStore]) -> 
 
 
 def _bind(dist_opt: "DistributedOptimizer", store: NVMeOptimizerStateStore) -> None:
+    # [FUNCTION DOC] HELPER: replace, on this one optimizer instance, the methods that touch
+    # optimizer state or streamed gradients with closures over the store (bound with the method
+    # type), and attach the store as a private attribute where checkpointing code looks for it.
+    # Replaced: the model-grad-to-main-grad copy, grads-for-norm getter, step with ready grads,
+    # model param reload, state dict, load state dict and sharded state dict.
     """Point the DistributedOptimizer entry points that touch optimizer state or streamed grads at ``store``."""
     from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 
     # The all-gather tail is copied from DistributedOptimizer.step_with_ready_grads and has
     # to stay in sync with it; the timer calls around it are dropped, hence the assert.
     def step_with_ready_grads(self) -> bool:
+        # [FUNCTION DOC] HELPER: replacement step. Asserts no timers are configured (the original's
+        # timer calls were dropped). Runs the store's streaming step; unless parameter all-gather is
+        # overlapped, starts the parameter sync on every model chunk. Returns the store's result.
         assert self.config.timers is None
         update_successful = store.step()
         if not self.ddp_config.overlap_param_gather:
@@ -720,6 +946,9 @@ def _bind(dist_opt: "DistributedOptimizer", store: NVMeOptimizerStateStore) -> N
         return update_successful
 
     def reload_model_params(self, state_dict=None) -> None:
+        # [FUNCTION DOC] HELPER: replacement. With no state dict, re-initialises the on-disk mains
+        # from the model params. With one, runs the original class method with that state dict
+        # inside the store's refresh (mains materialised before, written back after).
         if state_dict is None:
             store.initialize_main_from_model_params()
         else:
@@ -730,18 +959,26 @@ def _bind(dist_opt: "DistributedOptimizer", store: NVMeOptimizerStateStore) -> N
     # save_to()/load_from() carry the real state; returning empties here rather than forcing
     # --no-save-optim keeps opt_param_scheduler, saved under the same guard, working.
     def state_dict(self):
+        # [FUNCTION DOC] HELPER: replacement; returns a placeholder mapping with a single true flag
+        # (real state is written by the store's save method).
         return {"nvme_state_store": True}
 
     def load_state_dict(self, state_dict) -> None:
+        # [FUNCTION DOC] HELPER: replacement no-op (state is loaded by the store's load method).
         return
 
     def sharded_state_dict(self, model_sharded_state_dict, is_loading=False, sharding_type=None, metadata=None):
+        # [FUNCTION DOC] HELPER: replacement; returns an empty mapping, ignoring all arguments.
         return {}
 
     # The gradient overrides below follow DistributedOptimizer._copy_model_grads_to_main_grads at
     # radixark/Megatron-LM miles-main fd15ee20a4f0, whose clip skips a child with no .grad at all
     # (radixark/Megatron-LM#106); recheck them when bumping Megatron.
     def _copy_model_grads_to_main_grads(self) -> None:
+        # [FUNCTION DOC] HELPER: replacement. For each natively-fp32 param (strictly paired model
+        # and shard groups), sets the shard's gradient to this rank's slice of the model param's
+        # reduced gradient buffer, converted to fp32. Streamed params are handled bucket by bucket
+        # in the store's step.
         # Only the GPU-resident native-fp32 params get their fp32 grads here; store.step()
         # converts the streamed ones bucket by bucket.
         for model_group, shard_group in zip(self.model_fp32_groups, self.shard_fp32_groups, strict=True):
@@ -750,6 +987,9 @@ def _bind(dist_opt: "DistributedOptimizer", store: NVMeOptimizerStateStore) -> N
                 shard_main_param.grad = model_param.main_grad.view(-1)[param_range.start : param_range.end].float()
 
     def get_grads_for_grad_norm(self, grad_norm_group=None):
+        # [FUNCTION DOC] HELPER: replacement. Gets the original class method's gradients for the
+        # group; when no group is requested (the default group), appends the store's one-element
+        # streamed-gradient norm; returns the list.
         grads = DistributedOptimizer.get_grads_for_grad_norm(self, grad_norm_group)
         return grads + store.grads_for_norm() if grad_norm_group is None else grads
 

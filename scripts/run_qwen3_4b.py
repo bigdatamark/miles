@@ -1,3 +1,9 @@
+# [MODULE DOC] Launcher for GRPO training of Qwen3 dense models (default 4B) on dapo-math-17k with
+# either the Megatron or the FSDP train backend, optional true-on-policy mode, FP8, megatron
+# bridge, mismatch correction (mis), multi-dataset eval and dynamic sampling. Exposes a typer app
+# with three commands: full_train (download, convert, train), prepare (download and convert only)
+# and train (train only). Parallelism sizes are derived in the args post-init step; true-on-policy
+# launch details come from the miles.true_on_policy package.
 from dataclasses import dataclass
 from typing import Literal
 
@@ -15,6 +21,16 @@ app = typer.Typer()
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC] Command-line configuration extending the shared train config. Fields: mode
+    # (normal, debug_minimal with tiny responses, debug_one_sample with a single tiny rollout for
+    # CI), run id, model name, Megatron model type (derived when the backend is megatron), GPUs
+    # per node (derived from hardware), hardware, extra raw args, directories, multi_eval (adds
+    # GPQA and IFBench), true-on-policy options (flag, sglang target, contract), dynamic sampling,
+    # enable_eval, train backend (fsdp or megatron), rollout fp8, train fp8, megatron bridge, mis,
+    # use_kl_loss (default on) and tis_use_rs. The post-init step also sets plain attributes that
+    # are not declared fields: tensor, pipeline and context parallel sizes, context-parallel
+    # communication type, sequence-parallel flag, max tokens per GPU, rollout GPUs per engine and
+    # train memory margin bytes.
     mode: Literal["normal", "debug_minimal", "debug_one_sample"] = "normal"
     run_id: str = command_utils.create_run_id()
     model_name: str = "Qwen3-4B"
@@ -40,6 +56,15 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     tis_use_rs: bool = True
 
     def __post_init__(self):
+        # [FUNCTION DOC] Resolves derived settings in place. Steps: resolve hardware and GPUs per
+        # node from a hardware table when not given; for the megatron backend look up the Megatron
+        # model type from the model name. Parallelism defaults: tensor parallel 1 for the 0.6B
+        # model else 2, pipeline 1, context parallel 1 for 0.6B else 4 with all-to-all context
+        # communication when above 1, sequence parallel when tensor parallel exceeds 1, max tokens
+        # per GPU 32768 for fsdp else 9216, one rollout GPU per engine, train memory margin of 3 GiB
+        # in bytes. Then applies the true-on-policy script defaults (which may mutate fields).
+        # Raises a value error when megatron bridge mode is combined with kl loss (no Megatron
+        # format reference checkpoint exists in bridge mode).
         self.hardware = command_utils.resolve_hardware(self)
         self.num_gpus_per_node = self.num_gpus_per_node or command_utils.NUM_GPUS_OF_HARDWARE[self.hardware]
         if self.train_backend == "megatron":
@@ -64,6 +89,9 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
 
 def _prepare_download(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Creates model and data directories and downloads the HF model, the
+    # dapo-math-17k and aime-2024 datasets, plus GPQA-diamond and IFBench when multi_eval is on and
+    # the prebuilt FP8 model when rollout fp8 is on. Shell and network side effects via the backend.
     U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.model_dir} {args.data_dir}")
     U.exec_command_cpu(f"hf download Qwen/{args.model_name} --local-dir {args.model_dir}/{args.model_name}")
@@ -81,6 +109,8 @@ def _prepare_download(args: ScriptArgs):
 
 
 def _prepare_megatron_ckpt(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Converts the HF checkpoint to Megatron torch_dist format in the model
+    # directory, only for the megatron backend without bridge mode; otherwise does nothing.
     U = args.create_backend()
     if (args.train_backend == "megatron") and not args.enable_megatron_bridge:
         U.convert_checkpoint(
@@ -94,6 +124,35 @@ def _prepare_megatron_ckpt(args: ScriptArgs):
 
 
 def _execute_train(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Builds the full training argument string and submits the job through
+    # the backend. Raises not-implemented error for an unknown train backend.
+    # Sizing: model-parallel size is tensor x pipeline x context; the actor uses exactly that many
+    # GPUs per node (not the full node); data-parallel size is the train world size divided by it
+    # (at least 1). Debug mode is any mode other than normal. Debug one-sample mode uses
+    # max(2, data-parallel) rollouts, 1 prompt x 1 sample, 2 response tokens, global batch equal to
+    # data-parallel size, disables CUDA graphs and adds CI test flags with the KL checker off.
+    # Checkpoints: HF checkpoint with FP8 suffix if rollout fp8; save to the per-run directory
+    # (interval 2 in debug else 20, retain interval likewise for megatron); load the torch_dist
+    # dir unless bridge mode; reference load only when kl loss is on (torch_dist dir for megatron,
+    # HF dir otherwise).
+    # Rollout: dapo-math-17k, math reward, 3000 rollouts, 32x8, response 8192 (100 in minimal
+    # debug), global batch 256, optional dynamic sampling (not in debug) with over-sampling batch
+    # 64 and a nonzero-reward-std filter. Eval (not in debug, when enabled): every 20, max response
+    # 16384; multi_eval writes a pseudo-file config with AIME, GPQA and IFBench datasets (top-p
+    # 0.7, 16/2/1 samples) else a single AIME dataset with top-p 1. Algorithm: grpo, clip
+    # 0.2/0.28, kl loss with zero coefficient if enabled. Optimizer adam lr 1e-6.
+    # Backend blocks: fsdp uses flash attention 2, gradient checkpointing, 512 MiB update buffer,
+    # expandable segments env, sglang memory fraction 0.75; megatron adds parallel sizes,
+    # optional sequence parallel and cp comm type, expert parallel 1, full recompute, dropout off,
+    # fp32 allreduce, flash backend, memory margin, sglang memory fraction 0.7. Both use dynamic
+    # batch with the derived tokens per GPU. Misc: colocate, fault tolerance outside debug, dump
+    # details. The Qwen3-4B-Base model gets a 36000 context length and an environment flag
+    # allowing a longer context. Train fp8 adds transformer engine bf16 blockwise fp8 flags and an
+    # fp32 block scaling variable. Bridge and mis (token-level truncated TIS, bounds 0.5 to 2.0)
+    # add their flags like in the sibling launchers. True-on-policy plan arguments and environment
+    # variables are merged last, before the extra raw args.
+    # KNOWN ISSUE: the optimizer block has a commented-out fsdp cpu offload line; the sequence
+    # parallel check repeats the tensor-size test already implied by the flag.
     U = args.create_backend()
     is_debug_mode = args.mode != "normal"
     is_debug_one_sample = args.mode == "debug_one_sample"
@@ -330,6 +389,7 @@ tis_batch_normalize: true
 @app.command()
 @command_utils.dataclass_cli
 def full_train(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] Command that runs download, checkpoint conversion and training in order.
     _prepare_download(args)
     _prepare_megatron_ckpt(args)
     _execute_train(args)
@@ -338,6 +398,7 @@ def full_train(args: ScriptArgs) -> None:
 @app.command()
 @command_utils.dataclass_cli
 def prepare(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] Command that downloads models and datasets and converts the checkpoint only.
     _prepare_download(args)
     _prepare_megatron_ckpt(args)
 
@@ -345,11 +406,14 @@ def prepare(args: ScriptArgs) -> None:
 @app.command()
 @command_utils.dataclass_cli
 def train(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] Command that only submits the training job (assumes prepare was done).
     _execute_train(args)
 
 
 @app.callback()
 def _callback() -> None:
+    # [FUNCTION DOC] HELPER: Empty typer callback; its presence forces typer to keep subcommand
+    # names even though several commands exist. Does nothing.
     pass
 
 

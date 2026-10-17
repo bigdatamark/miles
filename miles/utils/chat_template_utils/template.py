@@ -1,3 +1,11 @@
+# [MODULE DOC] Chat template loading and rendering in the inference server's style. Offers: a
+# loader for the original template of a Hugging Face model (cached download), a normalizer of
+# tool-call argument representation, a tool definition canonicalizer, a renderer from a template
+# string (no tokenizer), and a tokenizer-based renderer that routes DeepSeek and Inkling
+# checkpoints to their own paths. Rendering retries once with bare function dictionaries when the
+# template rejects the full tool format. Also re-exports two matcher functions for backward
+# compatibility. Network access happens in the loader (first call only).
+
 """Core chat template operations: load from HuggingFace and render from string.
 
 ``load_hf_chat_template`` fetches original (unmodified) chat templates via
@@ -36,6 +44,14 @@ from miles.utils.chat_template_utils.message_matcher_hub import (  # noqa: F401
 
 
 def load_hf_chat_template(model_id: str) -> str:
+    # [FUNCTION DOC] Downloads (or reads from the local cache) the tokenizer config of the model
+    # and reads its chat template field. If the field is a non-empty string, returns it. If it is
+    # a list of named templates, returns the one named default or having no name, else the first.
+    # If the field is empty or absent, downloads the separate template file and returns its
+    # contents. Network access on a cold cache; errors from the download (missing file etc.)
+    # propagate.
+    # KNOWN ISSUE: files are opened without an explicit encoding, so decoding depends on the
+    # platform default.
     """Load an original chat template from HuggingFace (cached locally).
 
     Handles two layouts:
@@ -60,6 +76,12 @@ def load_hf_chat_template(model_id: str) -> str:
 
 
 def normalize_tool_arguments(messages: list[dict], format: Literal["dict", "json"]) -> list[dict]:
+    # [FUNCTION DOC] Returns a deep copy of the messages. For assistant messages only: a null
+    # content becomes an empty string, and for each tool call that has a non-empty function entry,
+    # the arguments are converted according to the format: for dict, a string is parsed as JSON
+    # (raises a JSON decode error if invalid); for json, a dictionary is serialized without
+    # escaping non-ASCII characters. Values already in the target form are left alone. Tool calls
+    # must be dictionaries. The input is not modified.
     """Deep-copy *messages*, normalize assistant ``content: None`` -> "", and coerce
     tool_call ``arguments`` to the form the downstream renderer needs (``format`` picks
     the direction; never mutates the input):
@@ -85,6 +107,10 @@ def normalize_tool_arguments(messages: list[dict], format: Literal["dict", "json
 
 
 def extract_tool_dicts(tools: list[dict] | None) -> list[dict] | None:
+    # [FUNCTION DOC] Returns None for None or an empty list. Each entry that is not already a
+    # dictionary with a function key is wrapped as a function-type tool around it. The list is
+    # validated against the server's tool model (validation errors propagate) and each tool is
+    # dumped back to a dictionary with defaults filled in.
     """Canonicalize tools via Pydantic, returning full Tool model dumps.
 
     Matches SGLang's ``_process_messages`` (``serving_chat.py`` lines 343-344):
@@ -106,6 +132,13 @@ def apply_chat_template_from_str(
     tools: list[dict] | None = None,
     **kwargs,
 ) -> str:
+    # [FUNCTION DOC] Renders the template string for one conversation and returns the text. Steps:
+    # normalize tool arguments to dictionaries; canonicalize tools; render via the Hugging Face
+    # Jinja helper with the generation-prompt flag (default true), tools and any extra keyword
+    # arguments passed to the template. On a template error with tools present, retries once with
+    # each tool replaced by its bare function dictionary; if that also fails raises a value error
+    # (fallback wording, chained); with no tools, raises a value error directly. No tokenizer is
+    # involved.
     """Render a Jinja2 chat template string (tokenize=False, no tokenizer needed).
 
     Calls HF transformers' ``render_jinja_template`` directly — the same
@@ -117,6 +150,8 @@ def apply_chat_template_from_str(
     """
 
     def _render(tool_defs):
+        # [FUNCTION DOC] HELPER: Renders the enclosing messages and template with the given tool
+        # definitions and returns the single rendered string (first of the batch of one).
         rendered, _ = render_jinja_template(
             conversations=[messages],
             chat_template=chat_template,
@@ -148,6 +183,15 @@ def apply_chat_template(
     tokenize: bool = False,
     **kwargs,
 ) -> str | list[int]:
+    # [FUNCTION DOC] Keyword-only tokenizer and options. Routing: (1) if the tokenizer is a
+    # DeepSeek official-encoder checkpoint, normalizes arguments to JSON strings and delegates to
+    # the DeepSeek renderer. (2) If it is an Inkling checkpoint, calls the tokenizer's own
+    # templating with the bundled fixed Inkling template, dictionary-form arguments and
+    # canonicalized tools. (3) Otherwise normalizes arguments to dictionaries, canonicalizes
+    # tools, and calls the tokenizer's templating (dict output disabled), returning a string or
+    # token id list per the tokenize flag; on a template error with tools present retries once
+    # with bare function dictionaries, then raises a value error; without tools raises a value
+    # error directly. Extra keyword arguments are forwarded to the templating.
     """Apply chat template via HF tokenizer in SGLang style.
 
     Passes ``return_dict=False`` to match SGLang's ``serving_chat.py``,

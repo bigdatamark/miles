@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Launcher script (single command, run through typer) for GRPO training of JoyAI-LLM-Flash on DAPO
+# math with optional AIME eval, Megatron training on a few GPUs and SGLang rollout on others in the
+# same node (training and rollout GPUs are listed separately, so no colocation flag is used).
+# Blackwell hardware only. The single command downloads the model and data, optionally converts the
+# model to MXFP8 for rollout, converts it to a Megatron checkpoint, and then trains. Supports MXFP8
+# rollout and MXFP8 training with a few layers kept in bf16, mismatch correction (MIS), and a CI mode.
+# Module-level constants: layer-name fragments kept in high precision for MXFP8 (Hugging Face names
+# and Megatron names, as space-separated text) and the transformer engine precision config text that
+# keeps latent attention up-projections and shared expert projections in bf16.
 from dataclasses import dataclass
 from typing import Literal
 
@@ -46,6 +56,15 @@ matchers:
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC]
+    # Command line options extending the shared train configuration (num_nodes, output dir, backend
+    # creation). Fields: mode (debug_minimal gives short responses of 100 tokens, saves every 2 steps,
+    # no eval), run id, Hugging Face org/name, Megatron model type, GPUs per node (None derived from
+    # hardware), actor GPUs (default 4) and rollout GPUs (default 4), hardware (Blackwell types only),
+    # eval switch, extra raw args, directories, rollout_mxfp8 and train_mxfp8 (training requires
+    # rollout), MIS switch with rejection-sampling flag, CI test flag, checkpoint saving switch (on),
+    # number of rollouts, global batch size, optional padding multiple and log-prob chunk size, and
+    # the number of layers kept in bf16 at the start (1) and end (6) when using MXFP8.
     mode: Literal["normal", "debug_minimal"] = "normal"
     run_id: str = command_utils.create_run_id()
     model_org: str = "jdopensource"
@@ -74,6 +93,9 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     mxfp8_num_layers_at_end_in_bf16: int = 6
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Resolves hardware and GPUs per node from a per-hardware table when unset. Asserts that MXFP8
+        # training is only requested together with MXFP8 rollout.
         self.hardware = command_utils.resolve_hardware(self)
         self.num_gpus_per_node = self.num_gpus_per_node or command_utils.NUM_GPUS_OF_HARDWARE[self.hardware]
         if self.train_mxfp8:
@@ -81,6 +103,13 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
 
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Creates model/data directories, downloads the Hugging Face model, the DAPO math
+    # and AIME 2024 datasets. If rollout MXFP8 is on, runs the Hugging Face to MXFP8 conversion tool
+    # (GPU command) into a "-MXFP8" folder, passing the bf16 layer counts at start and end, the high
+    # precision layer-name list, and the user's extra args. Then converts the original checkpoint to a
+    # Megatron distributed checkpoint in the model directory using the actor GPUs.
+    # KNOWN ISSUE: the user's extra raw args are appended to the MXFP8 conversion command, which is
+    # meant for the training command.
     U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.model_dir} {args.data_dir}")
     U.exec_command_cpu(
@@ -111,6 +140,28 @@ def prepare(args: ScriptArgs):
 
 
 def execute(args: ScriptArgs, *, wandb_file: str = __file__):
+    # [FUNCTION DOC] Builds the training argument string and submits the job. The wandb_file argument
+    # selects the file used to derive default logging names (defaults to this file). Checkpoint: hf
+    # checkpoint is the MXFP8 folder when MXFP8 training is on, else the plain folder; reference load
+    # from the distributed folder; load/save under the output directory run folder (every 2 steps debug
+    # else 20) only if saving is on. Rollout: DAPO math, math reward, chat template, shuffled, rollouts
+    # and global batch from options, 32 prompts x 8 samples, temperature 1, response length 100 (debug)
+    # or 8192, balanced data. Eval (non-debug and enabled): AIME every 20 steps, 16 samples, length
+    # 16384, top-p 1. Perf: full uniform recompute, dynamic batch 32768 tokens per GPU, optional padding
+    # multiple and log-prob chunk. GRPO with kl loss on at zero coefficient, zero entropy, asymmetric
+    # clip. Adam 1e-6. Misc: dropout off, fp32 accumulation, auto attention backend, one actor node with
+    # the configured actor GPUs, separate rollout GPU count, fault tolerance. MXFP8 training (Blackwell
+    # only): transformer engine mxfp8 recipe with first and last layers in bf16. Hardware (only
+    # Blackwell types; others raise not implemented): tensor and expert parallel equal to actor GPUs,
+    # sequence parallel, pipeline 1, context 1; SGLang memory fraction 0.7 and trtllm latent-attention
+    # backend; MXFP8 rollout uses 2-GPU engines with data-parallel attention, flashinfer gemm and moe
+    # backends, cuda graph 256, routing replay, shared-experts fusion disabled, high-precision layer
+    # lists, optimizer CPU offload group, and a precision config pseudo-file; otherwise 1-GPU engines
+    # with cuda graph 256. Optional MIS config (token-level truncated importance sampling) and custom
+    # weight function. Optional CI test flag. Submits via the backend with no extra environment.
+    # KNOWN ISSUE: the data-parallel attention flag is added twice in the MXFP8 rollout engine flags.
+    # KNOWN ISSUE: MXFP8 rollout without MXFP8 training loads the bf16 hf checkpoint into rollout
+    # (the MXFP8 folder is only chosen when training MXFP8 is on).
     U = args.create_backend()
     ref_load_path = f"{args.model_dir}/{args.model_name}_torch_dist"
     load_save_path = f"{args.output_dir}/{args.run_id}/checkpoints"
@@ -306,6 +357,7 @@ tis_batch_normalize: true
 
 @command_utils.dataclass_cli
 def main(args: ScriptArgs):
+    # [FUNCTION DOC] Command line entry point: runs prepare, then execute (training).
     prepare(args)
     execute(args)
 

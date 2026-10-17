@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Launcher script (typer command line app) for GRPO training of GLM-4.5 (355B total, 32B active
+# parameters, mixture of experts) with Megatron training and SGLang rollout colocated on all GPUs.
+# Supports an optional block-quantized FP8 rollout checkpoint (with DeepEP all-to-all and data
+# parallel attention), FP8 KV cache, MTP speculative decoding (EAGLE), a throughput benchmark mode
+# using a random-output-length generator, and train/inference mismatch correction (MIS). Tasks: DAPO
+# math with AIME eval, or GSM8K. Commands: full-train, prepare (download, optional FP8 cast,
+# Megatron conversion across all nodes), and train. H100 is rejected at train time.
 """
 This file is in preview, and will be further refined and optimized.
 """
@@ -15,6 +23,14 @@ app = typer.Typer()
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC]
+    # Command line options extending the shared train configuration (num_nodes, output dir, backend
+    # creation). Fields: mode (debug_minimal shortens saves to every 2 steps and responses to 100
+    # tokens, drops eval and dynamic sampling), run id, Hugging Face org/name, Megatron model type,
+    # GPUs per node (None means derived from hardware), hardware (auto, H100, GB200, GB300), eval
+    # switch (on), extra raw args, directories (model_local_dir is the node-local copy target),
+    # rollout_fp8 / rollout_attn_fp8 (FP8 weights / FP8 KV cache for rollout), enable_mtp,
+    # dynamic_sampling, enable_benchmark, enable_mis with tis_use_rs, and task.
     mode: Literal["normal", "debug_minimal"] = "normal"
     run_id: str = command_utils.create_run_id()
     model_org: str = "zai-org"
@@ -39,11 +55,17 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     task: Literal["dapo_aime", "gsm8k"] = "dapo_aime"
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Resolves hardware and fills GPUs per node from a per-hardware table when unset.
         self.hardware = command_utils.resolve_hardware(self)
         self.num_gpus_per_node = self.num_gpus_per_node or command_utils.NUM_GPUS_OF_HARDWARE[self.hardware]
 
 
 def _prepare_download(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Creates model/data directories, downloads the Hugging Face model, then the
+    # datasets for the task (DAPO math, AIME 2024 and AIME 2025 for dapo_aime; GSM8K for gsm8k), and
+    # finally runs the FP8 conversion when rollout_fp8 is set.
+    # KNOWN ISSUE: the AIME 2025 dataset is downloaded but no argument in this script uses it.
     U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.model_dir} {args.data_dir}")
     U.exec_command_cpu(
@@ -62,6 +84,9 @@ def _prepare_download(args: ScriptArgs):
 
 
 def _convert_hf_to_fp8(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Idempotent FP8 cast. If the "-FP8" output folder already exists, returns
+    # immediately. Otherwise runs the Hugging Face to FP8 tool (GPU command) with block quantization
+    # 128 by 128 and 4 workers, reading the model folder and writing the output folder.
     U = args.create_backend()
     path_output = f"{args.model_dir}/{args.model_name}-FP8/"
     if Path(path_output).exists():
@@ -77,6 +102,8 @@ def _convert_hf_to_fp8(args: ScriptArgs):
 
 
 def _prepare_megatron_ckpt(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Converts the Hugging Face checkpoint to a Megatron distributed checkpoint
+    # in the model directory, as a multi-node job across all nodes with default parallelism.
     U = args.create_backend()
     U.convert_checkpoint(
         model_name=args.model_name,
@@ -91,6 +118,9 @@ def _prepare_megatron_ckpt(args: ScriptArgs):
 
 
 def _prepare_cmd(args: ScriptArgs) -> dict[str, str]:
+    # [FUNCTION DOC] HELPER: Returns a mapping with a "trainer" entry joining rsync copies, run in
+    # sequence, of the Megatron distributed checkpoint and the Hugging Face model (plus the FP8 folder
+    # when rollout_fp8) from the shared model directory to the node-local directory.
     copies = [
         command_utils.rsync_cmd(
             f"{args.model_dir}/{args.model_name}_torch_dist",
@@ -108,6 +138,35 @@ def _prepare_cmd(args: ScriptArgs) -> dict[str, str]:
 
 
 def _execute_train(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Builds the training argument string and submits the job. Asserts the
+    # hardware is not H100. Checkpoint: hf checkpoint is the local FP8 folder if rollout_fp8 else the
+    # plain local folder; reference load from the local distributed folder; load/save under the output
+    # directory, every 2 steps (debug) or 10. Rollout: math reward, chat template, shuffled, 3000
+    # rollouts, 32 prompts x 8 samples, temperature 1, one step per rollout, balanced data, GLM stop
+    # token ids. Optional over-sampling 256 with nonzero-reward-std filter when dynamic sampling is
+    # on and not debug. Eval (non-debug and enabled): every 20 steps, top-p 1. Task data: dapo_aime
+    # response length 100 (debug) or 8192 with AIME eval (8 samples, length 8192); gsm8k length 256 with
+    # a 1-sample eval. Parallelism: up to 4 nodes tensor 4, sequence parallel, pipeline 1, context 1,
+    # expert 4 (flagged as not really runnable, for rollout-only debugging); more nodes tensor 4,
+    # pipeline 8 if exactly 8 nodes else 4, context 2, expert 8. Full uniform recompute, dynamic batch
+    # with 16384 tokens per GPU. GRPO with all kl/entropy coefficients zero, truncated importance
+    # sampling flag on, and clip values of 1e-4 / 2e-4. Adam 1e-6.
+    # SGLang: one engine of min(32, total GPUs) GPUs, memory fraction 0.8 on GB300 else 0.7, tensor =
+    # engine size, chunked prefill 2048 per GPU; Blackwell hardware uses the trtllm_mha attention
+    # backend; FP8 rollout adds expert parallel, data-parallel attention (attention tensor size
+    # min(8, engine)), deep gemm moe, DeepEP low latency, concurrency/prefill/cuda-graph limits derived
+    # from decode batch 256, and a DeepEP token limit environment variable; MTP adds EAGLE speculative
+    # flags and spec-v2 environment variable. Misc: update-weight buffer 2 GiB (4 GiB reportedly runs
+    # out of memory), colocate, fault tolerance, dump details, router health flags. Benchmark mode
+    # appends a random-output-length generator, 128 prompts, distributed post, round-robin routing,
+    # high server concurrency and a larger memory fraction. FP8 KV cache flag if requested. MIS mode
+    # adds a pseudo-file config (token-level truncated importance sampling, bounds 0.5 to 2.0, optional
+    # rejection sampling, veto threshold, batch normalize) plus the custom weight function path.
+    # Submits via the backend with extra environment variables and the per-role copy commands.
+    # KNOWN ISSUE: the clip values 1e-4 / 2e-4 are marked with a TODO "wrong?" in the code, and the
+    # kl-loss flag is commented out with a coefficient of zero.
+    # KNOWN ISSUE: benchmark mode appends a second rollout batch size and sample count flag after the
+    # earlier ones, and a second memory fraction flag; it relies on the later flag winning.
     U = args.create_backend()
     assert args.hardware != "H100", "H100 is not yet supported in this script"
 
@@ -394,6 +453,7 @@ tis_batch_normalize: true
 @app.command()
 @command_utils.dataclass_cli
 def full_train(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] Command "full-train": download (and FP8 cast), Megatron conversion, then training.
     _prepare_download(args)
     _prepare_megatron_ckpt(args)
     _execute_train(args)
@@ -402,6 +462,7 @@ def full_train(args: ScriptArgs) -> None:
 @app.command()
 @command_utils.dataclass_cli
 def prepare(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] Command "prepare": download (and FP8 cast) plus Megatron conversion; no training.
     _prepare_download(args)
     _prepare_megatron_ckpt(args)
 
@@ -409,11 +470,13 @@ def prepare(args: ScriptArgs) -> None:
 @app.command()
 @command_utils.dataclass_cli
 def train(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] Command "train": training only; assumes preparation has been done.
     _execute_train(args)
 
 
 @app.callback()
 def _callback() -> None:
+    # [FUNCTION DOC] HELPER: Empty typer callback so commands stay sub-commands. Does nothing.
     pass
 
 

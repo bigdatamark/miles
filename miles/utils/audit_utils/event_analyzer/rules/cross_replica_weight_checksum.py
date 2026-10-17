@@ -1,3 +1,6 @@
+# [MODULE DOC] Rule: model weight checksums recorded by training engines must be identical across
+# data-parallel replicas. Exposes the issue type and a check function; the rest are helpers.
+
 from collections import defaultdict
 from collections.abc import Iterable
 from typing import Any
@@ -14,6 +17,9 @@ __all__ = ["ChecksumMismatchIssue", "check"]
 
 
 def check(events: list[Event]) -> list[ChecksumMismatchIssue]:
+    # [FUNCTION DOC] Keeps only the training-engine local weight checksum events (empty result if
+    # none), groups them by (rollout id, attempt), and checks each group in ascending key order.
+    # Returns all mismatch issues concatenated.
     """
     Check: weight checksum across replicas should be exactly the same
     """
@@ -36,12 +42,19 @@ def check(events: list[Event]) -> list[ChecksumMismatchIssue]:
 
 
 def _get_rank_key(event: TrainEngineLocalWeightChecksumEvent) -> int:
+    # [FUNCTION DOC] HELPER: Returns the rank within the cell for a training-process source;
+    # returns -1 for any other kind of source.
     if isinstance(event.source, TrainProcessIdentity):
         return event.source.rank_within_cell
     return -1
 
 
 def _check_one_step(events: list[TrainEngineLocalWeightChecksumEvent]) -> Iterable[ChecksumMismatchIssue]:
+    # [FUNCTION DOC] HELPER: Generator for one (rollout, attempt) group. Events are grouped by rank
+    # within the cell (so only replicas holding the same shard are compared). In each rank group
+    # the first event is the baseline, and every later event is compared with it by flattening
+    # each event's state to a flat mapping and diffing; labels are built from the rollout id and
+    # the source name. A group with one event yields nothing.
     # Group events by rank_within_cell so we only compare across replicas (cell_index),
     # not across TP/PP/EP ranks within the same cell (which have different param shards).
     # TODO: group by (component, rank_within_cell) once critic checksum events are supported.
@@ -63,9 +76,13 @@ def _check_one_step(events: list[TrainEngineLocalWeightChecksumEvent]) -> Iterab
 
 
 def _compute_label(event: TrainEngineLocalWeightChecksumEvent) -> str:
+    # [FUNCTION DOC] HELPER: Returns "rollout_" plus the rollout id, a slash and the source's
+    # process name.
     return f"rollout_{event.rollout_id}/{event.source.to_name()}"
 
 
 def _flatten_event(event: TrainEngineLocalWeightChecksumEvent) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Dumps the event's state model to plain data and flattens it with no
+    # prefix.
     """Flatten all fields of an event into a flat dict with dot-separated keys."""
     return flatten_nested(event.state.model_dump(), prefix="")

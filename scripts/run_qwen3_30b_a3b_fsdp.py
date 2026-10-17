@@ -1,3 +1,8 @@
+# [MODULE DOC] Launcher for an FSDP-backend GRPO training run of Qwen3-30B-A3B on a single node,
+# used to validate the FSDP training curve. Defines module constants (HF repo id, local model
+# name, wandb group), a script-args dataclass, a prepare step (downloads model and datasets), an
+# execute step (builds the argument string and submits via command_utils with no Megatron model
+# type since FSDP loads the HF checkpoint directly) and main (prepare then execute).
 """FSDP training-curve validation: Qwen3-30B-A3B (model_type=qwen3_moe, smallest of the series),
 single node.
 
@@ -25,6 +30,10 @@ WANDB_GROUP = "qwen3-30B-A3B-fsdp-dapo4k"
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC] Command-line configuration extending the shared train config: GPUs per node (4),
+    # number of rollouts (100), data directory (the root directory, where dataset folders are
+    # downloaded), model directory, wandb project name, whether the FSDP CPU offload is on
+    # (default on) and an extra raw argument string appended at the end. No derived values.
     num_gpus_per_node: int = 4
     num_rollout: int = 100
     data_dir: str = "/root"
@@ -35,6 +44,9 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
 
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Creates the model directory, downloads the HF model into it under the model
+    # name, and downloads the dapo-math-17k and aime-2024 datasets into the data directory, all
+    # through the backend's shell helpers (network and disk side effects). No return value.
     U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.model_dir}")
     U.exec_command_cpu(f"hf download {HF_REPO} --local-dir {args.model_dir}/{MODEL_NAME}")
@@ -43,6 +55,18 @@ def prepare(args: ScriptArgs):
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Builds the training argument string and submits the job (no return value).
+    # The same local model directory is used for the HF checkpoint and the reference load.
+    # Rollout: dapo-math-17k, deepscaler reward, shuffled, balanced, 32 prompts x 8 samples, max
+    # response 4096, temperature 1, global batch 256. Eval: AIME every 10 rollouts, 16 samples,
+    # max 4096 tokens, top-p 1. Algorithm: grpo with kl loss (all coefficients zero), clip
+    # 0.2/0.28. Optimizer: adam lr 1e-6 constant, weight decay 0.1, betas 0.9/0.98.
+    # Wandb flags are added only when the WANDB_API_KEY environment variable is set; the key is
+    # deliberately not put on the command line because the command is printed. SGLang: one GPU
+    # per engine, memory fraction 0.75, fa3 attention, chunked prefill 4096. Train backend: fsdp,
+    # 512 MiB weight update buffer, gradient checkpointing, flash attention 3, expandable CUDA
+    # allocator segments passed as a train environment JSON, optional CPU offload flag. Perf:
+    # dynamic batch with 9216 tokens per GPU. Misc: node and GPU counts, colocate, fault tolerance.
     U = args.create_backend()
     model_path = f"{args.model_dir}/{MODEL_NAME}"
 
@@ -147,6 +171,7 @@ def execute(args: ScriptArgs):
 
 @command_utils.dataclass_cli
 def main(args: ScriptArgs):
+    # [FUNCTION DOC] Command-line entry point: runs prepare, then execute.
     prepare(args)
     execute(args)
 

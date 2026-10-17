@@ -1,3 +1,10 @@
+# [MODULE DOC] Sparse-attention indexer for DeepSeek-V4 layers with compression ratio 4. Scores each
+# query against the compressed keys (produced by the compressor with rotation enabled) with a
+# multi-head, weighted, ReLU-style logit kernel, and selects the top-k compressed keys per query.
+# Supports unpacked and packed (THD) inputs, sequence-parallel input gathering, contiguous context
+# parallelism (keys all-gathered across the cp group), optional row-balanced scoring across cp ranks
+# (queries are exchanged so the causal work is even, then picks are returned to the owners), and an
+# RL top-k record/replay hook. Output is an int32 index tensor with -1 marking absent picks.
 import einops
 import torch
 from megatron.core import parallel_state
@@ -26,9 +33,20 @@ from miles_plugins.models.deepseek_v4.ops.utils import rotate_activation
 
 
 class V4Indexer(MegatronModule):
+    # [CLASS DOC] Megatron module owning: a duplicated (non tensor-parallel) projection from the
+    # low-rank query to heads times head dim, a duplicated projection from hidden states to one
+    # weight per indexer head, and a compressor (ratio 4, rotation on) that produces the index keys.
+    # The compress ratio is fixed at 4.
     """DSA Indexer for DeepSeek-V4 C4 layers."""
 
     def __init__(self, config: TransformerConfig, pg_collection=None, layer_id: int = 0):
+        # [FUNCTION DOC] Reads hidden size, query low-rank rank (falls back to hidden size when unset),
+        # indexer head count, head dim, top-k, top-k backend name, rope head dim, and whether fp8 QAT
+        # simulation is on (config fp8 set) from the config. If no process-group collection is passed,
+        # builds one from the global parallel state with tensor and context groups. Creates the two
+        # bias-free duplicated Transformer-Engine linears and the compressor over the cp group.
+        # Registers the module with the indexer replay manager, keyed by layer id as stream index, so
+        # top-k picks can be recorded or replayed (no effect unless the manager is enabled).
         super().__init__(config=config)
 
         self.hidden_size = config.hidden_size
@@ -88,6 +106,26 @@ class V4Indexer(MegatronModule):
         packed_seq_params=None,
         thd_layout: ThdLayout | None = None,
     ):
+        # [FUNCTION DOC] Pipeline: (1) if sequence parallel with tensor-parallel size above one,
+        # all-gather x and qr along the sequence. (2) Project qr to per-head queries. (3) Build rotary
+        # frequencies for the global length (local length times cp size) using the compress rotary base;
+        # unpacked: slice this rank's contiguous part; packed: index the table by each row's position
+        # inside its own segment. (4) On a copy of the queries apply rotary in place to the last rope
+        # dims (done batch-major), then Hadamard-rotate and, with fp8 QAT, fp8-simulate (block 128).
+        # (5) Per-head weights come from the hidden-state projection, scaled by head-count to the minus
+        # half and head-dim to the minus half, in float32. (6) Row balancing is enabled only when
+        # cp size is above one, a cp group exists, and replay is not enabled; the exchange of queries
+        # and weights is started before the compressor runs to overlap, and the local references are
+        # deleted. (7) Compress keys from the compacted hidden rows if the layout is pre-grouped, else
+        # from x. If the compressor returns nothing, asserts no rows are in flight and returns an
+        # int32 tensor filled with -1 of shape batch, local length, top-k. (8) Under cp, all-gather
+        # keys along dim 0; if the layout has the sequence-to-rank-row map, reorder keys to
+        # sequence-major. (9) Select the top-k function (backend, wrapped by the replay manager) and
+        # compute the picks for local rows. The mask and packed_seq_params arguments are unused.
+        # Returns int32 picks, shape batch, rows, min(top-k, number of keys).
+        # KNOWN ISSUE: the documented output claims a fixed shape of "top-k columns of -1" for the
+        # empty case, which holds, but the non-empty case may have fewer than top-k columns; callers
+        # must tolerate both widths.
         """Forward pass.
 
         Args:
@@ -176,6 +214,13 @@ class V4Indexer(MegatronModule):
 
 
 def start_row_exchange(q, weights, thd_layout, cp_group, *, balance: bool) -> RowExchange | LocalRows:
+    # [FUNCTION DOC] HELPER: Detaches the queries and weights (the exchange carries no gradient). If
+    # balancing is requested, asks for a row-balance plan; if none is requested or the plan says
+    # balancing does not pay, returns a no-exchange handle holding the detached tensors and the
+    # global positions of local rows (contiguous). Otherwise starts the asynchronous exchange and
+    # returns its handle.
+    # KNOWN ISSUE: because the tensors are detached, no gradient flows from the indexer top-k back to
+    # the queries and weights; this is consistent with top-k selection being non-differentiable.
     """Start sending this rank's indexer rows to their scoring ranks, or keep them if balancing does not pay."""
     tensors = [q.detach(), weights.detach()]
     plan = _row_balance_plan(q.shape[0], thd_layout, cp_group, q.device) if balance else None
@@ -187,6 +232,9 @@ def start_row_exchange(q, weights, thd_layout, cp_group, *, balance: bool) -> Ro
 
 
 def topk_for_local_rows(exchange, k, thd_layout, *, compress_ratio, index_topk, topk_fn):
+    # [FUNCTION DOC] HELPER: Waits for the exchange to deliver queries and weights, runs the scoring
+    # and top-k on the rows this rank scores, then sends the picks (row axis is dim 1) back to the
+    # rows' owners. Returns picks in local row order.
     """The top-k picks for this rank's rows, in local order, scored on the rank ``exchange`` sent them to."""
     q, weights = exchange.wait()
     topk_indices = indexer_topk(
@@ -204,6 +252,14 @@ def topk_for_local_rows(exchange, k, thd_layout, *, compress_ratio, index_topk, 
 
 
 def indexer_topk(q, k, weights, positions, thd_layout, *, compress_ratio, index_topk, topk_fn):
+    # [FUNCTION DOC] HELPER: If there are no rows, returns an empty int32 result of the right trailing
+    # shape (the scoring kernel cannot launch an empty grid). Visible key range per row: unpacked,
+    # start is zero and end is (position plus one) divided by ratio (rounded down); packed, taken from
+    # the per-segment bounds. Calls the logit kernel for scores of shape batch, rows, keys; flattens to
+    # two dimensions, calls the top-k function with count min(top-k, keys), and reshapes back to
+    # batch, rows, count. Returned indices are into the compressed keys alone; the semantics of
+    # entries outside the visible range depend on the top-k kernel (unused slots may hold arbitrary
+    # values per the surrounding code).
     """Score the query rows at global stream ``positions`` against their visible compressed keys.
 
     Args:
@@ -235,6 +291,10 @@ def indexer_topk(q, k, weights, positions, thd_layout, *, compress_ratio, index_
 
 
 def _row_balance_plan(seqlen_local, thd_layout, cp_group, device) -> RowBalancePlan | None:
+    # [FUNCTION DOC] HELPER: Total rows is local length times cp size. Sequence lengths are one
+    # sequence of that length when unpacked, otherwise the layout's host segment lengths (asserted
+    # to sum to the total). Returns the memoized plan for this rank, or none when balancing would not
+    # help.
     """This micro-batch's balanced exchange; every CP rank derives the same one."""
     cp_size = cp_group.size()
     total_rows = seqlen_local * cp_size

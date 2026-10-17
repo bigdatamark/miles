@@ -1,3 +1,15 @@
+# [MODULE DOC] "Engram" module for DeepSeek-V4.1: a hashed n-gram embedding memory. Token ids are
+# mapped through a normalization-based compressed vocabulary, n-gram hashes (multiplicative hash with
+# per-layer random odd multipliers, xor-combined, reduced modulo distinct primes per head, plus
+# per-head offsets) address rows of a very large fp8 embedding table that stays on the host in memory
+# mapped form (read from the Hugging Face safetensors checkpoint, optionally sharded by tensor
+# parallel rank). Looked-up rows go through a learned projection into per-residual-stream keys and one
+# value, and a gated residual update is added to the hidden streams. Environment variables:
+# MILES_DSV41_ENGRAM_GATE_CHUNK (sequence chunk size for gating, default 4096, zero disables
+# chunking), MILES_DSV41_ENGRAM_HOST_TABLE ("sharded" default or "shared": whether each tensor-parallel
+# rank holds a row shard, combined by all-reduce, or the full table), and
+# MILES_DSV41_ENGRAM_GATHER_THREADS (host threads for the row gather, default 16). Module-level caches
+# hold the compressed token map per checkpoint path and the layout per configuration.
 import json
 import logging
 import os
@@ -23,6 +35,9 @@ _LAYOUT_CACHE: dict[tuple, "EngramLayout"] = {}
 
 
 def find_next_prime(start: int, seen_primes: set[int]) -> int:
+    # [FUNCTION DOC] HELPER: Returns the smallest prime strictly greater than start that is not in the
+    # given set of already used primes (linear search with a primality test from sympy, imported
+    # lazily).
     from sympy import isprime
 
     candidate = start + 1
@@ -32,6 +47,15 @@ def find_next_prime(start: int, seen_primes: set[int]) -> int:
 
 
 def build_compressed_token_map(tokenizer) -> tuple[list[int], int]:
+    # [FUNCTION DOC] HELPER: Builds a many-to-one map from original token ids to compressed ids.
+    # A normalizer pipeline (compatibility composition, decomposition, accent stripping, lowercasing,
+    # whitespace collapsing to a single space, with a private-use sentinel protecting a lone-space
+    # token from being stripped away) is applied to each token's decoded text. Tokens whose decoded
+    # text contains the replacement character (partial bytes) use their raw vocabulary token string
+    # as the key; others use the normalized text, or the original text if normalization yields empty.
+    # Tokens sharing a key share a compressed id, numbered in first-seen order. Iterates over the
+    # whole tokenizer vocabulary (slow for big vocabularies). Returns (list indexed by original id,
+    # number of distinct compressed ids). Requires a fast tokenizer with a backend tokenizer.
     from tokenizers import Regex, normalizers
 
     sentinel = "\ue000"
@@ -66,6 +90,9 @@ def build_compressed_token_map(tokenizer) -> tuple[list[int], int]:
 
 
 def get_compressed_token_map(hf_checkpoint: str) -> tuple[list[int], int]:
+    # [FUNCTION DOC] HELPER: Memoized per checkpoint path in a module-level dictionary. On a miss,
+    # loads the tokenizer from the checkpoint (remote code trusted; may read from disk or network) and
+    # builds the compressed map. Returns (map, compressed vocabulary size).
     if hf_checkpoint not in _TOKEN_MAP_CACHE:
         from transformers import AutoTokenizer
 
@@ -75,6 +102,13 @@ def get_compressed_token_map(hf_checkpoint: str) -> tuple[list[int], int]:
 
 
 def compute_hash_multipliers(layer_ids, max_ngram_size: int, vocab_size: int) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Deterministic per-layer hash multipliers. For each layer, seeds a numpy
+    # generator with 10007 times the layer id and draws one integer per n-gram position uniformly in
+    # [0, bound), where bound is max(1, (largest signed 64-bit integer divided by vocabulary size)
+    # divided by 2); each value is doubled and incremented to be odd, so products of a token id and a
+    # multiplier cannot overflow 64 bits. Returns a 64-bit integer tensor of shape layers by n-gram
+    # size, in the order of the given layer ids. Must produce identical values to the training
+    # checkpoint's convention.
     max_long = np.iinfo(np.int64).max
     multiplier_bound = max(1, (max_long // vocab_size) // 2)
     rows = []
@@ -86,6 +120,12 @@ def compute_hash_multipliers(layer_ids, max_ngram_size: int, vocab_size: int) ->
 
 
 def _mmap_rows(path: str, name: str, row_start: int, row_end: int, row_bytes: int) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Reads the safetensors header (8-byte little-endian length, then a JSON
+    # header) to find the named tensor's data start offset, then memory-maps the requested byte rows
+    # of that tensor read-only without loading them. Empty or inverted ranges return an empty
+    # (zero rows) byte tensor. Returns an unsigned-byte tensor of shape rows by row_bytes that shares
+    # the mapping (read-only warnings are suppressed). Raises a key error if the name is absent from
+    # the header, and file errors for unreadable paths. The tensor is assumed to be 2-D bytes, row-major.
     """Rows [row_start, row_end) of a 2-D uint8 safetensors tensor, memory-mapped read-only."""
     import struct
 
@@ -107,6 +147,10 @@ def _mmap_rows(path: str, name: str, row_start: int, row_end: int, row_bytes: in
 
 @dataclass(frozen=True)
 class EngramLayout:
+    # [CLASS DOC] HELPER: Immutable description of the engram configuration shared by all engram
+    # layers: largest n-gram size, the engram layer ids, number of table rows per engram layer, the
+    # hashing primes (nested per layer, per n-gram order from 2 up to the maximum, per head), head
+    # count, and per-row byte width of the table (head dim).
     max_ngram_size: int
     layer_ids: tuple
     num_embeddings: tuple
@@ -116,6 +160,11 @@ class EngramLayout:
 
 
 def build_engram_layout(config: TransformerConfig) -> EngramLayout | None:
+    # [FUNCTION DOC] HELPER: Returns none if no engram layers are configured. Otherwise memoized by a
+    # key of layer ids, embedding counts, max n-gram size, head count, head dim and vocabulary size.
+    # On a miss, allocates primes: for each engram layer, for each n-gram order from 2 to the maximum,
+    # for each head, the next prime above the previous one (starting above vocabulary size minus one)
+    # not used anywhere yet, so all primes are distinct across the whole layout. Returns the layout.
     layer_ids = tuple(config.v41_engram_layer_ids)
     if not layer_ids:
         return None
@@ -157,6 +206,12 @@ assert ENGRAM_HOST_TABLE in ("sharded", "shared"), ENGRAM_HOST_TABLE
 
 
 def engram_gate(x, kv, q_weight, k_weight, eps, clamp_value, chunk: int | None = None):
+    # [FUNCTION DOC] HELPER: Applies the gate to hidden streams x (sequence, batch, streams, dim) with
+    # the projected key/value kv. Chunk defaults to the environment-configured size. If chunking is
+    # disabled or the sequence is short enough, runs the gate once. Without gradient mode, processes
+    # sequence chunks into a preallocated output. With gradient mode, upcasts the two weights to
+    # float32 once (so gradients accumulate in float32) and runs each chunk under activation
+    # checkpointing (non-reentrant) to save memory, concatenating results along the sequence.
     chunk = ENGRAM_GATE_CHUNK if chunk is None else chunk
     seqlen = x.shape[0]
     if not chunk or seqlen <= chunk:
@@ -180,6 +235,13 @@ def engram_gate(x, kv, q_weight, k_weight, eps, clamp_value, chunk: int | None =
 
 
 def _engram_gate(x, kv, q_weight, k_weight, eps, clamp_value):
+    # [FUNCTION DOC] HELPER: Splits kv along the last dim into per-stream keys (streams times dim) and
+    # one value (dim). In float32: weight is the product of the two learned weights (streams by dim);
+    # the score per stream is the sum over dim of x times weight times key, multiplied by the product
+    # of the inverse RMS of x and of the key (with epsilon) and by dim to the minus one half. The gate
+    # is the sigmoid of the signed square root of the score's magnitude floored at clamp_value (sign
+    # preserved). Output is x plus gate (per stream scalar) times value (broadcast over streams), cast
+    # back to x's dtype.
     hc_mult, dim = x.shape[-2:]
     key, value = kv.split([hc_mult * dim, dim], dim=-1)
     key = key.float().unflatten(-1, (hc_mult, dim))
@@ -192,7 +254,21 @@ def _engram_gate(x, kv, q_weight, k_weight, eps, clamp_value):
 
 
 class DeepSeekV41Engram(MegatronModule):
+    # [CLASS DOC] Per-layer engram module. Holds hash constants as non-persistent buffers (token map,
+    # multipliers, primes, offsets), a host-resident memory-mapped fp8 row table with e8m0 per-32
+    # scales (loaded from the checkpoint, not part of the state dict), a duplicated linear projection
+    # from concatenated looked-up rows to (streams plus one) times hidden size, and two float32 gate
+    # weights (streams by hidden), initialized to ones. Not sequence-parallel for its parameters.
     def __init__(self, config: TransformerConfig, layer_id: int, tp_group, cp_group=None):
+        # [FUNCTION DOC] Builds the layout and finds this layer's index among engram layers (raises a
+        # value error if the layer is not an engram layer). Computes table sharding: with the sharded
+        # mode each tensor-parallel rank owns a contiguous ceil-divided row range (clipped to the real
+        # row count); with shared mode the full table. Creates the projection, gate weights (kept in
+        # float32) and marks all parameters as not sequence-parallel. Loads the compressed token map
+        # for the checkpoint (asserts its size equals the configured compressed vocab size), maps the
+        # padding token id, precomputes per-head cumulative offsets into the concatenated table rows
+        # from the primes, and registers the buffers. Finally memory-maps the table (reads checkpoint
+        # index and safetensors headers).
         super().__init__(config=config)
         self.cp_group = cp_group
         self.cp_size = cp_group.size() if cp_group is not None else 1
@@ -258,6 +334,11 @@ class DeepSeekV41Engram(MegatronModule):
         self._load_table()
 
     def _load_table(self):
+        # [FUNCTION DOC] HELPER: Reads the checkpoint's weight index to find which shard file holds this
+        # layer's engram embedding weight and scale tensors, then memory-maps this rank's row range of
+        # each (weights have head-dim bytes per row; scales have head-dim divided by 32 bytes per
+        # row), and marks the table as loaded. File I/O only; no tensors are copied to GPU.
+        # KNOWN ISSUE: the index file handle is opened without being closed explicitly.
         ckpt = self.config.v41_hf_checkpoint
         index = json.load(open(os.path.join(ckpt, "model.safetensors.index.json")))["weight_map"]
         end = self.row_start + self.rows_avail
@@ -278,6 +359,15 @@ class DeepSeekV41Engram(MegatronModule):
         self._table_loaded = True
 
     def hash_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] Maps token ids (batch, sequence) to compressed ids, then for each shift from 0
+        # to the max n-gram size minus one gathers the token that many positions back (clamped at
+        # position zero); positions before the shift (cumulatively blocked) are replaced with the
+        # padding id. Stacks to (batch, sequence, n-gram size), multiplies by the per-layer multipliers
+        # (64-bit integer, wraps around on overflow), then builds rolling xor over increasing n-gram
+        # orders; for orders 2 to max, takes the rolling hash modulo the per-head primes for that
+        # order. Concatenates over orders (giving (orders minus one) times heads columns) and adds the
+        # per-column offsets. Returns row indices into this layer's table, 64-bit, shape
+        # (batch, sequence, columns).
         batch, seqlen = input_ids.shape
         compressed = self.token_map[input_ids]
         positions = torch.arange(seqlen, device=input_ids.device).expand(batch, seqlen)
@@ -295,6 +385,11 @@ class DeepSeekV41Engram(MegatronModule):
         return torch.cat(hashes, dim=-1) + self.offsets
 
     def _staging(self, n: int):
+        # [FUNCTION DOC] HELPER: Lazily (re)allocates, when missing or too small, a tuple of pinned
+        # host byte buffers (rows of head-dim bytes, scales of head-dim / 32 bytes) plus a CUDA event.
+        # Always blocks until the event from the previous use has completed, so the buffers are safe to
+        # refill. Returns the first n rows of each buffer and the event. The buffers persist on the
+        # module between calls.
         """Pinned buffers the host gather writes into, reused across forwards."""
         if self._stage is None or self._stage[0].shape[0] < n:
             self._stage = (
@@ -308,6 +403,16 @@ class DeepSeekV41Engram(MegatronModule):
         return rows[:n], scales[:n], done
 
     def lookup(self, ids: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] Maps row ids (any shape) to dequantized bfloat16 embeddings of shape ids shape
+        # plus head dim. Loads the table if needed. Local row = id minus this rank's first row; rows
+        # outside the owned range are redirected to row zero (and zeroed later). Local ids are moved to
+        # host, the pinned staging buffers are acquired, host threads are temporarily raised to the
+        # configured gather count (restored in a finally block), and weight rows and scale rows are
+        # gathered with index selection into the pinned buffers. They are copied to the ids' device
+        # asynchronously and the event is recorded. Dequantization: reinterpret bytes as fp8 e4m3, view
+        # in groups of 32, multiply by e8m0 scales, flatten, cast to bfloat16. In shared mode returns
+        # the values. In sharded mode, zeroes rows not owned, and sums across the tensor-parallel group
+        # with an all-reduce (when group size above one).
         if not self._table_loaded:
             self._load_table()
         local = ids - self.row_start
@@ -337,6 +442,15 @@ class DeepSeekV41Engram(MegatronModule):
         return values
 
     def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] Input hidden states (sequence, batch, streams times hidden), sequence-sharded
+        # under sequence parallel (gathered first); input ids (batch, local sequence), asserted present
+        # and matching the hidden shape. Without gradients: under context parallelism all-gathers the
+        # id chunks from the cp group, hashes the full ids, and slices this rank's range; otherwise
+        # hashes directly; result is transposed to sequence-major; then looks up embeddings. With
+        # gradients: projects the flattened looked-up rows to keys and value, views the hidden states
+        # as (sequence, batch, streams, hidden), applies the gated update, flattens streams back, and
+        # scatters to the sequence-parallel layout if needed. Returns the updated hidden states in the
+        # input layout.
         if self.sequence_parallel:
             hidden_states = gather_from_sequence_parallel_region(
                 hidden_states, tensor_parallel_output_grad=False, group=self.tp_group
