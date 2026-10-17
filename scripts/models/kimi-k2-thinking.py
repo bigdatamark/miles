@@ -1,7 +1,15 @@
+# [MODULE DOC] HELPER: Megatron model-argument definition for Kimi-K2-Thinking (DeepSeek-style MoE
+# with multi-latent attention): 61 layers by default with 1 dense layer, hidden 7168, 64 heads,
+# YaRN rotary scaling factor 64 from original context 4096, rotary base 50000, 384 routed experts
+# with top-8 sigmoid routing scaled by 2.827, shared expert, vocabulary 163840. Import has no side
+# effects.
 from model_args_utils import moe_layer_freq
 
 
 def model_args(nlayers: int = 61, first_k_dense_replace: int = 1, beta_fast: int = 1) -> str:
+    # [FUNCTION DOC] HELPER: return the flag string for the given total layers (default 61),
+    # leading dense layer count (default 1, through the MoE frequency pattern) and YaRN fast-beta
+    # (default 1). Norm epsilon is 1e-5.
     return (
         "--disable-bias-linear "
         f"--num-layers {nlayers} "

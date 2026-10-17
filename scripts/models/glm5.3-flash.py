@@ -1,7 +1,15 @@
+# [MODULE DOC] HELPER: Megatron model-argument definition for GLM-5.3 Flash (MoE with multi-latent
+# attention, 45 layers by default, first 3 dense): hidden 4096, 64 heads, no rotary sub-dimension in
+# the MLA head, 288 routed experts with top-8 sigmoid routing scaled by 2.5, shared expert,
+# vocabulary 154880, rotary base 10000, activation clamp 10 matching the checkpoint's SwiGLU limit,
+# built with the GLM-5-next spec plugin. Import has no side effects.
 from model_args_utils import moe_layer_freq
 
 
 def model_args(nlayers: int = 45, first_k_dense_replace: int = 3) -> str:
+    # [FUNCTION DOC] HELPER: return the flag string for the given total layer count (default 45)
+    # and number of leading dense layers (default 3), embedded through the MoE layer frequency
+    # pattern.
     return (
         "--spec miles_plugins.models.glm5_next.glm5_next get_glm5_next_spec "
         f"--num-layers {nlayers} "

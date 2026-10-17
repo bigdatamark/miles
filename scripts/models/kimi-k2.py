@@ -1,3 +1,8 @@
+# [MODULE DOC] HELPER: Megatron model-argument definition for Kimi-K2 (DeepSeek-style MoE with
+# multi-latent attention): 61 layers with 1 dense layer (module constants), hidden 7168, 64 heads,
+# YaRN rotary scaling factor 32 from original context 4096, rotary base 50000, 384 routed experts
+# with top-8 sigmoid routing scaled by 2.827, shared expert, vocabulary 163840. Import has no side
+# effects.
 from model_args_utils import moe_layer_freq
 
 
@@ -6,6 +11,11 @@ FIRST_K_DENSE_REPLACE = 1
 
 
 def model_args() -> str:
+    # [FUNCTION DOC] HELPER: return the constant flag string (no parameters, no environment use).
+    # Norm epsilon is 1e-6. The layer count flag is a literal 61 while the MoE frequency pattern
+    # uses the module constant.
+    # KNOWN ISSUE: the layer count is hardcoded as 61 in the flag text instead of using the
+    # NLAYERS constant, so editing the constant would desynchronise them.
     return (
         "--disable-bias-linear "
         "--num-layers 61 "

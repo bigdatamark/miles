@@ -1,4 +1,13 @@
+# [MODULE DOC] HELPER: Megatron model-argument definition for gpt-oss-20b (MoE, 24 layers): hidden
+# 2880, 64 heads with 8 query groups and key-value channels 64, rotary base 150000 with maximum
+# positions 131072 (matching the checkpoint's YaRN setup), learnable softmax offsets with
+# alternating sliding-window (128, 0) and full attention, 32 experts with top-4 routing in an
+# fp32 router, vocabulary 201088, untied embeddings. Import has no side effects.
 def model_args() -> str:
+    # [FUNCTION DOC] HELPER: return the constant flag string (no parameters, no environment use).
+    # The expert FFN width is not set separately, so it equals the dense FFN width (2880). Bias
+    # in linear layers is left enabled because the checkpoint has attention bias. Masked-softmax
+    # and rope fusions are disabled for compatibility with the attention pattern.
     return (
         # Base architecture
         "--num-layers 24 "

@@ -1,8 +1,15 @@
+# [MODULE DOC] HELPER: Megatron model-argument definition for GLM-4.5 106B-A12B (MoE): 1 dense plus
+# 45 MoE layers (module constants), hidden 4096, 96 heads with 8 query groups, 128 experts with
+# top-8 sigmoid routing, shared expert, QKV bias, partial rotary (50 percent), untied embeddings,
+# vocabulary 151552. Import has no side effects.
 N_DENSE_LAYERS = 1
 N_MOE_LAYERS = 45
 
 
 def model_args() -> str:
+    # [FUNCTION DOC] HELPER: return the constant flag string (no parameters, no environment use).
+    # Total layers is the sum of the two constants; the MoE layer frequency is a pattern of the
+    # dense layers (zeros) followed by the MoE layers (ones).
     return (
         "--disable-bias-linear "
         "--group-query-attention "

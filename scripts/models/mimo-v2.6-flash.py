@@ -1,3 +1,9 @@
+# [MODULE DOC] HELPER: Megatron model-argument definition for the MiMo-V2.6-Flash-RL text decoder
+# (MoE, 48 layers, first layer dense, hidden 4096, 64 heads with 4 global-attention key-value
+# heads and key channels 192, 256 experts with top-8 sigmoid routing and no load balancing,
+# vocabulary 152576, partial rotary 0.334 with base 10,000,000). The flags only describe the
+# global-attention shape and MoE layout; per-layer sliding-window attention, sinks, value head dim
+# and rotary bases come from the Megatron-Bridge model definition. Import has no side effects.
 # XiaomiMiMo MiMo-V2.6-Flash-RL text decoder. Train through Megatron-Bridge
 # (`--megatron-to-hf-mode bridge`) on the BF16 checkpoint written by
 # tools/convert_mimo_v2_to_bf16.py: the bridge (miles_plugins/megatron_bridge/mimo_v2.py) supplies the
@@ -19,6 +25,9 @@ FIRST_K_DENSE_REPLACE = 1
 
 
 def model_args(nlayers: int = N_LAYERS) -> str:
+    # [FUNCTION DOC] HELPER: return the flag string for the given total layer count (default 48),
+    # embedding it and the MoE frequency pattern with one leading dense layer. Everything else is
+    # constant.
     return (
         f"--num-layers {nlayers} "
         f"--hidden-size {NHIDDEN} "

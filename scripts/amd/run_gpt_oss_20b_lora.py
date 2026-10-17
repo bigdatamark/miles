@@ -1,3 +1,9 @@
+# [MODULE DOC] ROCm launcher for GRPO LoRA training of gpt-oss-20b (BF16 HF checkpoint loaded
+# directly through Megatron-Bridge, no conversion step). Typer commands: prepare (download model
+# and dapo math dataset), train, full-train. Fixed layout: tensor parallel 4 with sequence
+# parallel, colocated rollout/training, Triton backends for sglang attention, MoE and LoRA.
+# Argument groups are built as strings (checkpoint, LoRA, rollout, optimizer, GRPO, perf, sglang,
+# misc) and submitted through the shared command utilities.
 """gpt-oss-20b GRPO LoRA training script for AMD (MI350X / MI355X).
 
 The checkpoint is loaded directly through Megatron-Bridge. ROCm uses Triton for
@@ -31,6 +37,12 @@ _HF_REPO = "lmsys/gpt-oss-20b-bf16"
 
 @dataclass
 class ScriptArgs(U.ExecuteTrainConfig):
+    # [CLASS DOC] Configuration: model name and Megatron type, hardware (auto, MI350X, MI355X),
+    # optional GPU count override (default from hardware), directories, LoRA settings (rank 32,
+    # alpha 32, dropout 0, target modules for the MoE projections, CPU backup of the base
+    # weights), rollout sizes (20 rollouts, 8 prompts by 8 samples, 4096 response tokens, global
+    # batch 64), learning rate 1e-5, engine size 4 GPUs, sglang memory fraction 0.2, W&B toggle
+    # and team, free-form extra args. The run id default is computed once at import time.
     run_id: str = U.create_run_id()
     model_name: str = "gpt-oss-20b-bf16"
     megatron_model_type: str = "gpt-oss-20b"
@@ -64,6 +76,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
 
 
 def _set_rocm_environment() -> None:
+    # [FUNCTION DOC] HELPER: mutate the process environment (only setting defaults) so Ray does not
+    # blank HIP / CUDA visibility, copy HIP_VISIBLE_DEVICES to CUDA_VISIBLE_DEVICES when set
+    # (overwriting), and disable NVLink SHARP (default off) to avoid the NVIDIA topology probe.
     os.environ.setdefault("RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES", "1")
     os.environ.setdefault("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", "1")
     if hip_visible_devices := os.environ.get("HIP_VISIBLE_DEVICES"):
@@ -73,17 +88,24 @@ def _set_rocm_environment() -> None:
 
 
 def _resolve_num_gpus(args: ScriptArgs) -> tuple[str, int]:
+    # [FUNCTION DOC] HELPER: resolve the hardware name (auto-detected when auto) and return it with
+    # the GPU count: the explicit override if set, else the hardware's default.
     hardware = U.resolve_hardware(args)
     return hardware, args.num_gpus_per_node or U.NUM_GPUS_OF_HARDWARE[hardware]
 
 
 def _download_inputs(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] HELPER: create model and data dirs, download the BF16 HF checkpoint into model
+    # dir / model name and the dapo math 17k dataset (shell commands via the utilities).
     U.exec_command_cpu(f"mkdir -p {args.model_dir} {args.data_dir}")
     U.exec_command_cpu(f"hf download {_HF_REPO} --local-dir {args.model_dir}/{args.model_name}")
     U.hf_download_dataset("zhuzilin/dapo-math-17k", data_dir=args.data_dir)
 
 
 def _get_wandb_args(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: empty string when W&B is disabled; otherwise the default W&B flags for
+    # this script and run id (empty if no API key), plus a quoted team flag when a team is given
+    # and the default flags were non-empty.
     if not args.enable_wandb:
         return ""
     wandb_args = U.get_default_wandb_args(__file__, run_id=args.run_id)
@@ -93,6 +115,14 @@ def _get_wandb_args(args: ScriptArgs) -> str:
 
 
 def _execute(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] HELPER: set the ROCm environment, resolve GPUs, print a summary and submit
+    # training. Blocks: checkpoint (HF path, bridge conversion mode); LoRA (rank, alpha, dropout,
+    # target modules, no virtual experts, optional base CPU backup); rollout (dapo math, math reward,
+    # shuffled, balanced data, temperature 1); Adam with constant lr, weight decay 0.1, betas 0.9 /
+    # 0.98; GRPO with clip 0.2 / 0.28 and no entropy bonus; perf (TP 4, sequence parallel, PP/CP/EP/
+    # expert TP 1, full uniform recompute, micro batch 1, 4096 tokens per GPU); sglang (Triton LoRA /
+    # MoE / attention backends, bf16, max LoRA rank); misc (Megatron backend, dropout off, bshd
+    # format, unfused attention, node and GPU counts, colocate).
     _set_rocm_environment()
     hardware, num_gpus = _resolve_num_gpus(args)
     print(f"[run] gpt-oss-20b LoRA on {hardware}: {num_gpus} GPUs, trainer TP=4, rollout TP=4")
@@ -198,6 +228,7 @@ def _execute(args: ScriptArgs) -> None:
 @app.command()
 @U.dataclass_cli
 def prepare(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] CLI command: download inputs only.
     """Download the checkpoint and training dataset."""
     _download_inputs(args)
 
@@ -205,6 +236,7 @@ def prepare(args: ScriptArgs) -> None:
 @app.command()
 @U.dataclass_cli
 def train(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] CLI command: training only.
     """Run GRPO LoRA training using prepared inputs."""
     _execute(args)
 
@@ -212,6 +244,7 @@ def train(args: ScriptArgs) -> None:
 @app.command()
 @U.dataclass_cli
 def full_train(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] CLI command: download then train.
     """Download inputs and run GRPO LoRA training."""
     _download_inputs(args)
     _execute(args)
@@ -219,6 +252,7 @@ def full_train(args: ScriptArgs) -> None:
 
 @app.callback()
 def _callback() -> None:
+    # [FUNCTION DOC] HELPER: empty typer callback keeping the command group explicit.
     pass
 
 

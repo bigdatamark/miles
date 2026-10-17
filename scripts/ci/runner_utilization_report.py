@@ -1,4 +1,17 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Command-line tool that reports GitHub Actions self-hosted runner utilization over a
+# time window, using the gh CLI against the REST API. Pipeline: list workflow runs (server-side
+# date filter with a cursor to get past the 1000-result cap, with extra lookback before the window),
+# skip workflows unlikely to use GPU runners, fetch every run's jobs (all retry attempts) in a thread
+# pool, dedupe carried-over re-run records, turn each job into an info record (queue wait, busy
+# interval, labels, outcome), then per runner label compute pool utilization (union of busy
+# intervals per host, divided by host count times window), queue-wait statistics (average, P50, P90,
+# P99, max), concurrency / saturation by sweep line, outcome counts, and an hourly queue timeline.
+# Output is a markdown report (stdout or file, also appended to the GitHub step summary file when
+# the environment provides one) and optionally a JSON queue series. Requires an authenticated gh.
+#
+# Module constants: default labels to ignore, GitHub-hosted labels, outcome display order and emoji,
+# and a hint list of workflow-name substrings treated as non-GPU.
 """
 Runner Utilization Report (miles)
 
@@ -37,12 +50,22 @@ STATUS_EMOJI = {
 
 
 def format_status_counts(counts: dict) -> str:
+    # [FUNCTION DOC] HELPER: one-line summary of outcome counts in the fixed display order: emoji
+    # followed by the count, space separated, omitting zero or missing outcomes; an em dash when
+    # nothing is present.
     """Compact per-label outcome summary, e.g. '✅120 ❌3 🔄2 ⏳4'."""
     parts = [f"{STATUS_EMOJI[s]}{counts[s]}" for s in STATUS_ORDER if counts.get(s)]
     return " ".join(parts) if parts else "—"
 
 
 def run_gh_command(args: list[str], max_retries: int = 10) -> dict:
+    # [FUNCTION DOC] Run the gh api command with the given arguments as a subprocess and parse its
+    # standard output as JSON. On nonzero exit, retry only when the error text contains a retryable
+    # marker (rate limit, abuse detection, 5xx messages, connection reset, EOF, timeout), sleeping
+    # an exponential backoff (2 to the attempt plus up to one second of jitter, capped at 60
+    # seconds); non-retryable errors stop immediately. After the attempts are used up or a
+    # non-retryable error, raises a plain exception carrying the attempt count and the first 300
+    # characters of the last error text. Spawns processes and sleeps.
     """Run gh CLI command and return JSON result.
 
     Retries on transient failures (5xx, secondary rate limits, network
@@ -90,6 +113,13 @@ def run_gh_command(args: list[str], max_retries: int = 10) -> dict:
 
 
 def get_workflow_runs(repo: str, since: datetime, max_pages: int = 400) -> tuple[list[dict], bool]:
+    # [FUNCTION DOC] List workflow runs created since the given time, newest first, with a cursor
+    # walk. Loop: query pages of 100 (up to 10 pages, the API's 1000-result cap) for the created
+    # range (open-ended at the top first); dedupe by run id across chunks; stop when the chunk holds
+    # as many runs as the reported total, or when the global page budget is spent (truncated), or
+    # when the cursor cannot advance (no new runs, or the new upper bound equals the old one:
+    # truncated). Otherwise move the upper bound down to the oldest created time in the chunk. Prints a
+    # warning when truncated. Returns (runs, truncated flag).
     """Get workflow runs created after `since`.
 
     Returns (runs, truncated). `truncated` is True when the safety cap cut
@@ -179,6 +209,8 @@ def get_workflow_runs(repo: str, since: datetime, max_pages: int = 400) -> tuple
 
 
 def get_jobs_for_run(repo: str, run_id: int) -> list[dict]:
+    # [FUNCTION DOC] Fetch all job records of a run, every attempt, in pages of 100, stopping at a
+    # short page or after 20 pages (2000 jobs). API errors propagate from the command helper.
     """Get all jobs for a workflow run, including all retry attempts.
 
     `filter=all` is required so that re-run attempts of the same job
@@ -205,6 +237,9 @@ def get_jobs_for_run(repo: str, run_id: int) -> list[dict]:
 
 
 def get_runners(repo: str, online_only: bool = True) -> list[dict]:
+    # [FUNCTION DOC] List the repo's self-hosted runners (pages of 100, at most 10 pages), keeping
+    # only those with online status by default. Any exception (typically missing admin permission)
+    # is caught, a warning printed and an empty list returned.
     """Get all self-hosted runners with pagination. Returns empty if no permission."""
     try:
         all_runners = []
@@ -227,6 +262,8 @@ def get_runners(repo: str, online_only: bool = True) -> list[dict]:
 
 
 def parse_time(time_str: str) -> datetime:
+    # [FUNCTION DOC] HELPER: parse an ISO-8601 timestamp (a trailing Z becomes a zero UTC offset)
+    # into an aware datetime; returns none for an empty or missing value.
     """Parse ISO timestamp to datetime."""
     if not time_str:
         return None
@@ -234,6 +271,9 @@ def parse_time(time_str: str) -> datetime:
 
 
 def carried_over_fingerprint(job: dict):
+    # [FUNCTION DOC] HELPER: for completed jobs only, a tuple of run id, name, runner name, start
+    # and completion times used to recognise duplicate records of one execution; none for jobs that
+    # are not completed.
     """Identity of one physical job execution, for deduping re-run carryover.
 
     When a run is re-run, the completed jobs that were NOT re-run reappear
@@ -257,6 +297,9 @@ def carried_over_fingerprint(job: dict):
 
 
 def union_seconds(intervals: list[tuple]) -> float:
+    # [FUNCTION DOC] HELPER: total length in seconds of the union of (start, end) datetime pairs:
+    # sort, merge overlapping or touching-by-overlap intervals (a gap is strictly later start than
+    # current end), and sum merged lengths. Empty input gives zero.
     """Total length in seconds of the union of (start, end) intervals."""
     busy = 0.0
     cur_start = cur_end = None
@@ -273,6 +316,14 @@ def union_seconds(intervals: list[tuple]) -> float:
 
 
 def classify_job(job: dict, now: datetime):
+    # [FUNCTION DOC] Turn one API job record into an info mapping, or none if it never waited for or
+    # occupied a runner or lacks a creation time. Cases by status: queued (wait ends at now, no
+    # busy interval; the placeholder start time is ignored); in progress with a start time (wait
+    # ends at start, busy from start to now); completed with start, completion and a runner name
+    # (busy from start to completion); anything else none. Result keys: start, end, created time,
+    # queue end, busy duration seconds, queue time seconds (never negative), job name, runner name,
+    # labels (excluding default and GitHub-hosted labels), outcome bucket (queued, running; for
+    # completed: pass on success, cancel on cancelled, otherwise fail) and html url.
     """Derive the queue-wait and busy interval for a single job.
 
     Returns a job_info dict, or None when the job neither waited for nor
@@ -346,6 +397,13 @@ def calculate_concurrency_metrics(
     window_end: datetime,
     num_runners: int,
 ) -> dict:
+    # [FUNCTION DOC] Compute concurrency statistics over the window for the job info list. Returns
+    # a mapping with peak concurrent running jobs, average concurrent jobs (running seconds divided
+    # by window seconds), seconds and percent of the window with running count at or above
+    # num_runners, and peak queue depth. All zeros for no jobs or a non-positive window. Running
+    # events come from jobs with both start and end overlapping the window, clamped to it. Queue
+    # events use the creation time to the queue end (or start) for waits that overlap the window.
+    # Events are sorted by time with ends before starts at equal times.
     """Sweep-line algorithm: peak/avg concurrent, saturation time, peak queue."""
     if not jobs:
         return {
@@ -448,6 +506,9 @@ _NON_GPU_WORKFLOW_HINTS = (
 
 
 def percentile(values: list[float], p: float) -> float | None:
+    # [FUNCTION DOC] HELPER: nearest-rank style percentile: sort the values and take the element at
+    # the rounded index (length minus one) times p, with no interpolation. Python rounding is
+    # to-even at halves. None for an empty list.
     if not values:
         return None
     ordered = sorted(values)
@@ -460,6 +521,13 @@ def queue_timeline(
     window_end: datetime,
     bucket_minutes: int = 60,
 ) -> list[dict]:
+    # [FUNCTION DOC] Build an hourly (bucket size configurable, default 60 minutes) queue timeline.
+    # Buckets start on whole hours from the first boundary at or after the window start up to the
+    # window end; an empty list if none. Backlog per bucket is the peak number of simultaneously
+    # waiting jobs (sweep line over creation-to-queue-end intervals clamped to the window, the
+    # level carried through every bucket in a gap). Started count and P90 wait (minutes, zero when
+    # none) cover jobs whose start falls in the bucket. Returns a list of mappings with the bucket
+    # start as an ISO string, backlog, started count and p90 wait in minutes.
     """Per-bucket queue backlog and wait p90, for the Lark timeline card.
 
     `backlog` is the sweep-line counter calculate_concurrency_metrics reduces
@@ -484,6 +552,8 @@ def queue_timeline(
     peaks = [0] * len(starts)
 
     def bucket_index(when: datetime) -> int:
+        # [FUNCTION DOC] HELPER: index of the bucket containing the time, computed from the offset
+        # to the origin and capped at the last bucket. Times before the origin are not handled.
         """Bucket `when` falls in. Callers drop anything before origin."""
         offset = (when - origin).total_seconds() // (bucket_minutes * 60)
         return min(len(starts) - 1, int(offset))
@@ -527,6 +597,9 @@ def queue_timeline(
 
 
 def _likely_no_gpu_jobs(workflow_name: str) -> bool:
+    # [FUNCTION DOC] HELPER: true if the lowercased workflow name contains any non-GPU hint
+    # substring; false for an empty name. Substring matching is broad (e.g. the hint auto or doc
+    # matches many names).
     """Heuristic: skip per-run job-fetch for workflows that don't dispatch
     to self-hosted GPU runners. The GH API rate limit is the bottleneck on
     busy 24h windows where ~18k workflow runs fire — but only a fraction
@@ -546,6 +619,21 @@ def calculate_utilization(
     runner_filter: str = None,
     lookback_hours: float = None,
 ):
+    # [FUNCTION DOC] Main analysis. Lists runs since window start minus lookback (default the
+    # smaller of 12 hours and half the window), drops non-GPU workflows and completed lookback runs
+    # that finished before the window, shrinks the window to the covered span if listing was
+    # truncated, reads online runners (label to host sets), fetches jobs for all runs with four
+    # worker threads (failed runs are counted and reported as a data-completeness percentage),
+    # dedupes carried-over jobs, classifies jobs, drops jobs entirely before the window, and groups
+    # by label and by host. Per-host busy seconds are the union of busy intervals clamped to the
+    # window. Per label (filtered by substring if given): hosts are the union of online runners
+    # with the label and hosts that ran jobs under it; the runner count is that size (1 if none);
+    # active seconds sum host busy time; utilization is active over runners times window;
+    # queue statistics use only positive waits (average, P50, P90, P99, max); concurrency uses the
+    # effective runner count (lower of runner count and observed peak, if that is positive and
+    # lower) for saturation; outcome counts and the hourly queue timeline are added.
+    # Prints progress. Returns (list of per-label result mappings, fetch failure percent, jobs
+    # sorted by longest queue wait, covered hours).
     """Calculate runner utilization metrics.
 
     `lookback_hours` extends the run *listing* (not the analysis window)
@@ -637,6 +725,8 @@ def calculate_utilization(
     print(f"Fetching jobs for {total_runs} runs in parallel...")
 
     def fetch_jobs_for_run(run):
+        # [FUNCTION DOC] HELPER: thread-pool worker. Returns (run id, job list, none) on success or
+        # (run id, none, first 200 characters of the error) when fetching fails after retries.
         """Fetch jobs for a single run.
 
         Returns (run_id, jobs, error_msg). `error_msg` is None on success.
@@ -837,6 +927,15 @@ def format_report(
     top_n: int = 20,
     coverage_hours: float = None,
 ) -> str:
+    # [FUNCTION DOC] Render the markdown report. Header with covered hours and generation time;
+    # coverage warning if less than the requested window (beyond 0.05 hours) was covered; data
+    # completeness warning if more than 1 percent of runs failed to fetch; a per-label table
+    # (runners, jobs, active hours, utilization with a ten-segment bar, average, P50, P90, P99 and
+    # max queue minutes, outcome counts); a top-N (default 20) longest positive queue waits table
+    # with links; a concurrency table (API versus effective runners, peak and average concurrent
+    # with percent of effective, saturation hours and percent, peak queue); and recommendations per
+    # label (high saturation above 50 percent or queue above 5, moderate above 20 percent or any
+    # queue, low utilization below 30 percent average with jobs, else healthy). Returns the text.
     """One compact summary table — original schema, fixed columns.
 
     Active (hrs) and Utilization now reflect the actual host pool's
@@ -970,6 +1069,11 @@ def format_report(
 
 
 def main():
+    # [FUNCTION DOC] CLI entry. Options: repo (default radixark/miles), hours (default 24), lookback
+    # hours, label substring filter, output file, queue-series JSON output path. Runs the analysis,
+    # formats the report, optionally writes the JSON series (bucket minutes 60 and label to
+    # timeline), writes the report to the output file or prints it, and appends it to the file named
+    # by the GitHub step summary environment variable when set.
     parser = argparse.ArgumentParser(description="Generate runner utilization report")
     parser.add_argument("--repo", default="radixark/miles", help="GitHub repo")
     parser.add_argument("--hours", type=float, default=24, help="Time window in hours (fractional ok)")

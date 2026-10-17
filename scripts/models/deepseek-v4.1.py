@@ -1,3 +1,9 @@
+# [MODULE DOC] HELPER: Megatron model-argument definition for DeepSeek-V4.1 (40 layers by default;
+# hidden 5120, 64 heads, query LoRA rank 1280, 384 routed experts with top-6 square-root-softplus
+# routing and scaling 1.5, 4 residual streams, output groups 8, no hash-routed layers, DSA indexer
+# with 32 heads and top-k 512, and a tiny layer-norm epsilon). Module constants: the per-layer
+# compression-ratio list (two zeros, eighteen 2s, then twenty 1s) and the extra SwiGLU clamp
+# flags (clamp value 10, no fused bias SwiGLU). Import has no side effects.
 import os
 
 from model_args_utils import moe_layer_freq
@@ -8,6 +14,10 @@ SWIGLU_LIMIT_ARGS = "--activation-func-clamp-value 10 --no-bias-swiglu-fusion"
 
 
 def model_args(nlayers: int | None = None, compress_ratios: str = COMPRESS_RATIOS) -> str:
+    # [FUNCTION DOC] HELPER: return the flag string. Layer count: argument, else environment
+    # variable MODEL_ARGS_NUM_LAYERS if set and nonempty, else 40. The compression ratio list is
+    # embedded as given. All layers are MoE (no leading dense layers). Uses the V4.1 spec plugin and
+    # appends the SwiGLU clamp flags. Reads the environment at call time.
     nlayers = nlayers if nlayers is not None else int(os.environ.get("MODEL_ARGS_NUM_LAYERS") or 40)
     return (
         "--disable-bias-linear "

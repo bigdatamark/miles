@@ -1,3 +1,8 @@
+# [MODULE DOC] HELPER: Megatron model-argument definition for DeepSeek-V3 (671B MoE, 61 layers by
+# default): multi-latent attention with query LoRA rank 1536 and key-value LoRA rank 512,
+# hidden size 7168, 128 heads, 256 routed experts with top-8 sigmoid routing in 8 groups, shared
+# expert, and YaRN-style rotary settings. The module constant gives the number of leading dense
+# (non-MoE) layers (3). Truncated variants load this file as a sibling. Import has no side effects.
 import os
 
 from model_args_utils import moe_layer_freq
@@ -7,6 +12,10 @@ FIRST_K_DENSE_REPLACE = 3
 
 
 def model_args(nlayers: int | None = None) -> str:
+    # [FUNCTION DOC] HELPER: return the flag string. Layer count: the argument if given, else the
+    # environment variable MODEL_ARGS_NUM_LAYERS if set and nonempty, else 61. Embeds the layer
+    # count and a MoE layer-frequency pattern with the first 3 layers dense. Reads the environment
+    # at call time.
     nlayers = nlayers if nlayers is not None else int(os.environ.get("MODEL_ARGS_NUM_LAYERS") or 61)
     return (
         "--disable-bias-linear "

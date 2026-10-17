@@ -1,3 +1,9 @@
+# [MODULE DOC] HELPER: Megatron model-argument definition for a 4-layer slice of Nemotron-3 Ultra
+# 550B-A55B (source layers 0, 1, 7, 8 renumbered 0 to 3: Mamba, MoE, attention, MoE), used for
+# single-node CI. Hidden 8192, 64 heads with 2 query groups, no position embedding, and the same
+# MoE settings as the full model (512 experts, top-22 sigmoid routing scaled by 5.0, latent size
+# 2048). Written out in full rather than derived from the full definition. Import has no side
+# effects.
 # 4-layer slice of NVIDIA Nemotron-3-Ultra-550B-A55B, for single-node (8 GPU) CI.
 #
 # Built by cluster_scripts/debug_tool_set/checkpoint/prune_nemotron_h.py, which
@@ -14,6 +20,7 @@
 
 
 def model_args() -> str:
+    # [FUNCTION DOC] HELPER: return the constant flag string (no parameters, no environment use).
     return (
         "--disable-bias-linear "
         "--group-query-attention "

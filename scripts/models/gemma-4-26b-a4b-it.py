@@ -1,4 +1,11 @@
+# [MODULE DOC] HELPER: Megatron model-argument definition for Gemma-4 26B-A4B instruct (MoE): 30
+# layers, hidden 2816, 16 attention heads with 8 query groups and key-value channels 256, 128
+# experts with top-8 softmax routing and expert FFN width 704, tied input/output embeddings (the
+# untie flag is deliberately omitted), vocabulary 262144, rotary base 1,000,000. Import has no
+# side effects.
 def model_args() -> str:
+    # [FUNCTION DOC] HELPER: return the constant flag string (no parameters, no environment use).
+    # Router: fp32, one expert group, no load-balancing aux loss coefficient and no bias update.
     return (
         "--disable-bias-linear "
         "--group-query-attention "

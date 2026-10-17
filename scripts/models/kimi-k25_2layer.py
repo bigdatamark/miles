@@ -1,7 +1,12 @@
+# [MODULE DOC] HELPER: Megatron model-argument definition for the 2-layer pruned Kimi-K2.5
+# debugging model (1 dense plus 1 MoE layer), derived from the kimi-k25 definition. Import has no
+# side effects.
 from model_args_utils import load_sibling_model_args
 
 
 def model_args() -> str:
+    # [FUNCTION DOC] HELPER: return the sibling kimi-k25 flag string with 2 layers and 1 leading
+    # dense layer; only the layer count and MoE frequency mask change.
     # Override for the 2-layer pruned debugging model (first_k_dense_replace=1):
     # 1 dense layer + 1 MoE layer. Architecture is otherwise identical to the full
     # Kimi-K2.5 / K2-Thinking, so we reuse those MODEL_ARGS and only patch the

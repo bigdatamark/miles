@@ -1,3 +1,9 @@
+# [MODULE DOC] HELPER: Megatron model-argument definition for GLM-4.7 Flash (MoE with multi-latent
+# attention): 1 dense plus 46 MoE layers, hidden 2048, 20 heads, query LoRA rank 768, key-value
+# LoRA rank 512, 64 routed experts with top-4 sigmoid routing scaled by 1.8, one shared expert, one
+# multi-token-prediction layer, vocabulary 154880. Module constants hold expert counts, widths,
+# layer counts and heads; the shared-expert width is derived as expert FFN width times the number
+# of shared experts. Import has no side effects.
 MOE_ROUTED_EXPERTS = 64
 MOE_ACTIVE_ROUTED_EXPERTS = 4
 MOE_SHARED_EXPERTS = 1
@@ -11,6 +17,9 @@ NHEADS = 20
 
 
 def model_args() -> str:
+    # [FUNCTION DOC] HELPER: return the constant flag string (no parameters, no environment use).
+    # Both rope-type and rope position embedding flags and the no-learned-position-embedding flag
+    # are passed; rope fusion disabled; key-value channels 192 with value head dim 256.
     return (
         f"--moe-layer-freq [0]*{N_DENSE_LAYERS}+[1]*{N_MOE_LAYERS} "
         f"--num-experts {MOE_ROUTED_EXPERTS} "

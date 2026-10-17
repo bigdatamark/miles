@@ -1,3 +1,7 @@
+# [MODULE DOC] ROCm launcher that submits Qwen3-4B GRPO training on dapo math (tensor parallel 2,
+# colocated, 2 GPUs per rollout engine). Single typer entry; assumes the Megatron torch_dist
+# checkpoint and datasets already exist (no prepare step). Exports ROCm / Ray device-visibility
+# variables into the process environment before submitting.
 """Qwen3-4B GRPO training script for AMD (MI300X / MI325X / MI350X / MI355X).
 
 =====================
@@ -34,6 +38,9 @@ from miles.utils.external_utils import command_utils
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC] Configuration: model name and Megatron type, optional GPU count (default from
+    # hardware), hardware (auto-detected), eval toggle (on), rollout count (3000), extra args and
+    # directories. The run id default is computed once at import time.
     run_id: str = command_utils.create_run_id()
     model_name: str = "Qwen3-4B"
     megatron_model_type: str = "qwen3-4B"
@@ -47,11 +54,23 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     megatron_path: str = "/root/Megatron-LM"
 
     def __post_init__(self):
+        # [FUNCTION DOC] Resolve hardware by auto-detection when needed and default the GPU count to
+        # the hardware's standard count.
         self.hardware = command_utils.resolve_hardware(self)
         self.num_gpus_per_node = self.num_gpus_per_node or command_utils.NUM_GPUS_OF_HARDWARE[self.hardware]
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Public entrypoint. Environment side effects: set (only if unset) the Ray
+    # no-HIP/CUDA-visibility-blanking variables and the NCCL NVLS-disable variable (exported rather
+    # than passed so the NVIDIA probe is skipped); mirror HIP_VISIBLE_DEVICES into
+    # CUDA_VISIBLE_DEVICES (overwriting) if set. Builds args: checkpoint (HF dir, ref-load from the
+    # torch_dist dir, load / save under output dir / checkpoints, save every 20); rollout (dapo
+    # math, deepscaler reward, batch 32 by 8 samples, 8192 response tokens, global batch 256);
+    # eval (aime every 20, 16 samples, if enabled); perf (TP 2 with sequence parallel, other
+    # parallel sizes 1, full uniform recompute, dynamic batch, 9216 tokens per GPU); GRPO with KL
+    # coefficient 0; Adam lr 1e-6; sglang (2 GPUs per engine, memory fraction 0.7); misc (dropout
+    # off, fp32 grad all-reduce, flash attention, colocate, node and GPU counts). Submits.
     # keep Ray from blanking HIP/CUDA visibility for the job entrypoint
     U = args.create_backend()
     os.environ.setdefault("RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES", "1")
@@ -169,6 +188,7 @@ def execute(args: ScriptArgs):
 
 @command_utils.dataclass_cli
 def main(args: ScriptArgs):
+    # [FUNCTION DOC] CLI entry: run the submission.
     execute(args)
 
 

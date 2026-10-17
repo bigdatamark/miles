@@ -1,7 +1,15 @@
+# [MODULE DOC] HELPER: Megatron model-argument definition for Qwen3.8 Flash-Next (hybrid linear /
+# full attention MoE with hyper-connections and per-layer embeddings, 48 layers by default, all
+# MoE): hidden 2560, 24 heads with 2 query groups and key-value channels 256, partial rotary 0.25
+# with base 10,000,000, 512 experts of width 640 with top-10 softmax routing and a gated shared
+# expert, attention output gate, vocabulary 248320, untied embeddings, built with the Qwen3.8-Next
+# spec plugin. Import has no side effects.
 from model_args_utils import moe_layer_freq
 
 
 def model_args(nlayers: int = 48) -> str:
+    # [FUNCTION DOC] HELPER: return the flag string for the given total layer count (default 48),
+    # embedded both as the layer count and in the MoE frequency pattern (no dense layers).
     return (
         "--spec miles_plugins.models.qwen3_8_next.qwen3_8_next get_qwen3_8_next_spec "
         "--disable-bias-linear "

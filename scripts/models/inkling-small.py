@@ -1,7 +1,15 @@
+# [MODULE DOC] HELPER: Megatron model-argument definition for Inkling-Small (276B MoE, 42 layers
+# by default): hidden 4096, 32 heads with 8 query groups, key-value channels 128, no position
+# embedding, maximum positions 1,048,576, 256 experts with top-6 sigmoid routing, shared expert,
+# QK layer norm, vocabulary 201024, and the Inkling custom model provider. Import has no side
+# effects.
 import os
 
 
 def model_args(nlayers: int | None = None) -> str:
+    # [FUNCTION DOC] HELPER: return the flag string. Layer count: argument, else environment
+    # variable MODEL_ARGS_NUM_LAYERS if set and nonempty, else 42 (used for layer slices). Reads
+    # the environment at call time.
     # Inkling-Small 276B config (42 layers; derived from the HF config the same way
     # inkling.py maps the Inkling one).
     nlayers = nlayers if nlayers is not None else int(os.environ.get("MODEL_ARGS_NUM_LAYERS") or 42)

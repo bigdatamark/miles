@@ -1,3 +1,12 @@
+# [MODULE DOC] ROCm (AMD MI355X) launcher for DeepSeek-V4-Flash GRPO training with a typer command
+# line. Commands: prepare-download (fetch HF checkpoint and dataset), prepare-single (cast FP8
+# checkpoint to BF16), prepare-spmd (convert BF16 to a Megatron torch_dist checkpoint), train, and
+# full-train (runs the missing preparation steps, skipping those whose sentinel file exists, then
+# trains). All shell work goes through the command utilities backend. Supports the full 43-layer
+# Flash model and a 4-layer prune for smoke tests. Training args are assembled as grouped strings
+# (checkpoint, rollout, perf, GRPO, optimizer, sglang, misc) and submitted via the backend.
+# KNOWN ISSUE: the usage examples in the docstring below say scripts/run_deepseek_v4.py but the
+# file lives under scripts/amd/.
 """
 DeepSeek V4 training script.
 
@@ -51,6 +60,17 @@ _MEGATRON_MODEL_TYPE = {
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC] Command-line configuration (extends the shared train config with node count etc.).
+    # Key fields: mode (normal or debug_minimal, default debug_minimal; non-debug adds oversampling
+    # with a nonzero-reward-std dynamic filter), model_name (full Flash FP8 or its 4-layer prune),
+    # model_org (HF org, derived from model_name when empty), task (dapo_aime or gsm8k), rollout
+    # sizes, optional cp_size, checkpoint and data directories, model_local_dir (defaults to
+    # model_dir; if different, model dirs are rsynced to it before training), optimizer CPU offload,
+    # fault tolerance, debug dump / replay options, precision options (R3 routing replay,
+    # deterministic mode, FP8 blockwise training default on, MIS) and free-form extra args.
+    # Derived (not constructor) fields: colocate, actor node / GPU counts, rollout GPU count.
+    # KNOWN ISSUE: run_id default is computed once at import time; debug_train_rollout_id is typed
+    # as an optional string but is assigned an integer default inside the train routine.
     mode: Literal["normal", "debug_minimal"] = "debug_minimal"
     run_id: str = command_utils.create_run_id()
     model_org: str = ""
@@ -105,6 +125,11 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     extra_args: str = ""
 
     def __post_init__(self):
+        # [FUNCTION DOC] Fill derived fields. Model org from the per-model table if empty; local model
+        # dir defaults to model dir. Asserts rollout node count is non-negative and below the total
+        # node count. Colocated when rollout nodes is zero (rollout GPUs = all GPUs); otherwise
+        # disaggregated: actor nodes = total minus rollout nodes, rollout GPUs = rollout nodes times
+        # GPUs per node. Actor GPUs per node equals GPUs per node.
         if not self.model_org:
             self.model_org = _DEFAULT_MODEL_ORG[self.model_name]
         if self.model_local_dir is None:
@@ -121,18 +146,25 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
     @property
     def megatron_model_type(self):
+        # [FUNCTION DOC] Property: Megatron model-type name looked up from the model name (key error
+        # for unknown names).
         return _MEGATRON_MODEL_TYPE[self.model_name]
 
     @property
     def torch_dist_name(self):
+        # [FUNCTION DOC] Property: directory name of the converted checkpoint, model name plus the
+        # suffix _torch_dist.
         return f"{self.model_name}_torch_dist"
 
     @property
     def bf16_name(self):
+        # [FUNCTION DOC] Property: directory name of the BF16-cast checkpoint, model name plus -bf16.
         return f"{self.model_name}-bf16"
 
 
 def _download_dataset(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: download the dataset(s) for the task from HF into the data dir: dapo
+    # math 17k and aime 2024 for dapo_aime, gsm8k for gsm8k.
     """Download the task-specific dataset(s)."""
     U = args.create_backend()
     match args.task:
@@ -144,11 +176,15 @@ def _download_dataset(args: ScriptArgs):
 
 
 def _hf_checkpoint_path(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: the explicit hf_checkpoint if given, else model dir / model name.
     """Resolve hf_checkpoint path: explicit override wins, else {model_dir}/{model_name}."""
     return args.hf_checkpoint or f"{args.model_dir}/{args.model_name}"
 
 
 def _ensure_4layer_model_type(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: only for the 4-layer model; if its config.json exists and contains the
+    # legacy model type string deepseek_ref, rewrite the file in place with deepseek_v4 and print a
+    # patch notice. Otherwise no-op.
     """Undo the old deepseek_ref workaround for local 4-layer prunes."""
     if args.model_name != "DeepSeek-V4-Flash-FP8-4layer":
         return
@@ -162,6 +198,9 @@ def _ensure_4layer_model_type(args: ScriptArgs):
 
 
 def _prepare_download(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: create model and data dirs; download the HF checkpoint into model dir /
+    # model name unless an explicit hf_checkpoint was supplied; patch the 4-layer config; download
+    # the dataset. Idempotent (HF skips existing blobs).
     """Download HF checkpoint + task dataset. Idempotent: hf skips existing blobs."""
     U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.model_dir} {args.data_dir}")
@@ -177,11 +216,14 @@ def _prepare_download(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def prepare_download(args: ScriptArgs):
+    # [FUNCTION DOC] CLI command wrapper around the private download helper.
     """Download HF checkpoint + dataset from HuggingFace. Run on one node (shared NFS)."""
     _prepare_download(args)
 
 
 def _prepare_single(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: download the dataset, then cast the FP8 source checkpoint to BF16 into
+    # model dir / bf16 name.
     U = args.create_backend()
     _download_dataset(args)
 
@@ -195,11 +237,18 @@ def _prepare_single(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def prepare_single(args: ScriptArgs):
+    # [FUNCTION DOC] CLI command wrapper around the private FP8-to-BF16 helper.
     """FP8 -> BF16 cast for Megatron. Needs --hf-checkpoint (or pre-downloaded). One node."""
     _prepare_single(args)
 
 
 def _prepare_spmd(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: convert the BF16 checkpoint to a Megatron torch_dist checkpoint through
+    # the backend. Extra args: the implementation flag, expert TP 1, context parallel 1, plus a
+    # parallel layout: single actor node with the 4-layer model uses TP/PP/EP all 1; single node
+    # with the full Flash model uses TP 1, PP 1, EP 8; any other combination raises not-implemented
+    # error. GPUs used: actor GPUs per node, or 1 for the 4-layer model. Multi-node conversion when
+    # more than one actor node.
     U = args.create_backend()
     is_4layer = args.model_name == "DeepSeek-V4-Flash-FP8-4layer"
     actor_num_nodes = args.actor_num_nodes
@@ -240,10 +289,14 @@ def _prepare_spmd(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def prepare_spmd(args: ScriptArgs):
+    # [FUNCTION DOC] CLI command wrapper around the private conversion helper.
     _prepare_spmd(args)
 
 
 def _prepare_cmd(args: ScriptArgs) -> dict[str, str]:
+    # [FUNCTION DOC] HELPER: pre-train commands per role. Empty mapping when local and shared model
+    # dirs are the same; otherwise a mapping for the trainer role holding rsync commands (joined
+    # with shell and-and) that copy the torch_dist checkpoint and the HF model dir to the local dir.
     if args.model_local_dir == args.model_dir:
         return {}
 
@@ -257,6 +310,11 @@ def _prepare_cmd(args: ScriptArgs) -> dict[str, str]:
 
 
 def _get_parallel_config(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: parallelism flags string. One actor node: TP = GPUs per node divided by
+    # CP size (cp_size default 1), sequence parallel, PP 1, CP as given (allgather-cp flag added when
+    # CP > 1), EP = GPUs per node, expert TP 1. Eight GPUs per node and 32 total (4 nodes): TP 4,
+    # sequence parallel, PP 4 with 11 layers first stage and 10 last (43 layers), CP 1, EP 8,
+    # expert TP 1. Anything else raises not-implemented error.
     """Return parallel config args for tested GPU configurations.
 
     Only includes configurations that have been verified to work.
@@ -302,6 +360,20 @@ def _get_parallel_config(args: ScriptArgs) -> str:
 
 
 def _train(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: build the whole training argument string and submit it. Prints the
+    # precision and topology; patches the 4-layer config. Blocks: checkpoint (HF path, ref-load from
+    # local torch_dist; load / save under save dir / run id unless skip_saving); rollout (math reward,
+    # shuffled, 3000 rollouts, temperature 0.8; non-debug adds oversampling and dynamic filter);
+    # eval (interval 20 if enabled); task-specific data and lengths (dapo_aime: 8192 response tokens,
+    # thinking mode, aime eval with 8 samples; gsm8k: 256 tokens); performance (parallel config plus
+    # full uniform recompute, micro batch 1, 2048 tokens per GPU); GRPO and optimizer (Adam, lr 1e-6,
+    # optional CPU offload, and on 4 actor nodes a 0.75 offload fraction without offloading train
+    # weights); sglang (4-GPU engines, TP 4, EP 4, router health settings); misc (dropout off,
+    # weight buffer 1 GiB, memory margin, colocate or rollout GPU count, optional dump / replay /
+    # MIS / fault tolerance / routing replay / deterministic mode with NCCL ring / FP8 blockwise
+    # training with BF16 / MTP speculative decoding with EAGLE). Environment variables for sglang
+    # and aiter are set. Finally calls the backend execute with the model type and the prepare
+    # command mapping. Mutates args when a debug train run id is set without a rollout id (sets 1).
     U = args.create_backend()
     print(f"[precision] fp8_training={args.fp8_training}")
     print(
@@ -532,6 +604,7 @@ def _train(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def train(args: ScriptArgs):
+    # [FUNCTION DOC] CLI command: run training only via the private train helper.
     """Run training. Assumes data/model/torch_dist are already prepared on {model_local_dir}."""
     _train(args)
 
@@ -539,6 +612,9 @@ def train(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def full_train(args: ScriptArgs):
+    # [FUNCTION DOC] CLI command: download; cast to BF16 unless the BF16 dir already has its
+    # safetensors index file; convert to torch_dist unless the latest-iteration marker exists;
+    # default hf_checkpoint to local model dir / model name (mutating args); then train.
     _prepare_download(args)
 
     bf16_dir = Path(f"{args.model_dir}/{args.bf16_name}")

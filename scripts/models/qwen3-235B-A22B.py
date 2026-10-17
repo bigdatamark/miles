@@ -1,3 +1,7 @@
+# [MODULE DOC] HELPER: Megatron model-argument definition for Qwen3 235B-A22B (MoE): 94 layers (all
+# MoE; module constants), hidden 4096, 64 heads with 4 query groups and key-value channels 128, QK
+# layer norm, 128 experts of width 1536 with top-8 softmax routing, untied embeddings, vocabulary
+# 151936. Import has no side effects.
 import os
 
 from model_args_utils import moe_layer_freq
@@ -8,6 +12,11 @@ FIRST_K_DENSE_REPLACE = 0
 
 
 def model_args(rotary_base: str | None = None) -> str:
+    # [FUNCTION DOC] HELPER: return the flag string. Rotary base (string): argument, else the
+    # environment variable MODEL_ARGS_ROTARY_BASE if set and nonempty, else "1000000". Reads the
+    # environment at call time.
+    # KNOWN ISSUE: the layer count flag is a literal 94 while the MoE frequency pattern uses the
+    # NLAYERS constant, so the two could drift apart.
     rotary_base = rotary_base if rotary_base is not None else os.environ.get("MODEL_ARGS_ROTARY_BASE") or "1000000"
     return (
         "--disable-bias-linear "

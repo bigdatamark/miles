@@ -1,3 +1,9 @@
+# [MODULE DOC] AMD launcher for GRPO training of Qwen3-30B-A3B on MI300X-class and MI350X-class
+# GPUs (single typer entry that runs prepare then execute). Supports optional FP8 rollout
+# checkpoint, FP8 blockwise training, Megatron-Bridge loading instead of checkpoint conversion,
+# and optional train/infer mismatch correction through a generated config. Only 1 or 2 nodes on
+# the supported hardware list have a parallel layout (TP 1, PP 2, CP 2, EP 4 with optimizer CPU
+# offload); other combinations raise not-implemented error.
 from dataclasses import dataclass
 from typing import Literal
 
@@ -8,6 +14,11 @@ from miles.utils.external_utils import command_utils
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC] Configuration: mode (normal or debug_minimal), model name and Megatron type,
+    # optional GPU count (default from hardware), hardware (auto-detected by default), eval toggle,
+    # extra args, directories, FP8 rollout / training toggles, Megatron-Bridge toggle, train/infer
+    # mismatch (MIS) toggle and whether it also uses rejection sampling (default true). The run id
+    # default is computed once at import time.
     mode: Literal["normal", "debug_minimal"] = "normal"
     run_id: str = command_utils.create_run_id()
     model_name: str = "Qwen3-30B-A3B"
@@ -27,11 +38,17 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     tis_use_rs: bool = True
 
     def __post_init__(self):
+        # [FUNCTION DOC] Resolve the hardware name (auto-detect) and default the GPU count to the
+        # hardware's standard count when not given.
         self.hardware = command_utils.resolve_hardware(self)
         self.num_gpus_per_node = self.num_gpus_per_node or command_utils.NUM_GPUS_OF_HARDWARE[self.hardware]
 
 
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Public entrypoint. Creates model and data dirs, downloads the HF model, the
+    # dapo math and aime 2024 datasets, the FP8 model variant when FP8 rollout is on, and, unless
+    # Megatron-Bridge is used, converts the HF checkpoint into a torch_dist checkpoint in the model
+    # dir (shared folder for multi-node use).
     U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.model_dir} {args.data_dir}")
     U.exec_command_cpu(f"hf download Qwen/{args.model_name} --local-dir {args.model_dir}/{args.model_name}")
@@ -57,6 +74,18 @@ def prepare(args: ScriptArgs):
 
 # TODO improve layering: split algorithm vs infra
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Public entrypoint: assemble and submit training. Checkpoint: reference load is
+    # the HF dir (bridge mode) or the torch_dist dir; load / save under output dir / run id; save
+    # interval 2 in debug else 20; HF checkpoint is the FP8 variant if FP8 rollout. Rollout: dapo
+    # math, deepscaler reward, 3000 rollouts, batch 32 by 8 samples, response length 100 (debug) or
+    # 8192, global batch 256, balanced data. Eval (non-debug and enabled): aime 2024, 16 samples,
+    # every 20. Perf: full uniform recompute, dynamic batch size. GRPO with KL loss at coefficient 0,
+    # clip 0.2 / 0.28. Adam lr 1e-6. Misc: dropout off, fp32 grad all-reduce, flash attention,
+    # colocate, fault tolerance, dump details; FP8 training adds Transformer Engine blockwise FP8
+    # flags and env vars; bridge adds the bridge conversion mode. Hardware / node match chooses the
+    # parallel layout and sglang settings (2 GPUs per engine, memory fraction 0.7, 512 requests)
+    # or raises not-implemented error. MIS writes an inline config (truncated token-level importance
+    # sampling bounds 0.5 to 2.0, optional rejection sampling) passed as a pseudo-file.
     U = args.create_backend()
     ref_load_path = (
         f"{args.model_dir}/{args.model_name}/"
@@ -234,6 +263,7 @@ tis_batch_normalize: true
 
 @command_utils.dataclass_cli
 def main(args: ScriptArgs):
+    # [FUNCTION DOC] CLI entry: prepare, then execute.
     prepare(args)
     execute(args)
 

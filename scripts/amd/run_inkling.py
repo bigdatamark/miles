@@ -1,3 +1,9 @@
+# [MODULE DOC] ROCm launcher for GRPO training on truncated Inkling-Small slices (4 or 6 layers)
+# on one node, with typer commands train, prepare-cp (rsync the shared torch_dist checkpoint to a
+# node-local directory) and full-train. The layer count is parsed from the model name and exported
+# to the model-definition script through an environment variable at argument construction time.
+# Optimizer state and weights are offloaded to disk during training. Argument groups are assembled
+# as strings and submitted through the backend.
 """
 Inkling training script for ROCm (Inkling-Small layer slices).
 
@@ -40,12 +46,21 @@ _MODEL_REGISTRY = {
 
 
 def _slice_num_layers(model_name: str) -> int | None:
+    # [FUNCTION DOC] HELPER: the integer N if the name ends with dash N layer, else none.
     match = re.search(r"-(\d+)layer$", model_name)
     return int(match.group(1)) if match else None
 
 
 @dataclass
 class ScriptArgs(U.ExecuteTrainConfig):
+    # [CLASS DOC] Configuration: model name (4 or 6 layer slice), train mode and task (single
+    # choices), eval toggle (off), rollout sizes (100 rollouts, 32 prompts by 8 samples, global batch
+    # 64, 4096 response tokens), checkpoint paths (HF checkpoint, shared torch_dist, node-local
+    # torch_dist), directories, optional save dir, GPUs per node (4), engine size (4), learning rate
+    # (default 1e-6), sglang context length 8192, train offload dir, routing replay toggle, extra
+    # args. Derived fields: colocate (always true), actor node and GPU counts.
+    # KNOWN ISSUE: train_mode and task are single-value literals that are only printed; the run id
+    # default is computed at import time.
     run_id: str = U.create_run_id()
     model_name: Literal["Inkling-Small-4layer", "Inkling-Small-6layer"] = "Inkling-Small-4layer"
 
@@ -80,6 +95,10 @@ class ScriptArgs(U.ExecuteTrainConfig):
     extra_args: str = ""
 
     def __post_init__(self):
+        # [FUNCTION DOC] Side effect: sets the process environment variable for the model-args layer
+        # count from the model name. Fills defaults: HF checkpoint at model dir / name; torch_dist at
+        # model dir / name plus _torch_dist; local torch_dist equals torch_dist; lr 1e-6. Sets
+        # colocate true, actor nodes equal to total nodes, actor GPUs per node equal to GPUs per node.
         if (num_layers := _slice_num_layers(self.model_name)) is not None:
             os.environ["MODEL_ARGS_NUM_LAYERS"] = str(num_layers)
         if self.hf_checkpoint is None:
@@ -96,6 +115,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
 
 
 def _get_parallel_config(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: for sliced models on a single actor node returns TP 4 with sequence
+    # parallel, PP 1, EP 4, expert TP 1 (regardless of the GPU count). Otherwise raises
+    # not-implemented error naming the total GPU count.
     """Return parallel config args for tested GPU configurations.
 
     Only includes configurations that have been verified to work.
@@ -119,6 +141,17 @@ def _get_parallel_config(args: ScriptArgs) -> str:
 
 
 def _train(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: assemble and submit training. Checkpoint: loads from the node-local
+    # torch_dist, raw megatron-to-HF mode, no optimizer / RNG load, finetune; saves under save dir /
+    # run id every 10 steps if a save dir is set. Rollout: dapo math, math reward, temperature 1,
+    # balanced data; optional aime25 eval every 5 rollouts. GRPO with clip 0.2 / 0.28 / 3.0, no
+    # entropy bonus, truncated importance sampling, optional routing replay. Adam lr from args,
+    # distributed optimizer, fp32 grad all-reduce, no NaN check, training state offloaded to disk
+    # dir. Perf: parallel config plus full uniform recompute, micro batch 1. Sglang: engine size,
+    # memory fraction 0.6, 64 running requests, 327680 max tokens, triton backends, extra-buffer
+    # mamba radix cache, multimodal, context length, custom all-reduce disabled. Misc: Transformer
+    # Engine, bf16, dropout off, colocate. Environment variables for sglang, ray monitor and NCCL
+    # are set. Submits with the registry's model type name.
     backend = args.create_backend()
     print(
         f"running {args.model_name} {args.train_mode}/{args.task} on "
@@ -258,10 +291,13 @@ def _train(args: ScriptArgs):
 @app.command()
 @U.dataclass_cli
 def train(args: ScriptArgs):
+    # [FUNCTION DOC] CLI command: training on pre-staged checkpoints.
     _train(args)
 
 
 def _prepare_cp(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: run the rsync command copying the shared torch_dist to the node-local
+    # path on every node (multi-node execution).
     args.create_backend().exec_command_multi_node(
         U.rsync_cmd(path_src=args.torch_dist, path_dst=args.torch_dist_local)
     )
@@ -270,6 +306,7 @@ def _prepare_cp(args: ScriptArgs):
 @app.command()
 @U.dataclass_cli
 def prepare_cp(args: ScriptArgs):
+    # [FUNCTION DOC] CLI command wrapper around the private copy helper.
     """Copy the shared torch_dist checkpoint to node-local NVMe (torch_dist_local)."""
     _prepare_cp(args)
 
@@ -277,6 +314,8 @@ def prepare_cp(args: ScriptArgs):
 @app.command()
 @U.dataclass_cli
 def full_train(args: ScriptArgs):
+    # [FUNCTION DOC] CLI command: copy the checkpoint to the local path only when it differs from
+    # the shared one, then train.
     if args.torch_dist_local != args.torch_dist:
         _prepare_cp(args)
     _train(args)

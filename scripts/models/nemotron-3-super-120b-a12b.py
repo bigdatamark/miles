@@ -1,4 +1,13 @@
+# [MODULE DOC] HELPER: Megatron model-argument definition for Nemotron-3 Super 120B-A12B (hybrid
+# Mamba / attention / MoE): 88 layers, hidden 4096, 32 heads with 2 query groups, no position
+# embedding, 512 experts of width 2688 with top-22 sigmoid routing scaled by 5.0, shared expert
+# 5376, expert input/output bottlenecked through a latent of size 1024 (supplied to the model by
+# the bridge from the HF config; the flag here is for the argument parser), vocabulary 131072,
+# untied embeddings. Import has no side effects.
 def model_args() -> str:
+    # [FUNCTION DOC] HELPER: return the constant flag string (no parameters, no environment use).
+    # Routing is a single expert group (group-limited routing is a no-op) with sequence auxiliary
+    # loss type but coefficient zero and no bias update, matching the Nano 30B settings.
     return (
         "--disable-bias-linear "
         "--group-query-attention "

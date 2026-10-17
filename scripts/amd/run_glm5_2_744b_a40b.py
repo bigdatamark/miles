@@ -1,3 +1,7 @@
+# [MODULE DOC] ROCm launcher for GLM-5.2 pruned slices (default 5 layers: 3 dense plus 2 MoE) on
+# a single node, with typer commands full-train, prepare (download, validate, optional FP8
+# conversion, Megatron conversion) and train. Training args are grouped strings submitted through
+# the shared command utilities; sglang uses the NSA / tilelang DSA attention backends.
 """
 GLM-5.2 training script for ROCm (GLM-5.2 5-layer slice).
 
@@ -31,6 +35,12 @@ app = typer.Typer()
 
 @dataclass
 class ScriptArgs(U.ExecuteTrainConfig):
+    # [CLASS DOC] Configuration: mode, run id, HF org (default Pinaster) and model name (must
+    # contain the layer count, e.g. a 5layer name), Megatron model type (overwritten from the name),
+    # GPUs per node (default 4), FP8 rollout and DeepEP options, optional optimizer CPU offload,
+    # rollout sizes, global batch size, extra args and directories.
+    # KNOWN ISSUE: the megatron_model_type field default is always overridden in the post-init, so
+    # passing it on the command line has no effect; run_id default is computed at import time.
     mode: Literal["normal", "debug_minimal"] = "normal"
     run_id: str = U.create_run_id()
     model_org: str = "Pinaster"
@@ -51,6 +61,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
     megatron_path: str = "/root/Megatron-LM"
 
     def __post_init__(self):
+        # [FUNCTION DOC] Forces debug_minimal mode on a single node. Extracts the layer count from
+        # the model name (digits before the word layer) and sets the Megatron model type to the
+        # 5.2 744B pattern with that count; raises not-implemented error if the name has none.
         if self.num_nodes == 1:
             self.mode = "debug_minimal"
 
@@ -61,6 +74,10 @@ class ScriptArgs(U.ExecuteTrainConfig):
 
 
 def _validate_glm_checkpoint(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: read the model's config.json (file-not-found error if missing) and
+    # require model type glm_moe_dsa, the single architecture GlmMoeDsaForCausalLM and a hidden
+    # layer count equal to the number in the model name (not-implemented error if the name has no
+    # count); also forbids an auto_map entry. Raises runtime errors with explanatory messages.
     """Validate the basic native GLM-5.2 config fields."""
     config_path = Path(args.model_dir) / args.model_name / "config.json"
     if not config_path.exists():
@@ -89,6 +106,9 @@ def _validate_glm_checkpoint(args: ScriptArgs):
 
 
 def _convert_to_fp8(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: skip (printing a notice) if the destination (model dir / name plus
+    # _fp8) already has a safetensors index; otherwise run the repo's conversion tool on a GPU with
+    # block strategy, 128 by 128 blocks and 16 workers.
     """Convert HF checkpoint to FP8 (block quantization). Megatron still uses bf16."""
     src = f"{args.model_dir}/{args.model_name}"
     dst = f"{args.model_dir}/{args.model_name}_fp8"
@@ -105,6 +125,8 @@ def _convert_to_fp8(args: ScriptArgs):
 
 
 def _prepare_download(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: create model and data dirs, download the HF model from the org and
+    # download the dapo math 17k dataset.
     backend = args.create_backend()
     backend.exec_command_cpu(f"mkdir -p {args.model_dir} {args.data_dir}")
     backend.exec_command_cpu(
@@ -114,6 +136,9 @@ def _prepare_download(args: ScriptArgs):
 
 
 def _prepare_megatron_ckpt(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: convert the HF checkpoint to Megatron format on one GPU, single node,
+    # with TP, EP and PP all 1 (EP 1 holds all experts; PP 1 keeps the one stage starting on a
+    # computing layer because cross-layer index sharing forbids starting on a skip layer).
     # Pruned model converts on a single GPU: EP=1 holds all experts, and PP=1 keeps
     # the one pipeline stage starting on a computing layer (DSA cross-layer index
     # sharing forbids a stage starting on a skip layer). nproc=1 also avoids the
@@ -139,6 +164,17 @@ def _prepare_megatron_ckpt(args: ScriptArgs):
 
 
 def _execute_train(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: assemble and submit the training args. Checkpoint: HF path (the fp8
+    # copy when fp8 rollout), ref-load from the torch_dist dir, load / save under output dir / run
+    # id, save interval 20. Rollout: dapo math, deepscaler reward, response length 100 in debug mode
+    # else 32768, temperature 1. Perf: TP 4 with sequence parallel, PP 1, CP 1, EP = GPUs per node,
+    # expert TP 1, full uniform recompute, dynamic batch size at 2048 tokens per GPU. GRPO with
+    # truncated importance sampling (clip 0.5 to 2.0). Adam lr 1e-6, optional CPU offload. Sglang:
+    # engine size min(8, GPUs), memory fraction 0.70, EP equal to engine size, consistent-hashing
+    # router, optional mori all-to-all with fp8 rollout and DeepEP, fp8 KV cache, tilelang DSA
+    # backends, NSA attention, page size 64, decode CUDA-graph batch 32, 512 running requests.
+    # Misc: dropout off, fp32 grad all-reduce, flash attention backend, allgather-cp, colocate,
+    # alltoall MoE dispatcher. Environment: forces MLA in the NSA path and non-neox indexer rope.
     load_save_path = f"{args.output_dir}/{args.run_id}/checkpoints"
     hf_name = f"{args.model_name}_fp8" if args.fp8_rollout else args.model_name
     ckpt_args = (
@@ -285,6 +321,8 @@ def _execute_train(args: ScriptArgs):
 @app.command()
 @U.dataclass_cli
 def full_train(args: ScriptArgs):
+    # [FUNCTION DOC] CLI command: download, validate the config, FP8-convert if fp8 rollout,
+    # convert to Megatron, train.
     """Full pipeline: download, convert, train."""
     _prepare_download(args)
     _validate_glm_checkpoint(args)
@@ -297,6 +335,7 @@ def full_train(args: ScriptArgs):
 @app.command()
 @U.dataclass_cli
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] CLI command: the preparation half of full-train (no training).
     """Download model/data and convert to megatron checkpoint."""
     _prepare_download(args)
     _validate_glm_checkpoint(args)
@@ -308,12 +347,15 @@ def prepare(args: ScriptArgs):
 @app.command()
 @U.dataclass_cli
 def train(args: ScriptArgs):
+    # [FUNCTION DOC] CLI command: only the training submission.
     """Run training only (assumes data is prepared)."""
     _execute_train(args)
 
 
 @app.callback()
 def _callback() -> None:
+    # [FUNCTION DOC] HELPER: empty typer callback; its presence keeps the command group explicit
+    # (subcommand names required) even though only a few commands exist.
     pass
 
 

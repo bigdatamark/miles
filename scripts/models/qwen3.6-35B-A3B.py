@@ -1,3 +1,8 @@
+# [MODULE DOC] HELPER: Megatron model-argument definition for Qwen3.6 35B-A3B (hybrid linear /
+# full attention MoE, same architecture as Qwen3.5 35B-A3B): 40 layers (all MoE), hidden 2048, 16
+# heads with 2 query groups, 256 experts of width 512 with top-8 softmax routing and a gated
+# shared expert, attention output gate, one multi-token-prediction layer, Qwen3.5 spec plugin.
+# Import has no side effects.
 from model_args_utils import moe_layer_freq
 
 
@@ -6,6 +11,10 @@ FIRST_K_DENSE_REPLACE = 0
 
 
 def model_args() -> str:
+    # [FUNCTION DOC] HELPER: return the constant flag string (no parameters, no environment use).
+    # KNOWN ISSUE: the flag text is identical to the qwen3.5-35B-A3B definition (apart from a
+    # comment), and the layer count flag is a literal 40 while the MoE frequency pattern uses the
+    # NLAYERS constant.
     return (
         "--spec miles_plugins.models.qwen3_5 get_qwen3_5_spec "
         "--disable-bias-linear "

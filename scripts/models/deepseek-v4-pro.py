@@ -1,3 +1,9 @@
+# [MODULE DOC] HELPER: Megatron model-argument definition for DeepSeek-V4-Pro (61 layers by
+# default; hidden 7168, 128 heads, 384 routed experts with top-6 square-root-softplus routing and
+# scaling 2.5, 4 residual streams, output groups 16, DSA indexer top-k 1024). Module constants:
+# the per-layer compression-ratio list (starts 128, 128, then alternates 4 and 128, last layer 0)
+# and the extra SwiGLU clamp flags (clamp value 10, no fused bias SwiGLU, no clamp on the shared
+# expert). Import has no side effects.
 import os
 
 from model_args_utils import moe_layer_freq
@@ -10,6 +16,11 @@ SWIGLU_LIMIT_ARGS = "--activation-func-clamp-value 10 --no-bias-swiglu-fusion --
 def model_args(
     nlayers: int | None = None, rotary_scaling_factor: str | None = None, compress_ratios: str = COMPRESS_RATIOS
 ) -> str:
+    # [FUNCTION DOC] HELPER: return the flag string. Layer count: argument, else environment
+    # variable MODEL_ARGS_NUM_LAYERS if set and nonempty, else 61. Rotary scaling factor: argument,
+    # else environment variable ROTARY_SCALING_FACTOR if set and nonempty, else "16". The
+    # compression ratio list is embedded as given. All layers are MoE; three hash-routed MoE layers;
+    # custom V4 spec plugin; SwiGLU clamp flags appended. Reads the environment at call time.
     nlayers = nlayers if nlayers is not None else int(os.environ.get("MODEL_ARGS_NUM_LAYERS") or 61)
     rotary_scaling_factor = (
         rotary_scaling_factor if rotary_scaling_factor is not None else os.environ.get("ROTARY_SCALING_FACTOR") or "16"

@@ -1,4 +1,12 @@
+# [MODULE DOC] HELPER: Megatron model-argument definition for Nemotron-3 Nano 30B-A3B (MoE): 52
+# layers, hidden 2688, 32 heads with 2 query groups, no position embedding, 128 experts of width
+# 1856 with top-6 sigmoid routing scaled by 2.5 and a shared expert of 3712, vocabulary 131072,
+# untied embeddings. Import has no side effects.
 def model_args() -> str:
+    # [FUNCTION DOC] HELPER: return the constant flag string (no parameters, no environment use).
+    # Routing is configured as a single expert group (group-limited routing is a no-op), with
+    # sequence auxiliary loss type but coefficient zero and no bias update, to match the known-good
+    # GLM-4.7 Flash settings.
     return (
         "--disable-bias-linear "
         "--group-query-attention "

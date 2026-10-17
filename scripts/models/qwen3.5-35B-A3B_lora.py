@@ -1,3 +1,9 @@
+# [MODULE DOC] HELPER: Megatron model-argument definition used for Qwen3.5 35B-A3B LoRA runs
+# (hybrid linear / full attention MoE, 40 layers, all MoE, 256 experts with top-8 softmax routing,
+# gated shared expert, one multi-token-prediction layer, Qwen3.5 spec plugin). Import has no side
+# effects.
+# KNOWN ISSUE: the content is a verbatim copy of the qwen3.5-35B-A3B definition rather than a
+# derivation through the sibling loader, and contains no LoRA-specific flag.
 from model_args_utils import moe_layer_freq
 
 
@@ -6,6 +12,8 @@ FIRST_K_DENSE_REPLACE = 0
 
 
 def model_args() -> str:
+    # [FUNCTION DOC] HELPER: return the constant flag string (no parameters, no environment use).
+    # The layer count flag is a literal 40 while the MoE frequency pattern uses the NLAYERS constant.
     return (
         "--spec miles_plugins.models.qwen3_5 get_qwen3_5_spec "
         "--disable-bias-linear "

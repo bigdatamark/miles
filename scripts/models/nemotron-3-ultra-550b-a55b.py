@@ -1,3 +1,8 @@
+# [MODULE DOC] HELPER: Megatron model-argument definition for Nemotron-3 Ultra 550B-A55B (hybrid
+# Mamba2 / attention / MoE, 108 layers): hidden 8192, 64 heads with 2 query groups, no position
+# embedding, 512 experts of width 5120 with top-22 sigmoid routing scaled by 5.0, shared expert
+# 10240, expert latent size 2048, vocabulary 131072, untied embeddings. Loaded through the bridge
+# mode; Mamba groups of 8 limit tensor parallelism to at most 8. Import has no side effects.
 # NVIDIA Nemotron-3-Ultra-550B-A55B (BF16, MoE nemotron_h = hybrid Mamba2 + Attention + MoE).
 # HF config:
 #   num_hidden_layers=108  hidden_size=8192  num_attention_heads=64  num_key_value_heads=2
@@ -12,6 +17,7 @@
 
 
 def model_args() -> str:
+    # [FUNCTION DOC] HELPER: return the constant flag string (no parameters, no environment use).
     return (
         "--disable-bias-linear "
         "--group-query-attention "

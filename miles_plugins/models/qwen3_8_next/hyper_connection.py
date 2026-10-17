@@ -281,6 +281,8 @@ class Qwen38NextPLEHyperConnection(Qwen38NextHyperConnection):
         output_slot=None,
     ) -> tuple[Tensor, Tensor | None, Tensor, Tensor]:
         # [FUNCTION DOC] Resolve the PLE batch, add the PLE increment to the hidden states (with
+        # the all-gather / local-slice dance when sequence parallelism is enabled and TP size > 1;
+        # the gather does not TP-reduce its output gradient), then delegate to
         # the all-gather / local-slice dance when sequence parallelism is enabled and TP size > 1,
         # without gradient to the gathered input's output grad being TP-reduced), then delegate to
         # the base read step with the same recompute manager and output slot arguments (which will

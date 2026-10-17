@@ -1,3 +1,9 @@
+# [MODULE DOC] HELPER: Megatron model-argument definition used for GLM-5.2 744B-A40B LoRA runs:
+# 3 dense layers plus a configurable number of MoE layers (default 75), hidden 6144, 64 heads,
+# multi-latent attention, 256 routed experts, GLM-5 spec plugin, rotary base 8,000,000. Import has
+# no side effects.
+# KNOWN ISSUE: the content is a verbatim copy of the glm5.2-744B-A40B definition rather than a
+# derivation of it through the sibling loader, and contains no LoRA-specific flag.
 MOE_ROUTED_EXPERTS = 256
 MOE_ACTIVE_ROUTED_EXPERTS = 8
 MOE_SHARED_EXPERTS = 1
@@ -10,6 +16,8 @@ NHEADS = 64
 
 
 def model_args(n_moe_layers: int = 75) -> str:
+    # [FUNCTION DOC] HELPER: return the flag string for the given number of MoE layers (default
+    # 75); total layers is 3 plus that number, MoE frequency is 3 zeros then that many ones.
     return (
         "--spec miles_plugins.models.glm5.glm5 get_glm5_spec "
         f"--moe-layer-freq [0]*{N_DENSE_LAYERS}+[1]*{n_moe_layers} "

@@ -1,4 +1,9 @@
+# [MODULE DOC] HELPER: Megatron model-argument definition for MiMo-7B-RL (dense): 36 layers,
+# hidden 4096, FFN 11008, 32 heads with 8 query groups, QKV bias, rotary base 640000, maximum
+# positions 32768, vocabulary 151680, untied embeddings, one multi-token-prediction layer. Import
+# has no side effects.
 def model_args() -> str:
+    # [FUNCTION DOC] HELPER: return the constant flag string (no parameters, no environment use).
     return (
         "--swiglu "
         "--num-layers 36 "

@@ -1,4 +1,9 @@
+# [MODULE DOC] HELPER: Megatron model-argument definition for Gemma-4 31B instruct (dense): 60
+# layers, hidden 5376, FFN 21504, 32 attention heads with 16 query groups and key-value channels
+# 256, tied embeddings (untie flag deliberately omitted), vocabulary 262144, rotary base 1,000,000.
+# Import has no side effects.
 def model_args() -> str:
+    # [FUNCTION DOC] HELPER: return the constant flag string (no parameters, no environment use).
     return (
         "--disable-bias-linear "
         "--group-query-attention "

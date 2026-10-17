@@ -1,9 +1,18 @@
+# [MODULE DOC] HELPER: Megatron model-argument definition for DeepSeek-V3.2 (61 layers by default):
+# same geometry as DeepSeek-V3 (hidden 7168, 128 heads, MLA, 256 experts, top-8 sigmoid routing)
+# but built with the GLM-5 custom layer spec plugin. Import has no side effects.
 import os
 
 from model_args_utils import moe_layer_freq
 
 
 def model_args(nlayers: int | None = None, first_k_dense_replace: int | None = None) -> str:
+    # [FUNCTION DOC] HELPER: return the flag string. Layer count: argument, else environment
+    # variable MODEL_ARGS_NUM_LAYERS if set and nonempty, else 61. Leading dense layer count:
+    # argument, else MODEL_ARGS_FIRST_K_DENSE_REPLACE if set and nonempty, else 3. Both are embedded
+    # (the second via the MoE layer-frequency pattern). Reads the environment at call time.
+    # KNOWN ISSUE: the spec flag points at the GLM-5 plugin spec function even though this is
+    # the DeepSeek-V3.2 definition (likely intentional reuse of the shared DSA implementation).
     nlayers = nlayers if nlayers is not None else int(os.environ.get("MODEL_ARGS_NUM_LAYERS") or 61)
     first_k_dense_replace = (
         first_k_dense_replace

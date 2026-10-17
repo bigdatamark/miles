@@ -1,3 +1,7 @@
+# [MODULE DOC] HELPER: Megatron model-argument definition for Qwen3 30B-A3B (MoE, 48 layers by
+# default, all layers MoE): hidden 2048, 32 heads with 4 query groups and key-value channels 128,
+# QK layer norm, 128 experts of width 768 with top-8 softmax routing, untied embeddings,
+# vocabulary 151936. Truncated variants load this file as a sibling. Import has no side effects.
 import os
 
 from model_args_utils import moe_layer_freq
@@ -7,6 +11,10 @@ FIRST_K_DENSE_REPLACE = 0
 
 
 def model_args(nlayers: int | None = None, rotary_base: str | None = None) -> str:
+    # [FUNCTION DOC] HELPER: return the flag string. Layer count: argument, else environment
+    # variable MODEL_ARGS_NUM_LAYERS if set and nonempty, else 48. Rotary base (string): argument,
+    # else MODEL_ARGS_ROTARY_BASE if set and nonempty, else "1000000". Reads the environment at
+    # call time.
     nlayers = nlayers if nlayers is not None else int(os.environ.get("MODEL_ARGS_NUM_LAYERS") or 48)
     rotary_base = rotary_base if rotary_base is not None else os.environ.get("MODEL_ARGS_ROTARY_BASE") or "1000000"
     return (

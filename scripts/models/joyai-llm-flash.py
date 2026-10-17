@@ -1,3 +1,8 @@
+# [MODULE DOC] HELPER: Megatron model-argument definition for JoyAI LLM Flash (MoE with
+# multi-latent attention, 40 layers by default, first layer dense): hidden 2048, 32 heads, query
+# LoRA rank 1536, key-value LoRA rank 512, 256 routed experts of width 768 with top-8 sigmoid
+# routing scaled by 2.5, shared expert, vocabulary 129280. The module constant gives the leading
+# dense layer count (1). Import has no side effects.
 import os
 
 from model_args_utils import moe_layer_freq
@@ -7,6 +12,10 @@ FIRST_K_DENSE_REPLACE = 1
 
 
 def model_args(nlayers: int | None = None, rotary_base: str | None = None) -> str:
+    # [FUNCTION DOC] HELPER: return the flag string. Layer count: argument, else environment
+    # variable MODEL_ARGS_NUM_LAYERS if set and nonempty, else 40. Rotary base (string): argument,
+    # else environment variable MODEL_ARGS_ROTARY_BASE if set and nonempty, else "32000000".
+    # Reads the environment at call time.
     nlayers = nlayers if nlayers is not None else int(os.environ.get("MODEL_ARGS_NUM_LAYERS") or 40)
     rotary_base = rotary_base if rotary_base is not None else os.environ.get("MODEL_ARGS_ROTARY_BASE") or "32000000"
     return (

@@ -1,4 +1,9 @@
+# [MODULE DOC] HELPER: Megatron model-argument definition for Llama-3.1 8B Instruct (dense): 32
+# layers, hidden 4096, FFN 14336, 32 heads with 8 query groups, rotary base 500000 with rope
+# scaling factor 8, maximum positions 131072, vocabulary 128256, untied embeddings. Import has no
+# side effects.
 def model_args() -> str:
+    # [FUNCTION DOC] HELPER: return the constant flag string (no parameters, no environment use).
     return (
         "--swiglu "
         "--num-layers 32 "

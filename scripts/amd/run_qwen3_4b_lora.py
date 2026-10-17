@@ -1,3 +1,8 @@
+# [MODULE DOC] ROCm launcher for GRPO LoRA training of Qwen3-4B, loading the HF checkpoint through
+# Megatron-Bridge (no conversion). Typer commands prepare (download model, dapo math, and aime 2024
+# when eval is on), train, full-train. Rollout engines run one per GPU with Triton attention and
+# LoRA backends; training is colocated. Argument groups (checkpoint, LoRA, rollout, eval,
+# optimizer, GRPO, W&B, sglang, misc) are strings submitted via the backend.
 """Qwen3-4B GRPO LoRA training script for AMD (MI300X / MI325X / MI350X / MI355X).
 
 This is the AMD counterpart of
@@ -39,6 +44,11 @@ _HF_REPO = "Qwen/Qwen3-4B"
 
 @dataclass
 class ScriptArgs(U.ExecuteTrainConfig):
+    # [CLASS DOC] Configuration: model and Megatron type, hardware (auto-detected by default),
+    # optional GPU count, directories, save interval 50, LoRA settings (rank 64, alpha 32, dropout
+    # 0, all linear layers, CPU backup of base weights), rollout sizes (100 rollouts, 8 by 8
+    # samples, 8192 tokens, global batch 64), lr 2e-5, one GPU per engine, sglang memory fraction
+    # 0.4, eval / W&B toggles and team, extra args. Run id default is computed at import time.
     run_id: str = U.create_run_id()
     model_name: str = "Qwen3-4B"
     megatron_model_type: str = "qwen3-4B"
@@ -76,6 +86,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
 
 
 def _set_rocm_environment() -> None:
+    # [FUNCTION DOC] HELPER: set defaults for the Ray no-blanking variables and NVLS-disable in the
+    # process environment; copy HIP_VISIBLE_DEVICES over CUDA_VISIBLE_DEVICES when set.
     """Preserve the caller's ROCm device selection through Ray startup."""
     os.environ.setdefault("RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES", "1")
     os.environ.setdefault("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", "1")
@@ -86,12 +98,16 @@ def _set_rocm_environment() -> None:
 
 
 def _resolve_num_gpus(args: ScriptArgs) -> tuple[str, int]:
+    # [FUNCTION DOC] HELPER: return (hardware name, GPU count) using the override if given else the
+    # hardware default.
     hardware = U.resolve_hardware(args)
     num_gpus = args.num_gpus_per_node or U.NUM_GPUS_OF_HARDWARE[hardware]
     return hardware, num_gpus
 
 
 def _download_inputs(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] HELPER: create dirs; download the HF Qwen3-4B model, dapo math dataset, and
+    # aime 2024 only when eval is enabled.
     backend = args.create_backend()
     backend.exec_command_cpu(f"mkdir -p {args.model_dir} {args.data_dir}")
     backend.exec_command_cpu(f"hf download {_HF_REPO} --local-dir {args.model_dir}/{args.model_name}")
@@ -101,6 +117,8 @@ def _download_inputs(args: ScriptArgs) -> None:
 
 
 def _get_wandb_args(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: empty when W&B is off; else default W&B flags plus a quoted team flag
+    # when a team is given and the defaults are non-empty.
     if not args.enable_wandb:
         return ""
     wandb_args = U.get_default_wandb_args(__file__, run_id=args.run_id)
@@ -110,6 +128,12 @@ def _get_wandb_args(args: ScriptArgs) -> str:
 
 
 def _execute(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] HELPER: set ROCm environment, resolve GPUs, and submit. Checkpoint: HF dir,
+    # bridge mode, save under output dir / run id every save-interval steps (no load path). LoRA
+    # flags; rollout (dapo math, deepscaler reward, temperature 1); optional aime24 eval every 20
+    # with 16 samples; Adam; GRPO with zero KL and entropy coefficients and clip 0.2 / 0.28; sglang
+    # (engine size, memory fraction, chunked prefill 4096, Triton LoRA and attention backends);
+    # misc (Megatron backend, dropout off, fp32 grad all-reduce, per-token loss, colocate).
     _set_rocm_environment()
     hardware, num_gpus = _resolve_num_gpus(args)
     print(f"[run] Qwen3-4B LoRA on {hardware}: {num_gpus} GPUs, rollout TP=1")
@@ -222,6 +246,7 @@ def _execute(args: ScriptArgs) -> None:
 @app.command()
 @U.dataclass_cli
 def prepare(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] CLI command: download inputs.
     """Download Qwen3-4B and the configured training/evaluation datasets."""
     _download_inputs(args)
 
@@ -229,6 +254,7 @@ def prepare(args: ScriptArgs) -> None:
 @app.command()
 @U.dataclass_cli
 def train(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] CLI command: training only.
     """Run GRPO LoRA training using inputs already present on the node."""
     _execute(args)
 
@@ -236,6 +262,7 @@ def train(args: ScriptArgs) -> None:
 @app.command()
 @U.dataclass_cli
 def full_train(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] CLI command: download then train.
     """Download the inputs and run GRPO LoRA training."""
     _download_inputs(args)
     _execute(args)
@@ -243,6 +270,7 @@ def full_train(args: ScriptArgs) -> None:
 
 @app.callback()
 def _callback() -> None:
+    # [FUNCTION DOC] HELPER: empty typer callback keeping the command group explicit.
     pass
 
 

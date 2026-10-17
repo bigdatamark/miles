@@ -1,7 +1,15 @@
+# [MODULE DOC] HELPER: Megatron model-argument definition for the full Inkling model (66 layers by
+# default): hidden 6144, 64 heads with 8 query groups, key-value channels 128, no position
+# embedding, maximum positions 1,048,576, 256 experts with top-6 sigmoid routing and expert width
+# 3072, shared expert, QK layer norm, vocabulary 201024, and the Inkling custom model provider.
+# Import has no side effects.
 import os
 
 
 def model_args(nlayers: int | None = None) -> str:
+    # [FUNCTION DOC] HELPER: return the flag string. Layer count: argument, else environment
+    # variable MODEL_ARGS_NUM_LAYERS if set and nonempty, else 66 (set to 4 for the 4-layer slice).
+    # Reads the environment at call time.
     # Inkling config (66L full model; set MODEL_ARGS_NUM_LAYERS=4 for the 4-layer slice)
     nlayers = nlayers if nlayers is not None else int(os.environ.get("MODEL_ARGS_NUM_LAYERS") or 66)
     return (
