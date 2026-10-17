@@ -1,3 +1,16 @@
+# [MODULE DOC] Triton backward kernels for sglang-style fused MoE grouped matrix products, plus the
+# host launcher invoke_fused_moe_backward_kernel. The forward being differentiated is, for every
+# (token, selected expert) pair p: output[p] = input_row(p) times weight[expert(p)] transposed,
+# optionally multiplied by the pair's routing weight. Input row(p) is the token (pair index divided
+# by top-k) for the gate/up stage or the pair row itself for the down stage (top-k given as 1).
+# Pairs are processed in the "sorted and block-aligned" layout produced by the forward's alignment
+# step: a sorted list of pair indices padded with a sentinel (the pair count), one expert id per
+# block of BLOCK_SIZE_M entries (minus one = skip), and the padded length. Three kernels:
+# input gradient (grad_output times weight, scattered by atomic addition to token rows),
+# weight gradient (grad_output transposed times input, atomically added per expert), and
+# routing-weight gradient (dot product of grad_output with the recomputed unweighted forward
+# output). All three accumulate with atomic additions in the working precision (bfloat16 in the
+# callers), so accumulation order is nondeterministic and low precision.
 from __future__ import annotations
 
 from typing import Any
@@ -40,6 +53,17 @@ def fused_moe_backward_input_kernel(
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
 ):
+    # [FUNCTION DOC] Triton kernel for the input gradient. Launch: one program per (block of sorted
+    # pairs, block of output columns N), 1-D grid ordered in groups of GROUP_SIZE_M row blocks for
+    # cache reuse; blocks beyond the padded pair count or with expert id minus one do nothing. Per
+    # program: load the sorted pair indices of its block (valid if below num_valid_tokens), load the
+    # gradient tile (pairs by BLOCK_SIZE_N columns), multiply each row by the pair's routing weight
+    # if MUL_ROUTED_WEIGHT, then for each K block load the expert's weight tile (N by K) and compute
+    # gradient tile times weight tile; the result (cast to compute_type) is atomically added into
+    # grad_input at row (pair index divided by top_k), so different N blocks and different top-k
+    # slots of one token accumulate into the same row. grad_input must be pre-zeroed by the caller.
+    # KNOWN ISSUE: the grad_topk_weights pointer parameter is never used in this kernel (the host
+    # passes a dummy pointer for it).
     """
     Backward kernel for computing grad_input.
 
@@ -160,6 +184,15 @@ def fused_moe_backward_weight_kernel(
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
 ):
+    # [FUNCTION DOC] Triton kernel for the expert weight gradient; same grid and early-exit rules as
+    # the input-gradient kernel. Per program: load the block's sorted pair indices with a mask on the
+    # padded length (invalid ones clamped to row 0 and zeroed), pick the input row per pair (the pair
+    # index itself when MUL_ROUTED_WEIGHT, else pair index divided by top_k, also bounded by the
+    # token count), load the gradient tile for its column block, multiply by the routing weight if
+    # MUL_ROUTED_WEIGHT, zero padded rows, then for each K block load the input tile, zero padded
+    # rows, compute gradient tile transposed times input tile and atomically add it (cast to
+    # compute_type) into grad_weight at the expert's slice (columns beyond N or K masked).
+    # grad_weight must be pre-zeroed (the host launcher does so).
     """
     Backward kernel for computing grad_weight.
 
@@ -299,6 +332,14 @@ def fused_moe_backward_topk_weights_kernel(
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
 ):
+    # [FUNCTION DOC] Triton kernel for the routing-weight gradient; 1-D grid with one program per block
+    # of sorted pairs (blocks beyond the padded length or with expert id minus one do nothing). Per
+    # program: for each block of output columns N, load the gradient tile, recompute the unweighted
+    # forward output tile by looping over K blocks (input rows at pair index divided by top_k times
+    # the expert's weight tile transposed, float32 accumulation), and accumulate the row-wise sum of
+    # gradient times that output; finally atomically add the per-pair sums (cast to compute_type)
+    # into the flat routing-weight gradient at the pair index. Requires a pre-zeroed output.
+    # It does not use the GROUP_SIZE_M meta-parameter.
     """
     Backward kernel for computing grad_topk_weights.
 
@@ -413,6 +454,19 @@ def invoke_fused_moe_backward_kernel(
     config: dict[str, Any],
     compute_type: tl.dtype,
 ) -> None:
+    # [FUNCTION DOC] Launches the backward kernels for one chunk and returns nothing; results are
+    # written into the passed tensors. Asserts the routing weights have unit last stride and the
+    # sorted ids unit stride. A three-dimensional grad_output is flattened to pairs by columns. Let E,
+    # N, K be the weight shape (experts, output columns, input columns); the pair count is the row
+    # count of grad_output. Step 1: input-gradient kernel, atomically accumulating into grad_input
+    # (a dummy pointer is passed for the unused routing-weight gradient); grad_input must be zeroed
+    # by the caller. Step 2: grad_weight is zeroed in place by this function (any previous content is
+    # discarded), then the weight-gradient kernel runs. Step 3: only if mul_routed_weight is true and
+    # grad_topk_weights is given, the routing-weight kernel accumulates into the flattened
+    # grad_topk_weights (must be contiguous and pre-zeroed). The config mapping must supply the tile
+    # sizes BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K and GROUP_SIZE_M. Grids are sized from the padded
+    # sorted-id length. Gradient tensors should be bfloat16-compatible with compute_type since
+    # atomic additions are done in that type.
     """
     Invoke the fused MOE backward kernels to compute gradients.
 

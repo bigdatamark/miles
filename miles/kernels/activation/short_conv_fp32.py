@@ -1,3 +1,12 @@
+# [MODULE DOC] Residual depthwise causal short convolution over packed (concatenated) variable
+# length sequences, with float32 accumulation, as a differentiable operation.
+# Math: input x has shape tokens by channels, weight has one filter of W taps per channel. For
+# token t in a segment starting at token b, output[t, d] = x[t, d] (the residual) plus the sum over
+# taps i in 0..W-1 of weight[d, i] times x[t - (W-1) + i, d], where inputs before the segment start
+# b count as zero (so the last tap multiplies the current token and the first tap the oldest).
+# Segments never see each other. Forward runs a Triton kernel; backward computes the input gradient
+# with a second Triton kernel and the weight gradient with dense torch operations in float32.
+# Public entry point: short_conv_fp32.
 """Residual depthwise causal short convolution over packed sequences in fp32; forward is
 bit-identical to sglang's sconv kernel."""
 
@@ -18,6 +27,14 @@ def _sconv_fwd_kernel(
     BLOCK_T: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
+    # [FUNCTION DOC] HELPER: Triton forward kernel. Grid: dimension 0 tiles tokens by BLOCK_T,
+    # dimension 1 tiles channels by BLOCK_D. Inputs: x (tokens T by channels D, row-major), w (D
+    # by W filter taps, contiguous), bos (per-token index of the first token of its segment).
+    # Output y (same shape and dtype as x). For each tile, accumulates in float32 over the W taps
+    # in tap order: tap i reads the token W-1-i positions earlier, masked to zero when that
+    # position precedes the token's segment start (or is out of range); the last tap uses the
+    # current token. Finally adds the current token (residual) and stores cast to the output dtype.
+    # Out-of-range rows/columns are masked. The earlier-token loads use an evict-last cache hint.
     t_off = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
     d_off = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
     t_mask = t_off < T
@@ -60,6 +77,12 @@ def _sconv_bwd_dx_kernel(
     BLOCK_T: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
+    # [FUNCTION DOC] HELPER: Triton kernel for the gradient with respect to the input, same tiling
+    # as the forward kernel. Inputs: go (output gradient, T by D), w (D by W taps), eos (per-token
+    # index one past the last token of its segment). For token t it sums, in tap order, the
+    # gradient of the later token t+(W-1)-i times weight tap i, counting only later tokens that
+    # lie before the segment end, in float32; then adds the gradient of token t itself (the
+    # residual path) and stores cast to dx's dtype.
     t_off = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
     d_off = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
     t_mask = t_off < T
@@ -87,6 +110,12 @@ def _sconv_bwd_dx_kernel(
 
 
 def _bos_eos(seqlens, T, device):
+    # [FUNCTION DOC] HELPER: Builds per-token segment boundaries as two int32 tensors of length T
+    # on the device: bos (index of the segment's first token) and eos (index one past its last
+    # token). With no sequence lengths, or just one, the whole range is a single segment (0 to T);
+    # the single length value itself is ignored. Otherwise each token gets the cumulative start/end
+    # of its sequence; the lengths are expected to sum to T (a mismatch yields tensors whose
+    # length differs from T and later out-of-range reads).
     if seqlens is None or len(seqlens) <= 1:
         bos = torch.zeros(T, device=device, dtype=torch.int32)
         eos = torch.full((T,), T, device=device, dtype=torch.int32)
@@ -100,8 +129,16 @@ def _bos_eos(seqlens, T, device):
 
 
 class _SconvFP32Triton(torch.autograd.Function):
+    # [CLASS DOC] HELPER: Autograd function pairing the forward Triton kernel with the backward
+    # (input gradient by Triton, weight gradient by torch). Saves the contiguous input, the
+    # weight reshaped to channels by taps, and the segment boundary tensors, plus the original
+    # weight shape.
     @staticmethod
     def forward(ctx, x: torch.Tensor, weight: torch.Tensor, seqlens) -> torch.Tensor:
+        # [FUNCTION DOC] Computes the convolution for x (tokens by channels) and weight (any shape
+        # reshapeable to channels by taps; the tap count is the last dimension). seqlens is an
+        # optional sequence of segment lengths. Returns a new tensor of x's shape and dtype. Launches
+        # a grid of 64-token by 128-channel tiles unless there are no tokens. No error checking.
         T, D = x.shape
         W = weight.shape[-1]
         xc = x.contiguous()
@@ -117,6 +154,13 @@ class _SconvFP32Triton(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
+        # [FUNCTION DOC] Returns the gradients for (x, weight, seqlens): the input gradient from the
+        # Triton kernel (same dtype as x), the weight gradient, and none for the lengths. The weight
+        # gradient is built in float32 per tap i with shift = W-1-i: the sum over tokens of the
+        # output gradient times the input shifted back by that amount, counting only tokens whose
+        # shifted source lies inside their own segment (shift 0 counts all tokens); it is then
+        # reshaped to the original weight shape and cast to the working weight dtype. This
+        # materializes float32 copies of both the input and the gradient.
         xc, w2, bos, eos = ctx.saved_tensors
         T, D = xc.shape
         W = w2.shape[-1]
@@ -140,5 +184,9 @@ class _SconvFP32Triton(torch.autograd.Function):
 
 
 def short_conv_fp32(x: torch.Tensor, weight: torch.Tensor, seqlens=None) -> torch.Tensor:
+    # [FUNCTION DOC] Public entry: applies the residual causal depthwise short convolution to x
+    # (tokens by channels) with per-channel taps from weight, optionally restricted to the packed
+    # segments given by seqlens (a sequence of lengths summing to the token count; None means one
+    # segment). Returns a tensor of x's shape and dtype; differentiable in x and weight. Runs on GPU.
     """Packed-sequence residual sconv, forward bit-identical to sglang's kernel."""
     return _SconvFP32Triton.apply(x, weight, seqlens)

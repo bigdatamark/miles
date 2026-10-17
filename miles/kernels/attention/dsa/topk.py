@@ -1,3 +1,9 @@
+# [MODULE DOC] Top-k selection callables for DSA indexer scores. Provides a plain torch version, a
+# flashinfer version (with determinism and tie-breaking controlled by sglang environment
+# variables) and a factory choosing one by backend name. All take a scores tensor (last dimension =
+# candidate keys) and a count, and return 32-bit indices of the same leading shape with minus one
+# in place of any selected entry whose score is minus infinity (i.e. masked). flashinfer and
+# sglang are imported lazily inside the functions that need them.
 import torch
 
 
@@ -8,12 +14,22 @@ _FLASHINFER_TIE_BREAK_VALUES = {
 
 
 def torch_dsa_topk(logits: torch.Tensor, topk: int) -> torch.Tensor:
+    # [FUNCTION DOC] Top-k over the last dimension using the torch built-in (descending score
+    # order); converts indices to 32-bit and sets entries whose score is minus infinity to minus one.
+    # Torch raises if topk exceeds the number of candidates.
     score, indices = torch.topk(logits, topk, dim=-1)
     indices = indices.to(torch.int32)
     return indices.masked_fill(score == -torch.inf, -1)
 
 
 def flashinfer_dsa_topk(logits: torch.Tensor, topk: int) -> torch.Tensor:
+    # [FUNCTION DOC] Top-k using flashinfer's kernel (imports flashinfer and sglang's environment
+    # registry on call). Inputs with more than two dimensions are flattened to rows, and the result
+    # is reshaped back to the leading shape with topk as last dimension. The kernel is invoked with
+    # unsorted output (order of indices is not by score), the determinism flag read from the sglang
+    # environment variable for deterministic flashinfer top-k, the tie-break value from the helper
+    # below, and the graph-safe mode for DSA. Indices are converted to 32-bit and entries with
+    # minus-infinity scores become minus one.
     import flashinfer
     from sglang.srt.environ import envs
 
@@ -37,6 +53,8 @@ def flashinfer_dsa_topk(logits: torch.Tensor, topk: int) -> torch.Tensor:
 
 
 def get_dsa_topk_fn(topk_backend: str):
+    # [FUNCTION DOC] Returns the top-k callable for the backend name "torch" or "flashinfer";
+    # raises a value error for any other name.
     if topk_backend == "torch":
         return torch_dsa_topk
     if topk_backend == "flashinfer":
@@ -45,6 +63,10 @@ def get_dsa_topk_fn(topk_backend: str):
 
 
 def flashinfer_tie_break_value() -> int:
+    # [FUNCTION DOC] Reads the sglang environment setting for flashinfer top-k tie breaking
+    # (imports sglang's environment registry on call). Unset gives 0 (kernel default); otherwise the
+    # value, compared case-insensitively, must be "small" (returns 1) or "large" (returns 2); any
+    # other value raises a runtime error that reports the lower-cased value.
     from sglang.srt.environ import envs
 
     mode = envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.get()

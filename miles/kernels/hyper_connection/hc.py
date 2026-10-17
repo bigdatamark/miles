@@ -1,3 +1,16 @@
+# [MODULE DOC] Fused hyper-connection operations: the hidden state of each token is kept as n
+# parallel streams of C channels (flattened row of width W = n times C). Two public operations:
+# (1) hc_mix_inject: grouped RMS-normalize each stream (shared weight of length W), compute a
+# per-channel gate from the whole normalized row through a two-layer bottleneck (linear down with
+# a 1/n scale, SiLU, linear up, sigmoid), and mix the streams into one C-channel vector as the mean
+# over streams of gate times normalized value; optionally also compute a per-stream "injection"
+# coefficient h_post = 2 times sigmoid of a linear map of the normalized row divided by n.
+# (2) hc_combine: write the block output back to every stream, new stream c = old stream c plus
+# h_post for stream c times the block output y.
+# Elementwise stages are Triton kernels (one program per token, or per token and stream); the
+# matrix products of the gate chain run in torch in float32. Backward recomputes the normalization
+# and gate chain instead of saving them. Every reduction/elementwise step is float32 with one final
+# cast; token indices are widened to 64-bit before multiplying by the row width.
 """Triton hyper-connection kernels for Qwen3.8-Next (Qwen4Exp).
 
 Every reduction and elementwise step runs in fp32, with one cast onto the output dtype
@@ -23,6 +36,10 @@ def _gate_mul_mean_fwd_kernel(
     C: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
+    # [FUNCTION DOC] HELPER: Triton kernel, one program per token (surplus programs exit). For each
+    # channel, the output is the mean over the N streams of gate times normalized value (both
+    # float32, token rows of width N times C); the result row of C channels is cast to the output
+    # dtype and stored. BLOCK_C is the padded channel block.
     t = tl.program_id(0).to(tl.int64)
     if t >= T:
         return
@@ -50,6 +67,10 @@ def _gate_mul_mean_bwd_kernel(
     C: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
+    # [FUNCTION DOC] HELPER: Backward of the gate-times-mean kernel, one program per token. Takes the
+    # float32 gradient of the mixed row (C channels) divided by N, and for each stream writes the
+    # gate gradient (that value times the normalized input) and the normalized-input gradient
+    # contribution of the mix (that value times the gate) into float32 token-by-(N times C) buffers.
     t = tl.program_id(0).to(tl.int64)
     if t >= T:
         return
@@ -75,6 +96,10 @@ def _combine_fwd_kernel(
     C: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
+    # [FUNCTION DOC] HELPER: Triton kernel, one program per (token, stream) pair (program id divided
+    # by N gives the token, remainder the stream). Output stream row = residual stream row plus the
+    # stream's scalar coefficient (float32, from the token-by-N table) times the token's block output
+    # row (C channels, shared by all streams), computed in float32 and cast to the output dtype.
     pid = tl.program_id(0).to(tl.int64)
     t = pid // N
     c = pid % N
@@ -101,6 +126,11 @@ def _combine_bwd_kernel(
     C: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
+    # [FUNCTION DOC] HELPER: Backward of the combine kernel, one program per token. The gradient of
+    # the shared block output is the sum over streams of coefficient times incoming stream gradient
+    # (float32, cast to the output dtype); the gradient of each stream's coefficient is the sum over
+    # channels of incoming stream gradient times the block output (float32 token-by-N buffer). The
+    # gradient of the residual is the incoming gradient itself and is handled by the caller.
     t = tl.program_id(0).to(tl.int64)
     if t >= T:
         return
@@ -118,6 +148,10 @@ def _combine_bwd_kernel(
 
 
 def _gate_chain_fwd(normed, w_down, w_up, n):
+    # [FUNCTION DOC] HELPER: Torch computation of the gate in float32: z1 = linear(normed, w_down)
+    # divided by n; gate = sigmoid(linear(SiLU(z1), w_up)), weights converted to float32. Normed has
+    # width n times C, w_down maps it to the bottleneck width and w_up maps back to n times C.
+    # Returns (gate, z1), both float32.
     """fp32 gate = sigmoid(Wup silu(Wdown N / n)). Returns (gate, z1) fp32."""
     z1 = F.linear(normed, w_down.float()) / n
     gate = torch.sigmoid(F.linear(F.silu(z1), w_up.float()))
@@ -125,10 +159,19 @@ def _gate_chain_fwd(normed, w_down, w_up, n):
 
 
 class _HCMixInject(torch.autograd.Function):
+    # [CLASS DOC] HELPER: Autograd function for the normalize, gate, mix and injection-coefficient
+    # stage. Saves the input, norm weight, gate-chain weights, optional injection weight and the
+    # per-group reciprocal RMS; everything else is recomputed in backward.
     """Fused mix + inject gate."""
 
     @staticmethod
     def forward(ctx, x2d, weight, w_down, w_up, w_inject, n, eps):
+        # [FUNCTION DOC] Inputs: x2d (tokens by W = n times C), norm weight (length W), gate-chain
+        # weights w_down and w_up, optional injection weight w_inject (n by W, or none), stream
+        # count n and norm epsilon. Normalizes with the grouped RMS norm (float32), computes the gate,
+        # launches the gate-times-mean kernel to produce mixed (tokens by C, dtype of x2d), and, when
+        # w_inject is given, h_post = 2 times sigmoid(linear(normed, w_inject) / n) in float32
+        # (tokens by n); otherwise h_post is an empty float32 tensor. Returns (mixed, h_post).
         T, W = x2d.shape
         C = W // n
         normed, rstd = grouped_rmsnorm_fwd(x2d, weight, n, eps)
@@ -146,6 +189,17 @@ class _HCMixInject(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dmixed, dh_post):
+        # [FUNCTION DOC] Returns gradients for (x2d, weight, w_down, w_up, w_inject) and none for n
+        # and epsilon. Recomputes the normalized input, gate and bottleneck activations, runs the
+        # gate-times-mean backward kernel, then back-propagates in float32 torch: through the sigmoid
+        # of the gate, the up projection (weight gradient = transposed gradient times SiLU
+        # activation), SiLU (derivative sigmoid(z) times (1 + z times (1 - sigmoid(z)))), the 1/n
+        # scale, and the down projection, adding the contribution to the normalized-input gradient.
+        # If an injection weight exists and the h_post gradient is non-empty, adds the injection
+        # branch likewise (derivative 2 times sigmoid times (1 - sigmoid), divided by n). The norm
+        # weight gradient is the token sum of normalized-input gradient times the weight-free
+        # normalized input; the input gradient comes from the grouped-norm backward kernel (dtype of
+        # x2d). Weight gradients are cast to the parameter dtypes.
         x2d, weight, w_down, w_up, w_inject, rstd = ctx.saved_tensors
         n, eps = ctx.n, ctx.eps
         T, W = x2d.shape
@@ -196,10 +250,15 @@ class _HCMixInject(torch.autograd.Function):
 
 
 class _HCCombine(torch.autograd.Function):
+    # [CLASS DOC] HELPER: Autograd function for the write-back stage; saves the block output and the
+    # float32 coefficients, and remembers the coefficients' original dtype for the gradient.
     """out = residual + h_post[:, c, None] * y  (flattened [T, n*C])."""
 
     @staticmethod
     def forward(ctx, residual2d, y2d, h_post, n):
+        # [FUNCTION DOC] Inputs: residual (tokens by n times C), block output y (tokens by C),
+        # h_post (tokens by n; converted to contiguous float32), stream count n. Returns a new
+        # tensor shaped and typed like the residual with each stream row plus its coefficient times y.
         T, W = residual2d.shape
         C = W // n
         ctx.h_post_dtype = h_post.dtype
@@ -213,6 +272,9 @@ class _HCCombine(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout):
+        # [FUNCTION DOC] Returns (gradient for the residual, which is the incoming gradient made
+        # contiguous and passed through unchanged; gradient for y from the backward kernel in y's
+        # dtype; gradient for h_post in float32 cast to the original h_post dtype; none for n).
         y2d, h_post = ctx.saved_tensors
         n = ctx.n
         T, W = dout.shape
@@ -226,6 +288,10 @@ class _HCCombine(torch.autograd.Function):
 
 
 def hc_mix_inject(x, weight, w_down, w_up, w_inject, n: int, eps: float):
+    # [FUNCTION DOC] Public entry: flattens all leading dimensions of x (last dimension n times C)
+    # to tokens, applies the fused autograd function, and restores the leading shape. Returns
+    # (mixed with last dimension C, h_post with last dimension n) when w_inject is given; when it is
+    # none, the second value is the empty tensor from the autograd function (not reshaped).
     """Fused (grouped_gemma_rmsnorm -> hc_mix, hc_inject_gate)."""
     lead = x.shape[:-1]
     x2d = x.reshape(-1, x.shape[-1]).contiguous()
@@ -237,6 +303,9 @@ def hc_mix_inject(x, weight, w_down, w_up, w_inject, n: int, eps: float):
 
 
 def hc_combine(residual, block_output, h_post, n: int):
+    # [FUNCTION DOC] Public entry: flattens leading dimensions of the residual (last dimension n
+    # times C) and the block output (last dimension C) to tokens, reshapes h_post to tokens by n,
+    # applies the fused autograd function, and returns the result with the residual's shape.
     """``X'_c = X_c + a_c * y`` -- fused elementwise."""
     lead = residual.shape[:-1]
     r2d = residual.reshape(-1, residual.shape[-1]).contiguous()

@@ -1,3 +1,13 @@
+# [MODULE DOC] Builds the read-only FastAPI application behind the dashboard single-page app.
+# Exposes one factory, make_app, which registers JSON endpoints under /api (meta, metrics,
+# timeline queries, advisory, rollout summaries/groups/messages/tokens/trajectories) plus a static
+# mount and an index route when the static directory beside this module exists.
+# Conventions: query-window parameters t0/t1 are wall-clock seconds and a window wider than the
+# store's maximum window (4 hours) or with end not after start is a bad request. Metric keys
+# starting with the dump prefix are not stored in the metric store; they are computed from the
+# dump reader's per-step aggregates. All payloads pass through a sanitizer that turns non-finite
+# floats into nulls because JSON cannot carry them. Handlers are plain (synchronous) functions so
+# the framework runs them in its thread pool; they only read files and never mutate the store.
 """HTTP API of the miles dashboard.
 
 ``make_app(store, reader)`` wires the two read-side data sources — the
@@ -38,6 +48,10 @@ _STATIC_DIR = Path(__file__).parent / "static"
 
 @contextmanager
 def _translate_errors():
+    # [FUNCTION DOC] HELPER: Context manager that converts domain errors raised inside its body
+    # into HTTP errors: a dump-still-being-written error becomes status 503, a missing-file or
+    # missing-key error becomes 404 (detail is the error text), a value error becomes 400.
+    # Other exceptions propagate unchanged (server error). Nothing is yielded.
     try:
         yield
     except DumpStillWriting as e:
@@ -49,6 +63,10 @@ def _translate_errors():
 
 
 def _json_safe(value):
+    # [FUNCTION DOC] HELPER: Recursively copies a value made of floats, lists and mappings,
+    # replacing every non-finite float (not-a-number or either infinity) with null. Lists and
+    # mapping values are rebuilt; any other value (ints, strings, tuples, None) is returned as is,
+    # so non-finite floats nested inside tuples are NOT sanitized. Pure; returns the new value.
     """NaN/inf are not valid JSON; per-token GPU outputs can contain them."""
     if isinstance(value, float) and not math.isfinite(value):
         return None
@@ -60,10 +78,16 @@ def _json_safe(value):
 
 
 def _table(df) -> dict:
+    # [FUNCTION DOC] HELPER: Converts a polars data frame into a mapping with the column names
+    # and a list of row mappings (one per row, values sanitized for JSON).
     return dict(columns=df.columns, rows=[_json_safe(row) for row in df.to_dicts()])
 
 
 def _wandb_url(args: dict) -> str | None:
+    # [FUNCTION DOC] HELPER: Builds the run page address host/team/project/runs/run_id from the
+    # recorded training arguments (wandb team, project, run id, optional host; the host defaults
+    # to the public wandb site and a trailing slash is stripped). Returns None if team, project or
+    # run id is missing or empty.
     """Direct link to the run's wandb page, or None if any piece is missing
     (e.g. wandb disabled, or the run predates the snapshot fields)."""
     team, project, run_id = args.get("wandb_team"), args.get("wandb_project"), args.get("wandb_run_id")
@@ -81,10 +105,25 @@ def make_app(
     use_utilization_overview: bool = False,
     low_mfu: float = DEFAULT_LOW_MFU,
 ) -> FastAPI:
+    # [FUNCTION DOC] Creates the application (interactive API docs pages disabled) and registers
+    # every route as a closure over the given store and reader. Follow only changes the mode
+    # label reported by the meta endpoint (the tailing itself is done by the caller); the
+    # utilization-overview flag is only echoed in the capabilities of the meta endpoint; low_mfu
+    # is the threshold passed to the advisory computation. If the static directory exists it is
+    # mounted at /static, a middleware adds a no-cache header to the index page and static files,
+    # and "/" serves the index page.
     app = FastAPI(title="miles dashboard", docs_url=None, redoc_url=None)
 
     @app.get("/api/meta")
     def meta():
+        # [FUNCTION DOC] Endpoint for the catalog of the run: mode (follow or static), run name,
+        # start time and wandb link from the meta record (null if absent), latest data buffer
+        # length, overall time range, available train and eval rollout ids, metric keys, engine
+        # metric keys, step keys, a mapping from metric key to its step key, and capabilities
+        # (has metrics stream, tokenizer directory present, has timeline data from phases or gpu
+        # utilization, has engine series, maximum window seconds, utilization-overview flag).
+        # Dump-derived metric keys (dump prefix plus aggregate column) are appended to the metric
+        # keys only for offline runs: train dumps exist and the metrics stream is empty.
         ids = reader.rollout_ids()
         # dump-derived aggregates are the L0 fallback for dump-only dirs; a
         # run with a telemetry stream never advertises them (they torch.load
@@ -115,6 +154,9 @@ def make_app(
         )
 
     def _check_window(t0: float | None, t1: float | None) -> None:
+        # [FUNCTION DOC] HELPER: Validates a time window. If either bound is missing nothing is
+        # checked. Raises a value error (mapped to a 400 by the error translator) when the end is
+        # not strictly after the start or the span exceeds the store's maximum window.
         if t0 is None or t1 is None:
             return
         if t1 <= t0:
@@ -126,6 +168,12 @@ def make_app(
 
     @app.get("/api/rollout/{rollout_id}/trajectories")
     def rollout_trajectories(rollout_id: int, sample_index: int | None = None):
+        # [FUNCTION DOC] Endpoint returning lifecycle lanes for a rollout step: the sample indices
+        # are either the single requested one or all indices of the step summary. The consume
+        # anchor is the timestamp of the bubble record for this step; if none exists it falls back
+        # to the end of the overall time range (or none if the store is empty). The event window
+        # is [anchor minus the maximum window, anchor]. Returns lanes, the consume timestamp and
+        # the window start, sanitized for JSON. Errors are translated to HTTP statuses.
         """Batch anatomy: the consuming step's samples resolved to their
         lifecycle lanes. The event scan is capped at one viewport (4 h) before
         the consume anchor (design §18.5); empty lanes = run predates the
@@ -147,10 +195,14 @@ def make_app(
 
     @app.get("/api/timeline/topology")
     def timeline_topology():
+        # [FUNCTION DOC] Endpoint returning the GPU lanes and the engine topology validity windows.
         return dict(lanes=store.lanes(), windows=store.topology_windows())
 
     @app.get("/api/timeline/phases")
     def timeline_phases(t0: float | None = None, t1: float | None = None, lanes: str | None = None):
+        # [FUNCTION DOC] Endpoint returning phase intervals resolved onto GPU lanes for the
+        # window; lanes is an optional lane-selection string (see the store's lane grammar).
+        # Bad windows or selectors produce a 400.
         with _translate_errors():
             _check_window(t0, t1)
             return dict(phases=store.phases_by_lane(t0=t0, t1=t1, lanes=store.resolve_lanes(lanes)))
@@ -159,6 +211,9 @@ def make_app(
     def timeline_gpu(
         t0: float | None = None, t1: float | None = None, max_points: int = 2000, lanes: str | None = None
     ):
+        # [FUNCTION DOC] Endpoint returning per-lane GPU utilization, memory and power series for
+        # the window, downsampled to at most max_points (default 2000, must be at least 2 else a
+        # 400) points per lane; lanes optionally restricts the selection.
         with _translate_errors():
             _check_window(t0, t1)
             if max_points < 2:
@@ -167,6 +222,8 @@ def make_app(
 
     @app.get("/api/timeline/gpu_processes")
     def timeline_gpu_processes(t0: float | None = None, t1: float | None = None, lanes: str | None = None):
+        # [FUNCTION DOC] Endpoint returning per-process GPU memory readings (timestamp, node, gpu,
+        # pid, process name, memory in MB) for the window and optional lane selection.
         """Per-process VRAM breakdown, coarser cadence than ``/api/timeline/gpu``
         — the frontend resolves the nearest snapshot per lane client-side, same
         as it already does for the util/mem series."""
@@ -176,6 +233,9 @@ def make_app(
 
     @app.get("/api/advisory")
     def advisory(t0: float | None = None, t1: float | None = None):
+        # [FUNCTION DOC] Endpoint that computes the MFU summary from the store, then the list of
+        # advisories for the window using the store, the reader and the configured low-MFU
+        # threshold; returns the advisories converted to plain mappings plus the MFU summary.
         """Heuristic sglang config-tuning suggestions (design doc's config
         tuning advisory ask) — computed lazily on request, not persisted."""
         with _translate_errors():
@@ -192,6 +252,11 @@ def make_app(
         x_buckets: int = 1200,
         lanes: str | None = None,
     ):
+        # [FUNCTION DOC] Endpoint returning the rank-carpet heatmap as an octet-stream response.
+        # Metric is "util" by default (also memory, power, phase or lifecycle as supported by the
+        # store); x_buckets must be within 2 to 4000 else a 400. The body is a 4-byte little-endian
+        # header length, the JSON header (all store result fields except the raw values, sanitized)
+        # and then the raw one-byte cells in row-major order (lane rows by time buckets).
         """Binary rank carpet: [4-byte LE header length][header JSON][uint8
         matrix, row-major] — one byte per (lane, time bucket) cell."""
         with _translate_errors():
@@ -208,6 +273,9 @@ def make_app(
 
     @app.get("/api/timeline/fleet")
     def timeline_fleet(t0: float | None = None, t1: float | None = None, x_buckets: int = 600):
+        # [FUNCTION DOC] Endpoint returning the fleet overview (phase composition per bucket and
+        # utilization percentile band) for the window; x_buckets (default 600) must be within
+        # 2 to 4000 else a 400. Result is sanitized for JSON.
         with _translate_errors():
             _check_window(t0, t1)
             if not 2 <= x_buckets <= 4000:
@@ -216,6 +284,10 @@ def make_app(
 
     @app.get("/api/timeline/outliers")
     def timeline_outliers(criterion: str, t0: float | None = None, t1: float | None = None, top_k: int = 16):
+        # [FUNCTION DOC] Endpoint returning up to top_k candidate outlier lanes for the criterion
+        # (lowest utilization, or slowest phase of a given name). top_k must be within 1 to 256
+        # else a 400; an unknown criterion is also a 400.
+        # KNOWN ISSUE: unlike the sibling timeline endpoints it does not validate the t0/t1 window.
         with _translate_errors():
             if not 1 <= top_k <= 256:
                 raise ValueError(f"{top_k=} out of range [1, 256]")
@@ -229,6 +301,9 @@ def make_app(
         max_points: int = 2000,
         per_dp_rank: bool = False,
     ):
+        # [FUNCTION DOC] Endpoint returning scraped inference-engine series for one metric (raw or
+        # derived rate/mean name) in the window, downsampled to at most max_points (at least 2 else
+        # a 400) per series; per_dp_rank keeps data-parallel ranks separate instead of folding them.
         with _translate_errors():
             _check_window(t0, t1)
             if max_points < 2:
@@ -239,10 +314,21 @@ def make_app(
 
     @app.get("/api/timeline/bubbles")
     def timeline_bubbles():
+        # [FUNCTION DOC] Endpoint returning the per-step bubble records (step, timestamp, step
+        # time, wait ratio).
         return dict(bubbles=store.bubbles())
 
     @app.get("/api/metrics")
     def metrics(keys: str, x: str = "rollout/step", t0: float | None = None, t1: float | None = None):
+        # [FUNCTION DOC] Endpoint returning series for a comma-separated list of metric keys
+        # against the step axis x (default the rollout step key). Empty key list is a 400.
+        # Keys without the dump prefix come from the metric store (only records logged against
+        # that step key and inside the optional time window). Keys with the dump prefix are
+        # served from the reader's per-step aggregates: the column name after the prefix must be a
+        # known aggregate (else a 400), points with null values are skipped, x is the rollout id,
+        # y the value and the timestamp list is empty. The aggregate columns and the step list are
+        # zipped in strict mode, so a length mismatch raises a value error (also a 400).
+        # The time window is not validated here, and dump-derived series ignore it.
         with _translate_errors():
             requested = [k for k in keys.split(",") if k]
             if not requested:
@@ -267,12 +353,17 @@ def make_app(
 
     @app.get("/api/rollout/{rollout_id}/summary")
     def rollout_summary(rollout_id: int, evaluation: bool = Query(False, alias="eval")):
+        # [FUNCTION DOC] Endpoint returning the per-sample summary table of one rollout step (the
+        # eval query flag selects evaluation dumps) as rollout id, evaluation flag, column names
+        # and row mappings.
         with _translate_errors():
             df = reader.summary(rollout_id, evaluation=evaluation)
             return dict(rollout_id=rollout_id, evaluation=evaluation, **_table(df))
 
     @app.get("/api/rollout/{rollout_id}/groups")
     def rollout_groups(rollout_id: int, evaluation: bool = Query(False, alias="eval")):
+        # [FUNCTION DOC] Endpoint returning the per-group table of one rollout step in the same
+        # shape as the summary endpoint (rollout id, evaluation flag, columns, rows).
         with _translate_errors():
             df = reader.groups(rollout_id, evaluation=evaluation)
             return dict(rollout_id=rollout_id, evaluation=evaluation, **_table(df))
@@ -284,6 +375,9 @@ def make_app(
         occurrence: int = Query(0, ge=0),
         evaluation: bool = Query(False, alias="eval"),
     ):
+        # [FUNCTION DOC] Endpoint returning the reader's decoded chat messages of one sample.
+        # The occurrence query (non-negative, default 0) picks which duplicate of the sample index
+        # to use; the eval flag selects evaluation dumps. Result is returned unsanitized.
         with _translate_errors():
             return reader.trajectory_messages(
                 rollout_id, sample_index, sample_occurrence=occurrence, evaluation=evaluation
@@ -298,6 +392,10 @@ def make_app(
         end: int | None = None,
         evaluation: bool = Query(False, alias="eval"),
     ):
+        # [FUNCTION DOC] Endpoint returning per-token data of one sample for the token range from
+        # start (default 0) to end (default to the end), using the occurrence and eval query
+        # parameters as in the messages endpoint. Result is sanitized for JSON because per-token
+        # GPU outputs can contain non-finite floats.
         with _translate_errors():
             payload = reader.tokens(
                 rollout_id,
@@ -314,6 +412,10 @@ def make_app(
 
         @app.middleware("http")
         async def _no_stale_frontend(request, call_next):
+            # [FUNCTION DOC] HELPER: HTTP middleware that lets the request proceed and then sets a
+            # no-cache header on the response when the path is the root or under the static
+            # prefix, so browsers revalidate and never serve a stale frontend. Other responses are
+            # untouched.
             # without Cache-Control browsers cache heuristically and keep
             # serving a STALE SPA after a stack upgrade; no-cache forces a
             # revalidation (cheap 304s) so the frontend always matches serve
@@ -324,6 +426,7 @@ def make_app(
 
         @app.get("/", include_in_schema=False)
         def index():
+            # [FUNCTION DOC] Serves the single-page app's index file from the static directory.
             return FileResponse(_STATIC_DIR / "index.html")
 
     return app

@@ -1,3 +1,17 @@
+# [MODULE DOC] Tilelang backward of DSA sparse attention (multi-head latent attention flavor where
+# the value is the first `dim` channels of the shared key/value row and the optional tail channels
+# only take part in scores). Three compiled kernels plus a host driver, sparse_attention_bwd:
+# (1) preprocess: delta = per (batch, position, head) sum over value channels of output times
+# output gradient; (2) the main kernel: recomputes the probabilities from the saved base-2
+# log-sum-exp and the selected rows, and produces the query gradient directly (bfloat16) and the
+# key/value gradient accumulated with vectorized atomic additions into a float32 buffer;
+# (3) postprocess: casts that buffer to bfloat16.
+# Math per query and head: p = 2 to the power (score times scale times log2(e) minus lse),
+# dp = dO times V transposed, ds = p times (dp minus delta) times scale; dQ = ds times K,
+# dK_row += ds times Q, dV_row += p times dO. Padded (minus one) indices give zero probability.
+# Environment: reading MILES_HARDWARE_PLATFORM equal to "rocm" lowers the head-block size and
+# thread thresholds. Requires the tilelang package and a GPU; tensors must be bfloat16 / float32 /
+# 32-bit integers as asserted.
 # ruff: noqa
 # Adapt from https://github.com/tile-ai/tilelang/blob/4ff81c7d40803d269569e157e847623e84553f78/examples/deepseek_v32/sparse_mla_bwd.py
 import os
@@ -16,6 +30,10 @@ def _bwd_preprocess_kernel(
     dtype=T.bfloat16,
     accum_dtype=T.float32,
 ):
+    # [FUNCTION DOC] HELPER: Kernel factory (jit-compiled; the last parameter, Delta, is allocated
+    # and returned by the compiled callable). Asserts bfloat16 inputs and float32 accumulation.
+    # Arguments: head count, value dim, tile size block_ND (32) and pipeline stages (5). Batch and
+    # sequence length are dynamic.
     assert dtype == T.bfloat16
     assert accum_dtype == T.float32
     B = T.dynamic("batch")
@@ -28,6 +46,10 @@ def _bwd_preprocess_kernel(
         dO: T.Tensor(shape, dtype),
         Delta: T.Tensor([B, S, H], accum_dtype),
     ):
+        # [FUNCTION DOC] HELPER: Device program; grid of heads by query tiles of block_ND by batch.
+        # For its tile, loops over the value dim in chunks of block_ND (pipelined), accumulating the
+        # elementwise product of output and output gradient into a square float32 tile, then reduces
+        # across the chunk-column axis to one value per query and stores it as delta for that head.
         with T.Kernel(H, T.ceildiv(S, block_ND), B) as (bx, by, bz):
             o = T.alloc_fragment([block_ND, block_ND], accum_dtype)
             do = T.alloc_fragment([block_ND, block_ND], accum_dtype)
@@ -55,6 +77,10 @@ def _bwd_postprocess_kernel(
     dtype=T.bfloat16,
     accum_dtype=T.float32,
 ):
+    # [FUNCTION DOC] HELPER: Kernel factory (jit-compiled; the output buffer, the last parameter, is
+    # allocated and returned). Arguments: value dim, tail dim, kv group count, rows per block
+    # (64), threads (128). Asserts the dtypes. Returns a program converting the float32 key/value
+    # gradient to bfloat16.
     assert dtype == T.bfloat16
     assert accum_dtype == T.float32
     B = T.dynamic("batch")
@@ -66,6 +92,8 @@ def _bwd_postprocess_kernel(
         dKV: T.Tensor(dkv_shape, accum_dtype),
         dKV_out: T.Tensor(dkv_shape, dtype),
     ):
+        # [FUNCTION DOC] HELPER: Device program; grid of key blocks by kv groups by batch; copies
+        # (casting float32 to bfloat16) its block of rows over all channels.
         with T.Kernel(T.ceildiv(S_kv, block_N), kv_group, B, threads=threads) as (bx, by, bz):
             T.copy(
                 dKV[bz, bx * block_N : (bx + 1) * block_N, by, :],
@@ -100,6 +128,22 @@ def _sparse_attention_bwd_kernel(
     dtype=T.bfloat16,
     accum_dtype=T.float32,
 ):
+    # [FUNCTION DOC] HELPER: Kernel factory for the main backward (jit-compiled and cached per
+    # argument values; the query gradient, second to last parameter, is allocated and returned by
+    # the compiled callable). Arguments: head count, value dim, tail dim, top-k, kv group count,
+    # softmax scale (default one over the square root of value plus tail dim), software pipeline
+    # stages, split_store (number of pieces the per-block key/value gradient is staged through shared
+    # memory before the atomic adds; must divide block_size), and selected keys per iteration
+    # block_size (32). Asserts top-k is a multiple of block_size and the dtypes (bfloat16, float32,
+    # 32-bit indices). The scale is converted for base-2 exponentials.
+    # Tiling: heads per kv group are padded to a power of two (at least 16) and split into blocks of
+    # at most 64 heads (32 on ROCm when padded size is at least 64); threads are 256 for large head
+    # blocks (at least 32, or 64 on ROCm) and 128 otherwise. Pass options: TMA lowering and warp
+    # specialization are disabled, and aggressive shared-memory merging is disabled because it
+    # aliased live buffers and produced NaN gradients (costs about 5 percent).
+    # KNOWN ISSUE: the dtype asserts are repeated twice, and the head count is rebound to the per-group
+    # head count after being used; the query head offset used in the program (block index times
+    # block size) is only correct when heads per group need no padding (or there is a single group).
     assert topk % block_size == 0, "otherwise will load some index=0 thus causing wrong kv to be loaded"
     assert dtype == T.bfloat16
     assert accum_dtype == T.float32
@@ -146,6 +190,21 @@ def _sparse_attention_bwd_kernel(
         dQ: T.Tensor(q_shape, dtype),
         dKV: T.Tensor(k_shape, accum_dtype),
     ):
+        # [FUNCTION DOC] HELPER: Device program; one thread block per (query position, batch element,
+        # head block of one kv group). Inputs: queries and key/value cache (value = first value-dim
+        # channels), output gradient (value dim), selected indices (padding = minus one) and their
+        # clamped copy used for reads, base-2 log-sum-exp and delta per head. Outputs: dQ (bfloat16)
+        # and dKV (float32, accumulated atomically; must start at zero).
+        # Steps: load the query head block, output gradient and tail query; clear the dQ accumulators;
+        # for each block of selected keys (pipelined): build a validity mask, initialize scores to
+        # zero or minus infinity, gather key/value rows (and tail rows), add query-key products;
+        # probabilities = 2 to the power (score times scale times log2(e) minus lse); dp = dO times
+        # value rows transposed; ds = p times (dp minus delta) times scale; accumulate dQ with ds
+        # times keys (and tail); compute the block's key/value gradient as ds transposed times
+        # queries plus (value channels only) p transposed times dO, and tail channels as ds transposed
+        # times tail queries; copy it through shared memory in split_store pieces and add each row
+        # into dKV at its selected row using four-wide atomic additions (value dim and tail dim must
+        # be multiples of 4). Finally store dQ (value channels and tail channels) through shared memory.
         with T.Kernel(S, B, kv_group * NH, threads=threads) as (s_i, by, bz):
             Q_shared = T.alloc_shared([block_H, D], dtype)
             KV_shared = T.alloc_shared([BS, D], dtype)
@@ -279,6 +338,13 @@ def _sparse_attention_bwd_kernel(
 
 
 def sparse_attention_bwd(q, kv, o, do, indices, kv_indices, lse, d_v, *, sm_scale, num_stages, split_store):
+    # [FUNCTION DOC] Host driver. Asserts that queries, key/value cache, indices and lse are
+    # contiguous and that shapes agree (same width, same batch, indices batch by sequence by groups
+    # by top-k, lse batch by sequence by heads); the tail dim is query width minus d_v. Runs delta
+    # preprocessing from the output and output gradient, allocates a zero float32 key/value gradient
+    # buffer, runs the main kernel (which returns dQ), then casts the buffer to bfloat16. The sm_scale
+    # may be None (kernel default). Returns (dq, dkv, delta). The output, output gradient and clamped
+    # index copy are not checked for contiguity.
     """Shapes as in sparse_attention_fwd, plus o/do [B, S, H, d_v] and lse [B, S, H].
     Returns dq [B, S, H, d_v + d_tail] bf16, dkv [B, S_kv, G, d_v + d_tail] bf16 and delta [B, S, H] fp32
     (rowsum(o * do), which the caller needs for the attention-sink gradient)."""

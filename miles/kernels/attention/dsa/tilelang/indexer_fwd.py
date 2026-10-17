@@ -1,3 +1,9 @@
+# [MODULE DOC] Tilelang forward kernels of the DSA lightning indexer. Score of query t against key
+# j = sum over heads h of weights[t,h] times relu(q[t,h] dot k[j]), written as a dense float32
+# matrix (queries by keys). Two kernels: the scoring kernel, which computes scores for the union of
+# key ranges of a block of queries, and a cleaning kernel which overwrites every entry outside
+# each query's own key range [start, end) with minus infinity. Host entry point: indexer_fwd.
+# Requires the tilelang package and a GPU.
 # ruff: noqa
 # Adapted from https://github.com/tile-ai/tilelang/blob/4956b5835fa554af6c03d4a6289cad44bf310869/examples/deepseek_v32/fp8_lighting_indexer.py
 import tilelang
@@ -18,6 +24,11 @@ def _indexer_fwd_kernel(
     threads=512,
     block_Q=None,
 ):
+    # [FUNCTION DOC] HELPER: Kernel factory (jit-compiled, cached per argument values) for the
+    # scoring kernel with fast math enabled. Parameters: head count, head dim, keys per iteration
+    # block_N (128), pipeline stages (2), threads (512), and queries per thread block block_Q
+    # (default 256 integer-divided by heads, at least 1). Sequence and key lengths are dynamic.
+    # Returns the program below.
     if block_Q is None:
         block_Q = max(1, 256 // heads)
     dtype = T.bfloat16
@@ -40,6 +51,20 @@ def _indexer_fwd_kernel(
         CuSeqLenKS: T.Tensor([seq_len], index_dtype),  # type: ignore
         CuSeqLenKE: T.Tensor([seq_len], index_dtype),  # type: ignore
     ):
+        # [FUNCTION DOC] HELPER: Device program; one thread block per block of block_Q queries.
+        # Inputs: queries flattened to rows of (query, head) by dim, keys, per-query range start and
+        # end (32-bit), per-head float32 weights; output: float32 scores (queries by keys). Steps:
+        # reduce the block's range starts to their minimum and ends to their maximum (each clamped
+        # to the key count); load the block's query rows and weights; then iterate (software
+        # pipelined) over blocks of block_N keys covering that union range: matrix product of keys
+        # with the block's queries, relu, multiply by the head weight, sum over heads, and store into
+        # the output at the key's absolute column. Entries inside the union range but outside an
+        # individual query's own range are still written with computed scores, and columns outside the
+        # union range are never written, so callers must run the cleaning kernel to get exact
+        # minus-infinity masking.
+        # KNOWN ISSUE: there is no handling of a last query block that extends past the number of
+        # queries (range arrays and queries are read for the full block), so the query count is
+        # implicitly assumed to be a multiple of block_Q unless the compiler inserts guards.
         with T.Kernel(T.ceildiv(seq_len, block_Q), threads=threads) as bx:
             index_q_shared = T.alloc_shared([block_Q * heads, index_dim], dtype)
             index_k_shared = T.alloc_shared([block_N, index_dim], dtype)
@@ -92,6 +117,8 @@ def _clean_logits_kernel(
     threads: int = 512,
     block_K: int = 4096,
 ):
+    # [FUNCTION DOC] HELPER: Kernel factory (jit-compiled) for the cleaning kernel; threads per block
+    # (512) and columns per tile (4096) are parameters. Returns the program below.
     seq_len = T.dynamic("seq_len")
     seq_len_kv = T.dynamic("seq_len_kv")
 
@@ -104,6 +131,10 @@ def _clean_logits_kernel(
         CuSeqLenKS: T.Tensor([seq_len], indices_dtype),  # type: ignore
         CuSeqLenKE: T.Tensor([seq_len], indices_dtype),  # type: ignore
     ):
+        # [FUNCTION DOC] HELPER: Device program; one thread block per query row. Walks the row in tiles
+        # of block_K columns with each thread handling every threads-th column, and in place sets each
+        # entry whose column is before the query's range start or at/after its range end to minus
+        # infinity. Entries inside the range are left unchanged.
         with T.Kernel(seq_len, threads=threads) as bx:
             tx = T.thread_binding(0, threads, thread="threadIdx.x")
             cu_k_s = CuSeqLenKS[bx]
@@ -119,6 +150,13 @@ def _clean_logits_kernel(
 
 
 def indexer_fwd(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits=True):
+    # [FUNCTION DOC] Host wrapper. q is queries by heads by dim (bfloat16, must be viewable as
+    # (queries times heads) by dim, i.e. contiguous), kv is keys by dim (bfloat16), weights is
+    # queries by heads (float32), and the two range tensors are 32-bit per-query key range start and
+    # end (end exclusive). Allocates an uninitialized float32 matrix of queries by keys, runs the
+    # scoring kernel, and, if clean_logits (default true), runs the cleaning kernel so every entry
+    # outside a query's range is minus infinity. With clean_logits false the entries outside the
+    # scored union ranges are uninitialized memory. Returns the matrix.
     seq_len, heads, index_dim = q.shape
     seq_len_kv = kv.shape[0]
 

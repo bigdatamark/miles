@@ -1,3 +1,17 @@
+# [MODULE DOC] Triton backward pass for causal self-attention (multi-head, optional grouped-query
+# sharing of key/value heads), computed tile by tile without materializing the sequence-by-sequence
+# score matrix. The forward kernel does not save the softmax normalizer, so the backward first
+# recomputes the per-query log-sum-exp (LSE) and the per-query delta (row sum of output times output
+# gradient), then recomputes attention probabilities exactly as exp(score - LSE) inside the
+# gradient kernels. Gradients for keys/values and for queries are produced by two separate kernels
+# (one owns key blocks, the other owns query blocks), so no atomic additions are needed.
+# The driver, dense_attention_backward, processes each sequence of a batch separately on fixed-size
+# sequences and expands/reduces key and value heads for grouped-query attention.
+# Imports sglang's HIP detection to choose AMD-specific launch options. All arithmetic on scores is
+# float32; matrix products use the input dtype.
+# KNOWN ISSUE: the text below mentions per-sequence processing "via indptrs" (variable-length
+# batching), but nothing here takes indptrs; the driver only supports a batch of equal-length
+# sequences (batch size and sequence length). It also lists three kernels while four are defined.
 """Triton backward kernels for causal self-attention.
 
 Memory-efficient backward pass using tiled computation (no S*S materialization).
@@ -46,6 +60,11 @@ def _bwd_preprocess(
     BLOCK_M: tl.constexpr,
     BLOCK_HEADDIM: tl.constexpr,
 ):
+    # [FUNCTION DOC] HELPER: Triton kernel computing delta for one sequence. Grid: query tiles of
+    # BLOCK_M by heads. Delta, laid out heads by sequence length (float32), receives for every query
+    # position the sum over the (padded to BLOCK_HEADDIM, masked to headdim) channels of output times
+    # output gradient, both loaded as float32. Strides are given for the sequence axis and head axis
+    # of each tensor; the channel axis must be contiguous.
     """Compute delta_i = sum_d(O_i * dO_i) for each query position.
 
     Grid: (cdiv(seqlen, BLOCK_M), num_heads)
@@ -84,6 +103,15 @@ def _compute_lse(
     BLOCK_N: tl.constexpr,
     BLOCK_HEADDIM: tl.constexpr,
 ):
+    # [FUNCTION DOC] HELPER: Triton kernel producing the causal log-sum-exp per query, written to
+    # LSE (heads by sequence length, float32). One program per query tile and head. Loads the query
+    # tile, then loops over key tiles from position 0 up to the end of the causal range of the tile
+    # (min of the sequence length and the tile end), computing scores = q dot k transposed times
+    # sm_scale, masking positions where the key index exceeds the query index or is out of range with
+    # minus infinity, and updating a running maximum and running sum (online softmax with rescaling
+    # of the old sum). The result is maximum + log(sum); a zero sum is replaced by one before the log
+    # to avoid log of zero (rows with no valid key then get minus infinity). Key head index equals
+    # the program's head index (grouped-query keys are expanded beforehand).
     """Compute LSE (log-sum-exp) for each query position using online accumulation.
 
     LSE_i = log(sum_{j: j<=i} exp(q_i @ k_j * scale))
@@ -170,6 +198,16 @@ def _bwd_kernel_dk_dv(
     BLOCK_N: tl.constexpr,
     BLOCK_HEADDIM: tl.constexpr,
 ):
+    # [FUNCTION DOC] HELPER: Triton kernel producing key and value gradients for one sequence. One
+    # program per key tile and head; holds float32 accumulators for dK and dV of the tile. Loops over
+    # query tiles starting at the first query tile that can see the key tile (begin index rounded
+    # down to a multiple of BLOCK_M) to the end of the sequence. For each query tile: recompute
+    # scores times sm_scale with the causal/range mask, probabilities p = exp(score - LSE of the
+    # query row), accumulate dV += p transposed times dO, compute dp = dO times V transposed,
+    # ds = p times (dp - delta) times sm_scale, and accumulate dK += ds transposed times q (ds cast to
+    # the query dtype, p cast to the dO dtype). Stores dK and dV cast to the key/value dtype, masked
+    # to valid rows and channels. LSE and delta are read per head and query (other value 0 for
+    # masked rows, which then produce zero probability because their scores are minus infinity).
     """Compute dK and dV for one K/V block.
 
     Grid: (cdiv(seqlen, BLOCK_N), num_heads)
@@ -270,6 +308,12 @@ def _bwd_kernel_dq(
     BLOCK_N: tl.constexpr,
     BLOCK_HEADDIM: tl.constexpr,
 ):
+    # [FUNCTION DOC] HELPER: Triton kernel producing query gradients for one sequence. One program
+    # per query tile and head, keeping the query tile, dO, LSE and delta resident and a float32 dQ
+    # accumulator. Loops over key/value tiles from position 0 to the causal end of the query tile;
+    # per tile recomputes the masked scaled scores, probabilities exp(score - LSE), dp = dO times V
+    # transposed, ds = p times (dp - delta) times sm_scale, and accumulates dQ += ds (cast to the key
+    # dtype) times K. Stores dQ cast to the query dtype, masked to valid rows and channels.
     """Compute dQ for one Q block.
 
     Grid: (cdiv(seqlen, BLOCK_M), num_heads)
@@ -337,6 +381,22 @@ def _bwd_kernel_dq(
 
 
 def dense_attention_backward(q, k, v, o, do, B, S, sm_scale=None):
+    # [FUNCTION DOC] Computes gradients (dq, dk, dv) of causal attention for B sequences of equal
+    # length S packed along the first axis (shape B*S by heads by head dim; query heads must be a
+    # multiple of key/value heads). o is the forward output and do the output gradient. The softmax
+    # scale defaults to one over the square root of the head dim; note a falsy scale (zero) also
+    # falls back to the default. Steps: pick block sizes (64 by 64 on all platforms, head dim
+    # rounded up to a power of two); for grouped-query attention expand K and V to the number of
+    # query heads by repeating each key/value head consecutively for its group of query heads;
+    # allocate outputs; then for each sequence in a Python loop run four kernels: delta, LSE, dK/dV
+    # (4 warps, 1 stage) and dQ (4 warps, 1 stage), with an AMD-only launch option of one wave per
+    # execution unit; copy the per-sequence results into the full outputs. Finally, for grouped-query
+    # attention, sum the expanded key/value gradients over each group and cast to the key/value dtype.
+    # Returns (dq, dk, dv) shaped like q, k, v. Allocates temporary expanded tensors and per-
+    # sequence buffers; GPU launches only, no other side effects.
+    # KNOWN ISSUE: the block-size selection uses the same value for HIP and non-HIP, so the
+    # conditional is redundant; the per-sequence dq buffer and the full dq are both zero-initialized
+    # although every element is overwritten.
     """Triton backward for causal self-attention (two-pass with LSE).
 
     Args:

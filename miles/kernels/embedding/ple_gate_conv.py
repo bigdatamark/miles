@@ -1,3 +1,19 @@
+# [MODULE DOC] Fused forward/backward for the per-layer-embedding (PLE) increment computed from a
+# multi-stream hidden state. Tokens are rows; the hidden state has n streams of C channels (row width
+# W = n times C). Pipeline per token and stream (all in float32, one cast to the output dtype):
+# (1) gate chain: RMS-normalize the key row and the hidden-state ("query") row of the stream (each
+# with its own weight in "one plus weight" form), take the dot product of the two normalized vectors
+# divided by sqrt(C), turn it into a gate in (0,1) with sigmoid of (sign times square root of the
+# magnitude, magnitude floored at 1e-6), and scale the per-token value row (C channels, shared by
+# all streams) by that gate: "gated"; (2) normalize gated per stream with a grouped RMS norm
+# (separate weight); (3) causal depthwise convolution over tokens (K taps, with a dilation, never
+# crossing sequence boundaries given by cumulative lengths) of the normalized signal, then SiLU;
+# (4) output = gated + SiLU(conv) (residual). Backward recomputes the gate chain and the norm from
+# the saved inputs instead of storing them, then runs the conv backward (weight gradient with atomic
+# additions), the grouped-norm backward and the gate-chain backward; per-token partial weight
+# gradients are summed on the host side with torch. Public entry point: ple_gate_conv.
+# Token indices are widened to 64-bit before multiplying by the row width, including the neighbors
+# used by the convolution.
 """Triton PLE kernels: fused gate chain and segment-aware causal depthwise conv.
 
 fp32 for every reduction and elementwise step, one cast onto the output dtype.
@@ -31,6 +47,15 @@ def _ple_gate_fwd_kernel(
     SQRTC: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
+    # [FUNCTION DOC] HELPER: Triton kernel; one program per (token, stream) pair (grid of T times N;
+    # program id divided by N is the token, remainder the stream; surplus programs exit). Loads the
+    # stream's key and query rows and the stream's slices of the key and query norm weights, in
+    # float32. Computes reciprocal root-mean-square for each (epsilon EPS), normalized-and-weighted
+    # vectors (times one plus weight), score = dot product divided by SQRTC (square root of C),
+    # magnitude = max of absolute score and 1e-6, gate = sigmoid of (sign of score, where zero counts
+    # as positive, times square root of magnitude). Stores: gated = gate times the token's value row
+    # (shared across streams) into a float32 token-by-W buffer; the gate and both reciprocal RMS
+    # values into float32 token-by-N buffers.
     pid = tl.program_id(0).to(tl.int64)
     t = pid // N
     c = pid % N
@@ -84,6 +109,17 @@ def _ple_gate_bwd_kernel(
     SQRTC: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
+    # [FUNCTION DOC] HELPER: Triton backward of the gate chain; same one-program-per-(token, stream)
+    # layout. Inputs: float32 gradient of gated, the original key / query / value, norm weights, and
+    # the saved gate and reciprocal RMS values. Steps: gradient of the value row per stream =
+    # incoming gradient times gate (stored per stream, summed over streams on the host); gradient of
+    # the gate = sum of incoming gradient times value; through the sigmoid; through the signed square
+    # root (derivative one over two times square root of magnitude, set to zero where the absolute
+    # score is not above 1e-6); gradients of the normalized key and query are the other normalized
+    # vector times that gradient divided by sqrt(C). Stores per-token partial weight gradients
+    # (gradient of normalized vector times its unweighted normalized input; summed over tokens on
+    # the host) and finally the RMS-norm backward for key and query (reciprocal RMS times gradient
+    # minus input times its cube times dot-product over C), cast to the key / query dtypes.
     pid = tl.program_id(0).to(tl.int64)
     t = pid // N
     c = pid % N
@@ -146,6 +182,13 @@ def _ple_conv_fwd_kernel(
     DIL: tl.constexpr,
     BLOCK_W: tl.constexpr,
 ):
+    # [FUNCTION DOC] HELPER: Triton forward of the convolution stage; grid of tokens by channel
+    # blocks of BLOCK_W. For token t and each channel computes the causal dilated depthwise
+    # convolution over the K taps: tap j reads the normalized signal at token t minus (K-1-j) times
+    # DIL, only if that token index is non-negative and not before the token's sequence start
+    # (otherwise contributes zero), weighted by the channel's tap weight (weights laid out channel by
+    # tap). Stores the pre-activation result (float32, kept for backward), then output = gated +
+    # SiLU(result), cast to the output dtype. W is the full row width, K and DIL are compile-time.
     t = tl.program_id(0).to(tl.int64)
     wb = tl.program_id(1)
     if t >= T:
@@ -185,6 +228,15 @@ def _ple_conv_bwd_kernel(
     DIL: tl.constexpr,
     BLOCK_W: tl.constexpr,
 ):
+    # [FUNCTION DOC] HELPER: Triton backward of the convolution stage; same grid as the forward.
+    # For its token and channel block: copies the incoming gradient (as float32) to the residual
+    # gradient output; computes the gradient at the convolution result through SiLU (using the saved
+    # pre-activation); for every tap with a valid source token (non-negative and not before the
+    # sequence start) atomically adds gradient times source value into the convolution weight
+    # gradient (float32, channel by tap, must be zero-initialized); and computes the gradient of the
+    # normalized signal at this token as the sum over taps of tap weight times the SiLU-backward
+    # gradient at the destination token that read it (destination = t plus (K-1-j) times DIL,
+    # included only if inside the token range and before this token's sequence end).
     t = tl.program_id(0).to(tl.int64)
     wb = tl.program_id(1)
     if t >= T:
@@ -222,6 +274,11 @@ def _ple_conv_bwd_kernel(
 
 
 def _seg_bounds(T: int, cu_seqlens, device):
+    # [FUNCTION DOC] HELPER: Builds per-token sequence boundaries as two int32 tensors of length T
+    # on the device: the first token index of the token's sequence and one past its last. Without
+    # cumulative lengths the whole range is one sequence (0 and T). Otherwise each boundary pair is
+    # repeated for the length of its sequence (negative lengths clamped to zero). The lengths are
+    # expected to sum to T.
     if cu_seqlens is None:
         lo = torch.zeros(T, dtype=torch.int32, device=device)
         hi = torch.full((T,), T, dtype=torch.int32, device=device)
@@ -234,8 +291,19 @@ def _seg_bounds(T: int, cu_seqlens, device):
 
 
 class _PLEGateConv(torch.autograd.Function):
+    # [CLASS DOC] HELPER: Autograd function for the whole PLE increment. Saves only the inputs and
+    # small per-token statistics (gate values, reciprocal RMS values, sequence bounds, and the
+    # pre-activation convolution result); large intermediates (gated signal, normalized signal) are
+    # recomputed in backward.
     @staticmethod
     def forward(ctx, hc_state, key, value, wk, wq, wc, conv_w, n, eps, dilation, cu_seqlens):
+        # [FUNCTION DOC] Inputs: hc_state (tokens by W) used as the query stream, key (tokens by W),
+        # value (tokens by C = W / n), key and query norm weights wk, wq (length W), conv-norm weight
+        # wc (length W), conv_w (W by 1 by K depthwise taps), number of streams n, epsilon, convolution
+        # dilation, and optional cumulative sequence lengths. Runs the gate kernel, the grouped RMS
+        # norm of the gated signal (using wc), the sequence bounds, and the convolution kernel with
+        # 256-channel blocks; empty token counts skip launches. Returns the output (tokens by W) in
+        # the dtype of hc_state. Stores the weight dtype and sizes on the context.
         T, W = hc_state.shape
         C = W // n
         Kk = conv_w.shape[-1]
@@ -294,6 +362,18 @@ class _PLEGateConv(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout):
+        # [FUNCTION DOC] Returns gradients in the order of the forward inputs: for hc_state, key,
+        # value, wk, wq, wc, conv_w, then none for n, eps, dilation and the sequence lengths.
+        # Steps: recompute the gated signal and the grouped-norm output (discarding the recomputed
+        # gate statistics, the saved ones are used later); run the convolution backward kernel to get
+        # the gradient of the normalized signal, the convolution weight gradient (float32 buffer with
+        # atomics, cast to the weight dtype and reshaped to W by 1 by K) and the residual gradient;
+        # the conv-norm weight gradient is the token sum of normalized-gradient times the
+        # weight-free normalized signal; run the grouped norm backward and add its result to the
+        # gated-signal gradient; run the gate backward kernel for the gradients of key and hc_state;
+        # the value gradient sums per-stream contributions over streams; the key / query norm weight
+        # gradients sum per-token partials over tokens. All reductions are in float32 and cast to the
+        # parameter dtypes.
         (hc_state, key, value, wk, wq, wc, convw2d, gate, rstdk, rstdq, rstdc, seg_lo, seg_hi, conv_pre) = (
             ctx.saved_tensors
         )
@@ -406,6 +486,12 @@ def ple_gate_conv(
     dilation: int,
     cu_seqlens,
 ):
+    # [FUNCTION DOC] Public entry point: makes hc_state, key and value contiguous and applies the
+    # fused autograd function (argument meanings as described for its forward). norm_key_w and
+    # norm_query_w are the per-channel gate-chain norm weights, norm_conv_w the weight of the grouped
+    # norm before the convolution, conv1d_weight the depthwise filter (W by 1 by K), n the stream
+    # count, eps the norm epsilon, dilation the tap spacing in tokens, cu_seqlens cumulative sequence
+    # lengths or None for one sequence. Returns the output with the shape and dtype of hc_state.
     """Full PLE increment (gate chain + norm + causal conv + SiLU + residual)."""
     return _PLEGateConv.apply(
         hc_state.contiguous(),

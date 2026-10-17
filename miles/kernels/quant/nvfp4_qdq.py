@@ -1,3 +1,26 @@
+# [MODULE DOC] Fused GPU "fake quantization" of a 2-D weight-like tensor to NVFP4 (4-bit E2M1 values
+# with one E4M3 scale per 16 consecutive elements along the last axis, plus one per-tensor FP32
+# scale) followed immediately by dequantization back to the input dtype, written with the CuTe DSL
+# and inline PTX. It exists for quantization-aware training and reproduces Transformer Engine's
+# arithmetic order bit for bit (round-to-nearest everywhere, explicit single-instruction operations,
+# no fast math).
+# Algorithm per 16-element block (one GPU thread each, grid-stride loop, 128-bit loads/stores):
+# global encode scale S_enc = (E4M3max times 6) / tensor amax (limited to the largest float, 1 if the
+# amax or the quotient is zero); block scale = block amax times S_enc divided by 6, rounded to E4M3;
+# values are multiplied by the reciprocal of (block scale times decode scale) and rounded to E2M1;
+# dequantized value = E2M1 value times block scale times tensor amax divided by (6 times E4M3max).
+# Optional "Four Over Six" mode (4over6) tries two block scales (maps block max to 6 or to 4, i.e.
+# 1.5 times larger scale), computes each candidate's reconstruction error (mean absolute or squared
+# error, in float32 or in an FP16-rounded variant) and keeps the better one; ties pick the map-to-6
+# candidate. E4M3max is 448, or 256 in 4over6 mode when selected.
+# Contents: configuration dataclass and environment-variable resolution (current_nvfp4_qdq_config);
+# inline-PTX helper ops (loads/stores, round-to-nearest arithmetic, half/bfloat16 packing and
+# conversions, E4M3 and E2M1 conversions); jit device functions (amax, scale, candidate error,
+# quantization paths, dequantize-store); the kernel class; compile/launch plumbing with a cache
+# keyed by (device capability, dtype, config); input validation; amax computation; the public
+# fused_nvfp4_qdq and the straight-through-estimator wrapper fake_nvfp4_quantization_ste.
+# Requires an SM10x (compute capability major 10) GPU, the CUTLASS CuTe DSL package, and
+# contiguous 16-byte-aligned rank-2 BF16/FP16 CUDA input with a last dimension divisible by 16.
 """Fused CuTe DSL NVFP4 quantize-dequantize for fake QAT.
 
 The kernel keeps the E4M3 block scale and packed E2M1 values in registers and
@@ -46,6 +69,8 @@ _INT32_MAX = 2**31 - 1
 
 
 class NVFP4QDQErrorMode(IntEnum):
+    # [CLASS DOC] Integer enum selecting the per-element error term used to compare the two Four Over
+    # Six candidates: MAE (0, absolute difference) or MSE (1, squared difference).
     """Four Over Six candidate error metric."""
 
     MAE = 0
@@ -54,6 +79,10 @@ class NVFP4QDQErrorMode(IntEnum):
 
 @dataclass(frozen=True)
 class NVFP4QDQConfig:
+    # [CLASS DOC] Immutable (hashable, used as a compile-cache key) numerical configuration. Fields:
+    # use_4over6 (try two block scales, default false), e4m3_max (448 default, or 256; 256 only with
+    # 4over6), error_mode (MAE default or MSE), error_use_fast_math (selects the FP16-rounded candidate
+    # error variant; only valid with 4over6). Validation happens at construction.
     """Compile-time numerical configuration for fused NVFP4 QDQ.
 
     ``error_use_fast_math`` retains Transformer Engine's public knob name, but
@@ -66,6 +95,9 @@ class NVFP4QDQConfig:
     error_use_fast_math: bool = False
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] Validates the combination, raising a value error if e4m3_max is not 256 or
+        # 448, if 256 is requested without 4over6, or if the FP16 error variant is requested without
+        # 4over6.
         if self.e4m3_max not in (256, 448):
             raise ValueError(f"NVFP4 E4M3 max must be 256 or 448, got {self.e4m3_max}.")
         if not self.use_4over6 and self.e4m3_max != 448:
@@ -75,6 +107,8 @@ class NVFP4QDQConfig:
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
+    # [FUNCTION DOC] HELPER: Reads an environment variable (surrounding whitespace stripped, default
+    # "0") as a boolean flag: "1" is true, "0" or empty is false; anything else raises a value error.
     value = os.getenv(name, default).strip()
     if value == "1":
         return True
@@ -84,6 +118,9 @@ def _env_flag(name: str, default: str = "0") -> bool:
 
 
 def _env_applies_to_weights(name: str, default: str) -> bool:
+    # [FUNCTION DOC] HELPER: Reads an environment variable (lower-cased, stripped, with the given
+    # default) that must be one of none, weights, activations or all (else a value error); returns
+    # true for "weights" and "all" (this module only quantizes weights).
     value = os.getenv(name, default).strip().lower()
     if value not in ("none", "weights", "activations", "all"):
         raise ValueError(f"{name} must be one of none, weights, activations, or all; got {value!r}.")
@@ -91,6 +128,13 @@ def _env_applies_to_weights(name: str, default: str) -> bool:
 
 
 def current_nvfp4_qdq_config() -> NVFP4QDQConfig:
+    # [FUNCTION DOC] Builds the configuration from environment variables (read on every call).
+    # NVTE_USE_FAST_MATH must not be "1" (value error). NVTE_NVFP4_4OVER6 (default none) enables
+    # 4over6 when it names weights or all. NVTE_NVFP4_4OVER6_E4M3_USE_256 (default all) selects the
+    # E4M3 maximum 256 instead of 448, but only if 4over6 is enabled. NVTE_NVFP4_4OVER6_ERR_MODE
+    # (default MAE, case-insensitive) must be MAE or MSE (value error otherwise).
+    # NVTE_NVFP4_4OVER6_ERR_USE_FAST_MATH (flag, default 0) selects the FP16-rounded error variant, and
+    # is ignored unless 4over6 is enabled. Returns the frozen configuration.
     """Resolve the weight QDQ contract from Transformer Engine environment variables."""
     if _env_flag("NVTE_USE_FAST_MATH"):
         raise ValueError(
@@ -118,12 +162,16 @@ def current_nvfp4_qdq_config() -> NVFP4QDQConfig:
 
 @dsl_user_op
 def _get_ptr(tensor: cute.Tensor, offset: Int32, *, loc=None, ip=None) -> Int64:
+    # [FUNCTION DOC] HELPER: Device op. Returns the raw 64-bit address of the tensor's element at the
+    # given element offset from its start pointer. loc and ip are DSL source-location/insertion hooks.
     elem_ptr = tensor.iterator + offset
     return Int64(llvm.ptrtoint(T.i64(), elem_ptr.llvm_ptr, loc=loc, ip=ip))
 
 
 @dsl_user_op
 def _load_v4_u32(base_ptr: Int64, *, loc=None, ip=None) -> tuple[Uint32, Uint32, Uint32, Uint32]:
+    # [FUNCTION DOC] HELPER: Inline-PTX 128-bit global load of four 32-bit words from the address (must
+    # be 16-byte aligned); no side effects. Returns the four words in memory order.
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
         [Int64(base_ptr).ir_value(loc=loc, ip=ip)],
@@ -145,6 +193,8 @@ def _load_v4_u32(base_ptr: Int64, *, loc=None, ip=None) -> tuple[Uint32, Uint32,
 
 @dsl_user_op
 def _store_v4_u32(base_ptr: Int64, v0: Uint32, v1: Uint32, v2: Uint32, v3: Uint32, *, loc=None, ip=None) -> None:
+    # [FUNCTION DOC] HELPER: Inline-PTX 128-bit global store of four 32-bit words to the address (16-byte
+    # aligned); marked as having side effects so it is not reordered or removed.
     llvm.inline_asm(
         None,
         [
@@ -166,6 +216,8 @@ def _store_v4_u32(base_ptr: Int64, v0: Uint32, v1: Uint32, v2: Uint32, v3: Uint3
 
 @dsl_user_op
 def _fadd_rn(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
+    # [FUNCTION DOC] HELPER: Inline-PTX single-precision addition with round-to-nearest-even, never
+    # fused or contracted by the compiler.
     return Float32(
         llvm.inline_asm(
             T.f32(),
@@ -183,6 +235,7 @@ def _fadd_rn(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
 
 @dsl_user_op
 def _fsub_rn(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
+    # [FUNCTION DOC] HELPER: Inline-PTX single-precision subtraction (a minus b), round-to-nearest-even.
     return Float32(
         llvm.inline_asm(
             T.f32(),
@@ -200,6 +253,8 @@ def _fsub_rn(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
 
 @dsl_user_op
 def _fmul_rn(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
+    # [FUNCTION DOC] HELPER: Inline-PTX single-precision multiplication, round-to-nearest-even, never
+    # fused into a multiply-add.
     return Float32(
         llvm.inline_asm(
             T.f32(),
@@ -217,6 +272,9 @@ def _fmul_rn(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
 
 @dsl_user_op
 def _scale_f32x2_rn(value0: Float32, value1: Float32, scale: Float32, *, loc=None, ip=None) -> tuple[Float32, Float32]:
+    # [FUNCTION DOC] HELPER: Multiplies two floats by the same scale with one packed two-lane
+    # round-to-nearest multiply instruction (needs a GPU that supports packed float32 math); returns
+    # both products.
     """Multiply two FP32 values by one common scale with packed RN arithmetic."""
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.f32(), T.f32()]),
@@ -249,6 +307,8 @@ def _scale_f32x2_rn(value0: Float32, value1: Float32, scale: Float32, *, loc=Non
 
 @dsl_user_op
 def _square_f32x2_rn(a: Float32, b: Float32, *, loc=None, ip=None) -> tuple[Float32, Float32]:
+    # [FUNCTION DOC] HELPER: Squares two floats with one packed two-lane round-to-nearest multiply;
+    # returns both squares.
     """Square two FP32 values with the packed RN instruction used by TE."""
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.f32(), T.f32()]),
@@ -276,6 +336,8 @@ def _square_f32x2_rn(a: Float32, b: Float32, *, loc=None, ip=None) -> tuple[Floa
 
 @dsl_user_op
 def _fdiv_rn(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
+    # [FUNCTION DOC] HELPER: Inline-PTX IEEE division a over b with round-to-nearest-even (not the fast
+    # approximate division).
     return Float32(
         llvm.inline_asm(
             T.f32(),
@@ -293,6 +355,8 @@ def _fdiv_rn(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
 
 @dsl_user_op
 def _fmin(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
+    # [FUNCTION DOC] HELPER: Inline-PTX float minimum of two values (the non-not-a-number operand is
+    # returned if only one is not-a-number).
     return Float32(
         llvm.inline_asm(
             T.f32(),
@@ -310,6 +374,7 @@ def _fmin(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
 
 @dsl_user_op
 def _fabs(a: Float32, *, loc=None, ip=None) -> Float32:
+    # [FUNCTION DOC] HELPER: Inline-PTX float absolute value.
     return Float32(
         llvm.inline_asm(
             T.f32(),
@@ -327,6 +392,8 @@ def _fabs(a: Float32, *, loc=None, ip=None) -> Float32:
 
 @dsl_user_op
 def _half2_abs(x: Uint32, *, loc=None, ip=None) -> Uint32:
+    # [FUNCTION DOC] HELPER: Clears the sign bit of both 16-bit halves of a 32-bit word (a bit mask
+    # that works for packed FP16 and bfloat16 alike).
     return Uint32(
         llvm.inline_asm(
             T.i32(),
@@ -344,6 +411,7 @@ def _half2_abs(x: Uint32, *, loc=None, ip=None) -> Uint32:
 
 @dsl_user_op
 def _half2_max(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
+    # [FUNCTION DOC] HELPER: Lane-wise maximum of two words each holding two packed FP16 values.
     return Uint32(
         llvm.inline_asm(
             T.i32(),
@@ -361,6 +429,7 @@ def _half2_max(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
 
 @dsl_user_op
 def _bfloat2_max(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
+    # [FUNCTION DOC] HELPER: Lane-wise maximum of two words each holding two packed bfloat16 values.
     return Uint32(
         llvm.inline_asm(
             T.i32(),
@@ -378,6 +447,7 @@ def _bfloat2_max(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
 
 @dsl_user_op
 def _half2_max_to_f32(x: Uint32, *, loc=None, ip=None) -> Float32:
+    # [FUNCTION DOC] HELPER: Converts the two packed FP16 halves to float32 and returns their maximum.
     return Float32(
         llvm.inline_asm(
             T.f32(),
@@ -404,6 +474,8 @@ def _half2_max_to_f32(x: Uint32, *, loc=None, ip=None) -> Float32:
 
 @dsl_user_op
 def _bfloat2_max_to_f32(x: Uint32, *, loc=None, ip=None) -> Float32:
+    # [FUNCTION DOC] HELPER: Widens the two packed bfloat16 halves to float32 (by shifting into the
+    # high 16 bits) and returns their maximum.
     return Float32(
         llvm.inline_asm(
             T.f32(),
@@ -433,6 +505,7 @@ def _bfloat2_max_to_f32(x: Uint32, *, loc=None, ip=None) -> Float32:
 
 @dsl_user_op
 def _half2_to_f32x2(x: Uint32, *, loc=None, ip=None) -> tuple[Float32, Float32]:
+    # [FUNCTION DOC] HELPER: Unpacks a word of two FP16 values into two float32 values (low half first).
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.f32(), T.f32()]),
         [Uint32(x).ir_value(loc=loc, ip=ip)],
@@ -459,6 +532,8 @@ def _half2_to_f32x2(x: Uint32, *, loc=None, ip=None) -> tuple[Float32, Float32]:
 
 @dsl_user_op
 def _bfloat2_to_f32x2(x: Uint32, *, loc=None, ip=None) -> tuple[Float32, Float32]:
+    # [FUNCTION DOC] HELPER: Unpacks a word of two bfloat16 values into two float32 values (low half
+    # first) by placing each 16-bit pattern in the high half of a 32-bit word.
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.f32(), T.f32()]),
         [Uint32(x).ir_value(loc=loc, ip=ip)],
@@ -488,6 +563,9 @@ def _bfloat2_to_f32x2(x: Uint32, *, loc=None, ip=None) -> tuple[Float32, Float32
 
 @dsl_user_op
 def _cvt_f32_to_e4m3(a: Float32, *, loc=None, ip=None) -> Uint32:
+    # [FUNCTION DOC] HELPER: Converts a float to an 8-bit E4M3 value with round-to-nearest-even and
+    # saturation to the finite range; the code is returned in the low byte of the 32-bit result (upper
+    # bits zero).
     return Uint32(
         llvm.inline_asm(
             T.i32(),
@@ -513,6 +591,8 @@ def _cvt_f32_to_e4m3(a: Float32, *, loc=None, ip=None) -> Uint32:
 
 @dsl_user_op
 def _cvt_e4m3_to_f32(a: Uint32, *, loc=None, ip=None) -> Float32:
+    # [FUNCTION DOC] HELPER: Decodes the E4M3 code in the low byte of the word (exactly, via FP16) to a
+    # float32.
     return Float32(
         llvm.inline_asm(
             T.f32(),
@@ -552,6 +632,9 @@ def _cvt_e2m1x8(
     loc=None,
     ip=None,
 ) -> Uint32:
+    # [FUNCTION DOC] HELPER: Converts eight floats to E2M1 (4-bit float) with round-to-nearest-even and
+    # saturation, packing them into one 32-bit word: value i occupies nibble i (v0 in the lowest four
+    # bits, v7 in the highest).
     return Uint32(
         llvm.inline_asm(
             T.i32(),
@@ -587,6 +670,9 @@ def _cvt_e2m1x8(
 
 @dsl_user_op
 def _e2m1x2_to_f32x2(a: Uint32, *, loc=None, ip=None) -> tuple[Float32, Float32]:
+    # [FUNCTION DOC] HELPER: Decodes the two E2M1 nibbles in the low byte of the word (low nibble first)
+    # into float32 values; a nibble equal to negative zero (code 8) is forced to a float negative
+    # zero so the sign bit is preserved. Higher bytes are ignored.
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.f32(), T.f32()]),
         [Uint32(a).ir_value(loc=loc, ip=ip)],
@@ -632,6 +718,10 @@ def _e2m1x2_to_f32x2(a: Uint32, *, loc=None, ip=None) -> tuple[Float32, Float32]
 
 @dsl_user_op
 def _scaled_e2m1x2_e4m3_to_f32x2(packed: Uint32, scale: Uint32, *, loc=None, ip=None) -> tuple[Float32, Float32]:
+    # [FUNCTION DOC] HELPER: Decodes the two E2M1 nibbles in the low byte of the packed word into FP16,
+    # decodes the E4M3 scale code (low byte of the scale word) into FP16, multiplies both lanes by it in
+    # FP16 with round-to-nearest, and returns the two products widened to float32. Used by the FP16-
+    # rounded candidate-error path.
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.f32(), T.f32()]),
         [Uint32(packed).ir_value(loc=loc, ip=ip), Uint32(scale).ir_value(loc=loc, ip=ip)],
@@ -667,6 +757,8 @@ def _scaled_e2m1x2_e4m3_to_f32x2(packed: Uint32, scale: Uint32, *, loc=None, ip=
 
 @dsl_user_op
 def _pack_f32x2_to_half2(a: Float32, b: Float32, *, loc=None, ip=None) -> Uint32:
+    # [FUNCTION DOC] HELPER: Rounds two floats to FP16 (round-to-nearest-even) and packs them, a in the
+    # low half and b in the high half.
     return Uint32(
         llvm.inline_asm(
             T.i32(),
@@ -691,6 +783,8 @@ def _pack_f32x2_to_half2(a: Float32, b: Float32, *, loc=None, ip=None) -> Uint32
 
 @dsl_user_op
 def _pack_f32x2_to_bfloat2(a: Float32, b: Float32, *, loc=None, ip=None) -> Uint32:
+    # [FUNCTION DOC] HELPER: Rounds two floats to bfloat16 (round-to-nearest-even) and packs them, a in
+    # the low half and b in the high half.
     return Uint32(
         llvm.inline_asm(
             T.i32(),
@@ -715,6 +809,9 @@ def _pack_f32x2_to_bfloat2(a: Float32, b: Float32, *, loc=None, ip=None) -> Uint
 
 @dsl_user_op
 def _normal_block_scale(block_amax: Float32, global_encode_scale: Float32, *, loc=None, ip=None) -> Float32:
+    # [FUNCTION DOC] HELPER: High-precision block scale of the standard path: block amax times
+    # (global encode scale times the float32 constant nearest 1/6), each product rounded to nearest;
+    # the association order matters for bit-exactness. Returns zero when the block amax is zero.
     """TE's intentionally associated ``amax * (S_enc * (1/6))`` expression."""
     return Float32(
         llvm.inline_asm(
@@ -745,6 +842,8 @@ def _normal_block_scale(block_amax: Float32, global_encode_scale: Float32, *, lo
 
 @cute.jit
 def _input_values(words: tuple, is_bfloat16: bool) -> tuple:
+    # [FUNCTION DOC] HELPER: Device function. Unpacks eight 32-bit words (sixteen packed bfloat16 or FP16
+    # values) into a tuple of sixteen float32 values in memory order. Loops are unrolled at compile time.
     values = ()
     for i in cutlass.range_constexpr(8):
         if cutlass.const_expr(is_bfloat16):
@@ -757,6 +856,10 @@ def _input_values(words: tuple, is_bfloat16: bool) -> tuple:
 
 @cute.jit
 def _block_amax(words: tuple, is_bfloat16: bool) -> Float32:
+    # [FUNCTION DOC] HELPER: Device function. Returns the largest absolute value among the sixteen
+    # packed elements as float32: clears sign bits word by word, reduces pairwise with packed
+    # two-lane maximum instructions (bfloat16 or FP16 flavor), then takes the larger of the final two
+    # lanes after widening to float32.
     maxima = ()
     for i in cutlass.range_constexpr(8):
         value = _half2_abs(words[i])
@@ -780,6 +883,10 @@ def _block_amax(words: tuple, is_bfloat16: bool) -> Float32:
 
 @cute.jit
 def _scale_pack_e2m1(values: tuple, scale: Float32) -> tuple[Uint32, Uint32]:
+    # [FUNCTION DOC] HELPER: Device function. Multiplies sixteen float32 values by the scale in packed
+    # pairs (round-to-nearest) and converts them to E2M1 with saturation, returning two words: the
+    # first eight values in the first word, the last eight in the second (nibble i = value i of the
+    # half).
     """Scale and immediately pack each eight-value half to limit live FP32 state."""
     scaled_lo = ()
     for pair_idx in cutlass.range_constexpr(4):
@@ -815,6 +922,9 @@ def _scale_pack_e2m1(values: tuple, scale: Float32) -> tuple[Uint32, Uint32]:
 
 @cute.jit
 def _scale_pack_input_words(words: tuple, scale: Float32, is_bfloat16: bool) -> tuple[Uint32, Uint32]:
+    # [FUNCTION DOC] HELPER: Same result as unpacking all values, scaling and packing to E2M1, but
+    # processes the first four words, then the last four, so only eight scaled floats are live at once
+    # (register pressure). Returns the two packed E2M1 words (low half-block, high half-block).
     """Standard-path input conversion with at most eight scaled FP32 values live."""
     scaled_lo = ()
     for i in cutlass.range_constexpr(4):
@@ -858,6 +968,9 @@ def _scale_pack_input_words(words: tuple, scale: Float32, is_bfloat16: bool) -> 
 
 @cute.jit
 def _global_encode_scale(amax: Float32, e4m3_max: int) -> Float32:
+    # [FUNCTION DOC] HELPER: Per-tensor encode scale = (6 times the E4M3 maximum) divided by the tensor
+    # amax with round-to-nearest, limited to the largest finite float; replaced by 1.0 if the amax is
+    # zero or if the scale ends up zero (infinite amax).
     scale = _fdiv_rn(Float32(float(e4m3_max * 6)), amax)
     scale = _fmin(scale, Float32(_FP32_MAX))
     if amax == Float32(0.0):
@@ -869,6 +982,9 @@ def _global_encode_scale(amax: Float32, e4m3_max: int) -> Float32:
 
 @cute.jit
 def _candidate_inverse_scale(scale_f32: Float32, global_decode_scale: Float32) -> Float32:
+    # [FUNCTION DOC] HELPER: Multiplier applied to input values before E2M1 rounding: the reciprocal
+    # (round-to-nearest) of block scale times global decode scale, limited to the largest finite float
+    # (an infinite result for a zero denominator becomes that limit).
     product = _fmul_rn(scale_f32, global_decode_scale)
     return _fmin(_fdiv_rn(Float32(1.0), product), Float32(_FP32_MAX))
 
@@ -881,6 +997,10 @@ def _standard_quantize(
     global_decode_scale: Float32,
     is_bfloat16: bool,
 ) -> tuple[Uint32, Uint32, Uint32]:
+    # [FUNCTION DOC] HELPER: Standard NVFP4 block quantization. Computes the high-precision block scale,
+    # rounds it to E4M3 (saturating), decodes it back, forms the inverse multiplier with the global
+    # decode scale, and scales and packs the block's values to E2M1. Returns (E4M3 scale code word, low
+    # packed word, high packed word).
     scale_high_precision = _normal_block_scale(block_amax, global_encode_scale)
     scale = _cvt_f32_to_e4m3(scale_high_precision)
     scale_f32 = _cvt_e4m3_to_f32(scale)
@@ -899,6 +1019,14 @@ def _candidate_error(
     global_encode_scale: Float32,
     config: NVFP4QDQConfig,
 ) -> Float32:
+    # [FUNCTION DOC] HELPER: Reconstruction error of one Four Over Six candidate: the sum over the sixteen
+    # values of the absolute (MAE) or squared (MSE) difference between the dequantized candidate and the
+    # original, accumulated sequentially in float32 with round-to-nearest. Inputs: the sixteen original
+    # float values, the two packed E2M1 words, the E4M3 scale code, tensor amax and global encode scale.
+    # FP16 variant (config.error_use_fast_math): the candidate is decoded and scaled by the block scale
+    # in FP16, and the original is multiplied by the global encode scale (error measured in the encoded
+    # domain). Otherwise: the candidate is multiplied by the block scale, then by the tensor amax, then
+    # divided by (6 times the E4M3 maximum), and compared against the unscaled original.
     error = Float32(0.0)
     if cutlass.const_expr(config.error_use_fast_math):
         for pair_idx in cutlass.range_constexpr(8):
@@ -961,6 +1089,12 @@ def _four_over_six_quantize(
     global_decode_scale: Float32,
     config: NVFP4QDQConfig,
 ) -> tuple[Uint32, Uint32, Uint32]:
+    # [FUNCTION DOC] HELPER: Four Over Six block quantization. Takes the sixteen unpacked float values,
+    # block amax, tensor amax and the global encode/decode scales. Builds the map-to-6 high-precision
+    # scale (block amax divided by 6 times the encode scale) and the map-to-4 scale (1.5 times larger);
+    # each is capped at 448 and rounded to E4M3; each gets its inverse multiplier, packed E2M1 words and
+    # reconstruction error; the map-to-4 candidate is chosen only if its error is strictly smaller, so
+    # ties go to map-to-6. Returns the chosen (E4M3 scale code word, low packed word, high packed word).
     # TE intentionally associates this differently from standard NVFP4. Keep
     # the zero-amax path in the same expression stream as TE as well: packing
     # the candidates is what preserves negative-zero E2M1 sign bits.
@@ -991,6 +1125,8 @@ def _four_over_six_quantize(
 
 @cute.jit
 def _dequantize_pack_pair(packed_pair: Uint32, final_scale: Float32, is_bfloat16: bool) -> Uint32:
+    # [FUNCTION DOC] HELPER: Decodes the two E2M1 nibbles in the low byte of the word, multiplies both by
+    # the final scale (round-to-nearest) and packs the results as bfloat16 or FP16 into one word.
     q0, q1 = _e2m1x2_to_f32x2(packed_pair)
     out0, out1 = _scale_f32x2_rn(q0, q1, final_scale)
     if cutlass.const_expr(is_bfloat16):
@@ -1009,6 +1145,11 @@ def _dequantize_store(
     e4m3_max: int,
     is_bfloat16: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Dequantizes a 16-element block and writes it to the output tensor at the
+    # given element offset. The final scale is the decoded block scale times the tensor amax times the
+    # float32 constant for 1 / (6 times the E4M3 maximum), each product rounded to nearest. Writes the
+    # first eight elements (low packed word) with one 128-bit store at offset, and the last eight
+    # (high packed word) at offset plus 8; elements are produced in order, four byte-pairs per word.
     """Dequantize, cast, and store one half-block at a time."""
     scale_f32 = _cvt_e4m3_to_f32(scale)
     final_scale = _fmul_rn(scale_f32, global_amax)
@@ -1030,9 +1171,15 @@ def _dequantize_store(
 
 
 class _NVFP4QDQKernel:
+    # [CLASS DOC] HELPER: CuTe DSL kernel object. Holds the dtype flag, the configuration and the launch
+    # geometry chosen from it: standard mode uses 256 threads per CTA, a compile launch bound of 4 CTAs
+    # per SM and a runtime grid of up to 24 CTAs per SM; 4over6 mode uses 128 threads, 8 CTAs per SM for
+    # both bound and grid.
     """One thread processes one contiguous 1x16 quantization block."""
 
     def __init__(self, is_bfloat16: bool, config: NVFP4QDQConfig) -> None:
+        # [FUNCTION DOC] HELPER: Stores the flag and configuration and picks thread count, minimum CTAs
+        # per SM and CTAs-per-SM grid multiplier from the module constants according to use_4over6.
         self.is_bfloat16 = is_bfloat16
         self.config = config
         if config.use_4over6:
@@ -1054,6 +1201,11 @@ class _NVFP4QDQKernel:
         num_ctas: Int32,
         stream,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Host-side jit entry that launches the kernel on the given stream with a
+        # one-dimensional grid of num_ctas CTAs, one-dimensional blocks of the configured thread count
+        # (also the maximum thread count), the configured minimum CTAs per SM, and no shared memory.
+        # Inputs are flat element tensors (input, output), the one-element float32 tensor holding the
+        # tensor amax, and the number of 16-element blocks.
         self.kernel(input_tensor, output_tensor, global_amax, total_blocks).launch(
             grid=[num_ctas, 1, 1],
             block=[self.threads, 1, 1],
@@ -1071,6 +1223,14 @@ class _NVFP4QDQKernel:
         global_amax: cute.Tensor,
         total_blocks: Int32,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Device kernel. Each thread first reads the tensor amax and derives the
+        # global encode scale and its reciprocal decode scale (redundantly per thread). Then it
+        # processes blocks index = global thread id, plus multiples of the total thread count, while
+        # below total_blocks: block element offset = index times 16; two 128-bit loads give the sixteen
+        # packed values; the block amax is computed; the Four Over Six path (unpacking to float32
+        # first) or the standard path yields the E4M3 scale code and two packed E2M1 words; the block is
+        # dequantized and stored in the input dtype at the same offset. Offsets are 32-bit, so the
+        # tensor must have at most 2^31 minus 1 elements and be 16-byte aligned.
         """Quantize and immediately dequantize grid-stride 1x16 blocks."""
         thread_idx, _, _ = cute.arch.thread_idx()
         block_idx, _, _ = cute.arch.block_idx()
@@ -1106,6 +1266,8 @@ class _NVFP4QDQKernel:
 
 @dataclass(frozen=True)
 class _NVFP4QDQSpecialization:
+    # [CLASS DOC] HELPER: Immutable record of a compiled kernel callable plus the thread count and
+    # CTAs-per-SM multiplier needed to compute the launch grid at call time.
     """Compiled callable and its statically selected launch geometry."""
 
     launch: Any
@@ -1113,11 +1275,15 @@ class _NVFP4QDQSpecialization:
     grid_blocks_per_sm: int
 
 
+# Module-level cache of compiled specializations keyed by (device capability, input dtype, config);
+# filled lazily on first launch, never evicted, not protected by a lock.
 _KERNEL_CACHE: dict[tuple[Any, ...], _NVFP4QDQSpecialization] = {}
 
 
 @functools.cache
 def _device_info(device_index: int) -> tuple[tuple[int, int], int]:
+    # [FUNCTION DOC] HELPER: Memoized per device index: returns ((major, minor) compute capability,
+    # multiprocessor count) read inside that device's context.
     """Cache immutable capability and SM-count metadata outside the QAT hot path."""
     with torch.cuda.device(device_index):
         capability = torch.cuda.get_device_capability(device_index)
@@ -1126,6 +1292,12 @@ def _device_info(device_index: int) -> tuple[tuple[int, int], int]:
 
 
 def _validate_input(x: torch.Tensor, amax: torch.Tensor) -> tuple[int, tuple[int, int], int, int]:
+    # [FUNCTION DOC] HELPER: Checks the contract and returns (device index, capability, SM count,
+    # element count). Raises a value error unless x is a CUDA tensor that is rank 2, contiguous,
+    # 16-byte aligned, has a last dimension divisible by 16, is non-empty and has at most 2^31 minus 1
+    # elements, amax is a CUDA tensor on the same device, and the device capability major is 10; a type
+    # error if x is not bfloat16 or FP16 or amax is not exactly one float32 value; a runtime error if
+    # the device has no concrete index.
     if not x.is_cuda:
         raise ValueError("Fused NVFP4 QDQ requires a CUDA tensor.")
     if x.dtype not in (torch.bfloat16, torch.float16):
@@ -1157,6 +1329,12 @@ def _validate_input(x: torch.Tensor, amax: torch.Tensor) -> tuple[int, tuple[int
 
 
 def _compile_specialization(dtype: torch.dtype, config: NVFP4QDQConfig) -> _NVFP4QDQSpecialization:
+    # [FUNCTION DOC] HELPER: Compiles the kernel for one dtype and configuration ahead of use. Raises a
+    # runtime error if a CUDA graph capture is in progress (warm up first). Builds a kernel object,
+    # fake compact tensors for input and output (symbolic length, 16-byte alignment) and amax (one
+    # float32 element, 4-byte alignment), a fake stream bound to the framework's environment stream, and
+    # compiles with the foreign-function-interface option and placeholder block and CTA counts of 1.
+    # Returns the specialization record (callable, threads, CTAs-per-SM multiplier).
     """Compile one dtype/config specialization outside the steady-state path."""
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("Warm up fused NVFP4 QDQ before CUDA graph capture.")
@@ -1190,6 +1368,12 @@ def _launch_fused_nvfp4_qdq(
     multiprocessors: int,
     num_elements: int,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Launches the kernel on the current device and returns a new tensor shaped
+    # and typed like x. Looks up (or compiles and caches) the specialization for (capability, dtype,
+    # config); allocates the output; passes flat detached views of input, output and the amax; the
+    # block count is element count divided by 16 and the CTA count is the smaller of the CTAs needed to
+    # give each thread one block and (SM count times the CTAs-per-SM multiplier). The launch uses the
+    # framework's current stream.
     """Launch on the current CUDA device with cached static dispatch."""
     key = (capability, x.dtype, config)
     specialization = _KERNEL_CACHE.get(key)
@@ -1211,6 +1395,9 @@ def _launch_fused_nvfp4_qdq(
 
 
 def compute_nvfp4_amax(x: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] Returns the per-tensor amax as a float32 scalar tensor: the infinity norm (largest
+    # absolute value) of the detached input, accumulated in float32. Raises a value error for an empty
+    # tensor.
     """Compute the TE-compatible FP32 per-tensor amax with PyTorch."""
     if x.numel() == 0:
         raise ValueError("Cannot compute NVFP4 amax for an empty tensor.")
@@ -1218,6 +1405,11 @@ def compute_nvfp4_amax(x: torch.Tensor) -> torch.Tensor:
 
 
 def fused_nvfp4_qdq(x: torch.Tensor, amax: torch.Tensor, config: NVFP4QDQConfig | None = None) -> torch.Tensor:
+    # [FUNCTION DOC] Public forward-only entry: quantizes and dequantizes x (rank 2, see the module
+    # contract) using the given float32 one-element amax and configuration (default: resolved from the
+    # environment variables on each call). Validates the input (errors as in the validator), then
+    # launches on x's device, switching the current CUDA device for the call if it differs. Returns a
+    # new tensor of the same shape and dtype that is detached from autograd.
     """Run register-resident NVFP4 QDQ and return a detached high-precision tensor."""
     if config is None:
         config = current_nvfp4_qdq_config()
@@ -1230,22 +1422,34 @@ def fused_nvfp4_qdq(x: torch.Tensor, amax: torch.Tensor, config: NVFP4QDQConfig 
 
 
 class _FusedNVFP4QDQSTE(torch.autograd.Function):
+    # [CLASS DOC] HELPER: Straight-through-estimator autograd function: the forward runs the fused
+    # kernel; the backward passes the gradient to x unchanged, with none for the amax and the config.
     """Identity backward around the non-differentiable fused QDQ kernel."""
 
     @staticmethod
     def forward(ctx: Any, x: torch.Tensor, amax: torch.Tensor, config: NVFP4QDQConfig) -> torch.Tensor:
+        # [FUNCTION DOC] Calls the fused function with the given amax and configuration; the context is
+        # unused and nothing is saved.
         """Apply fused QDQ in the STE forward pass."""
         del ctx
         return fused_nvfp4_qdq(x, amax, config)
 
     @staticmethod
     def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, None, None]:
+        # [FUNCTION DOC] Returns the incoming gradient as the gradient of x (identity) and none for the
+        # amax and configuration.
         """Propagate the weight gradient through fake quantization unchanged."""
         del ctx
         return grad_output, None, None
 
 
 def fake_nvfp4_quantization_ste(x: torch.Tensor, config: NVFP4QDQConfig | None = None) -> torch.Tensor:
+    # [FUNCTION DOC] Public differentiable entry for QAT. Resolves the configuration (default from the
+    # environment), computes the per-tensor amax of x with torch (a device synchronization-free
+    # reduction), applies the fused kernel in the forward pass with an identity gradient in the backward
+    # pass, and, if x carries a main_grad attribute (a master-gradient buffer used by the optimizer
+    # framework), copies that attribute reference onto the output so the buffer stays reachable.
+    # Returns the fake-quantized tensor. Input requirements as in the module contract.
     """Apply fused NVFP4 QDQ in forward and the straight-through estimator in backward."""
     if config is None:
         config = current_nvfp4_qdq_config()

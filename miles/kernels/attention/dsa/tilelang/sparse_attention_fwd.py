@@ -1,3 +1,11 @@
+# [MODULE DOC] Tilelang forward of DSA sparse attention. For every query and head, attends only to
+# the key/value rows listed in the query's selected-index row (minus one = padding), in blocks,
+# with an online softmax computed in base 2; the value is the first `dim` channels of the shared
+# key/value row while the optional tail channels only contribute to scores. An optional
+# per-head sink logit is added to the softmax denominator. Produces the output (bfloat16) and the
+# per-row log-sum-exp in base-2 units including the sink (float32), which the backward consumes.
+# One compiled kernel factory plus the host wrapper sparse_attention_fwd. Requires the tilelang
+# package and a GPU.
 # ruff: noqa
 # Adapted from https://github.com/tile-ai/tilelang/blob/e666d2d3cc483829c57618c9ebf2e4f4ada0819d/examples/deepseek_v32/sparse_mla_fwd.py
 
@@ -24,6 +32,15 @@ def _sparse_attention_fwd_kernel(
     block_I=64,
     threads=256,
 ):
+    # [FUNCTION DOC] HELPER: Kernel factory (jit-compiled, cached per argument values; the last two
+    # parameters, output and log-sum-exp, are allocated and returned by the compiled callable).
+    # Arguments: head count, value dim, tail dim, top-k, kv group count (default 1), softmax scale
+    # (default one over the square root of value plus tail dim; folded with log2(e) for base-2
+    # exponentials), whether a sink input is used, selected keys per iteration block_I (64) and
+    # threads (256). Asserts: value dim and tail dim (if non-zero) are powers of two, top-k is a
+    # multiple of block_I; if heads per group are padded to a power of two (at least 16) there must
+    # be a single group; if heads per group exceed 64 they must be a multiple of 64 and the work is
+    # replicated across blocks of 64 heads. TMA lowering and warp specialization are disabled.
     assert dim == tilelang.math.next_power_of_2(dim), f"haven't check padding correctness yet, dim={dim}"
     assert tail_dim == 0 or tail_dim == tilelang.math.next_power_of_2(
         tail_dim
@@ -79,6 +96,18 @@ def _sparse_attention_fwd_kernel(
         Output: T.Tensor(o_shape, dtype),  # type: ignore
         Lse: T.Tensor(lse_shape, accum_dtype),  # type: ignore
     ):
+        # [FUNCTION DOC] HELPER: Device program; one thread block per (query position times head block
+        # replica, batch element, kv group). Loads the head block of queries (value channels and tail),
+        # then for each block of selected keys (not software pipelined): gathers key/value rows via the
+        # clamped indices, sets the score tile to zero or minus infinity by index validity, adds
+        # query-key products, and applies an online softmax update in base 2 (running maximum starts at
+        # minus 2 to the 30 rather than minus infinity to avoid not-a-number, rescale factor for the old
+        # sum and output, probabilities cast to bfloat16 before multiplying with the value channels).
+        # After the loop: if a sink is used, add 2 to the power (sink logit times log2(e) minus scaled
+        # maximum) to the denominator; floor the denominator at 1e-30 (so a query with no valid key
+        # yields a zero output and a finite log-sum-exp instead of not-a-number); divide the output
+        # by it; the log-sum-exp is log2 of the denominator plus scaled maximum. Writes the output
+        # (value channels) and log-sum-exp for the head block.
         with T.Kernel(seq_len * REPLICATE_H, batch, kv_group, threads=threads) as (
             bx,
             by,
@@ -179,6 +208,12 @@ def _sparse_attention_fwd_kernel(
 
 
 def sparse_attention_fwd(q, kv, indices, kv_indices, sink, d_v, *, sm_scale, threads, block_I=64):
+    # [FUNCTION DOC] Host wrapper. Asserts queries, key/value cache and indices are contiguous and
+    # shapes agree (matching width and batch, indices batch by sequence by groups by top-k); the
+    # tail dim is query width minus d_v. Compiles (or fetches) the kernel for these sizes, using a
+    # sink only if one is given (otherwise passes a zero vector that is ignored). Returns
+    # (output batch by sequence by heads by d_v in bfloat16, log-sum-exp batch by sequence by heads
+    # in float32, base 2). Note the clamped index copy is trusted without checks.
     """q [B, S, H, d_v + d_tail], kv [B, S_kv, G, d_v + d_tail], indices [B, S, G, topk] (-1 = padding),
     kv_indices = indices.clamp(min=0) (the rows actually read), sink [H] fp32 or None.
     Returns out [B, S, H, d_v] and lse [B, S, H] in log2 space."""

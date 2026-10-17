@@ -1,3 +1,12 @@
+# [MODULE DOC] Command-line entry point that serves the dashboard web app over a dump directory.
+# Parses command-line options, builds a metric store and a dump reader on the directory, wraps
+# them in the HTTP application from the server module and runs it with uvicorn (blocking).
+# Options: dump directory (required unless demo mode), host (default all interfaces), port
+# (default 7788), follow mode, tensor LRU size (default 2), cache directory, demo mode, a flag
+# forcing the fleet utilization overview, and the low-MFU warning threshold (default taken from
+# the advisory module; zero disables the rule).
+# In follow mode a daemon thread calls the store's follow method every FOLLOW_INTERVAL_SECONDS
+# (2 seconds) to pick up appended telemetry lines.
 """Standalone dashboard server over a ``--dump-details`` directory.
 
     python -m miles.dashboard.serve --dump-details /path/to/dump_details \\
@@ -28,6 +37,11 @@ FOLLOW_INTERVAL_SECONDS = 2.0
 
 
 def make_demo_dir(target: Path) -> Path:
+    # [FUNCTION DOC] Fills the target directory with synthetic data for demo mode and returns it.
+    # Imports the test-suite dummy generators lazily (they only exist in a repo checkout); if the
+    # import fails it exits the process with a message instead of raising an import error.
+    # Writes 3 steps of dummy rollout/train dumps (8 prompts, 4 samples per prompt, max response
+    # length 48) and then 3 steps of dummy telemetry (32 samples per step) into the directory.
     """Populate ``target`` with generated demo data (dumps + telemetry).
 
     Uses the dummy generators from the test suite, so it requires a miles
@@ -43,6 +57,15 @@ def make_demo_dir(target: Path) -> Path:
 
 
 def main(argv: list[str] | None = None) -> None:
+    # [FUNCTION DOC] Parses arguments (from the given list, or the process arguments when None),
+    # builds the app and serves it forever; returns only when the server stops.
+    # Steps: in demo mode create a temporary directory and fill it with demo data, otherwise
+    # require the dump directory option; assert the directory exists. Load the metric store from
+    # the "dashboard" subdirectory, create the dump reader (cache directory and tensor LRU from
+    # options), build the app (follow flag, utilization-overview flag, low-MFU threshold), start
+    # the follow thread if requested, then run uvicorn on the host and port.
+    # Raises an assertion error when no dump directory is given outside demo mode or when it is
+    # not a directory. The demo temporary directory is never cleaned up.
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dump-details", default=None, help="the run's --dump-details directory")
     parser.add_argument("--host", default="0.0.0.0")
@@ -90,6 +113,9 @@ def main(argv: list[str] | None = None) -> None:
     if args.follow:
         # races the threadpool handlers: list appends are GIL-atomic, partition caches lock
         def _tail() -> None:
+            # [FUNCTION DOC] HELPER: Background loop of the follow thread: sleep for the follow
+            # interval, then ask the store to read newly appended lines; never returns and does
+            # not catch exceptions, so a corrupt-line error ends the thread silently.
             while True:
                 time.sleep(FOLLOW_INTERVAL_SECONDS)
                 store.follow()

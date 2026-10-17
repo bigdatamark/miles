@@ -1,3 +1,15 @@
+# [MODULE DOC] Storage and query layer for dashboard telemetry, backed by append-only JSONL files.
+# Defines (1) the record types, one dataclass per stream, with the Stream enum naming each stream
+# and its file; (2) a partition reader for hour-partitioned streams; (3) MetricStore, with a write
+# side (buffer, flush, meta, lane catalog) used by the live collector and a read side (load,
+# follow, timeline/metric/engine queries) used by the server and advisory code; and (4) two
+# downsampling helpers.
+# On disk, under the store directory: meta.json, one {stream}.jsonl per low-rate stream (metrics,
+# topology, data_buffer), a {stream}/{YYYYMMDD_HH}.jsonl partition directory per high-rate stream
+# (gpu_util, engine_series, phases, trajectories, gpu_processes; hour in UTC), and
+# lane_catalog.json. Timestamps are epoch seconds (floats).
+# Concurrency: queries run concurrently from a thread pool; the partition reader and the engine
+# frame cache use locks, while the plain record lists rely on append-only list semantics.
 """File-backed store for miles dashboard time series.
 
 The live collector buffers records via ``append()`` and persists them with
@@ -46,6 +58,9 @@ import polars as pl
 
 
 class Stream(StrEnum):
+    # [CLASS DOC] String enum naming the eight telemetry streams: metrics, phases, topology,
+    # gpu_util, engine_series, trajectories, gpu_processes and data_buffer. The value is the
+    # stream's file stem and partition directory name.
     METRICS = "metrics"
     PHASES = "phases"
     TOPOLOGY = "topology"
@@ -57,26 +72,41 @@ class Stream(StrEnum):
 
     @property
     def filename(self) -> str:
+        # [FUNCTION DOC] Property: the flat file name of the stream, its value plus the
+        # ".jsonl" suffix.
         return f"{self.value}.jsonl"
 
 
 @dataclass
 class Record:
+    # [CLASS DOC] Base dataclass of all stream records. Each subclass sets the class-level stream it
+    # belongs to; one record serializes to one JSON object per line. Subclasses (other than the
+    # phase event) carry a timestamp field named ts, which the default timestamps method uses.
     stream: ClassVar[Stream]
 
     def to_dict(self) -> dict:
+        # [FUNCTION DOC] Returns the record as a plain nested mapping of its dataclass fields
+        # (class-level stream marker excluded); this is the JSON line payload.
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict) -> Record:
+        # [FUNCTION DOC] Builds a record from a mapping by passing every key as a constructor
+        # argument. Raises a type error for unknown or missing keys (callers treat that as
+        # corruption). Subclasses with nested records override it.
         return cls(**data)
 
     def timestamps(self) -> tuple[float, ...]:
+        # [FUNCTION DOC] Returns the timestamps this record contributes to the global time range:
+        # by default just its single ts field.
         return (self.ts,)
 
 
 @dataclass
 class MetricsRecord(Record):
+    # [CLASS DOC] Metrics stream record: ts, the name of the step axis the values were logged
+    # against (step_key, may be None), the integer step (may be None) and a mapping from metric
+    # key to value.
     """One ``tracking_utils.log()`` payload."""
 
     stream: ClassVar[Stream] = Stream.METRICS
@@ -87,6 +117,8 @@ class MetricsRecord(Record):
 
 
 class Role(StrEnum):
+    # [CLASS DOC] String enum of process roles for phase events: train, rollout_manager, and
+    # derived (synthesized on the read side, e.g. the initialize band, never written).
     TRAIN = "train"
     ROLLOUT_MANAGER = "rollout_manager"
     DERIVED = "derived"  # synthesized by the read side, not observed
@@ -98,6 +130,10 @@ INITIALIZE_PHASE = "initialize"
 
 @dataclass
 class PhaseEvent(Record):
+    # [CLASS DOC] Phases stream record: phase name, start t0 and end t1 (epoch seconds), node,
+    # list of GPU ids on that node, process rank, and role (a Role value as a string). An event
+    # with t1 equal to the open sentinel -1 marks a still-running interval. Has no ts field; it
+    # overrides the timestamps method.
     """One completed timer interval on one process (Timer sink event).
 
     ``rollout_manager`` events carry no GPUs (the manager is a driver-side
@@ -119,14 +155,19 @@ class PhaseEvent(Record):
 
     @property
     def open(self) -> bool:
+        # [FUNCTION DOC] Property: true when the end time equals the open sentinel (-1).
         return self.t1 == self.OPEN_T1
 
     def timestamps(self) -> tuple[float, ...]:
+        # [FUNCTION DOC] Returns only the start for an open event, else both start and end.
         return (self.t0,) if self.open else (self.t0, self.t1)
 
 
 @dataclass
 class EngineInfo:
+    # [CLASS DOC] Not a stream record: description of one rollout engine inside a topology
+    # snapshot. Fields: address, worker type, engine rank, the list of (node ip, gpu id) pairs it
+    # occupies, and a parallel list of GPU UUIDs (entries may be None).
     addr: str
     worker_type: str
     engine_rank: int
@@ -136,6 +177,8 @@ class EngineInfo:
 
 @dataclass
 class TopologySnapshot(Record):
+    # [CLASS DOC] Topology stream record: timestamp plus the full list of engines at that moment.
+    # It replaces the previous snapshot, so each is valid until the next one.
     """Full engine topology; snapshot N is valid until snapshot N+1."""
 
     stream: ClassVar[Stream] = Stream.TOPOLOGY
@@ -144,11 +187,15 @@ class TopologySnapshot(Record):
 
     @classmethod
     def from_dict(cls, data: dict) -> TopologySnapshot:
+        # [FUNCTION DOC] Builds a snapshot from a mapping with ts and engines, converting each
+        # engine mapping into an engine info. Raises a key error or type error on bad shape.
         return cls(ts=data["ts"], engines=[EngineInfo(**e) for e in data["engines"]])
 
 
 @dataclass
 class DataBufferSample(Record):
+    # [CLASS DOC] Data buffer stream record: timestamp and the integer number of samples held in
+    # the rollout data source's buffer.
     """One report of ``RolloutDataSourceWithBuffer.get_buffer_length()``
     (design doc's "show the data status in databuffer" ask). Appended once
     per ``RolloutExecutor.get()`` call — a no-op for plain
@@ -162,6 +209,8 @@ class DataBufferSample(Record):
 
 
 class TrajectoryEventKind(StrEnum):
+    # [CLASS DOC] String enum of sample lifecycle event kinds: attempt start/end, generation
+    # start/end and tool-call start/end.
     ATTEMPT_START = "attempt_start"
     GEN_START = "gen_start"
     GEN_END = "gen_end"
@@ -172,6 +221,9 @@ class TrajectoryEventKind(StrEnum):
 
 @dataclass
 class TrajectoryEvent(Record):
+    # [CLASS DOC] Trajectories stream record: ts, kind (a TrajectoryEventKind value as string),
+    # sample index, group index (-1 if none), turn number, weight version string and a free-text
+    # detail (for attempt end, the final status).
     """One lifecycle boundary of one sample's rollout (design §18.3).
 
     ``sample_index`` is the run-global ``Sample.index`` — the same key the
@@ -192,6 +244,8 @@ class TrajectoryEvent(Record):
 
 @dataclass
 class GpuSample(Record):
+    # [CLASS DOC] GPU utilization stream record: ts, node, gpu index, utilization percent, memory
+    # used in MB and power in watts (all integers except ts and node).
     """One NVML sample of one GPU."""
 
     stream: ClassVar[Stream] = Stream.GPU_UTIL
@@ -205,6 +259,8 @@ class GpuSample(Record):
 
 @dataclass
 class EngineSample(Record):
+    # [CLASS DOC] Engine series stream record: ts, engine address, normalized metric name, a
+    # mapping of kept labels (strings) and the float value.
     """One scraped sglang engine metric value."""
 
     stream: ClassVar[Stream] = Stream.ENGINE_SERIES
@@ -217,6 +273,8 @@ class EngineSample(Record):
 
 @dataclass
 class GpuProcessSample(Record):
+    # [CLASS DOC] GPU process stream record: ts, node, gpu index, process id, process name and
+    # memory in MB used by that process on that GPU.
     """One NVML per-process memory reading on one GPU, at a coarser cadence
     than GpuSample (design doc's GPU/CPU/disk memory-breakdown TODO — this
     covers the GPU side: who is actually holding the VRAM, not just the
@@ -231,6 +289,8 @@ class GpuProcessSample(Record):
     mem_mb: int
 
 
+# Module-level mapping from each stream to its record class, built from every record class's
+# stream marker.
 _RECORD_TYPE_OF_STREAM: dict[Stream, type[Record]] = {
     cls.stream: cls
     for cls in (
@@ -248,6 +308,9 @@ _RECORD_TYPE_OF_STREAM: dict[Stream, type[Record]] = {
 
 @dataclass
 class Meta:
+    # [CLASS DOC] Run metadata persisted as meta.json: run name, collector start time (epoch
+    # seconds), a mapping of the training arguments snapshot, and a schema version (default 1,
+    # not checked anywhere on load). FILENAME is the file name inside the store directory.
     run_name: str
     start_ts: float
     args: dict[str, Any]
@@ -257,15 +320,27 @@ class Meta:
 
 
 def _hour_key(ts: float) -> str:
+    # [FUNCTION DOC] HELPER: Formats an epoch timestamp as the UTC hour partition stem
+    # year-month-day underscore hour (eight digits, underscore, two digits).
     return time.strftime("%Y%m%d_%H", time.gmtime(ts))
 
 
 def _hour_bounds(key: str) -> tuple[float, float]:
+    # [FUNCTION DOC] HELPER: Inverse of the hour key: parses it as a UTC hour and returns the
+    # epoch start of that hour and start plus 3600 seconds. Raises a value error on a malformed key.
     start = calendar.timegm(time.strptime(key, "%Y%m%d_%H"))
     return float(start), float(start + 3600)
 
 
 class _PartitionReader:
+    # [CLASS DOC] HELPER: Lazy reader over one stream's partition directory plus an optional legacy
+    # flat file. Parsing is delegated to injected callables: parse (raw bytes of complete lines,
+    # path, byte offset -> block), concat (list of blocks -> one block; empty list gives an empty
+    # block), length (block -> row count) and line_stamps (decoded line mapping -> tuple of
+    # timestamps). Parsed blocks are cached per partition key in an LRU of max_blocks entries
+    # (evicting also forgets the byte offset, so a later read reparses the whole file). A block is
+    # refreshed by reading from its stored byte offset and consuming only complete lines. A lock
+    # serializes block fills because concurrent fills from one stale offset would duplicate rows.
     """One hourly-partitioned JSONL stream on the read side.
 
     Files parse lazily at first windowed read into an LRU block cache; a
@@ -288,6 +363,9 @@ class _PartitionReader:
         line_stamps: Callable[[dict], tuple],
         max_blocks: int,
     ):
+        # [FUNCTION DOC] HELPER: Stores the partition directory, the legacy flat file path and the
+        # injected callables, and creates an empty ordered block cache, an offset table and a lock.
+        # No file is touched.
         self.dir = dir
         self.legacy_path = legacy_path
         self._parse = parse
@@ -300,15 +378,24 @@ class _PartitionReader:
         self._lock = threading.Lock()
 
     def files(self) -> list[tuple[str, Path]]:
+        # [FUNCTION DOC] HELPER: Lists (key, path) pairs: the legacy file first under the key
+        # "legacy" if it exists, then every jsonl file in the partition directory (if it is a
+        # directory) keyed by file stem, sorted by stem (chronological). Scans the disk each call.
         out = [(self.LEGACY_KEY, self.legacy_path)] if self.legacy_path.exists() else []
         if self.dir.is_dir():
             out.extend(sorted((path.stem, path) for path in self.dir.glob("*.jsonl")))
         return out
 
     def has_data(self) -> bool:
+        # [FUNCTION DOC] HELPER: True if any partition or legacy file has non-zero size.
         return any(path.stat().st_size > 0 for _, path in self.files())
 
     def window(self, t0: float | None, t1: float | None) -> Any:
+        # [FUNCTION DOC] HELPER: Returns one concatenated block of all non-empty blocks of the
+        # partitions that may intersect the window. A dated partition is skipped when its hour
+        # ends at or before t0 or starts after t1; the legacy partition is always included. Blocks
+        # are loaded or tail-refreshed as needed. The result is NOT trimmed to the exact window;
+        # callers filter rows themselves.
         """Concatenated block over the partitions intersecting [t0, t1]."""
         blocks = []
         for key, path in self.files():
@@ -320,6 +407,9 @@ class _PartitionReader:
         return self._concat([block for block in blocks if self._length(block)])
 
     def refresh_cached(self) -> int:
+        # [FUNCTION DOC] HELPER: For each currently cached key whose file still exists, tail-reads
+        # appended complete lines into the block. Returns the total rows added. Partitions never
+        # read are skipped, and cached keys whose file vanished are left untouched.
         """Tail-refresh every cached block; returns rows appended. Partitions
         never read remain lazy — they parse fully at their first read."""
         paths = dict(self.files())
@@ -332,7 +422,14 @@ class _PartitionReader:
         return added
 
     def _block(self, key: str, path: Path) -> Any:
-        # read+parse release the GIL; two fills from one stale offset append the bytes twice
+        # [FUNCTION DOC] HELPER: Returns the up-to-date block for one partition, under the lock.
+        # If cached and the file is not larger than the stored offset, only marks it most recently
+        # used. Otherwise reads bytes from the stored offset (0 if none) to the end, keeps only
+        # up to the last newline, parses those complete lines with the injected parser (errors
+        # propagate) and concatenates them after the cached block, advancing the offset. If there
+        # is no complete line and the key is uncached, an empty block is cached. Finally the key
+        # becomes most recently used and the least recently used blocks beyond the cap are evicted
+        # together with their offsets.        # read+parse release the GIL; two fills from one stale offset append the bytes twice
         with self._lock:
             offset = self._offsets.get(key, 0)
             if key in self._blocks and path.stat().st_size <= offset:
@@ -357,7 +454,12 @@ class _PartitionReader:
             return self._blocks[key]
 
     def edge_stamps(self) -> list[float]:
-        """Global-range candidates from the first line of the oldest file and
+        # [FUNCTION DOC] HELPER: Cheaply finds timestamps bounding the stream without a full scan.
+        # Takes the non-empty files, reads the first line of the first (oldest) file and the last
+        # complete line within the final 64 KiB of the last file, decodes each as JSON and applies
+        # the injected line-stamp function. A line that fails to decode (partial write) is ignored.
+        # Returns the stamps (empty list if no data). Assumes files are ordered chronologically and
+        # lines roughly time-ordered.        """Global-range candidates from the first line of the oldest file and
         the last complete line of the newest — no full scan."""
         files = [(key, path) for key, path in self.files() if path.stat().st_size > 0]
         if not files:
@@ -382,6 +484,18 @@ class _PartitionReader:
 
 
 class MetricStore:
+    # [CLASS DOC] The telemetry store, used for writing (collector) and reading (server).
+    # Class constants: COLUMNAR_STREAMS (gpu_util, engine_series) are held as polars frames with
+    # the column schemas in FRAME_SCHEMAS (engine labels become a JSON string column);
+    # PARTITIONED_STREAMS (those two plus phases, trajectories, gpu_processes) are stored as hourly
+    # files and parsed lazily with at most PARTITION_CACHE_BLOCKS (24) cached hours; MAX_WINDOW_S is
+    # the largest allowed query window (4 hours); CATALOG_FILENAME names the lane catalog file.
+    # Instance state: meta (or None); records, a per-stream list for the non-partitioned streams
+    # (metrics, topology, data_buffer) filled by load/follow; write buffers per stream; byte
+    # offsets for tailing; one partition reader per partitioned stream; the in-memory lane catalog
+    # accumulator of the write side; and a lock-guarded cache of the full engine frame with
+    # per-metric partitions, invalidated when partition file sizes change.
+    # Write side and read side are meant for different processes (or the same, in tests).
     COLUMNAR_STREAMS: ClassVar[tuple[Stream, ...]] = (Stream.GPU_UTIL, Stream.ENGINE_SERIES)
     PARTITIONED_STREAMS: ClassVar[tuple[Stream, ...]] = (
         Stream.GPU_UTIL,
@@ -404,6 +518,10 @@ class MetricStore:
     }
 
     def __init__(self, dir: Path | str):
+        # [FUNCTION DOC] Initializes empty state for the store rooted at dir (no I/O; the directory
+        # need not exist yet). Creates record lists and byte offsets only for the non-partitioned
+        # streams, buffers for all streams, one partition reader per partitioned stream, and the
+        # engine cache fields (version, full frame, per-metric partition cache) plus their lock.
         self.dir = Path(dir)
         self.meta: Meta | None = None
         self.records: dict[Stream, list[Record]] = {s: [] for s in Stream if s not in self.PARTITIONED_STREAMS}
@@ -420,10 +538,20 @@ class MetricStore:
         self._engine_parts_cache: dict[tuple[str, bool], dict[tuple[str, str], pl.DataFrame]] = {}
 
     def _make_reader(self, stream: Stream) -> _PartitionReader:
+        # [FUNCTION DOC] HELPER: Builds the partition reader for one stream. Columnar streams use
+        # the columnar parser, a concatenation that returns the empty typed frame for no blocks, a
+        # single block unchanged, else a non-rechunked concat (rechunked if over 256 chunks), the
+        # frame height as length, and the ts field as the line stamp. Object streams (phases,
+        # trajectories, gpu_processes; asserted) use the object-line parser, list concatenation,
+        # list length, and the record's own timestamps (so open phase intervals skip the sentinel)
+        # as line stamps. Both use the partition cache size constant.
         if stream in self.COLUMNAR_STREAMS:
             empty = pl.DataFrame(schema=self.FRAME_SCHEMAS[stream])
 
             def concat_frames(blocks: list, empty: pl.DataFrame = empty) -> pl.DataFrame:
+                # [FUNCTION DOC] HELPER: Merges frame blocks: empty typed frame for none, the
+                # block itself for one, otherwise a concat without rechunking; the result is
+                # rechunked when it has more than 256 chunks to bound fragmentation.
                 if not blocks:
                     return empty
                 merged = blocks[0] if len(blocks) == 1 else pl.concat(blocks, rechunk=False)
@@ -457,12 +585,19 @@ class MetricStore:
     # ------------------------------ write side ------------------------------
 
     def append(self, record: Record) -> None:
+        # [FUNCTION DOC] Adds a record to its stream's in-memory write buffer (no I/O until flush).
         self._buffers[record.stream].append(record)
 
     def buffered_count(self, stream: Stream) -> int:
+        # [FUNCTION DOC] Returns how many unflushed records the stream's buffer holds.
         return len(self._buffers[stream])
 
     def drop_oldest_buffered(self, stream: Stream, *, keep_ratio: float = 0.9) -> int:
+        # [FUNCTION DOC] Deletes the oldest records from the stream's buffer, keeping about
+        # keep_ratio of them: drops max(1, floor(length times one minus keep_ratio)). Returns that
+        # count; mutates the buffer.
+        # KNOWN ISSUE: the minimum of one means an empty buffer still reports one dropped record
+        # although nothing was removed.
         """Drop the oldest buffered (not yet flushed) records of one stream and
         return how many were dropped. Lets the collector bound memory when the
         disk stays unwritable instead of growing without limit."""
@@ -472,11 +607,21 @@ class MetricStore:
         return dropped
 
     def write_meta(self, meta: Meta) -> None:
+        # [FUNCTION DOC] Sets the store's meta, creates the directory (with parents) and writes
+        # meta.json as indented JSON, overwriting any existing file. Disk I/O.
         self.meta = meta
         self.dir.mkdir(parents=True, exist_ok=True)
         (self.dir / Meta.FILENAME).write_text(json.dumps(asdict(meta), indent=1))
 
     def flush(self) -> None:
+        # [FUNCTION DOC] Persists all buffers. Creates the store directory, merges buffered
+        # records into the lane catalog, then for each non-empty buffer: partitioned streams are
+        # grouped by UTC hour of their timestamp (phase events use the end time, or the start for
+        # open events) and each group is appended to its hour file in the stream's subdirectory
+        # (groups written in sorted key order); other streams are appended to their flat file.
+        # Records are written as compact JSON, one per line. A buffer is cleared only after its
+        # stream was fully written; on an I/O error the failing buffer and later ones stay buffered,
+        # and any hour files already appended in the failing stream would be duplicated on retry.
         self.dir.mkdir(parents=True, exist_ok=True)
         self._merge_catalog()
         for stream, buffer in self._buffers.items():
@@ -504,6 +649,13 @@ class MetricStore:
             buffer.clear()
 
     def _merge_catalog(self) -> None:
+        # [FUNCTION DOC] HELPER: Updates the lane catalog from the buffered records. Loads the
+        # existing catalog file on first use (empty if absent). Lanes are keyed by node name, a
+        # colon, and the gpu index. Train phase events add the train role and, for non-negative
+        # ranks, the rank to each of their GPUs; topology snapshots add the rollout role and the
+        # engine address to each engine GPU; GPU utilization samples only ensure the lane exists.
+        # If anything changed, the three lists of every lane are sorted and the file is rewritten
+        # atomically (temporary file then replace). Not thread-safe; called from flush.
         """Fold buffered records into ``lane_catalog.json``: per-lane train
         ranks, engine addrs and roles, so selection resolution and heatmap
         rows never need a stream scan. Atomic rewrite, only when changed."""
@@ -514,6 +666,8 @@ class MetricStore:
         dirty = False
 
         def entry(node: str, gpu: int) -> dict:
+            # [FUNCTION DOC] HELPER: Returns the catalog entry for a lane, creating one with empty
+            # ranks, engine address and role lists (and marking the catalog dirty) if missing.
             nonlocal dirty
             key = f"{node}:{gpu}"
             if key not in lanes:
@@ -522,6 +676,8 @@ class MetricStore:
             return lanes[key]
 
         def add(values: list, value) -> None:
+            # [FUNCTION DOC] HELPER: Appends the value to the list unless already present,
+            # marking the catalog dirty when it did.
             nonlocal dirty
             if value not in values:
                 values.append(value)
@@ -556,6 +712,9 @@ class MetricStore:
 
     @classmethod
     def load(cls, dir: Path | str) -> MetricStore:
+        # [FUNCTION DOC] Opens an existing store directory for reading: constructs the store,
+        # reads meta.json if present, then performs an initial follow to ingest the non-partitioned
+        # streams. Returns the store. Raises a value error on a corrupt complete line.
         store = cls(dir)
         meta_path = store.dir / Meta.FILENAME
         if meta_path.exists():
@@ -564,6 +723,13 @@ class MetricStore:
         return store
 
     def follow(self) -> int:
+        # [FUNCTION DOC] Ingests newly appended lines. For each non-partitioned stream whose file
+        # exists: reads from the saved byte offset, keeps bytes up to the last newline, decodes
+        # each line into the stream's record type and appends it to the in-memory list; a bad line
+        # raises a value error naming the file, offset and line prefix, in which case the offset is
+        # not advanced (records of earlier lines in that chunk were already appended and will be
+        # duplicated on a retry). Then tail-refreshes every cached partition block. Returns the
+        # number of rows added across both. The meta record is not re-read.
         """Read records appended since the last load()/follow(). Returns the count.
 
         Only complete lines (terminated by a newline) are consumed, so a
@@ -600,6 +766,13 @@ class MetricStore:
         return num_new
 
     def _parse_columnar(self, stream: Stream, raw: bytes, path: Path, offset: int) -> pl.DataFrame:
+        # [FUNCTION DOC] HELPER: Parses newline-delimited JSON bytes into a polars frame with the
+        # stream's fixed schema (column set must match exactly, then each column is cast to its
+        # type). For engine series, the labels mapping column is converted to a JSON string column
+        # named labels_json (the constant empty-object string if all labels are empty or the column
+        # is absent) and the original column dropped. Any parse or schema error is re-raised as a
+        # value error mentioning the file path and byte offset. path and offset are only used for
+        # the message.
         schema = self.FRAME_SCHEMAS[stream]
         try:
             frame = pl.read_ndjson(io.BytesIO(raw))
@@ -618,6 +791,10 @@ class MetricStore:
             raise ValueError(f"corrupt record in {path} near byte {offset}: {e}") from e
 
     def _parse_object_lines(self, record_type: type[Record], raw: bytes, path: Path, offset: int) -> list[Record]:
+        # [FUNCTION DOC] HELPER: Decodes each line of the bytes as JSON into a record of the given
+        # type, returning the list in order. A decode, type or key error becomes a value error
+        # naming the file, byte offset (of the chunk start, not the line) and the first 200 bytes
+        # of the line.
         events = []
         for line in raw.splitlines():
             try:
@@ -627,12 +804,16 @@ class MetricStore:
         return events
 
     def trajectory_events(self, t0: float | None = None, t1: float | None = None) -> list[TrajectoryEvent]:
+        # [FUNCTION DOC] Returns trajectory events whose ts lies inside the inclusive window (open
+        # ends allowed), in file order (not sorted). Loads the touched hour partitions.
         """Lifecycle events in [t0, t1], keyed by emission ts (no slack here —
         the consuming-step join and its lookback window live in the reader)."""
         return self._window_records(self._readers[Stream.TRAJECTORIES].window(t0, t1), t0, t1)
 
     @staticmethod
     def _window_records(events: list[TrajectoryEvent], t0: float | None, t1: float | None) -> list[TrajectoryEvent]:
+        # [FUNCTION DOC] HELPER: Static. Filters records having a ts field to the inclusive window
+        # (a missing bound is open). Despite the annotation it is also used for GPU process records.
         return [e for e in events if (t0 is None or e.ts >= t0) and (t1 is None or e.ts <= t1)]
 
     def trajectory_lanes(
@@ -642,6 +823,21 @@ class MetricStore:
         t1: float | None = None,
         sample_indices: set[int] | None = None,
     ) -> list[dict]:
+        # [FUNCTION DOC] Groups the window's trajectory events by sample index (optionally limited
+        # to the given set) and builds one lane mapping per sample, sorted by first event time.
+        # Per sample, events are sorted by ts and walked in order: attempt start remembers the
+        # start; attempt end appends an attempt window (start possibly None), records the event's
+        # detail as status (keeping the previous when empty), and force-closes every still-open
+        # segment at that time, filling a missing weight version from the attempt-end event;
+        # gen/tool start opens a segment keyed by (kind, turn); gen/tool end closes the matching
+        # open segment (taking the end event's version if non-empty) or, if none is open, adds a
+        # segment with unknown start. An attempt still running at the end is added with unknown
+        # end. If any generation segment has a positive turn, coarse generation segments (negative
+        # turn) are removed. Lane fields: sample index, group index of the first event, first and
+        # last event ts, segments (kind, t0, t1, turn, weight version), attempts, status, and the
+        # sorted distinct numeric weight versions seen. Unknown event kinds raise a value error.
+        # KNOWN ISSUE: only segments are paired by (kind, turn); a second start with the same key
+        # replaces the open entry so the first segment is left without an end.
         """Per-sample lifecycle assembly for the batch-anatomy swimlanes:
         gen/tool segments paired by (kind, turn), attempt windows, and the
         version span observed across segments. A start without an end (still
@@ -731,20 +927,34 @@ class MetricStore:
         return lanes
 
     def phase_events(self, t0: float | None = None, t1: float | None = None) -> list[PhaseEvent]:
+        # [FUNCTION DOC] Public accessor: all phase events that may matter for a window (see the
+        # private helper), including open markers, without lane expansion or de-duplication.
         """Raw phase events, open markers included — advisory heuristics need
         the unexpanded events rather than the lane-resolved view."""
         return self._phase_events(t0, t1)
 
     def _phase_events(self, t0: float | None, t1: float | None) -> list[PhaseEvent]:
+        # [FUNCTION DOC] HELPER: Returns phase events from all partitions up to t1 plus the maximum
+        # window (no upper limit when t1 is None). Phases are partitioned by end hour, so an
+        # interval overlapping the window can live in a later partition; the lower bound is not
+        # applied at all, so older partitions are loaded too. The result is not trimmed to the
+        # window. KNOWN ISSUE: the t0 parameter is unused.
         upper = None if t1 is None else t1 + self.MAX_WINDOW_S
         return self._readers[Stream.PHASES].window(None, upper)
 
     def has_stream(self, stream: Stream) -> bool:
+        # [FUNCTION DOC] True if the stream has any data: for partitioned streams any non-empty
+        # file on disk (checked live), otherwise any in-memory record loaded so far.
         if stream in self.PARTITIONED_STREAMS:
             return self._readers[stream].has_data()
         return bool(self.records[stream])
 
     def iter_records(self, stream: Stream) -> list[Record]:
+        # [FUNCTION DOC] Materializes every record of a stream as record objects (despite the name,
+        # returns a list). GPU utilization and engine series rows are rebuilt from frames (engine
+        # labels decoded from JSON with null entries removed); phases, trajectories and GPU
+        # processes come from the full-range partitions; other streams copy the in-memory list.
+        # Loads everything, so meant for tests and tools.
         """Records as dataclass objects — slow materialization for tests/tools."""
         if stream is Stream.GPU_UTIL:
             frame = self._readers[stream].window(None, None)
@@ -770,6 +980,8 @@ class MetricStore:
 
     @staticmethod
     def _window(frame: pl.DataFrame, t0: float | None, t1: float | None) -> pl.DataFrame:
+        # [FUNCTION DOC] HELPER: Static. Keeps frame rows whose ts column is within the inclusive
+        # window; a missing bound is open.
         if t0 is not None:
             frame = frame.filter(pl.col("ts") >= t0)
         if t1 is not None:
@@ -779,15 +991,20 @@ class MetricStore:
     # ------------------------------- queries --------------------------------
 
     def metric_keys(self) -> list[str]:
+        # [FUNCTION DOC] Returns the sorted union of metric keys over all loaded metrics records.
         keys: set[str] = set()
         for record in self.records[Stream.METRICS]:
             keys.update(record.metrics.keys())
         return sorted(keys)
 
     def step_keys(self) -> list[str]:
+        # [FUNCTION DOC] Returns the sorted distinct non-null step axis names in the metrics records.
         return sorted({r.step_key for r in self.records[Stream.METRICS] if r.step_key is not None})
 
     def step_key_of_metric_key(self) -> dict[str, str]:
+        # [FUNCTION DOC] Returns a mapping from metric key to the step axis name of the LAST record
+        # that contained it; records without a step key are skipped, so keys logged only that way
+        # are absent.
         ans: dict[str, str] = {}
         for record in self.records[Stream.METRICS]:
             if record.step_key is None:
@@ -799,6 +1016,9 @@ class MetricStore:
     def metric_series(
         self, keys: list[str], *, x_key: str, t0: float | None = None, t1: float | None = None
     ) -> dict[str, dict[str, list]]:
+        # [FUNCTION DOC] Returns, for each requested key (all present even if empty), a mapping
+        # with parallel lists x (step), y (value) and ts (record time). Only records whose step key
+        # equals x_key and whose ts is in the optional inclusive window contribute, in file order.
         """Series for each key, restricted to records logged against ``x_key``
         (e.g. "rollout/step") so values from different step axes never mix."""
         out: dict[str, dict[str, list]] = {k: {"x": [], "y": [], "ts": []} for k in keys}
@@ -816,6 +1036,10 @@ class MetricStore:
         return out
 
     def time_range(self) -> tuple[float, float] | None:
+        # [FUNCTION DOC] Returns (earliest, latest) timestamp over everything known, or None if
+        # empty. Uses every timestamp of the in-memory records plus the cheap edge stamps of each
+        # partitioned stream (first line of the oldest file, last complete line of the newest), so
+        # it assumes partitioned data is roughly time-ordered at the file edges.
         stamps = [ts for records in self.records.values() for record in records for ts in record.timestamps()]
         for reader in self._readers.values():
             stamps.extend(reader.edge_stamps())
@@ -826,10 +1050,14 @@ class MetricStore:
     # --------------------------- timeline queries ---------------------------
 
     def lanes(self) -> list[dict]:
+        # [FUNCTION DOC] Returns the lane list reduced to node, gpu and global index, taken from
+        # the lane index (so sorted by node then gpu).
         """Every (node, gpu) seen in any stream — one timeline lane each."""
         return [dict(node=entry["node"], gpu=entry["gpu"], index=entry["index"]) for entry in self.lane_index()]
 
     def topology_windows(self) -> list[dict]:
+        # [FUNCTION DOC] Sorts topology snapshots by ts and returns one mapping each with t0 (its
+        # ts), t1 (next snapshot's ts or None for the last) and the engines as plain mappings.
         """Engine topology snapshots with validity windows: snapshot N is valid
         [ts_N, ts_{N+1}); the last one is open-ended (t1=None)."""
         snapshots = sorted(self.records[Stream.TOPOLOGY], key=lambda s: s.ts)
@@ -843,6 +1071,7 @@ class MetricStore:
         ]
 
     def latest_data_buffer_length(self) -> int | None:
+        # [FUNCTION DOC] Returns the length of the last data buffer record in file order, or None.
         """Most recent ``RolloutDataSourceWithBuffer`` buffer length, or None
         when the run's data source never reported one (plain RolloutDataSource,
         or a dump predating this probe)."""
@@ -852,6 +1081,21 @@ class MetricStore:
     def phases_by_lane(
         self, *, t0: float | None = None, t1: float | None = None, lanes: set[tuple[str, int]] | None = None
     ) -> list[dict]:
+        # [FUNCTION DOC] Returns phase interval mappings (name, t0, t1, node, gpu, rank, role),
+        # sorted by node, gpu and start, for intervals overlapping the window, optionally limited
+        # to a set of (node, gpu) lanes.
+        # Steps: (1) load events; an open marker is dropped if a closed event with the same node,
+        # rank, name and start exists, otherwise its end is set to the newest known data timestamp
+        # (but not before its start). (2) Train-side events are emitted once per own GPU.
+        # Rollout-manager events are expanded per topology window: clipped to the window bounds,
+        # skipped if the clipped span is empty, and emitted for every GPU of every engine of that
+        # window; if the window's engines list no GPUs (external engines), all known lanes whose
+        # node matches an engine address host are used. (3) If meta is known and the window starts
+        # at or before the run start, a derived "initialize" interval (rank -1) is added per lane
+        # from the run start to the lane's earliest emitted start, when that is later and overlaps
+        # the window.
+        # KNOWN ISSUE: the branch for a still-open manager event (negative end) is dead code,
+        # because open events were already given a non-negative end in step (1).
         """Phase intervals resolved onto (node, gpu) lanes.
 
         Train-side events carry their own GPUs. ``rollout_manager`` events have
@@ -861,6 +1105,8 @@ class MetricStore:
         """
 
         def overlaps(a0: float, a1: float) -> bool:
+            # [FUNCTION DOC] HELPER: True if the interval from a0 to a1 starts before the query end
+            # and ends after the query start (strict inequalities; missing bounds always pass).
             return (t1 is None or a0 < t1) and (t0 is None or a1 > t0)
 
         # resolve OPEN intervals (Timer.start markers): a closing event with
@@ -964,6 +1210,11 @@ class MetricStore:
         max_points: int = 2000,
         lanes: set[tuple[str, int]] | None = None,
     ) -> dict[str, dict]:
+        # [FUNCTION DOC] Returns a mapping from lane key (node, colon, gpu) to parallel lists ts,
+        # util, mem_mb and power_w, sorted by lane and by time. Rows are the window's GPU samples
+        # (exact inclusive filtering), optionally restricted to the lane set. Per lane at most
+        # max_points (at least 2) samples are kept by min/max bucket downsampling on utilization;
+        # the same indices are applied to all four arrays.
         """Per-lane NVML series, min/max-downsampled on util (the primary
         signal); mem/power take the same indices so all arrays stay aligned."""
         frame = self._window(self._readers[Stream.GPU_UTIL].window(t0, t1), t0, t1)
@@ -985,6 +1236,8 @@ class MetricStore:
     def gpu_processes(
         self, *, t0: float | None = None, t1: float | None = None, lanes: set[tuple[str, int]] | None = None
     ) -> list[dict]:
+        # [FUNCTION DOC] Returns per-process memory readings (ts, node, gpu, pid, name, mem_mb) in
+        # the inclusive window, optionally restricted to a lane set, in file order, no downsampling.
         """Per-process memory snapshots in [t0, t1] (coarser cadence than
         ``gpu_series``): the timeline hover resolves the nearest snapshot per
         lane client-side, same as it already does for the util/mem series."""
@@ -1018,6 +1271,10 @@ class MetricStore:
     )
 
     def engine_metric_names(self) -> list[str]:
+        # [FUNCTION DOC] Returns the sorted catalog of servable engine metric names: raw names not
+        # ending in a cumulative suffix (total, sum, count), plus each derived rate name whose base
+        # counter was seen, plus each derived mean name whose base has both sum and count seen.
+        # Loads the full engine frame through the cache.
         """Distinct scraped engine metrics — the L0 sglang category catalog."""
         frame, _ = self._engine_cache()
         raw = set(frame.get_column("metric").unique())
@@ -1039,6 +1296,11 @@ class MetricStore:
         max_points: int = 2000,
         per_dp_rank: bool = False,
     ) -> list[dict]:
+        # [FUNCTION DOC] Returns a list of series mappings (addr, labels, ts, value lists), one per
+        # engine address and label set, each reduced to at most max_points (at least 2) points.
+        # Derived rate names yield per-second increases of the base counter; derived mean names
+        # yield increase of the sum over increase of the count. Other metrics are served raw using
+        # evenly spaced index downsampling. The per_dp_rank flag is passed down to the grouping.
         """One series per (engine addr, label set) for the given metric.
 
         By default per-dp-rank samples (dp-attention engines export one per
@@ -1068,6 +1330,10 @@ class MetricStore:
     def _engine_parts(
         self, metric: str, t0: float | None, t1: float | None, *, per_dp_rank: bool = False
     ) -> dict[tuple[str, str], pl.DataFrame]:
+        # [FUNCTION DOC] HELPER: Returns, for one raw metric, a mapping from (address, labels JSON
+        # string) to a frame sorted by ts. With no window the memoized full-range result is used.
+        # Otherwise the window's partitions are loaded, filtered exactly, restricted to the metric,
+        # and (unless per_dp_rank) data-parallel ranks are folded; groups are ordered by key.
         if t0 is None and t1 is None:
             return self._engine_parts_cached(metric, per_dp_rank)
         frame = self._window(self._readers[Stream.ENGINE_SERIES].window(t0, t1), t0, t1).filter(
@@ -1081,6 +1347,11 @@ class MetricStore:
         }
 
     def _fold_dp_ranks(self, frame: pl.DataFrame, metric: str) -> pl.DataFrame:
+        # [FUNCTION DOC] HELPER: Collapses rows that differ only by data-parallel rank. First each
+        # distinct labels string is rewritten with the rank label and null-valued labels removed
+        # (keys sorted), then rows are grouped by timestamp, address, metric and labels, and the
+        # value is averaged for metrics in the mean-aggregated set, else summed. An empty frame
+        # is returned unchanged. Output columns: ts, addr, metric, labels_json, value.
         """Engine-level view: collapse per-dp-rank samples — including
         same-tick duplicates from dumps written before ``dp_rank`` was kept —
         into one value per (addr, ts). Ranks share a scrape ts (one fetch per
@@ -1101,6 +1372,10 @@ class MetricStore:
         return frame.group_by(["ts", "addr", "metric", "labels_json"]).agg(agg.alias("value"))
 
     def _engine_cache(self) -> tuple[pl.DataFrame, dict[tuple[str, bool], dict[tuple[str, str], pl.DataFrame]]]:
+        # [FUNCTION DOC] HELPER: Under the cache lock, computes a version from the (key, size) of
+        # every engine partition file; if it differs from the cached version, reloads the full
+        # range frame and resets the per-metric partition cache, setting the version last so a
+        # failed reload is retried. Returns the frame and the partition cache dictionary.
         """The full-window frame and its partition cache, returned as a pair so a
         caller racing a rebuild files partitions under the frame they came from."""
         reader = self._readers[Stream.ENGINE_SERIES]
@@ -1113,6 +1388,9 @@ class MetricStore:
             return self._engine_frame_cache, self._engine_parts_cache
 
     def _engine_parts_cached(self, metric: str, per_dp_rank: bool) -> dict[tuple[str, str], pl.DataFrame]:
+        # [FUNCTION DOC] HELPER: Returns the per-(address, labels) frames of one metric over the
+        # full range, memoized per (metric, per_dp_rank) in the cache that belongs to the current
+        # full frame. Computed like the windowed variant without a window filter.
         frame, cache = self._engine_cache()
         cache_key = (metric, per_dp_rank)
         parts = cache.get(cache_key)
@@ -1128,6 +1406,16 @@ class MetricStore:
         return parts
 
     def _derived_series(self, num_parts, den_parts, max_points: int) -> list[dict]:
+        # [FUNCTION DOC] HELPER: Turns cumulative counter frames into series. Inputs are mappings
+        # from (address, labels) to frames with ts and value, for the numerator and, optionally,
+        # the denominator. For each numerator group: with a denominator, the matching group is
+        # required (else skipped) and both are inner-joined on identical timestamps; without one,
+        # the time difference is the denominator. At least two points are needed. Consecutive
+        # differences are computed; intervals with a negative numerator difference (counter reset)
+        # or a non-positive denominator difference are dropped, so gaps remain. Each kept point is
+        # stamped with the later timestamp and its value is difference ratio; the points are
+        # downsampled evenly to at most max_points. Groups with no points are omitted. Returns
+        # mappings of addr, labels (nulls removed), ts and value lists.
         """Per-interval derivative: rate when ``den_parts`` is None (dt as the
         denominator), else delta(num)/delta(den) joined on scrape timestamps."""
         out = []
@@ -1158,6 +1446,13 @@ class MetricStore:
         return out
 
     def lane_index(self) -> list[dict]:
+        # [FUNCTION DOC] Returns one mapping per lane (node, gpu, ranks, engine_addrs, roles, and a
+        # global index), sorted by node then gpu, index being the sorted position. If the catalog
+        # file exists it is read (every call, uncached) and the key split at its last colon.
+        # Otherwise lanes are derived by scanning: GPUs seen in GPU samples, phase events and
+        # topology snapshots; train phase events add the train role and non-negative ranks,
+        # topology engines add the rollout role and address. In the scan fallback the lane order
+        # follows the sorted set of (node, gpu) pairs.
         """Per-lane metadata for selection resolution: train ranks observed on
         the lane, engine addrs that ever covered it, and derived roles.
 
@@ -1228,6 +1523,15 @@ class MetricStore:
         ]
 
     def resolve_lanes(self, grammar: str | None) -> set[tuple[str, int]] | None:
+        # [FUNCTION DOC] Returns None (meaning all lanes) for a missing, blank or "all" grammar;
+        # otherwise the union of the lanes matched by each comma-separated selector, as a set of
+        # (node, gpu) pairs. Integer ranges are inclusive. Rank and global-index selectors may be
+        # a single number or low-high; node matches exactly; gpu takes node and index split at the
+        # last colon and is added even if the lane is unknown; engine matches by substring of any
+        # engine address; every selects lanes whose global index is divisible by the stride; role
+        # selects train or rollout lanes. Empty tokens are skipped. Raises a value error for a
+        # token without a value, an unknown kind, a missing node in a gpu selector, a stride not
+        # positive or an invalid role; non-numeric numbers raise the usual conversion value error.
         """Parse the lane-selection grammar into a lane set (None = all lanes).
 
         Comma-separated selectors: ``rank:5`` / ``rank:0-7`` (train ranks),
@@ -1290,6 +1594,21 @@ class MetricStore:
         x_buckets: int = 1200,
         lanes: set[tuple[str, int]] | None = None,
     ) -> dict:
+        # [FUNCTION DOC] Builds the carpet. Returns a mapping with rows (per-lane node, gpu, global
+        # index, roles; or per-sample indices for lifecycle), x_buckets, t0, t1, metric, values
+        # (raw bytes of a rows-by-x_buckets unsigned 8-bit matrix, row-major), scale and palette.
+        # x_buckets must be at least 2 (assertion). With no data at all, returns empty rows and
+        # bytes with t0 and t1 zero. Missing bounds default to the overall time range; end must be
+        # after start (assertion). The metric "lifecycle" delegates to the lifecycle carpet and
+        # ignores the lane set. Rows are the lane index entries filtered by the lane set.
+        # Magnitude metrics (util, mem_mb, power_w): GPU samples are bucketed by time (clamped to
+        # the edge buckets), the per-cell maximum is kept, and cells are scaled to 0-255 by 100 for
+        # util or by the observed peak (1.0 if no samples) otherwise, capped at 255; cells without
+        # samples stay 0; scale holds the maximum, palette is None.
+        # Metric "phase": cell value is the 1-based id of the phase name (sorted names; palette
+        # element 0 is the empty string for none); idle phases (initialize, train_wait, sleep) are
+        # painted first so any active phase in the same cell overwrites them; each interval fills
+        # its clipped bucket range inclusively; scale is None. Other metrics raise a value error.
         """Rank-carpet matrix: one uint8 cell per (lane, time bucket).
 
         Magnitude metrics take the bucket MAX (activity must not average away);
@@ -1317,6 +1636,8 @@ class MetricStore:
         span = t1 - t0
 
         def bucket(ts: float) -> int:
+            # [FUNCTION DOC] HELPER: Maps a timestamp to its column index in the window, truncating
+            # toward zero and clamping to the range 0 to x_buckets minus 1.
             return min(x_buckets - 1, max(0, int((ts - t0) / span * x_buckets)))
 
         if metric in self.HEATMAP_MAGNITUDE_FIELDS:
@@ -1375,6 +1696,14 @@ class MetricStore:
     LIFECYCLE_MAX_ROWS: ClassVar[int] = 1024  # y-cap: thousands of samples must not explode the canvas
 
     def _lifecycle_heatmap(self, t0: float, t1: float, x_buckets: int) -> dict:
+        # [FUNCTION DOC] HELPER: Builds the lifecycle carpet for the given window. Takes the
+        # trajectory lanes in the window, keeps the first LIFECYCLE_MAX_ROWS (1024) in order. Each
+        # row is filled first with the queue state (id 1) across every attempt window, then with
+        # generating (2) or tool wait (3) across each segment, so segments overwrite the queue
+        # state; a missing start or end (None or zero) extends to the window edge. Cell id 0 means
+        # nothing. Returns rows (sample index and group index), the uncapped lane count as
+        # rows_total, x_buckets, t0, t1, metric lifecycle, values bytes, scale None and the palette
+        # list (empty, queue, generating, tool_wait).
         """Run-wide trajectory carpet: y = samples ordered by first event,
         color = lifecycle state. Queue paints attempt windows first so gen and
         tool segments win the shared buckets. Rows cap at LIFECYCLE_MAX_ROWS
@@ -1387,6 +1716,8 @@ class MetricStore:
         state_id = {name: i for i, name in enumerate(self.LIFECYCLE_PALETTE)}
 
         def bucket(ts: float) -> int:
+            # [FUNCTION DOC] HELPER: Same mapping as in the main carpet: timestamp to a column index
+            # clamped to the valid range.
             return min(x_buckets - 1, max(0, int((ts - t0) / span * x_buckets)))
 
         for row, lane in enumerate(lanes):
@@ -1409,6 +1740,13 @@ class MetricStore:
         )
 
     def fleet(self, *, t0: float | None = None, t1: float | None = None, x_buckets: int = 600) -> dict:
+        # [FUNCTION DOC] Builds the fleet overview from the phase carpet over all lanes. Result:
+        # t0, t1 (resolved window), x_buckets, lane count, phase palette, composition (a mapping
+        # from phase name, "none" for the empty id, to a list per bucket of the fraction of lanes
+        # in that phase, rounded to 4 decimals; empty if no lanes) and band (lists per bucket of
+        # p10, p50, p90 and min of per-lane utilization, null for buckets without samples). The
+        # band takes the maximum utilization per lane per bucket first, then quantiles across lanes.
+        # With no data, the empty carpet has a zero window and no lanes. Asserts x_buckets >= 2.
         """Scale-invariant fleet overview: per-bucket phase composition
         (fraction of lanes in each phase) and the util distribution band
         across all lanes. Payload size is O(x_buckets), never O(lanes)."""
@@ -1454,6 +1792,11 @@ class MetricStore:
     def outliers(
         self, criterion: str, *, t0: float | None = None, t1: float | None = None, top_k: int = 16
     ) -> list[dict]:
+        # [FUNCTION DOC] Returns up to top_k mappings (node, gpu, score). Criterion "lowest_util"
+        # scores each lane by mean utilization over the window and returns the lowest first.
+        # Criterion "slowest_phase:<name>" scores each lane by the mean duration of intervals of
+        # that phase name and returns the highest first. Ties are ordered by node and gpu in the
+        # tuple sort. Any other criterion raises a value error.
         """Candidate lanes for the quick-pick buttons; the user confirms the
         selection — the machine only proposes."""
         if criterion == "lowest_util":
@@ -1475,6 +1818,10 @@ class MetricStore:
         return [dict(node=node, gpu=gpu, score=score) for score, node, gpu in scored[:top_k]]
 
     def bubbles(self) -> list[dict]:
+        # [FUNCTION DOC] For each metrics record whose step key ends with the rollout step suffix,
+        # looks up the step time and the wait-time ratio metrics (exact key first, else the first
+        # key ending with a slash and that name); records with neither are skipped. Returns
+        # mappings of step, ts, step_time and wait_ratio (either may be None), in file order.
         """Per-step bubble summary strip: step time and wait ratio from the
         perf metrics, with the wall-clock ts as the timeline zoom anchor."""
         out = []
@@ -1490,6 +1837,9 @@ class MetricStore:
 
 
 def _metric_by_suffix(metrics: dict[str, float], base_key: str) -> float | None:
+    # [FUNCTION DOC] HELPER: Returns the value for the exact key if present and not null,
+    # otherwise the first value (in mapping order) whose key ends with a slash plus the base key,
+    # otherwise None.
     if (value := metrics.get(base_key)) is not None:
         return value
     for key, value in metrics.items():
@@ -1502,10 +1852,14 @@ def _metric_by_suffix(metrics: dict[str, float], base_key: str) -> float | None:
 
 
 def _engine_labels(labels_json: str) -> dict:
+    # [FUNCTION DOC] HELPER: Decodes a labels JSON string into a mapping, dropping null values.
     return {k: v for k, v in json.loads(labels_json).items() if v is not None}
 
 
 def stride_downsample(xs, ys, max_points: int) -> tuple[np.ndarray, np.ndarray]:
+    # [FUNCTION DOC] Reduces two parallel sequences to at most max_points (asserted at least 2)
+    # by picking evenly spaced indices from first to last element inclusive (truncated to
+    # integers). Returns the two arrays unchanged if already short enough. Returns arrays.
     xs, ys = np.asarray(xs), np.asarray(ys)
     assert max_points >= 2, f"{max_points=}"
     if len(xs) <= max_points:
@@ -1515,6 +1869,11 @@ def stride_downsample(xs, ys, max_points: int) -> tuple[np.ndarray, np.ndarray]:
 
 
 def minmax_downsample(xs, ys, max_points: int) -> tuple[np.ndarray, np.ndarray]:
+    # [FUNCTION DOC] Splits the sequences into max_points divided by two (integer division)
+    # equal-index buckets and keeps, per non-empty bucket, the positions of the minimum and the
+    # maximum of ys (the first occurrence of each), returned in original order without duplicates.
+    # Asserts max_points >= 2; returns inputs unchanged (as arrays) when already short enough.
+    # Output length is at most 2 times the bucket count.
     """Bucketed downsampling keeping each bucket's min and max, so spikes and
     dips survive. Output length is at most ``max_points``."""
     xs, ys = np.asarray(xs), np.asarray(ys)

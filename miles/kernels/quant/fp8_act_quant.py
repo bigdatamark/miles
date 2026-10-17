@@ -1,3 +1,12 @@
+# [MODULE DOC] Tilelang block-wise FP8 (E4M3) activation quantization, ported from the DeepSeek-V4
+# reference inference kernels for bit-exact parity. Each row of the last dimension is split into
+# groups of block_size (default 128) elements; each (row, group) gets a scale = group absolute
+# maximum (floored at 1e-4) divided by 448, optionally rounded up to a power of two (MX-style) via
+# integer bit tricks; values are divided by the scale, clamped to [-448, 448] and cast to FP8. A
+# fused "inplace" mode quantizes and immediately dequantizes back to the input dtype (fake
+# quantization). Contains three small bit-manipulation helpers, the kernel factory act_quant_kernel
+# and the host wrapper act_quant. Importing this module sets the tilelang log level to WARNING
+# (a global side effect). Requires tilelang and a GPU.
 """Block-wise FP8 activation quantization for DeepSeek-V4.
 
 Ported verbatim from deepseek-ai/DeepSeek-V4-Pro/inference/kernel.py to keep
@@ -27,6 +36,9 @@ INT32 = "int32"
 
 
 def fast_log2_ceil(x):
+    # [FUNCTION DOC] HELPER: Tilelang expression builder. Reinterprets a float32 value as bits and
+    # returns the integer ceil of log base 2: biased exponent minus 127, plus one when the mantissa
+    # bits are non-zero. Valid for positive normal values only.
     """Compute ceil(log2(x)) via IEEE 754 bit manipulation. Avoids slow log/ceil intrinsics."""
     bits_x = T.reinterpret("uint32", x)
     exp_x = (bits_x >> 23) & 0xFF
@@ -35,12 +47,16 @@ def fast_log2_ceil(x):
 
 
 def fast_pow2(x):
+    # [FUNCTION DOC] HELPER: Tilelang expression builder returning two to the integer power x as a
+    # float32, by placing (x plus 127) into the exponent field; valid for exponents in the normal range.
     """Compute 2^x for integer x via IEEE 754 bit manipulation."""
     bits_x = (x + 127) << 23
     return T.reinterpret("float32", bits_x)
 
 
 def fast_round_scale(amax, fp8_max_inv):
+    # [FUNCTION DOC] HELPER: Rounds the scale amax times fp8_max_inv up to the next power of two
+    # (two to the integer ceil of its log base 2), for power-of-two (MX) scale formats.
     return fast_pow2(fast_log2_ceil(amax * fp8_max_inv))
 
 
@@ -48,6 +64,18 @@ def fast_round_scale(amax, fp8_max_inv):
 def act_quant_kernel(
     N, block_size=128, in_dtype=BF16, out_dtype=FP8, scale_dtype=FP32, round_scale=False, inplace=False
 ):
+    # [FUNCTION DOC] Kernel factory (jit-compiled, cached per argument values). N is the row width
+    # (columns); block_size the group width; in_dtype the input type name (default bfloat16);
+    # out_dtype the quantized type name (default float8 E4M3), which is replaced by the input type when
+    # inplace; scale_dtype the stored scale type name; round_scale selects power-of-two scales;
+    # inplace selects fake-quantization back to the input type. The row count M is symbolic.
+    # Returns a program with a grid of (row tiles of 32, column groups), 128 threads: for each tile
+    # it loads the 32-by-group block, takes the per-row absolute maximum, floors it at 1e-4, derives
+    # the scale (maximum / 448, or power-of-two rounded), then writes either the clamped quotient
+    # cast to the output type, or (inplace) the clamped quotient cast to FP8, widened to float32,
+    # multiplied by the scale and cast to the input type; the scale (cast to scale_dtype) is
+    # always written to the scale tensor of shape rows by groups. Pipeline stages are 0 when
+    # round_scale or inplace, else 2. Pass options disable warp specialization and TMA lowering.
     """Block-wise FP8 quantization. inplace=True does fused quant+dequant back to BF16."""
     M = T.symbolic("M")
     fp8_min = -448.0
@@ -114,6 +142,16 @@ def act_quant(
     scale_dtype: torch.dtype = torch.float32,
     inplace: bool = False,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Host wrapper. x has any leading shape and last dimension N divisible by
+    # block_size (asserted). scale_fmt: any non-none value turns on power-of-two scales; scale_dtype
+    # float8 E8M0 selects that scale storage, any other value stores float32 scales (the tilelang
+    # scale type is only distinguished for E8M0; other requested dtypes would still be allocated in
+    # the requested dtype). Not inplace: returns the tuple (FP8 tensor shaped like x, scales shaped like
+    # x's leading shape plus N / block_size). Inplace: runs fake quantization into a temporary, copies
+    # it back into x (mutating the caller's tensor) and returns x only; the scales are computed but
+    # discarded. The input is made contiguous for the kernel.
+    # KNOWN ISSUE: the declared return type is a single tensor, but the non-inplace path returns a
+    # pair (quantized, scales).
     """Block-wise FP8 quantization. inplace=True does fused quant+dequant back to BF16.
     When scale_fmt is set, scales are rounded to power-of-2 (MXFP).
     """

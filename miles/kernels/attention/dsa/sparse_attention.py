@@ -1,3 +1,19 @@
+# [MODULE DOC] Differentiable sparse attention where each query attends only to a given list of
+# key/value rows (selected indices, minus one meaning padding), with an optional learnable
+# per-head "sink" logit that joins the softmax denominator without contributing a value.
+# Shapes: queries batch by sequence by heads by (value dim + tail dim), key/value cache batch by
+# kv length by kv groups by the same width (keys and values share storage: the value is the first
+# value-dim channels), indices batch by sequence by groups by top-k.
+# Forward backends: the FlashMLA sparse prefill kernel (when installed, GPU architecture major 9
+# or 10, value dim 512, width 512 or 576, one kv group, at most 128 heads) or a tilelang kernel.
+# Backward is always the tilelang kernel; it consumes a log-sum-exp in base-2 units with the sink
+# already folded in (both forward backends return it in that form), plus a per-row "delta" it
+# returns, from which the sink gradient is derived.
+# Tuning: a frozen config dataclass selects the forward backend and kernel tiling; a table keyed by
+# (architecture major, whether a RoPE tail exists, power-of-two bucket of query heads per group,
+# clamped to 8..64) gives measured choices, with a default for missing keys and an automatic
+# fallback to tilelang when FlashMLA is unsupported. Caller may pass an explicit config.
+# FlashMLA import failure is tolerated (the function is then None).
 """Sparse attention over top-k selected KV rows (DeepSeek Sparse Attention core).
 
 q [B, S, H, d_v + d_tail] bf16, kv [B, S_kv, G, d_v + d_tail] bf16, indices [B, S, G, topk] int32 with
@@ -32,6 +48,11 @@ _FLASH_MLA_ARCH_MAJORS = (9, 10)
 
 @dataclass(frozen=True)
 class SparseAttentionConfig:
+    # [CLASS DOC] Immutable kernel selection and tiling parameters. forward_backend is "flash_mla"
+    # (default) or "tilelang"; forward_threads is the thread count of the tilelang forward kernel
+    # (default 256); backward_stages is the software pipeline depth of the tilelang backward
+    # (default 0); backward_split_store is how many pieces the backward splits its key/value
+    # gradient store into (default 2).
     forward_backend: Literal["flash_mla", "tilelang"] = "flash_mla"
     forward_threads: int = 256
     backward_stages: int = 0
@@ -63,6 +84,9 @@ _TUNED = {
 
 
 def _pad_topk_block(indices, multiple: int):
+    # [FUNCTION DOC] HELPER: Pads the last dimension of the index tensor with minus one up to a
+    # multiple of the given number; returns a contiguous tensor (the input made contiguous when no
+    # padding is needed).
     topk = indices.shape[-1]
     padded = (topk + multiple - 1) // multiple * multiple
     if padded == topk:
@@ -71,6 +95,14 @@ def _pad_topk_block(indices, multiple: int):
 
 
 def _default_config(q, kv, d_v: int) -> SparseAttentionConfig:
+    # [FUNCTION DOC] HELPER: Chooses the config for this call. Reads the CUDA capability major of the
+    # query's device, computes query heads per kv group, rounds it up to a power of two clamped to
+    # the range 8 to 64 as the bucket, and looks up (architecture, whether the width exceeds the
+    # value dim i.e. a tail exists, bucket) in the tuned table, falling back to the default config.
+    # FlashMLA is deemed supported if the library imported, architecture major is 9 or 10, value dim
+    # is 512, width is 512 or 576, there is exactly one kv group and at most 128 heads. When the
+    # chosen config wants FlashMLA but it is unsupported, returns a copy using tilelang with 128
+    # forward threads for buckets below 64 and 256 otherwise.
     arch_major = torch.cuda.get_device_capability(q.device)[0]
     heads_per_group = q.shape[2] // kv.shape[2]
     heads_bucket = min(max(8, 1 << (heads_per_group - 1).bit_length()), 64)
@@ -89,6 +121,18 @@ def _default_config(q, kv, d_v: int) -> SparseAttentionConfig:
 
 
 def _flash_mla_forward(q, kv, indices, attn_sink, sm_scale):
+    # [FUNCTION DOC] HELPER: Runs the FlashMLA sparse prefill kernel and adapts it to this module's
+    # conventions. Flattens batch and sequence of the queries; pads the head count with zero heads
+    # up to 64 or 128 (and the sink with zeros; raises a stop-iteration error beyond 128 heads); pads
+    # indices to a multiple of 128 with minus one; for batch size one, indices index the kv cache
+    # directly, otherwise each batch element's valid indices are shifted by its offset into the
+    # flattened kv cache (padding stays minus one). The kv cache is flattened to a single group.
+    # Calls the kernel with value dim 512, the scale and the sink; the output is cut back to the real
+    # heads, and the returned log-sum-exp (natural-log units, excluding the sink) is converted to
+    # base 2 by multiplying by log2(e) and, if a sink exists, combined with the sink logit (also
+    # scaled to base 2) by a base-2 log-add-exp. Returns (output batch by sequence by heads by 512,
+    # lse batch by sequence by heads, contiguous). The value dim is hard-coded rather than taken
+    # from the caller.
     batch, seq_len, heads, _ = q.shape
     seq_len_kv = kv.shape[1]
     padded_heads = next(h for h in _FLASH_MLA_HEADS if h >= heads)
@@ -113,8 +157,15 @@ def _flash_mla_forward(q, kv, indices, attn_sink, sm_scale):
 
 
 class _SparseAttention(torch.autograd.Function):
+    # [CLASS DOC] HELPER: Autograd function running the selected forward backend and the tilelang
+    # backward. Saves q, kv, padded indices, clamped indices (padding mapped to row zero), the sink,
+    # the output and the base-2 log-sum-exp; stores the scale, value dim and config on the context.
     @staticmethod
     def forward(ctx, q, kv, indices, attn_sink, sm_scale, d_v, config):
+        # [FUNCTION DOC] Makes q and kv contiguous and pads indices to a multiple of 64 with minus
+        # one; computes the clamped index copy used for safe memory reads. Dispatches on the config:
+        # FlashMLA wrapper, or the tilelang forward (lazily imported) with the given value dim, scale
+        # and thread count. Returns the attention output (batch, sequence, heads, value dim).
         q, kv, indices = q.contiguous(), kv.contiguous(), _pad_topk_block(indices, _TILELANG_TOPK_MULTIPLE)
         kv_indices = indices.clamp(min=0)
         if config.forward_backend == "flash_mla":
@@ -141,6 +192,13 @@ class _SparseAttention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
+        # [FUNCTION DOC] Runs the tilelang backward (lazily imported) with the saved tensors, the
+        # contiguous output gradient, and the configured pipeline stages and split-store count,
+        # obtaining gradients for queries and the key/value cache plus a per-row delta. If a sink was
+        # given, its probability mass per row is 2 to the power (sink logit in base 2 minus lse), and
+        # the sink gradient is minus the sum over batch and sequence of delta times that mass,
+        # giving one value per head. Returns gradients for (q, kv, indices, sink, scale, value dim,
+        # config) with none for the non-differentiable ones.
         q, kv, indices, kv_indices, attn_sink, out, lse = ctx.saved_tensors
         from miles.kernels.attention.dsa.tilelang.sparse_attention_bwd import sparse_attention_bwd
 
@@ -173,6 +231,10 @@ def sparse_attention(
     attn_sink=None,
     config: SparseAttentionConfig | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Public entry. d_v defaults to the full query width (no tail); config defaults to
+    # the tuned or fallback choice for the device and shapes (this requires a CUDA device and queries
+    # on it). Applies the autograd function and returns the output, batch by sequence by heads by
+    # value dim, in the query dtype. Differentiable in q, kv and the sink.
     """Returns out [B, S, H, d_v] bf16. ``d_v`` defaults to the full head dim (no RoPE tail).
     ``config`` defaults to the measured row for this arch and shape."""
     if d_v is None:

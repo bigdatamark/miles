@@ -1,3 +1,9 @@
+# [MODULE DOC] Periodic scraper of Prometheus-format inference-engine (sglang) metrics.
+# Defines the whitelist of metric names kept, the label names preserved (engine type and data
+# parallel rank), a scrape-mode enum (router or direct) and the SglangScraper class that runs a
+# daemon thread fetching text-format metrics over HTTP, parsing them with the prometheus client
+# parser and passing one engine sample record per accepted sample to a sink callable. The HTTP
+# getter is injectable for tests; the default uses the requests library (imported lazily).
 """Scraper turning sglang engine metrics into dashboard ``EngineSample`` records.
 
 Two fetch modes (design doc §6.6):
@@ -75,11 +81,16 @@ KEPT_LABELS = ("engine_type", "dp_rank")
 
 
 class ScrapeMode(StrEnum):
+    # [CLASS DOC] String enum of where metrics are fetched from: "router" (one aggregated request
+    # to the router) or "direct" (one request per engine address).
     ROUTER = "router"
     DIRECT = "direct"
 
 
 def _default_http_get(url: str, timeout: float) -> str:
+    # [FUNCTION DOC] HELPER: Performs an HTTP GET with the given timeout in seconds using the
+    # requests library (imported on call) and returns the response body text. Raises the library's
+    # error for non-success status codes, timeouts and connection failures. Network I/O.
     import requests
 
     response = requests.get(url, timeout=timeout)
@@ -88,6 +99,14 @@ def _default_http_get(url: str, timeout: float) -> str:
 
 
 class SglangScraper:
+    # [CLASS DOC] Background scraper that turns engine metric text into engine sample records.
+    # Lifecycle: start launches one daemon thread; stop signals it and waits up to timeout plus
+    # one second. Each tick (every interval seconds, but never sleeping less than half a second
+    # after a tick) scrapes once with the tick start time as the sample timestamp; any exception
+    # from a tick is swallowed and reported through a rate-limited warning, leaving a gap.
+    # Router mode makes one request to the router's aggregated endpoint; direct mode requests every
+    # engine address (from a provider callable evaluated each tick) concurrently with at most 8
+    # worker threads, and skips engines whose request fails.
 
     def __init__(
         self,
@@ -101,6 +120,13 @@ class SglangScraper:
         whitelist: Iterable[str] = DEFAULT_METRIC_WHITELIST,
         http_get: Callable[[str, float], str] = _default_http_get,
     ):
+        # [FUNCTION DOC] Stores configuration. sink receives each sample record; mode selects the
+        # fetch strategy; router_addr (base address, required in router mode) and engine_addrs (a
+        # callable returning the current engine base addresses, required in direct mode) are
+        # checked with assertions; interval and timeout are in seconds (defaults 2 and 5);
+        # whitelist is the iterable of normalized metric names to keep (stored as a frozen set);
+        # http_get is the fetch function taking a URL and timeout and returning text. Creates the
+        # stop event and a rate-limited warner; the thread is not started.
         if mode == ScrapeMode.ROUTER:
             assert router_addr is not None, "router mode needs router_addr"
         else:
@@ -120,16 +146,23 @@ class SglangScraper:
     # ------------------------------ lifecycle -------------------------------
 
     def start(self) -> None:
+        # [FUNCTION DOC] Starts the scrape loop in a named daemon thread. Asserts it was not
+        # started before (so a stopped scraper cannot be restarted).
         assert self._thread is None, "scraper already started"
         self._thread = threading.Thread(target=self._run, name="dashboard-sglang-scraper", daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
+        # [FUNCTION DOC] Sets the stop event and, if started, joins the thread for at most timeout
+        # plus one second (an in-flight tick may outlive the join). Safe to call without start.
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=self.timeout + 1)
 
     def _run(self) -> None:
+        # [FUNCTION DOC] HELPER: Thread body. Until stopped: record the tick start time, run one
+        # scrape with it (catching all exceptions into a rate-limited warning), then wait on the
+        # stop event for the interval minus elapsed time, with a floor of 0.5 seconds.
         while not self._stop_event.is_set():
             started = time.time()
             try:
@@ -141,6 +174,9 @@ class SglangScraper:
     # ------------------------------- one tick -------------------------------
 
     def scrape_once(self, now: float) -> int:
+        # [FUNCTION DOC] Fetches all sources, ingests each response stamping samples with now
+        # (epoch seconds), and returns the total number of samples sent to the sink. Exceptions
+        # from the router fetch or parsing propagate to the caller.
         """Fetch, parse and sink one round of samples. Returns the count."""
         count = 0
         for addr, text in self._fetch():
@@ -148,6 +184,11 @@ class SglangScraper:
         return count
 
     def _fetch(self) -> list[tuple[str | None, str]]:
+        # [FUNCTION DOC] HELPER: Returns a list of pairs (engine address or None, metrics text).
+        # Router mode: a single pair with no address from the router's engine-metrics endpoint
+        # (errors propagate). Direct mode: evaluates the address provider, fetches each engine's
+        # metrics endpoint in a thread pool of min(8, number of engines, at least 1) workers, and
+        # drops engines whose fetch raised (warning rate-limited); order follows the address order.
         if self.mode == ScrapeMode.ROUTER:
             # addr None: the router aggregation carries worker_addr labels
             return [(None, self._http_get(f"{self.router_addr}/engine_metrics", self.timeout))]
@@ -155,6 +196,8 @@ class SglangScraper:
         addrs = list(self.engine_addrs())
 
         def fetch_one(addr: str) -> tuple[str | None, str] | None:
+            # [FUNCTION DOC] HELPER: Fetches one engine's metrics text and returns it with the
+            # address; on any exception emits a warning and returns None.
             try:
                 return addr, self._http_get(f"{addr}/metrics", self.timeout)
             except Exception:
@@ -165,6 +208,13 @@ class SglangScraper:
             return [result for result in pool.map(fetch_one, addrs) if result is not None]
 
     def _ingest(self, addr: str | None, text: str, now: float) -> int:
+        # [FUNCTION DOC] HELPER: Parses Prometheus text with the client library's parser (imported
+        # on call) and sends an engine sample to the sink for every sample whose normalized name
+        # (colons replaced by underscores) is in the whitelist. Address is the given engine
+        # address, or in router mode the sample's worker address label; a sample lacking it is
+        # dropped with a warning. Labels are reduced to the kept label names (engine type, dp
+        # rank) and the value is converted to a float. Returns the number of samples sent.
+        # Parse errors propagate.
         from prometheus_client.parser import text_string_to_metric_families
 
         count = 0
@@ -187,4 +237,5 @@ class SglangScraper:
         return count
 
     def _warn(self, message: str) -> None:
+        # [FUNCTION DOC] HELPER: Forwards a message to the rate-limited warner (logging side effect).
         self._warner.warn(message)
