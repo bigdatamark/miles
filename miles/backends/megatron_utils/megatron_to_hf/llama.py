@@ -1,8 +1,23 @@
+# [MODULE DOC]
+# Megatron-to-Hugging Face converter for dense Llama models: maps one Megatron parameter (double
+# "module." prefix) to a list of (HF name, tensor) pairs, covering embeddings, head, final norm,
+# attention (fused QKV split per query group into q, k, v; output projection), SwiGLU MLP (fused
+# first linear split in halves into gate then up; second linear as down) and layernorms. No bias,
+# no QK norm and no MoE handling.
 import re
 import torch
 
 
 def convert_llama_to_hf(args, name, param):
+    # [FUNCTION DOC]
+    # Exact names: embedding, output head, final norm. Head size is kv_channels (or hidden over
+    # heads if absent/unset); queries per group is heads over query groups. Decoder layers: output
+    # projection to o_proj; fused QKV weight viewed as (query groups, queries-per-group + 2, head
+    # size, hidden) and split along axis 1 into q (queries-per-group slices), k (one) and v (one),
+    # each reshaped to (rows, hidden); fused first MLP linear split in halves along axis 0 into
+    # gate then up; second linear to down; QKV-fused layer norm weight to input layernorm; MLP-fused
+    # layer norm weight and the pre-MLP layernorm to post-attention layernorm. Unknown names raise
+    # a value error.
     if name == "module.module.embedding.word_embeddings.weight":
         return [("model.embed_tokens.weight", param)]
     if name == "module.module.output_layer.weight":

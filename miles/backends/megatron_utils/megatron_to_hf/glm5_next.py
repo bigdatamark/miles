@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Megatron-to-Hugging Face converter for GLM-5 "next" models (hybrid with linear "KDA" attention
+# layers, sparse-attention indexer, and multi-hyper-connection sites). Handles only the names
+# specific to this architecture through lookup tables (KDA projections and gating tensors, indexer
+# tensors, hyper-connection function/base tensors), the KDA convolution (split in three equal parts
+# along axis 0 into q, k, v conv weights), and the hyper-connection alpha scalars (buffered in a
+# module-level store keyed by layer index and site until all three arrive, then emitted as one
+# length-three scale tensor in order pre, post, res). Everything else is delegated to the
+# DeepSeek-V3 converter.
 """Megatron -> HF weight-update conversion for GLM-5.3-Flash, the inverse of `miles_plugins/mbridge/glm5_next.py`.
 
 DSA indexer names are mapped here, not in `convert_deepseekv3_to_hf`, so its rope-interleave half-swap never runs
@@ -61,6 +70,11 @@ _hc_scale_buffers: dict[tuple[str, str], dict[str, torch.Tensor]] = {}
 
 
 def _convert_hc_scale(layer_idx: str, site: str, alpha_name: str, param: torch.Tensor):
+    # [FUNCTION DOC] HELPER: Stores the tensor in the module-level buffer for (layer index text,
+    # site) under its alpha label. Returns an empty list until all three labels arrived, then
+    # removes the buffer and returns one pair: the layer's attention or MLP scale name (by site)
+    # and the concatenation of the three tensors, each reshaped to length one, in the fixed order
+    # pre, post, res. Global mutable state; a repeated label overwrites.
     buffer = _hc_scale_buffers.setdefault((layer_idx, site), {})
     buffer[alpha_name] = param
     if len(buffer) < len(_HC_ALPHA_ORDER):
@@ -71,6 +85,13 @@ def _convert_hc_scale(layer_idx: str, site: str, alpha_name: str, param: torch.T
 
 
 def convert_glm5_next_to_hf(args, name, param):
+    # [FUNCTION DOC]
+    # For decoder layer names: first tries the three suffix tables (KDA, indexer, hyper-connection
+    # function/base) and emits one pair named model.layers.<idx>.<HF suffix>; then the KDA
+    # convolution weight, split into thirds along axis 0 as q, k, v convolution weights; then
+    # hyper-connection alpha names via the buffering helper (returns an empty list until complete).
+    # All other names (and decoder names matching none of these) are delegated to the DeepSeek-V3
+    # converter, which raises a value error for unknown names.
     match = _LAYER_PATTERN.match(name)
     if match:
         layer_idx, rest = match.groups()

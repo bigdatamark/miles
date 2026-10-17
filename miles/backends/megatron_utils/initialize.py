@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Process-level initialization of the Megatron backend: sets Megatron's global args, initializes
+# model parallelism, builds the independent-DP group and the global parallel state, seeds all
+# random number generators (python, numpy, torch, Megatron's tracked CUDA states), builds the
+# tokenizer, sets up the (unused but required) microbatch calculator, configures deterministic
+# mode, tensor-parallel communication overlap and an optional user init hook. Also provides a
+# capture/restore object for random generator states and a rank predicate for logging.
 import dataclasses
 import logging
 import os
@@ -30,6 +37,11 @@ def _set_random_seed(
     inference_rng_tracker: bool = False,
     use_cudagraphable_rng: bool = False,
 ):
+    # [FUNCTION DOC] HELPER: Seeds python, numpy, torch and Megatron's model-parallel CUDA RNG
+    # tracker. Effective seed = base seed + 100 times the pipeline-parallel rank (so stages differ),
+    # plus, when data-parallel random init is on, 10 times the effective data-parallel rank. The
+    # last three flags are forwarded to the Megatron seeding call (TE tracker, inference tracker,
+    # CUDA-graph-capable RNG). Global side effects on all RNG states.
     """Set random seed for reproducability."""
     # Ensure that different pipeline MP stages get different seeds.
     seed = seed_ + (100 * get_parallel_state().pp.rank)
@@ -43,6 +55,9 @@ def _set_random_seed(
 
 
 def set_random_seed_from_args(args) -> None:
+    # [FUNCTION DOC] Logs the seed on rank zero and seeds all generators from args.seed using the
+    # data-parallel-random-init, TE-RNG-tracker and inference-RNG-tracker flags. The CUDA-graph RNG
+    # option is left at its default (off).
     if args.rank == 0:
         logger.info(f"> setting random seeds to {args.seed} ...")
     _set_random_seed(
@@ -55,21 +70,36 @@ def set_random_seed_from_args(args) -> None:
 
 @dataclasses.dataclass(frozen=True)
 class RandomState:
+    # [CLASS DOC]
+    # Immutable snapshot of random generator states: the python generator state, the numpy global
+    # generator state, and Megatron's tuple of tracked CUDA RNG states. (The torch CPU generator is
+    # not captured.)
     python: tuple[Any, ...]
     numpy: dict[str, Any] | tuple[Any, ...]
     megatron: tuple[Any, ...]
 
     @classmethod
     def capture(cls) -> "RandomState":
+        # [FUNCTION DOC] Reads the current python, numpy and Megatron CUDA RNG states and returns
+        # them as a new snapshot object. Does not modify any generator.
         return cls(python=random.getstate(), numpy=np.random.get_state(), megatron=_get_all_rng_states())
 
     def restore(self) -> None:
+        # [FUNCTION DOC] Sets the python, numpy and Megatron CUDA generators back to the captured
+        # states (global side effects).
         random.setstate(self.python)
         np.random.set_state(self.numpy)
         _set_all_rng_states(*self.megatron)
 
 
 def _initialize_distributed(args, get_embedding_ranks=None, get_position_embedding_ranks=None):
+    # [FUNCTION DOC] HELPER: Calls Megatron's model-parallel initialization with the tensor,
+    # pipeline, virtual pipeline, context (flat and hierarchical), expert and expert-tensor
+    # parallel sizes, the distributed optimizer instance count, timeout minutes, NCCL communicator
+    # config path and pipeline communication backend from args. The rank ordering is
+    # tensor-context-expert-data-pipeline unless the TP-PP-DP mapping flag is set, in which case
+    # pipeline precedes data. Optional embedding-rank callbacks are forwarded; gloo groups are
+    # created per the use-gloo flag. Assumes torch distributed is already initialized by the caller.
     """Initialize torch.distributed and core model parallel."""
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
@@ -97,6 +127,20 @@ def init(
     indep_dp_store_addr: str | None = None,
     indep_dp_info: IndepDPInfo | None = None,
 ):
+    # [FUNCTION DOC]
+    # Main initialization entry. Steps in order: default the independent-DP info to the trivial
+    # (single-cell) one; set Megatron's global args; enable Megatron experimental features if
+    # requested; initialize model parallelism; create the independent-DP group from the store
+    # address and info with this process's global rank and world size; build and install the global
+    # parallel state; if independent DP is on assert the data-parallel size is 1; seed RNGs;
+    # register HF config aliases; build the tokenizer; initialize the Megatron microbatch
+    # calculator (needed only to satisfy Megatron validation); in deterministic mode enable
+    # deterministic cuDNN and torch algorithms (strict, errors not warnings), disable cuDNN
+    # benchmark, and set torch's fill-uninitialized-memory to follow the MILES_FILL_UNINIT
+    # environment variable being "1" (default off); with the deterministic-collective debug flag
+    # assert overlapped grad reduce is off; if TP comm overlap is on, initialize Megatron's
+    # tensor-parallel communicators; finally, if a custom init path is set, load that function and
+    # call it with args. Returns nothing; extensive global side effects.
     if indep_dp_info is None:
         indep_dp_info = IndepDPInfo.create_trivial()
 
@@ -162,6 +206,9 @@ def init(
 
 # TODO shall we use a simpler method to determine which rank to init wandb?
 def is_first_replica_megatron_main_rank():
+    # [FUNCTION DOC] True on exactly one rank per model replica group: the rank with zero effective
+    # data-and-context-parallel rank, zero tensor-parallel rank and the last pipeline stage. Used to
+    # decide which rank logs/tracks. Reads the global parallel state.
     return (
         get_parallel_state().effective_dp_cp.rank == 0
         and get_parallel_state().tp.rank == 0

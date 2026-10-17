@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Exports the Megatron model as a Hugging Face checkpoint directory. Two writers: in raw
+# conversion mode with a non-LoRA model, weights are converted by the snapshot publisher from the
+# model's named parameters and buffers; otherwise (bridge mode, or LoRA which needs the bridge to
+# merge adapters) the Megatron-Bridge library saves the pretrained-format checkpoint. For LoRA the
+# adapter is additionally written to an "adapter" subfolder. The directory is written through a
+# helper that creates a completion marker once all ranks finish.
 """Backend selection and checkpoint writing for Megatron HF exports."""
 
 import logging
@@ -22,6 +29,9 @@ logger = logging.getLogger(__name__)
 
 @cache
 def _get_hf_bridge(hf_checkpoint: str):
+    # [FUNCTION DOC] HELPER: Memoized (per checkpoint path, per process) construction of a
+    # Megatron-Bridge auto bridge from the HF checkpoint path with remote code trusted. The
+    # bridge package is imported lazily since only the bridge export path needs it.
     # Local: megatron.bridge is only needed on the bridge export path.
     from megatron.bridge import AutoBridge
 
@@ -37,6 +47,13 @@ def save_hf_model(
     path: str | Path | None = None,
     raise_on_error: bool = False,
 ) -> None:
+    # [FUNCTION DOC]
+    # Collective (all ranks must call). The output path is the explicit path, or else the args
+    # HF-save template formatted with the rollout id. Only the rank with zero effective data/context
+    # parallel rank and zero tensor-parallel rank logs. Writes via the checkpoint-directory writer
+    # with a completion marker, passing an inner writer function. On any exception: re-raises when
+    # raise_on_error is set, else logs the error (on the logging rank) and swallows it; on success
+    # logs completion.
     """Collectively write an HF model, with an additional HF adapter for LoRA.
 
     Writes a ``.complete`` marker after all ranks finish. Export errors are logged
@@ -46,6 +63,16 @@ def save_hf_model(
     path = Path(path if path is not None else args.save_hf.format(rollout_id=rollout_id))
 
     def write_weights(checkpoint_dir: Path):
+        # [FUNCTION DOC] HELPER: Writes the weights into the given directory. Raw mode without
+        # LoRA: the publisher writes the model from a mapping of globally named parameters and
+        # buffers, using the HF checkpoint for config/metadata. Otherwise: gets the cached bridge,
+        # saves with the model temporarily patched for the bridge, barriers on the gloo group, then
+        # rank zero checks that at least one safetensors or bin file exists and broadcasts the
+        # result; if none, every rank raises a runtime error saying the bridge likely lacks a
+        # mapping for the architecture. For LoRA models also has the publisher write the adapter
+        # into the "adapter" subdirectory.
+        # KNOWN ISSUE: the error message reports the outer output path rather than the directory
+        # actually being written, which may be a temporary location.
         if args.megatron_to_hf_mode == "raw" and not is_lora_model(model):
             # LoRA needs Bridge to merge the adapter into the base weights
             publisher.write_model(

@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Computes and logs SHA-256 checksums of this rank's local training state, to verify consistency
+# across replicas. The state has three parts: hashes of named model parameters, hashes of named
+# buffers (both keyed by pipeline-chunk prefix plus name), and for every inner optimizer a hashed
+# copy of its state dict plus a mapping from state-dict parameter index to model parameter name
+# (found through the fp32 main parameter tensors that optimizers hold). The result is emitted as a
+# structured event through the audit event logger. Fail-fast: any missing item raises an assertion
+# error rather than being skipped. Event-logger imports are local to break an import cycle.
 """Per-rank per-step weight checksum dumper for cross-replica consistency verification.
 
 Design principle: fail fast. This module must never silently produce partial results.
@@ -25,10 +33,13 @@ logger = logging.getLogger(__name__)
 
 
 class _MainParamId(NamedTuple):
+    # [CLASS DOC] HELPER: Hashable identity key for a tensor, wrapping the object's id (its
+    # in-process identity, not content). Valid only while the tensor object is alive.
     tensor_id: int
 
     @classmethod
     def from_tensor(cls, tensor: torch.Tensor) -> "_MainParamId":
+        # [FUNCTION DOC] HELPER: Builds the key from the tensor object's identity.
         return cls(tensor_id=id(tensor))
 
 
@@ -37,7 +48,10 @@ def dump_local_weight_checksums(
     model: Sequence[DDP],
     optimizer: MegatronOptimizer,
 ) -> None:
-    """Compute and dump weight checksums if enabled."""
+    # [FUNCTION DOC]
+    # Returns immediately unless the save-local-weight-checksum flag is set. Otherwise asserts the
+    # audit event logger has been initialized, computes the checksum state for the model chunks and
+    # optimizer, and logs it as a local-weight-checksum event (without printing it to the console).
 
     if not args.save_local_weight_checksum:
         return
@@ -65,6 +79,9 @@ def _compute_weight_checksum_state(
     model: Sequence[DDP],
     optimizer: MegatronOptimizer,
 ) -> "TrainEngineLocalWeightChecksumState":
+    # [FUNCTION DOC] HELPER: Hashes parameters (asserts at least one exists), buffers, and
+    # optimizer state (asserts at least one inner optimizer exists), and returns them packed in the
+    # checksum state record with fields for parameter, buffer and optimizer hashes.
     from miles.utils.audit_utils.event_logger.models import TrainEngineLocalWeightChecksumState
 
     param_hashes = _hash_named_tensors(model, accessor="named_parameters")
@@ -82,6 +99,10 @@ def _compute_weight_checksum_state(
 
 
 def _hash_named_tensors(model: Sequence[DDP], *, accessor: str) -> dict[str, str]:
+    # [FUNCTION DOC] HELPER: For each model chunk (index i), calls the named accessor method
+    # (named parameters or named buffers) and, in name-sorted order, asserts each tensor is present
+    # and records its SHA-256 hex digest under the key "pp" plus i plus "." plus name. Returns the
+    # mapping.
     """Hash all named tensors from model chunks using the given accessor method.
 
     Witness params (_is_witness_param) are intentionally included: cross-replica
@@ -99,6 +120,11 @@ def _collect_optimizer_hashes(
     model: Sequence[DDP],
     optimizer: MegatronOptimizer,
 ) -> list["OptimizerStateInfo"]:
+    # [FUNCTION DOC] HELPER: Builds the tensor-identity-to-name map from the model, then for each
+    # leaf sub-optimizer (flattening chained optimizers): asserts its inner optimizer is a torch
+    # optimizer, builds its index-to-name mapping, takes the inner state dict with every tensor
+    # replaced by a hash, and appends a record with the names and hashed state dict. Returns the
+    # list in optimizer order.
     """Collect optimizer state snapshots with tensors replaced by hashes."""
     from miles.utils.audit_utils.event_logger.models import OptimizerStateInfo
 
@@ -124,6 +150,11 @@ def _collect_optimizer_hashes(
 
 
 def _build_name_by_tensor_id(model: Sequence[DDP]) -> dict[_MainParamId, str]:
+    # [FUNCTION DOC] HELPER: For every named parameter of every chunk (asserting non-none), looks
+    # up its fp32 main parameter attribute. If absent, asserts the parameter is flagged as a
+    # sharded main parameter (the distributed optimizer case where another DP rank owns it) and
+    # skips it. Otherwise maps the main parameter's identity key to "pp" plus chunk index plus
+    # "." plus name. Returns the mapping.
     """Build _MainParamId(fp32_main_param) → name mapping from model parameters."""
     name_map: dict[_MainParamId, str] = {}
     for pp_idx, model_chunk in enumerate(model):
@@ -144,6 +175,10 @@ def _build_param_names_for_optimizer(
     inner: torch.optim.Optimizer,
     name_by_tensor_id: dict[_MainParamId, str],
 ) -> dict[int, str]:
+    # [FUNCTION DOC] HELPER: Walks the inner optimizer's parameter groups in order, numbering the
+    # parameters consecutively from zero (matching how the optimizer's state dict indexes them),
+    # and maps each index to the model parameter name found by the parameter's identity key.
+    # Asserts every optimizer parameter is known to the name map.
     """Build state_dict index → name mapping by walking optimizer's param_groups."""
     param_names: dict[int, str] = {}
     idx = 0
@@ -158,6 +193,11 @@ def _build_param_names_for_optimizer(
 
 
 def _transform_tensor_to_hash(obj: Any) -> Any:
+    # [FUNCTION DOC] HELPER: Recursively copies a nested structure: tensors become their SHA-256
+    # hex strings; mappings are rebuilt with the same keys; lists and tuples are rebuilt as the
+    # same container type; any other value is returned unchanged.
+    # KNOWN ISSUE: rebuilding a named tuple through its own type with a single generator argument
+    # would fail; only plain lists and tuples are expected in optimizer state dicts.
     """Recursively replace all tensors in a nested structure with their SHA-256 hashes."""
     if isinstance(obj, torch.Tensor):
         return _hash_tensor_sha256(obj)
@@ -169,6 +209,8 @@ def _transform_tensor_to_hash(obj: Any) -> Any:
 
 
 def _iter_sub_optimizers(optimizer: MegatronOptimizer) -> Iterator[MegatronOptimizer]:
+    # [FUNCTION DOC] HELPER: Generator yielding leaf optimizers depth-first: for an optimizer with a
+    # chained-optimizers list, recurses into each member in order; otherwise yields the optimizer.
     """Flatten ChainedOptimizer into individual sub-optimizers."""
     if hasattr(optimizer, "chained_optimizers"):
         for sub in optimizer.chained_optimizers:
@@ -178,5 +220,8 @@ def _iter_sub_optimizers(optimizer: MegatronOptimizer) -> Iterator[MegatronOptim
 
 
 def _hash_tensor_sha256(tensor: torch.Tensor) -> str:
+    # [FUNCTION DOC] HELPER: Hex SHA-256 digest of the tensor's raw bytes (via the CI utility's
+    # byte extraction, which copies GPU tensors to host and flattens them). Shape and dtype are not
+    # part of the hash.
     raw_bytes = _hash_tensor_bytes(tensor)
     return hashlib.sha256(raw_bytes).hexdigest()

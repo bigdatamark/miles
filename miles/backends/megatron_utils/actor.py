@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Ray actor that runs Megatron training for one rank. It owns the Megatron model chunks,
+# optimizer and optimizer-parameter scheduler, optional host-side weight backups (for switching
+# among actor / reference / teacher / old-actor / rollout-actor weights), the weight updater that
+# pushes weights to rollout engines, the snapshot publisher for HF export, and offload (sleep /
+# wake-up) of GPU memory through the memory saver. Public entry points called by the controller:
+# init, load_state, sleep, wake_up, offload_grad_buffer, train, save_model, export_hf,
+# update_weights, load_other_checkpoint, send_ckpt, reconfigure_indep_dp. Also defines a value spec
+# for shipping critic values by object reference and two small module helpers.
 import atexit
 import logging
 import os
@@ -88,6 +97,12 @@ CRITIC_VALUES_VALUE_SPEC: dict[str, ValueSpec] = {"values": ValueSpec(codec="typ
 
 
 def _setup_disk_offload_reclaim(disk_dir: str) -> None:
+    # [FUNCTION DOC] HELPER: Does nothing when the directory path is empty or none. Otherwise
+    # removes the directory tree (ignoring errors), recreates it empty, registers an exit handler
+    # that removes it again at interpreter exit (ignoring errors), and logs. Side effects: file
+    # system deletion and creation, exit hook registration.
+    # KNOWN ISSUE: the caller passes the environment lookup of the disk backup directory variable,
+    # which can be none; that case is silently skipped here even though disk offload was requested.
     """Wipe this rank's train disk-offload dir on startup and re-arm the atexit wipe.
 
     torch_memory_saver unlinks each backup file as its allocation is freed on a
@@ -103,6 +118,16 @@ def _setup_disk_offload_reclaim(disk_dir: str) -> None:
 
 
 class MegatronTrainRayActor(TrainRayActor):
+    # [CLASS DOC]
+    # Per-rank Megatron trainer. Key state: model (list of model chunks), optimizer, optimizer
+    # parameter scheduler, a weights backuper (host copies keyed by tag: "actor", and optionally
+    # "ref", "teacher", "old_actor", "rollout_actor"), the currently active model tag, an asleep
+    # flag (GPU memory offloaded) and a grad-buffer-paused flag, the weight updater and snapshot
+    # publisher (either may be none), the last rollout id trained, a captured random state taken
+    # right after initialization (used to restore on hot restart), and an optional user hook that
+    # post-processes rollout data. Replay managers (routing and other) are driven through stages:
+    # "fallthrough" for ref/teacher passes, "record" or "replay_forward" for the actor log-prob
+    # pass, "replay_backward" for training.
     @with_logs
     @with_defer(lambda: Timer().start("train_wait"))
     def init(
@@ -116,6 +141,32 @@ class MegatronTrainRayActor(TrainRayActor):
         indep_dp_info: IndepDPInfo,
         indep_dp_store_addr: str | None,
     ) -> int | None:
+        # [FUNCTION DOC]
+        # Initializes the actor and returns the rollout id to start from (the loaded checkpoint's
+        # start id), or zero in rollout-only debug mode. The decorators log the call and start the
+        # "train_wait" timer when init returns/exits. Steps in order: clear updater/publisher;
+        # patch the torch distributed module for reloadable process groups; run the base-class
+        # common init (args, role, reference and distillation-teacher flags); register replay-list
+        # functions (sequential for generic replay managers, MoE-specific for routing replay); run
+        # the Megatron init with the independent-DP store address and info; build the fault-tolerance
+        # test-action executor from the trainer pool and cell ids; apply dumper source patches if
+        # enabled; on the first replica's main rank start tracking and register with the dashboard;
+        # reject profile targets unsupported on Megatron (raises not-implemented only when the
+        # PyTorch profiler is also on); create the profiler; load HF assets; record the parallel
+        # config (empty with independent DP, else dp, cp, vpp sizes and microbatch group size);
+        # barrier on the gloo group; when train offload is on, set the memory-saver margin from
+        # args if positive and, for the disk target, arm disk reclaim on the backup directory
+        # environment variable. Return zero now if rollout-only debug. For non-critic roles enable
+        # each replay manager per its use-replay flag (and result checking in CI). Build the
+        # in-memory/received checkpointing context (received from a source rank when healing, which
+        # also overrides loading to take optimizer/rng and not finetune; or an in-memory local
+        # manager when the non-persistent type is local), build model/optimizer/scheduler, capture
+        # random state, set up hybrid context-parallel attention when cp size exceeds one, verify
+        # the parallel state, mark awake. Critic role: load state, sleep if offloading, return start
+        # id. Actor role: optionally build a main-weight cast context (rematerialize), create the
+        # weights backuper over the actor weight getter, set active tag "actor", default vocab size
+        # from the tokenizer, load state, create updater/publisher, load the optional rollout-data
+        # post-process function, sleep if offloading, notify profiler, and return the start id.
         self.weight_updater: WeightUpdater | None = None
         self.snapshot_publisher: SnapshotPublisher | None = None
         monkey_patch_torch_dist()
@@ -260,6 +311,10 @@ class MegatronTrainRayActor(TrainRayActor):
         return load_output.start_rollout_id
 
     def _init_training_state(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates the weight updater and snapshot publisher. Weight updates
+        # are enabled unless debug-train-only is set. Snapshots are published when HF saving is
+        # configured, or eval uses snapshots and an eval HF directory is set, or LoRA is enabled
+        # with a save path and the conversion mode is not raw.
         args = self.args
         self._init_weight_updater_and_publisher(
             update_weights=not args.debug_train_only,
@@ -271,6 +326,16 @@ class MegatronTrainRayActor(TrainRayActor):
         )
 
     def _init_weight_updater_and_publisher(self, *, update_weights: bool, publish_snapshots: bool) -> None:
+        # [FUNCTION DOC] HELPER: Resets updater and publisher to none, then optionally creates them.
+        # Model name is args.model_name or else the lowercased class name of the HF config; the
+        # quantization config comes from the HF config if present. If update_weights: determines
+        # whether LoRA rollout is on; with LoRA on a non-colocated setup, asserts the conversion
+        # mode is bridge (assertion error otherwise); creates the weight updater with the model,
+        # the actor-weights getter, the HF weight iterator factory, parallel state, the LoRA flag and
+        # (for LoRA) a LoRA config built from the adapter target modules. If publish_snapshots:
+        # builds an HF weight iterator requiring pipeline-parallel gathering (quantization config
+        # dropped for LoRA) and wraps it, plus the LoRA config when LoRA is enabled, in a snapshot
+        # publisher.
         args = self.args
         model_name = type(self.hf_config).__name__.lower() if args.model_name is None else args.model_name
         quantization_config = getattr(self.hf_config, "quantization_config", None)
@@ -312,6 +377,10 @@ class MegatronTrainRayActor(TrainRayActor):
             )
 
     def _clear_quantized_weight_workspaces(self) -> None:
+        # [FUNCTION DOC] HELPER: Only when the clear-on-offload option is set, the transformer
+        # implementation is transformer_engine, and CUDA graphs are off (a captured graph bakes in
+        # the workspace address): imports the engine's base module class lazily and empties the
+        # FP8 workspace cache of every such module in every model chunk. Otherwise returns at once.
         if not (
             self.args.clear_quantized_weight_workspaces_on_offload
             and self.args.transformer_impl == "transformer_engine"
@@ -328,6 +397,20 @@ class MegatronTrainRayActor(TrainRayActor):
 
     @with_logs
     def load_state(self) -> int:
+        # [FUNCTION DOC]
+        # Hot restart: rolls the trainer back to the state of a checkpoint and returns the rollout
+        # id to resume from. Preconditions are asserted (assertion errors): initialized; no
+        # rollout-only debug, LoRA, multi-LoRA, colocate, rematerialization from master weights,
+        # local non-persistent checkpoints, train offload, profiler, memory-history recording,
+        # keep-old-actor, or reference-update interval; and a requested load path must exist.
+        # Finishes any pending async save (blocking). If the load path has a checkpoint tracker
+        # iteration, loads that checkpoint with overrides (load path, no step, no finetune, load
+        # optimizer and rng). Otherwise asserts a finetune-from-scratch configuration (no fp16,
+        # precision-aware optimizer, optimizer CPU offload or optimizer-state offload, not bridge
+        # mode, finetune, no-load optimizer and rng, equal checkpoint and reference-checkpoint
+        # steps), restores the random state captured after init, and resets optimizer state. The
+        # scheduler step counter is reset to zero beforehand. Then performs the core load, clears the
+        # last-rollout id, logs, and returns the start id.
         assert self.is_initialized()
 
         # reloading does not support things like these
@@ -396,6 +479,11 @@ class MegatronTrainRayActor(TrainRayActor):
     def _load_state_core(
         self, *, checkpointing_context: dict | None, overrider_for_loading: dict[str, object]
     ) -> LoadCheckpointOutput:
+        # [FUNCTION DOC] HELPER: Loads model/optimizer/scheduler state through the model-state loader
+        # while the given argument overrides are temporarily applied to the args object (restored
+        # afterwards). For non-critic roles then loads the auxiliary checkpoints and switches to the
+        # actor weights. Clears GPU memory caches and returns the loader's output (which carries
+        # the start and loaded rollout ids).
         with inplace_modify_args(self.args, overrider_for_loading):
             load_output = load_model_state(
                 self.args,
@@ -416,6 +504,12 @@ class MegatronTrainRayActor(TrainRayActor):
         return load_output
 
     def _load_auxiliary_checkpoints(self) -> None:
+        # [FUNCTION DOC] HELPER: Backs up the freshly loaded actor weights to host if weight backup
+        # is enabled. Then, as configured, loads the reference model (from the ref load path), the
+        # distillation teacher (from the teacher load path), and when keeping an old actor loads
+        # the old actor from the main load path and, if the weight-update interval is one, also
+        # backs up the current actor as the rollout actor. Each load overwrites the live model and
+        # backs it up under its tag; the caller switches back to actor weights afterwards.
         if self._enable_weight_backup:
             self.weights_backuper.backup("actor")
 
@@ -434,6 +528,8 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.weights_backuper.backup("rollout_actor")
 
     def _finalize_pending_async_save(self) -> None:
+        # [FUNCTION DOC] HELPER: If asynchronous checkpoint saving is enabled, blocks until any
+        # in-flight async save has been finalized; otherwise does nothing.
         if not self.args.async_save:
             return
 
@@ -442,6 +538,15 @@ class MegatronTrainRayActor(TrainRayActor):
     @with_logs
     @timer
     def sleep(self) -> None:
+        # [FUNCTION DOC]
+        # Offloads training GPU memory (requires train offload; asserts). No-op with a log if
+        # already asleep. Steps: clear quantized weight workspaces; clear GPU and host memory; note
+        # whether to log CPU memory (first-replica main rank, after at least one train step); destroy
+        # process groups; pause memory-saver regions: with master-weight rematerialization on the
+        # actor role, pause the grad-buffer and default tags (params stay resident for the weight
+        # update, which pauses them later); with LoRA rollout, pause grad buffers once (tracking a
+        # flag) and the default tag; otherwise pause everything. Marks asleep and logs memory;
+        # logs CPU memory after offload when applicable. Decorated for logging and timing.
         assert self.args.offload_train
         if self._asleep:
             logger.info("sleep() called while already offloaded; skipping")
@@ -476,6 +581,10 @@ class MegatronTrainRayActor(TrainRayActor):
     @with_logs
     @timer
     def offload_grad_buffer(self) -> None:
+        # [FUNCTION DOC]
+        # Asserts train offload and LoRA rollout are on. Returns without effect if already asleep
+        # or the grad buffer is already paused. Otherwise pauses the memory-saver grad-buffer tag,
+        # sets the paused flag, and logs memory before and after. Decorated for logging and timing.
         """Free the LoRA grad buffers ahead of sleep(), so the engine can resume its weights first."""
         assert self.args.offload_train
         assert lora_rollout_enabled(self.args), "only LoRA keeps its grad buffers in a no-backup region"
@@ -489,6 +598,11 @@ class MegatronTrainRayActor(TrainRayActor):
     @with_logs
     @timer
     def wake_up(self) -> None:
+        # [FUNCTION DOC]
+        # Reverse of sleep (asserts train offload). If not asleep, only ensures process groups are
+        # reloaded and returns. Otherwise resumes memory-saver regions (with LoRA rollout: default
+        # and grad-buffer tags, clearing the grad-buffer-paused flag; else all), clears GPU memory,
+        # reloads process groups, marks awake, and logs memory. Decorated for logging and timing.
         assert self.args.offload_train
         if not self._asleep:
             logger.info("wake_up() called while already resident; ensuring process groups only")
@@ -510,6 +624,9 @@ class MegatronTrainRayActor(TrainRayActor):
 
     @property
     def _weight_sync_reads_tms_backup(self) -> bool:
+        # [FUNCTION DOC] HELPER: Property. True only when all hold: colocated mode, LoRA enabled,
+        # offload target is CPU, and no reference model, teacher or old actor is in use. In that case
+        # weight sync reads the memory saver's own host backup instead of a separate actor backup.
         """Under colocated LoRA the frozen base already has a memory-saver host backup; a
         pinned "actor" copy of it would duplicate the whole base per rank. Model switching
         still needs the real backups, and a disk offload target leaves no host backup to read."""
@@ -522,6 +639,8 @@ class MegatronTrainRayActor(TrainRayActor):
 
     @property
     def _enable_weight_backup(self) -> bool:
+        # [FUNCTION DOC] HELPER: Property. False when weight sync reads the memory saver backup;
+        # otherwise true if any of: reference model, teacher, old actor, colocate, train offload.
         """Keep host weights for model switching and weight sync while offloaded."""
         if self._weight_sync_reads_tms_backup:
             return False
@@ -534,6 +653,9 @@ class MegatronTrainRayActor(TrainRayActor):
         )
 
     def _switch_model(self, target_tag: str) -> None:
+        # [FUNCTION DOC] HELPER: Loads the host backup stored under the tag into the live model and
+        # records it as active. No-op when weight backup is disabled. Raises a value error for a tag
+        # with no backup.
         if not self._enable_weight_backup:
             return
         if target_tag not in self.weights_backuper.backup_tags:
@@ -542,6 +664,7 @@ class MegatronTrainRayActor(TrainRayActor):
         self._active_model_tag = target_tag
 
     def _set_replay_stage(self, stage: str) -> None:
+        # [FUNCTION DOC] HELPER: Sets the stage string on every registered replay manager.
         for m in all_replay_managers:
             m.stage = stage
 
@@ -553,6 +676,11 @@ class MegatronTrainRayActor(TrainRayActor):
         rollout_id: int,
         store_prefix: str = "",
     ) -> dict[str, list[torch.Tensor]]:
+        # [FUNCTION DOC] HELPER: Runs a forward-only pass over the data iterator computing log
+        # probabilities and entropy, inside a timer named with the prefix plus "log_probs". Output
+        # keys are prefixed with store_prefix (empty for actor, "ref_", "teacher_"); not forced to
+        # float32. The rollout sampling mask is used only for the unprefixed (actor) pass and when
+        # sampling-support replay is on. Returns a mapping from key to a list of tensors.
 
         with timer(f"{store_prefix}log_probs"):
             return forward_only(
@@ -581,6 +709,15 @@ class MegatronTrainRayActor(TrainRayActor):
         attempt: int = 0,
         external_data: TrainStepOutput | None = None,
     ) -> TrainStepOutput:
+        # [FUNCTION DOC]
+        # Runs one training step for a rollout and returns a train-step output. Decorated to log
+        # and to record an event-log context with the rollout id and attempt. Bumps the heartbeat,
+        # remembers the rollout id, wakes up if offloaded. Fetches the rollout data from the object
+        # store reference(s) (within a timer "data_preprocess"; the fetch result is kept open until
+        # the end via an exit stack); in rollout-only debug mode logs the data and returns a normal
+        # outcome without training. Critic role: trains the critic under timer "critic_train".
+        # Otherwise trains the actor, passing external data (e.g. critic values), witness info and
+        # attempt.
         self._heartbeat.bump()
         self._last_rollout_id = rollout_id
         if self.args.offload_train and self._asleep:
@@ -612,6 +749,13 @@ class MegatronTrainRayActor(TrainRayActor):
 
     @with_logs
     def _train_critic(self, rollout_id: int, rollout_data: RolloutBatch) -> TrainStepOutput:
+        # [FUNCTION DOC] HELPER: Builds the data iterator and microbatch counts; computes values by a
+        # forward-only pass and merges them into the rollout data; computes advantages and returns;
+        # sets the loss type on args to value loss (mutates args); runs the training loop with no
+        # witness info and attempt zero. Bumps heartbeat. If this rank is the last pipeline stage
+        # and values exist, copies them to CPU and puts them in the object store under the critic
+        # value spec, getting a reference. Returns a train-step output with the outcome and the
+        # values reference (none on other ranks).
         # Create data iterator for log_probs and train.
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
         rollout_data.update(
@@ -651,6 +795,8 @@ class MegatronTrainRayActor(TrainRayActor):
         return TrainStepOutput(outcome=train_step_outcome, values=values)
 
     def _use_rollout_replay(self, m) -> bool:
+        # [FUNCTION DOC] HELPER: Whether the args flag named "use_rollout_" plus the manager's name
+        # plus "_replay" is set (default false); i.e. replay data comes from the rollout.
         return getattr(self.args, f"use_rollout_{m.name}_replay", False)
 
     @with_logs
@@ -663,6 +809,27 @@ class MegatronTrainRayActor(TrainRayActor):
         witness_info: WitnessInfo | None,
         attempt: int,
     ) -> TrainStepOutput:
+        # [FUNCTION DOC] HELPER:
+        # Actor training for one rollout. Builds the data iterator and microbatch counts (one entry
+        # per optimizer step). If skip-actor-forward-only is set, asserts exactly one optimizer step
+        # and no precomputed actor log probs. For each replay manager using rollout replay, fills
+        # its replay data from the rollout data. Then, inside the "train" timer (and out of the
+        # "train_wait" timer): if advantages are computed here: for ref and teacher backups, set
+        # replay stage "fallthrough", switch weights and merge their forward-only log probs under
+        # "ref_"/"teacher_" prefixes; switch to old-actor (when kept) or actor weights; unless
+        # skipped, or rollout log probs are used without mismatch metrics, set enabled replay
+        # managers to "replay_forward" (rollout replay) or "record", compute actor log probs, then
+        # clear forward replay data; with a critic and external data on the last pipeline stage,
+        # fetch shipped values from the object store (asserting they exist) and materialize them on
+        # the current GPU; switch back to actor weights if needed; compute advantages and returns
+        # over the whole rollout and log the event. Then run the optional rollout-data post-process
+        # function, log rollout data, set replay stage "replay_backward", train under the
+        # "actor_train" timer with witness info, attempt and the fault-tolerance test executor, step
+        # the profiler. After: save debug train data, clear enabled replay managers. If the outcome
+        # is normal: refresh the host actor backup (or synchronize CUDA when backups are disabled)
+        # and, when the reference-update interval divides rollout id plus one and a ref backup
+        # exists, re-back-up ref from the current weights (under timer "ref_model_update"). Logs perf
+        # data with weight updater metrics. Bumps heartbeat and returns the outcome in an output.
         # Create data iterator for log_probs and train.
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
         num_optimizer_steps = len(num_microbatches)
@@ -812,6 +979,16 @@ class MegatronTrainRayActor(TrainRayActor):
 
     @timer
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
+        # [FUNCTION DOC]
+        # Saves a Megatron checkpoint for the rollout id (timed). Returns immediately in
+        # rollout-only debug mode. Steps: finalize any pending async save; save model, optimizer
+        # and scheduler (passing the snapshot publisher); on the actor role with HF saving
+        # configured, asserts a publisher exists and exports an HF checkpoint; if force_sync,
+        # finalizes the async save again. If a custom post-save hook path is set and this is global
+        # rank zero: finalize async save, compute the Megatron checkpoint directory and the
+        # HF checkpoint directory (the HF path template formatted with the rollout id, actor only,
+        # else none), load the hook function lazily and call it with args, rollout id and both
+        # directories.
         self._heartbeat.bump()
         if self.args.debug_rollout_only:
             return
@@ -852,6 +1029,10 @@ class MegatronTrainRayActor(TrainRayActor):
     @with_logs
     @timer
     def export_hf(self, rollout_id: int, path: str) -> None:
+        # [FUNCTION DOC]
+        # Collective HF export to the given directory path. Bumps heartbeat, asserts a snapshot
+        # publisher exists, and calls the HF save routine with the publisher, the explicit path
+        # and error raising enabled (so failures propagate). Decorated for logging and timing.
         """Export current weights as an HF checkpoint to ``path`` (collective).
 
         Uses the direct megatron->HF converters (the weight updater's machinery), so
@@ -866,6 +1047,9 @@ class MegatronTrainRayActor(TrainRayActor):
         )
 
     def _named_actor_weights(self, *, translate_gpu_to_cpu: bool = False):
+        # [FUNCTION DOC] HELPER: Returns an iterator of (name, tensor) pairs of the model's
+        # parameters and buffers; names are converted to global names only in raw conversion mode;
+        # optionally translates GPU tensors to their CPU backup. Used as the backuper's source getter.
         return named_params_and_buffers(
             self.args,
             self.model,
@@ -874,6 +1058,9 @@ class MegatronTrainRayActor(TrainRayActor):
         )
 
     def _get_actor_weights(self):
+        # [FUNCTION DOC] HELPER: Weights getter for the weight updater. Returns a mapping from name
+        # to tensor: from the memory saver CPU backup when that mode applies; the host actor backup
+        # when colocated, asleep, or the active tag is not actor; otherwise the live GPU weights.
         if self._weight_sync_reads_tms_backup:
             return dict(self._named_actor_weights(translate_gpu_to_cpu=True))
         # use cpu backup only when weight is not live on gpu
@@ -884,6 +1071,21 @@ class MegatronTrainRayActor(TrainRayActor):
     @with_logs
     @timer
     def update_weights(self, info: UpdatableEngines) -> int | None:
+        # [FUNCTION DOC]
+        # Pushes the actor weights to rollout engines; returns the new weight version, or none when
+        # skipped. Returns none at once in train-only or rollout-only debug mode; asserts a weight
+        # updater exists. If offloaded and asleep, reloads process groups (temporary) and destroys
+        # them again before returning. Reconnects the updater when its connection status says so
+        # for the snapshot cell hashes (with the memory saver disabled when offload is on, since
+        # connection setup allocates CUDA tensors). In skip-weight-update debug mode: warns on rank
+        # zero, pauses the param-buffer tag if rematerializing, tears down temporary groups, returns
+        # none. Otherwise, with the memory saver disabled under offload: logs memory, runs the
+        # update, in CI without LoRA verifies engine versions, and for keep-old-actor with interval
+        # one rotates backups (rollout_actor to old_actor, then actor to rollout_actor) or with
+        # other intervals re-backs-up old_actor. Afterwards pauses param buffer if rematerializing
+        # and destroys temporary groups. Returns the updater's weight version.
+        # KNOWN ISSUE: the keep-old-actor flag is read with a default here but accessed directly
+        # elsewhere in this class.
         self._heartbeat.bump()
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return None
@@ -939,6 +1141,14 @@ class MegatronTrainRayActor(TrainRayActor):
 
     @with_logs
     def load_other_checkpoint(self, model_tag: str, path: str) -> None:
+        # [FUNCTION DOC]
+        # Loads a model-only checkpoint from the path into the live model and backs it up under
+        # the tag, which becomes active. Temporarily mutates args: load path, no-load optimizer,
+        # no-load rng, finetune true (the old values are restored after the load). For tag "ref"
+        # with a reference checkpoint step, or tag "teacher" with a teacher checkpoint step, the
+        # args checkpoint step is temporarily replaced and restored. Calls the checkpoint loader
+        # with no optimizer or scheduler and an empty checkpointing context.
+        # KNOWN ISSUE: args are not restored if loading raises (no try/finally).
         old_args = self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune
         self.args.load = path
         self.args.no_load_optim = True
@@ -975,6 +1185,10 @@ class MegatronTrainRayActor(TrainRayActor):
 
     @with_logs
     def send_ckpt(self, dst_rank: int) -> None:
+        # [FUNCTION DOC]
+        # Fault-tolerance healing, sender side: sends the current model, optimizer, scheduler
+        # state and the last trained rollout id as the iteration to the destination rank within the
+        # independent-DP group. Asserts that keep-old-actor is off and at least one step was trained.
         # These states are not handled
         assert not self.args.keep_old_actor
         assert self._last_rollout_id is not None, "healing before the first train step is unsupported"
@@ -990,6 +1204,10 @@ class MegatronTrainRayActor(TrainRayActor):
 
     @with_logs
     def reconfigure_indep_dp(self, indep_dp_info: IndepDPInfo, indep_dp_store_addr: str | None) -> None:
+        # [FUNCTION DOC]
+        # Rebuilds the independent data-parallel group for a changed membership using the new store
+        # address and info and this rank's global rank and world size, then (if a weight updater
+        # exists) marks its trainer connection as stale so the next update reconnects.
         reconfigure_indep_dp_group(
             parallel_state=get_parallel_state(),
             store_addr=indep_dp_store_addr,
@@ -1004,4 +1222,7 @@ class MegatronTrainRayActor(TrainRayActor):
 def _materialize_critic_values(
     values: list[list[float] | torch.Tensor], device: torch.device | int
 ) -> list[torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Converts each entry (a list of floats or a tensor) into a float32
+    # tensor on the given device (device object or index); uses a clone so results own their memory.
+    # Returns a list of tensors in input order.
     return [torch.as_tensor(value, dtype=torch.float32, device=device).clone() for value in values]

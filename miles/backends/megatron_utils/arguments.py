@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Argument handling glue between the project's command-line arguments and Megatron-LM. Re-exports
+# Megatron's argument parser and validator, and adds a function that fills in or overrides Megatron
+# argument defaults that depend on project settings (optimizer kind, precision, sequence length,
+# tokenizer, vocabulary padding, model-family normalizations). Mutates the passed namespace.
 import logging
 import os
 
@@ -14,6 +19,22 @@ logger = logging.getLogger(__name__)
 
 
 def set_default_megatron_args(args):
+    # [FUNCTION DOC]
+    # Mutates and returns the argument namespace. In order: raises not-implemented if the
+    # true-on-policy flag is set (unsupported on this backend). Enables the distributed optimizer
+    # only when the optimizer is unset or Adam (case-insensitive) and optimizer is not disabled for
+    # debugging; forces it off when multi-LoRA adapters are configured. Sets bf16 as the inverse of
+    # fp16. Defaults sequence length to 4096 when unset and sets max position embeddings equal to
+    # it. If the environment variable for deprecated-Megatron compatibility equals "1", sets the
+    # pre-mcore-0.14 distributed checkpoint save flag. Always sets the MoE router to use torch
+    # matrix multiply (to keep log-prob differences small versus the TE gemm). If a rope type
+    # attribute exists and is unset, picks yarn for multi-latent attention else rope. If vocab size
+    # is given and padded vocab size is not, computes padded vocab size with Megatron's padding
+    # rule. If neither tokenizer model nor type is set, uses the HF checkpoint path as the tokenizer
+    # model with the HuggingFace tokenizer type (logged). Forces trust-remote-code on. Applies
+    # DeepSeek-V4 normalization for matching models. If the DSA implementation is "megatron",
+    # normalizes DSA args using the HF config loaded from the HF checkpoint; else if the context
+    # parallel communication type is unset sets it to a list containing point-to-point.
     if getattr(args, "true_on_policy_mode", False):
         raise NotImplementedError(
             "--true-on-policy-mode is not supported on the megatron backend with this Megatron "

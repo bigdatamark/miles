@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Megatron-to-Hugging Face parameter name/tensor converter for DeepSeek-V3-style models (also used
+# for GLM4 MoE Lite and GLM MoE DSA variants). One function maps a single Megatron parameter (names
+# start with the double "module." wrapper prefix) to a list of (HF name, tensor) pairs: embeddings,
+# output head, final norm, per-layer attention (multi-latent attention projections, norms, the
+# sparse-attention indexer with optional RoPE channel reordering), dense and shared-expert MLPs,
+# routed experts (the fused gate/up first linear is split in half along the first axis), router
+# weight and expert bias, and multi-token-prediction (MTP) layers whose index is shifted past the
+# main layers. A table maps names used by Megatron's native sparse attention to HF names.
 import re
 
 import torch
@@ -15,6 +24,36 @@ _NATIVE_DSA_ATTENTION_MAPPING = {
 
 
 def convert_deepseekv3_to_hf(args, name, param):
+    # [FUNCTION DOC]
+    # Input: run args, the Megatron parameter name, the tensor. Output: list of (HF name, tensor).
+    # Exact-name cases: word embeddings to the embed tokens weight; output layer to the language
+    # model head; final decoder layernorm to the final model norm. Then computes the attention head
+    # size (kv_channels if set else hidden size over attention heads; falls back to the latter if
+    # the attribute is missing) and the query heads per group. For decoder layer names (layer index
+    # and remainder captured): (1) names in the native-DSA table map directly to attention-module
+    # names (indexer weights/norms, q/kv layernorm to the "a" layernorms); (2) routed expert weights
+    # (remainder like experts.<kind>.weight<expert index>): fused first linear split in two equal
+    # halves along axis 0 into gate then up projections, second linear to down projection, anything
+    # else raises a value error; (3) shared experts likewise (first linear split into gate/up);
+    # (4) attention: output projection, query projection, query down projection, query up-projection
+    # layernorm to the q "a" layernorm, query up projection to q_b, kv down projection to the MQA kv
+    # "a" projection, kv up-projection layernorm and weight, indexer query/key/weights/k-norm
+    # (with the indexer RoPE interleave flag set, the 64-wide rotary halves of each 128-wide head
+    # are swapped for the query-b weight, and the first 64 and remaining entries swapped for the
+    # key weight and key norm weight and bias; sizes 128 and 64 are hard coded); fused QKV bias is
+    # reshaped by query group then split along axis 1 into sizes (queries per group times head size,
+    # head size, head size), each flattened to separate q, k, v biases; (5) dense MLP first linear
+    # split into gate/up, second linear to down; input layernorm (from either the fused QKV layer
+    # norm weight or the input layernorm); post-attention layernorm (from the MLP fused layer norm or
+    # the pre-MLP layernorm); router weight to the gate weight and router expert bias to the score
+    # correction bias. For MTP layers (index shifted by args.num_layers): eh projection, enorm and
+    # hnorm map directly, the final layernorm maps to the shared head norm, and anything else is
+    # renamed as an ordinary decoder layer at the shifted index (dropping transformer-layer and
+    # MTP-model-layer segments) and converted recursively. Raises a value error for unknown names
+    # (including unmatched decoder-layer remainders).
+    # KNOWN ISSUE: the key-weight swap rebuilds the tensor with a view to a two-dimensional shape
+    # while the key norm and bias swaps are one-dimensional; the 128/64 constants assume the indexer
+    # head dim and rope dim of one model and are not read from args.
     if name == "module.module.embedding.word_embeddings.weight":
         return [("model.embed_tokens.weight", param)]
     if name == "module.module.output_layer.weight":

@@ -1,3 +1,9 @@
+# [MODULE DOC] HELPER:
+# Assertions and bookkeeping used only in CI runs of the Megatron backend: per-layer SHA256 hashes
+# of model parameters (saved after training, checked after loading, one json file per parallel
+# rank), a check that only multi-token-prediction (MTP) parameters receive gradients, a check on
+# peak GPU memory after a low-memory resume, and an MTP loss upper bound. Every check is gated by
+# CI flags on the args object where noted and signals failure by raising assertion errors.
 """CI utilities for Megatron backend testing."""
 
 import hashlib
@@ -23,6 +29,10 @@ _LAYER_PATTERNS = (
 
 
 def _layer_key(name: str) -> str:
+    # [FUNCTION DOC] HELPER: Maps a parameter name to a grouping key. Tries, in order, patterns for
+    # encoder layers, decoder layers, bare layers and singular layer followed by a number, each as
+    # a dot-delimited path component; the first match yields "layer_" plus the number zero-padded
+    # to four digits. Names matching none yield "non_layer".
     for pattern in _LAYER_PATTERNS:
         match = pattern.search(name)
         if match:
@@ -31,6 +41,8 @@ def _layer_key(name: str) -> str:
 
 
 def _hash_tensor_bytes(tensor: torch.Tensor) -> bytes:
+    # [FUNCTION DOC] HELPER: Returns the raw memory bytes of a tensor: detaches it, copies to CPU
+    # if on GPU, makes it contiguous, flattens and reinterprets as unsigned bytes.
     data = tensor.detach()
     if data.is_cuda:
         data = data.cpu()
@@ -40,6 +52,12 @@ def _hash_tensor_bytes(tensor: torch.Tensor) -> bytes:
 
 
 def compute_model_hashes_by_layer(model: Sequence[DDP]) -> dict[str, str]:
+    # [FUNCTION DOC]
+    # For each model chunk (index used as a pipeline-chunk prefix "pp" plus index), iterates its
+    # parameters sorted by name, builds the full name "ppN.name", groups by layer key (see the
+    # layer key helper), and feeds a per-group SHA256 with the full name, the shape as text, the
+    # dtype as text and the raw parameter bytes. Returns a mapping from group key to hex digest,
+    # sorted by key. Parameters that are none are skipped (cannot occur from named parameters).
     """Compute per-layer SHA256 hashes over parameter bytes.
 
     Hash input includes parameter name, shape, dtype, and raw bytes.
@@ -60,6 +78,11 @@ def compute_model_hashes_by_layer(model: Sequence[DDP]) -> dict[str, str]:
 
 
 def _hash_file_path(base_dir: str | Path, iteration: int) -> Path:
+    # [FUNCTION DOC] HELPER: Builds the per-rank hash file path. If the base directory's name
+    # already starts with iter_ it is used as the iteration directory; otherwise the directory is
+    # base plus iter_ and the iteration zero-padded to seven digits. The file name encodes tensor,
+    # pipeline, data (intra-DP with context parallel) and context-parallel ranks from the global
+    # parallel state: model_hash_tp{}_pp{}_dp{}_cp{}.json.
     tp_rank = get_parallel_state().tp.rank
     pp_rank = get_parallel_state().pp.rank
     dp_rank = get_parallel_state().intra_dp_cp.rank
@@ -70,6 +93,11 @@ def _hash_file_path(base_dir: str | Path, iteration: int) -> Path:
 
 
 def save_model_hashes(args, model: Sequence[DDP], iteration: int, hashes: dict[str, str]) -> None:
+    # [FUNCTION DOC]
+    # Writes the given hash mapping as indented, key-sorted json into this rank's hash file under
+    # the save directory for the iteration (creating parent directories) and logs the path. Does
+    # nothing unless both the CI-test flag and the CI save-model-hash flag are set.
+    # KNOWN ISSUE: the model argument is unused; the hashes must be computed by the caller.
     if not args.ci_test or not args.ci_save_model_hash:
         return
     path = _hash_file_path(args.save, iteration)
@@ -80,6 +108,12 @@ def save_model_hashes(args, model: Sequence[DDP], iteration: int, hashes: dict[s
 
 
 def check_model_hashes(args, model: Sequence[DDP], iteration: int) -> None:
+    # [FUNCTION DOC]
+    # Does nothing unless the CI-test flag and the CI check-model-hash flag are set. Otherwise
+    # reads this rank's expected hash file from the load directory for the iteration (raises an
+    # assertion error if missing), recomputes hashes of the model, and raises an assertion error
+    # on any difference, reporting up to five missing, extra and mismatched layer keys each.
+    # Logs success otherwise.
     if not args.ci_test or not args.ci_check_model_hash:
         return
     path = _hash_file_path(args.load, iteration)
@@ -100,6 +134,13 @@ def check_model_hashes(args, model: Sequence[DDP], iteration: int) -> None:
 
 
 def check_mtp_only_grad(model: Sequence[DDP], step_id: int) -> None:
+    # [FUNCTION DOC]
+    # For every parameter in every chunk takes the main gradient buffer if present, else the
+    # regular gradient (skips parameters with neither); computes the maximum absolute gradient
+    # value; classifies the parameter as MTP if its name contains ".mtp." and records those with a
+    # positive maximum. Logs the counts, logs up to five offending non-MTP names as errors, then
+    # asserts that no non-MTP parameter has a nonzero gradient and that at least one MTP parameter
+    # does. Forces a device-to-host sync per parameter.
     """Check that only MTP parameters have non-zero gradients.
 
     This is used for CI testing to verify that when all outputs are truncated,
@@ -160,6 +201,12 @@ def check_mtp_only_grad(model: Sequence[DDP], step_id: int) -> None:
 
 
 def check_peak_gpu_memory_after_load(args) -> None:
+    # [FUNCTION DOC]
+    # Runs only when the CI-test flag and the low-memory-resume flag are set, and only when the HF
+    # checkpoint path contains the substring for the Qwen3 4B model (otherwise returns). Reads the
+    # peak allocated CUDA memory in GiB, logs it with the rank (zero if distributed is not
+    # initialized), and asserts it is below a fixed 20 GiB threshold (chosen between about 16.9 GiB
+    # with the optimization and 22.4 GiB without, on 8 H200 GPUs).
     """Assert that peak GPU memory stays below threshold when --low-memory-resume is active."""
     if not args.ci_test or not getattr(args, "low_memory_resume", False):
         return
@@ -181,6 +228,8 @@ def check_peak_gpu_memory_after_load(args) -> None:
 
 
 def check_mtp_loss(mtp_loss: float, max_mtp_loss: float = 1.0) -> None:
+    # [FUNCTION DOC]
+    # Asserts the loss is strictly below the maximum (default 1.0); the error message includes both.
     """Check that MTP loss is within expected bounds.
 
     Args:

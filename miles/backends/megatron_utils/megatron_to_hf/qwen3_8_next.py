@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Megatron-to-Hugging Face converter for Qwen3.8-Flash-Next (Qwen4Exp). Handles only what differs
+# from Qwen3.5 through lookup tables: model-level head hyper-connection contraction tensors,
+# per-layer hyper-connection mixing weights and norms, the per-layer-embedding (PLE) projections and
+# norms, the sparse indexer projections and norms, and the replicated gated-delta-net qkv projection
+# and convolution (which are already in HF layout, so they skip the group-major permutation). All
+# other names are delegated to the Qwen3.5 converter.
 """Megatron -> HF weight conversion for Qwen3.8-Flash-Next (Qwen4Exp).
 
 Inverse of the HF -> mcore names in ``Qwen38NextBridge``; everything Qwen3.5-shaped
@@ -45,6 +52,14 @@ _LAYER_PATTERN = re.compile(r"module\.module\.decoder\.layers\.(\d+)\.(.+)")
 
 
 def convert_qwen3_8_next_to_hf(args, name, param):
+    # [FUNCTION DOC]
+    # Order: (1) exact names in the head-contraction table map to the final hyper-connection mixer
+    # names under model.language_model; (2) for decoder layer names (layer index and remainder): a
+    # remainder in the suffix table (hyper-connection, PLE and indexer tensors) maps to the layer's
+    # HF name with that suffix; a remainder naming the replicated gated-delta-net qkv input
+    # projection weight or convolution weight keeps the tensor unchanged with the "self_attention."
+    # prefix dropped; (3) everything else is delegated to the Qwen3.5 converter. Returns a list of
+    # (HF name, tensor) pairs.
     if name in _HEAD_CONTRACTION_MAPPING:
         return [(_HEAD_CONTRACTION_MAPPING[name], param)]
 

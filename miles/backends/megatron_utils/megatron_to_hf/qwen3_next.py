@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Megatron-to-Hugging Face converter for Qwen3-Next (hybrid gated-delta-net linear attention and
+# gated full attention, MoE with a shared expert, optional multi-token-prediction layers). Standard
+# naming under "model."; MTP layers map to "mtp." names, with their inner transformer layer
+# converted by recursion through a proxy decoder name. Gated attention's fused QKV carries a gate
+# alongside queries, so queries are de-interleaved. The linear-attention convolution weight is
+# converted from Megatron's group-major row layout to HF's flat layout using the head layout read
+# from the HF checkpoint config.
 import re
 
 import torch
@@ -6,6 +14,28 @@ from miles.backends.megatron_utils.megatron_to_hf.linear_attn_layout import gdn_
 
 
 def convert_qwen3_next_to_hf(args, name, param):
+    # [FUNCTION DOC]
+    # Exact names: embedding, output head, final norm. Head size from kv_channels (or hidden over
+    # heads); queries per group = heads over query groups. Decoder layers: routed experts (first
+    # linear halves to gate then up, second to down; else value error); shared expert (names
+    # under "shared_expert", the gate named gate_weight to the shared-expert gate; else value error);
+    # output projection; fused QKV weight viewed as (groups, rows, head size, hidden) and split
+    # along axis 1 into (2 * queries-per-group, 1, 1): the first part holds query and gate rows
+    # interleaved by half and is reshaped to (groups, 2, queries-per-group, head size, hidden),
+    # swapped on axes 1 and 2 and flattened, so the result alternates gate/query per head slot; key
+    # and value flattened to rows; QKV bias split per group (sizes queries-per-group*head size, head
+    # size, head size) and flattened; dense MLP, layernorm and router names; QK layernorms; the
+    # linear-attention convolution weight is converted from group-major to flat layout using the
+    # head layout of the HF checkpoint; names listed under self-attention for the input layernorm,
+    # linear attention (A_log, dt_bias, in_proj_ba, in_proj_qkvz, norm, out_proj) and gated attention
+    # (q/k/v/o projections and norms) are passed through with the "self_attention." prefix dropped.
+    # MTP layers (module.module.mtp.layers.<idx>): enorm, hnorm, eh_proj, final_layernorm map to
+    # fixed "mtp." names (not indexed); transformer-layer parts are converted recursively as if a
+    # decoder layer of the same index and the "model.layers.<idx>" prefix rewritten to
+    # "mtp.layers.<idx>". Unknown names raise a value error.
+    # KNOWN ISSUE: the weight is split with a gate-doubled query part but the fused QKV bias is split
+    # as if there were no gate (queries-per-group * head size), which is inconsistent for gated
+    # attention layers.
     if name == "module.module.embedding.word_embeddings.weight":
         return [("model.embed_tokens.weight", param)]
     if name == "module.module.output_layer.weight":

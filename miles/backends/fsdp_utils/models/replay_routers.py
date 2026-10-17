@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Per-architecture hooks that make MoE routers replay recorded expert selections (rollout routing
+# replay) by swapping the router's top-k step for a function obtained from the shared routing
+# replay manager. Each install function attaches that replacement top-k function to the module
+# under a private attribute and rebinds the routing method on the instance. Supported: Qwen3 and
+# Qwen3.5 MoE routers (token-level gate module) and GLM4 MoE Lite blocks (routing done in the block).
 """Per-architecture expert-selection hooks for rollout routing replay."""
 
 import types
@@ -10,6 +16,12 @@ from miles.utils.replay_base import routing_replay_manager
 
 
 def _qwen3_router_forward(self, hidden_states):
+    # [FUNCTION DOC] HELPER: Replacement forward bound onto a router instance. Flattens the input
+    # to (tokens, hidden), computes router logits by a linear map with the router weight, a float32
+    # softmax over experts, takes the top-k probabilities and indices via the replay-aware top-k
+    # function (second argument is the router's top_k), renormalizes the selected probabilities to
+    # sum to one unless the router's norm flag is explicitly false (default true), and casts them to
+    # the logits dtype. Returns (router logits, top-k weights, top-k expert indices).
     hidden_states = hidden_states.reshape(-1, self.hidden_dim)
     router_logits = F.linear(hidden_states, self.weight)
     router_probs = F.softmax(router_logits, dtype=torch.float, dim=-1)
@@ -21,6 +33,10 @@ def _qwen3_router_forward(self, hidden_states):
 
 
 def install_qwen3_router_replay(router: nn.Module) -> None:
+    # [FUNCTION DOC]
+    # Gets from the routing replay manager a top-k function (returning both values and indices;
+    # underlying behavior is a plain top-k over the last axis when not replaying), stores it on the
+    # router, and rebinds the router's forward to the replacement above. Mutates the instance only.
     """Hook ``Qwen3MoeTopKRouter`` / ``Qwen3_5MoeTopKRouter``, whose forwards are identical apart
     from qwen3_5 always renormalizing."""
     router._miles_replay_topk = routing_replay_manager.get_topk_fn(
@@ -30,6 +46,14 @@ def install_qwen3_router_replay(router: nn.Module) -> None:
 
 
 def _glm4_moe_lite_route_tokens_to_experts(self, router_logits):
+    # [FUNCTION DOC] HELPER: Replacement routing method bound onto a GLM4 MoE Lite block.
+    # Algorithm: sigmoid of the logits; add the gate's score-correction bias to get selection
+    # scores; split experts into groups, score each group by the sum of its top two selection
+    # scores, keep the best topk_group groups (mask built by scattering ones), set scores of experts
+    # in other groups to negative infinity, then choose the top_k experts with the replay-aware
+    # top-k function (indices only). Weights are gathered from the sigmoid outputs (not the
+    # bias-corrected scores), renormalized by their sum plus a tiny constant when the norm flag is
+    # on, and multiplied by the routed scaling factor. Returns (top-k indices, top-k weights).
     router_logits = router_logits.sigmoid()
     router_logits_for_choice = router_logits + self.gate.e_score_correction_bias
     group_scores = (
@@ -56,6 +80,10 @@ def _glm4_moe_lite_route_tokens_to_experts(self, router_logits):
 
 
 def install_glm4_moe_lite_router_replay(block: nn.Module) -> None:
+    # [FUNCTION DOC]
+    # Gets from the routing replay manager a top-k function that returns indices only (unsorted
+    # top-k when not replaying), stores it on the block and rebinds the block's token-to-expert
+    # routing method to the replacement above. Mutates the instance only.
     """Hook ``Glm4MoeLiteMoE``, which selects experts in the block rather than the gate. Only the
     final expert-selection topk is replaced; the group-limited routing above it is left intact, and
     the weights still gather from the sigmoid'd logits so replayed routing stays differentiable."""

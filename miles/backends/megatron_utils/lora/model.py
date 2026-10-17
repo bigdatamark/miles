@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Module-level operations for multi-adapter LoRA training, built on the shared Megatron model
+# execution code: a single forward (and optionally backward) pass over one batch that returns
+# per-datum outputs and aggregated metrics, an optimizer step across slots, and activation and
+# release of adapter slots (creating or destroying the slot's adapter parameters and optimizer).
+# Megatron-Bridge imports are local (optional dependency).
 """Multi-LoRA slot operations extending the shared Megatron model execution."""
 
 from argparse import Namespace
@@ -26,6 +32,17 @@ def run_forward_backward(
     *,
     forward_only: bool = False,
 ) -> dict:
+    # [FUNCTION DOC]
+    # Runs one work unit: builds the data iterator and microbatch counts from the rollout data and
+    # asserts there is exactly one batch group (assertion error otherwise). Resets each data
+    # iterator, puts every model chunk in training mode, configures the iteration with no optimizer
+    # (bf16 loss scaling is the identity so none is needed), and, unless forward-only, resets DDP
+    # gradient bookkeeping while keeping accumulated gradients (so gradients from several calls
+    # accumulate until the optimizer step). Runs the shared forward/backward pass helper under a
+    # dumper utility tagged with the batch id (no rollout count), collects the per-datum outputs
+    # from every microbatch's reduced losses in order, and finalizes the dumper. Returns a mapping
+    # with "metrics" (aggregated training losses on the last pipeline stage; empty elsewhere) and
+    # "per_datum" (the list of per-datum outputs, present on all ranks).
     data_iterator, num_microbatches = get_data_iterator(args, model, rollout_data)
     assert len(num_microbatches) == 1, "a work unit is a single forward/backward pass"
 
@@ -60,11 +77,17 @@ def optim_step(
     slot_optimizers: dict[int, SlotOptimizer],
     adam_params_by_slot: dict[int, dict],
 ) -> dict[int, dict]:
+    # [FUNCTION DOC] Selects the optimizers for the slots named in the Adam parameters mapping (key
+    # error for an unknown slot) and steps them via the shared slot-stepping routine. Returns the
+    # per-slot outcome mapping (grad norm, or a skipped-nonfinite marker).
     stepped = {slot: slot_optimizers[slot] for slot in adam_params_by_slot}
     return step_slot_optimizers(stepped, adam_params_by_slot)
 
 
 def load_slot(args: Namespace, model: Sequence[DDP], slot: int, rank: int, alpha: float) -> SlotOptimizer:
+    # [FUNCTION DOC] Initializes the adapter parameters of the slot in the model with the given
+    # LoRA rank and alpha (through Megatron-Bridge), creates a new optimizer for that slot, zeroes
+    # the slot's gradients, and returns the optimizer.
     from megatron.bridge.peft.multi_lora_layers import init_adapter_slot
 
     init_adapter_slot(model, slot, rank=rank, alpha=alpha)
@@ -74,6 +97,8 @@ def load_slot(args: Namespace, model: Sequence[DDP], slot: int, rank: int, alpha
 
 
 def unload_slot(model: Sequence[DDP], slot_optimizer: SlotOptimizer) -> None:
+    # [FUNCTION DOC] Clears the slot's adapter parameters in the model (through Megatron-Bridge)
+    # and zeroes the slot's gradients. The optimizer object itself is not destroyed here.
     """The caller drops the instance afterwards; its state dies with it."""
     from megatron.bridge.peft.multi_lora_layers import clear_adapter_slot
 

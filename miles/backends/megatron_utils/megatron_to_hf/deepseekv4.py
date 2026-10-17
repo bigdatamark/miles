@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Megatron-to-Hugging Face converter for DeepSeek-V4 models. One function maps a Megatron
+# parameter (double "module." prefix) to a list of (HF name, tensor): embeddings, head, final norm,
+# the model-level hyper-connection head tensors, per-layer hyper-connection tensors (function,
+# base and a packed three-element scale), attention (low-rank query, key/value, grouped output
+# projections, norms, attention sink, compressor, indexer and its compressor), routed and shared
+# experts (fused first linear split in half into gate and up), router weight/bias/token-to-expert
+# table, dense MLP and layernorms. A module-level pending store plus a packing helper assembles
+# the hyper-connection scale from three separately arriving scalars (state persists across calls).
 import re
 
 import torch
@@ -7,6 +16,13 @@ _PENDING_ALPHAS: dict[str, dict[str, torch.Tensor]] = {}
 
 
 def _packed_alphas(name: str, param):
+    # [FUNCTION DOC] HELPER: Collects one of three hyper-connection scalars. Splits the Megatron
+    # name at its last ".alpha_" into a site prefix and a segment label, stores the tensor reshaped
+    # to length one in a module-level pending store keyed by prefix then label. While fewer than
+    # three labels are present returns none. When three are present removes the site from the store
+    # and returns the concatenation in the fixed order pre, post, res (a length-three tensor);
+    # a key error occurs if the three labels are not exactly those. Global mutable state: stale
+    # entries remain if a site is never completed, and a repeated label overwrites.
     """Pack a hyper-connection site's three alphas the way the checkpoint stores them.
 
     Megatron keeps alpha_pre / alpha_post / alpha_res as separate scalars, one per bias
@@ -24,6 +40,24 @@ def _packed_alphas(name: str, param):
 
 
 def convert_deepseekv4_to_hf(args, name, param):
+    # [FUNCTION DOC]
+    # Input: args (unused), Megatron name, tensor. Output: list of (HF name, tensor); an empty list
+    # means "nothing to emit yet" (a hyper-connection alpha whose siblings have not all arrived).
+    # Exact names: embedding, output head, final norm, and decoder hyper-connection head function,
+    # base and scale (to the model-level hc_head tensors). Decoder layer names (layer index,
+    # remainder): self-attention and MLP hyper-connection mapping projection to the function
+    # tensor, bias to the base tensor, alpha pieces to the packed scale tensor (via the packing
+    # helper); routed expert weights (first linear halves split along axis 0 into gate then up
+    # projections; second linear to down; other kinds raise a value error); shared experts likewise;
+    # attention: query down to wq_a, query layernorm to q_norm, query up to wq_b, kv projection to
+    # wkv, kv layernorm to kv_norm, grouped output projection to wo_a, output projection to wo_b,
+    # attention sink; compressor ape/wkv/wgate/norm; indexer wq_b/wk/k_norm weight and bias/weights
+    # projection; indexer compressor ape/wkv/wgate/norm; input layernorm and pre-MLP layernorm
+    # (to post-attention layernorm); router weight, expert bias, token-to-expert table (to the topk
+    # module); dense MLP first linear split to gate/up and second linear to down. Raises a value
+    # error for unknown names.
+    # KNOWN ISSUE: the grouped output projection key has no ".weight" suffix, unlike the sibling
+    # projections, so it only matches a bare parameter of that name.
     if name == "module.module.embedding.word_embeddings.weight":
         return [("model.embed_tokens.weight", param)]
     if name == "module.module.output_layer.weight":

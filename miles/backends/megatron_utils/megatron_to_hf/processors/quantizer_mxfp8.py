@@ -1,9 +1,29 @@
+# [MODULE DOC]
+# MXFP8 (microscaling FP8) quantizer for converted Hugging Face tensors, with the same
+# target-selection structure as the FP8 quantizer but using the project's MXFP8 quantization (which
+# returns quantized data plus per-block scales). Supports opt-out lists: named high-precision
+# layers (substring match on the Megatron name) and, optionally, bf16 first/last decoder layers.
 import re
 
 from miles.utils.mxfp8 import mxfp8_quantize
 
 
 def quantize_params_mxfp8(args, megatron_name, converted_named_params, quantization_config):
+    # [FUNCTION DOC]
+    # Asserts the config method is mxfp8. Returns the input unchanged if any entry of the args list
+    # of extra high-precision layer names occurs as a substring of the Megatron name. Finds a decoder
+    # layer (unanchored search) or an MTP layer (transformer-layer wrapper segments dropped); none
+    # found returns the input unchanged. If the first/last-layers-bf16 flag is set, layers with index
+    # below the start count or at/after (num_layers minus end count) are returned unchanged. Routed
+    # experts (linear_fc1/linear_fc2): quantize all pairs except HF names ending in "_scale", which are
+    # dropped. Shared experts (linear_fc1/linear_fc2 weights): quantize all pairs. Otherwise if the
+    # layer-relative name is a listed target (attention output/QKV, dense MLP linears, MLA
+    # projections, indexer query, DeepSeek-V4 kv projection and indexer query; plus indexer key
+    # weights unless indexer RoPE interleave is on, since interleaved indexers fuse that weight into
+    # a bf16 tensor whose loader would misread the uint8 scales) quantize all pairs. Everything else
+    # is returned unchanged.
+    # KNOWN ISSUE: the layer-bf16 check applies to MTP layers too (their index is compared against
+    # the main layer count), and the high-precision list is read twice via the same attribute.
     assert quantization_config["quant_method"] == "mxfp8"
 
     if getattr(args, "extra_high_precision_layers_megatron", False):
@@ -108,6 +128,9 @@ def quantize_params_mxfp8(args, megatron_name, converted_named_params, quantizat
 
 
 def _quantize_param(name, weight):
+    # [FUNCTION DOC] HELPER: Asserts the name ends with ".weight". Quantizes with the MXFP8 routine
+    # (returns quantized data and scale) and returns [(name, quantized), (name with ".weight"
+    # replaced by ".weight_scale_inv", scale)].
     assert name.endswith(".weight"), f"Expected weight parameter, got {name}"
     qweight, scale = mxfp8_quantize(weight)
     scale_name = name.replace(".weight", ".weight_scale_inv")

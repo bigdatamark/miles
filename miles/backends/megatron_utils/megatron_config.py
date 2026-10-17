@@ -1,3 +1,16 @@
+# [MODULE DOC]
+# Parsing and resolution of the --megatron-config file, which declares one or more Megatron
+# trainers (policy models and their roles) with per-trainer argument overrides. Flow: the raw file
+# (yaml, via the file-argument resolver; top-level key "trainers" or alias "megatron") is validated
+# into frozen raw records; each is resolved into a trainer config with a trainer id (default
+# model id plus dash plus role) and overrides type-coerced through the real Megatron/Miles argument
+# parser, restricted to an allow-list (per-policy args, plus model-definition args that the parser
+# declares); a critic trainer is synthesized when use-critic is on; validators enforce id syntax,
+# uniqueness, length, reserved names and one actor per model. Per-trainer args are derived by
+# deep-copying the run args, applying overrides, namespacing checkpoint directories per trainer,
+# and resolving the checkpoint-load fallback chain. Also holds the constants: role names, the
+# trainer checkpoint subdirectory name, the model id pattern, the reserved id for shared eval
+# rollouts, and the two allow-lists.
 import argparse
 import copy
 import logging
@@ -159,6 +172,9 @@ MODEL_DEFINITION_ARGS: frozenset[str] = frozenset(
 
 
 class _RawMegatronTrainerConfig(FrozenStrictBaseModel):
+    # [CLASS DOC] HELPER: Immutable, extra-fields-forbidden record of one trainer entry as written in
+    # the file: model id (required), role (actor or critic; default actor), optional explicit
+    # trainer id, and a mapping of argument overrides (default empty, values untyped).
     model_id: str
     role: TrainerRole = DEFAULT_MODEL_ROLE
     trainer_id: str | None = None
@@ -166,12 +182,17 @@ class _RawMegatronTrainerConfig(FrozenStrictBaseModel):
 
 
 class _RawMegatronConfig(FrozenStrictBaseModel):
+    # [CLASS DOC] HELPER: Immutable record of the whole file: a list of raw trainer entries, read
+    # from the key "trainers" or its alias "megatron".
     trainers: list[_RawMegatronTrainerConfig] = pydantic.Field(
         validation_alias=pydantic.AliasChoices("trainers", "megatron")
     )
 
     @classmethod
     def from_file_arg(cls, value: str) -> "_RawMegatronConfig":
+        # [FUNCTION DOC] HELPER: Resolves the command-line value to text (a path or inline content,
+        # per the file-argument resolver), parses it as yaml with the safe loader and validates it
+        # into the record. Raises validation errors on a bad shape.
         return cls.model_validate(yaml.safe_load(resolve_file_arg(value)))
 
 
@@ -179,6 +200,10 @@ class _RawMegatronConfig(FrozenStrictBaseModel):
 
 
 class MegatronTrainerConfig(FrozenStrictBaseModel):
+    # [CLASS DOC]
+    # Immutable resolved trainer: trainer id (identifies the trainer controller and its engine
+    # pool), model id (none for the implicit single default trainer), role (actor or critic) and the
+    # type-coerced overrides mapping.
     trainer_id: str
     model_id: str | None
     role: TrainerRole
@@ -186,6 +211,9 @@ class MegatronTrainerConfig(FrozenStrictBaseModel):
 
     @classmethod
     def resolve(cls, raw: _RawMegatronTrainerConfig) -> "MegatronTrainerConfig":
+        # [FUNCTION DOC] Builds the resolved trainer from a raw entry: the trainer id is the raw one
+        # if given, else the model id, a dash and the role; overrides are coerced and validated
+        # through the override resolver.
         return cls(
             trainer_id=raw.trainer_id if raw.trainer_id is not None else f"{raw.model_id}-{raw.role}",
             model_id=raw.model_id,
@@ -195,10 +223,17 @@ class MegatronTrainerConfig(FrozenStrictBaseModel):
 
 
 class MegatronConfig(FrozenStrictBaseModel):
+    # [CLASS DOC]
+    # Immutable resolved configuration: the ordered list of trainers (the first is the leader).
+    # Validated at construction: model ids and trainer ids syntactically valid, trainer ids unique
+    # and short enough, no model uses the reserved eval id, and at most one actor per model id.
     trainers: list[MegatronTrainerConfig]
 
     @pydantic.model_validator(mode="after")
     def _validate_ids(self) -> "MegatronConfig":
+        # [FUNCTION DOC] HELPER: Post-construction validator: checks model id syntax, that none is
+        # the reserved id, and trainer id syntax/uniqueness/length. Raises assertion errors. Returns
+        # the config itself.
         _assert_valid_ids(self.model_ids, kind="model")
         _assert_no_reserved_model_id(self.model_ids)
         _assert_valid_trainer_ids([t.trainer_id for t in self.trainers])
@@ -206,6 +241,9 @@ class MegatronConfig(FrozenStrictBaseModel):
 
     @pydantic.model_validator(mode="after")
     def _validate_one_actor_per_model(self) -> "MegatronConfig":
+        # [FUNCTION DOC] HELPER: Post-construction validator: asserts no two actor-role trainers
+        # share a model id (the run keys trainers by model id, so duplicates would be dropped
+        # silently). Returns the config itself.
         actor_model_ids = [t.model_id for t in self.trainers if t.role == ACTOR_ROLE]
         assert len(set(actor_model_ids)) == len(actor_model_ids), (
             f"--megatron-config declares several actors for the same model id ({actor_model_ids}); the run "
@@ -215,17 +253,25 @@ class MegatronConfig(FrozenStrictBaseModel):
 
     @property
     def model_ids(self) -> list[str]:
+        # [FUNCTION DOC] Property: the distinct non-none model ids of the trainers, in first-seen
+        # order.
         return list(dict.fromkeys(t.model_id for t in self.trainers if t.model_id is not None))
 
     @property
     def leader_model_id(self) -> str | None:
+        # [FUNCTION DOC] Property: the model id of the first trainer (may be none). Index error if
+        # there are no trainers.
         return self.trainers[0].model_id
 
     @property
     def is_multi_policy(self) -> bool:
+        # [FUNCTION DOC] Property: true when more than one distinct model id is present.
         return len(set(self.model_ids)) > 1
 
     def get(self, model_id: str) -> MegatronTrainerConfig:
+        # [FUNCTION DOC] Returns the first trainer whose model id equals the argument (so for a model
+        # with an actor and a critic, the earlier-listed one). Raises a key error listing known ids
+        # when none matches.
         for trainer in self.trainers:
             if trainer.model_id == model_id:
                 return trainer
@@ -233,10 +279,17 @@ class MegatronConfig(FrozenStrictBaseModel):
 
 
 def resolve_megatron_config(args) -> MegatronConfig:
+    # [FUNCTION DOC] Public entry: builds the validated configuration from the parsed run args
+    # (using the megatron_config, use_critic and critic_* attributes).
     return MegatronConfig(trainers=_compute_trainers(args))
 
 
 def _compute_trainers(args) -> list[MegatronTrainerConfig]:
+    # [FUNCTION DOC] HELPER: Without a config file, yields one default actor trainer (id "actor", no
+    # model id, no overrides). With one: asserts it declares no critic, resolves each entry, and
+    # asserts at least one trainer. If use-critic is set: asserts all trainers share one model id
+    # (multi-policy with critic unsupported) and appends a synthesized critic derived from the first
+    # trainer. Returns the list.
     if (raw := _resolve_raw_megatron_config(args.megatron_config)) is None:
         trainers = [MegatronTrainerConfig(trainer_id=ACTOR_ROLE, model_id=None, role=ACTOR_ROLE, overrides={})]
     else:
@@ -254,6 +307,9 @@ def _compute_trainers(args) -> list[MegatronTrainerConfig]:
 
 
 def _compute_critic_trainer(args, *, policy: MegatronTrainerConfig) -> MegatronTrainerConfig:
+    # [FUNCTION DOC] HELPER: Builds the critic trainer for a policy: id is "critic" when the policy
+    # has no model id, else the model id plus "-critic"; same model id; critic role; overrides are
+    # the policy's overrides updated with (and overridden by) the critic-specific ones.
     model_id = policy.model_id
     return MegatronTrainerConfig(
         trainer_id=CRITIC_ROLE if model_id is None else f"{model_id}-{CRITIC_ROLE}",
@@ -264,6 +320,9 @@ def _compute_critic_trainer(args, *, policy: MegatronTrainerConfig) -> MegatronT
 
 
 def _compute_critic_overrides(args) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: The fixed overrides applied to a synthesized critic: KL coefficient 0,
+    # on-policy distillation off, parameter-buffer CPU backup not disabled, and load path, save path,
+    # learning rate and warmup iterations taken from the critic_* attributes of args.
     return {
         "kl_coef": 0,
         "use_opd": False,
@@ -276,12 +335,15 @@ def _compute_critic_overrides(args) -> dict[str, Any]:
 
 
 def _resolve_raw_megatron_config(value: str | None) -> "_RawMegatronConfig | None":
+    # [FUNCTION DOC] HELPER: None if the argument is none, else the parsed raw configuration.
     if value is None:
         return None
     return _RawMegatronConfig.from_file_arg(value)
 
 
 def _assert_no_declared_critic(raw: "_RawMegatronConfig") -> None:
+    # [FUNCTION DOC] HELPER: Asserts no entry in the file has the critic role (assertion error
+    # listing their model ids), since critic-specific overrides only apply to a synthesized critic.
     # TODO: accept a declared critic once the critic overrides are applied to it too, not only to a synthesized one
     declared = [t.model_id for t in raw.trainers if t.role == CRITIC_ROLE]
     assert not declared, (
@@ -300,6 +362,15 @@ _ROLLOUT_SHARED_ARGS: frozenset[str] = frozenset(
 
 
 def compute_trainer_args(args: Namespace, trainer: MegatronTrainerConfig) -> Namespace:
+    # [FUNCTION DOC]
+    # Returns a deep copy of the run args specialized for one trainer; the input is not mutated.
+    # Assertions: the trainer does not override global_batch_size, nor any rollout-shared argument
+    # (advantage estimator, max tokens per GPU, micro batch size, dynamic batch size flag), nor any
+    # name the copied args lack. Steps: set trainer id and trainer model id; apply each override;
+    # apply derived overrides (the tokenizer model follows an overridden HF checkpoint if it
+    # equaled the base HF checkpoint); for trainers with a model id, nest save, load and HF-save
+    # directories under a per-trainer subdirectory (none stays none); when a megatron config was
+    # given, resolve the checkpoint-load fallbacks.
     # TODO: support policies with different global batch sizes.
     assert "global_batch_size" not in trainer.overrides, (
         f"--megatron-config trainer {trainer.trainer_id!r} overrides global_batch_size; every policy has to "
@@ -339,6 +410,9 @@ def compute_trainer_args(args: Namespace, trainer: MegatronTrainerConfig) -> Nam
 
 
 def _apply_critical_derived_overrides(ans: Namespace, *, base: Namespace, trainer: MegatronTrainerConfig) -> None:
+    # [FUNCTION DOC] HELPER: Mutates the trainer args: if the trainer overrides the HF checkpoint
+    # and the base args' tokenizer model was the base HF checkpoint, points the tokenizer model to
+    # the new HF checkpoint.
     # TODO: most derived defaults are still computed from the base args; revisit after the arguments refactor
     if "hf_checkpoint" in trainer.overrides and base.tokenizer_model == base.hf_checkpoint:
         ans.tokenizer_model = ans.hf_checkpoint
@@ -348,12 +422,21 @@ def _apply_critical_derived_overrides(ans: Namespace, *, base: Namespace, traine
 
 
 def compute_trainer_checkpoint_dir(*, base_dir: str | None, trainer_id: str) -> str | None:
+    # [FUNCTION DOC] Returns none for no base directory, else the text of base directory joined with
+    # the constant subdirectory "trainers" and the trainer id.
     if base_dir is None:
         return None
     return str(Path(base_dir) / TRAINER_CHECKPOINT_DIRNAME / trainer_id)
 
 
 def resolve_args_checkpoint_load(args: Namespace) -> None:
+    # [FUNCTION DOC]
+    # Mutates args. Records the originally requested load path as requested_load. If the load
+    # directory holds no Megatron checkpoint (exists with the tracker file): in bridge mode sets the
+    # load path to the reference load path, else the HF checkpoint, and start rollout id 0; in other
+    # modes sets no-load-optim, no-load-rng and finetune, sets load to the reference load path
+    # (possibly none), uses the reference checkpoint step as the checkpoint step if given, and
+    # start rollout id 0. If a checkpoint exists nothing else changes.
     # TODO: refactor
     args.requested_load = args.load
 
@@ -377,6 +460,8 @@ def resolve_args_checkpoint_load(args: Namespace) -> None:
 
 
 def _has_megatron_checkpoint(load_dir: str | None) -> bool:
+    # [FUNCTION DOC] HELPER: True if the directory is given, exists, and contains the tracker file
+    # latest_checkpointed_iteration.txt.
     return (
         load_dir is not None
         and os.path.exists(load_dir)
@@ -388,6 +473,8 @@ def _has_megatron_checkpoint(load_dir: str | None) -> bool:
 
 
 def _assert_valid_trainer_ids(trainer_ids: list[str]) -> None:
+    # [FUNCTION DOC] HELPER: Asserts the ids are unique, each matches the id pattern, and none
+    # exceeds the maximum trainer id length; assertion messages list the offenders.
     assert len(set(trainer_ids)) == len(trainer_ids), (
         f"--megatron-config trainer ids must be unique, got {trainer_ids}; a trainer id addresses one trainer "
         f"controller and its engine pool, so two entries sharing it would land in the same pool"
@@ -402,12 +489,16 @@ def _assert_valid_trainer_ids(trainer_ids: list[str]) -> None:
 
 
 def _assert_no_reserved_model_id(model_ids: list[str]) -> None:
+    # [FUNCTION DOC] HELPER: Asserts the reserved id "eval" (naming the shared eval rollouts) is not
+    # among the model ids.
     assert (
         RESERVED_MODEL_ID not in model_ids
     ), f"--megatron-config declares the model id {RESERVED_MODEL_ID!r}, which names the shared eval rollouts"
 
 
 def _assert_valid_ids(ids: list[str], *, kind: str) -> None:
+    # [FUNCTION DOC] HELPER: Asserts every id fully matches the DNS-label-style pattern (usable as
+    # pool names and path components); the message names the kind ("model" or "trainer").
     bad_ids = [identifier for identifier in ids if MODEL_ID_PATTERN.match(identifier) is None]
     assert not bad_ids, (
         f"--megatron-config {kind} ids {bad_ids} are not usable as Kubernetes pool names or path components: "
@@ -419,6 +510,10 @@ def _assert_valid_ids(ids: list[str], *, kind: str) -> None:
 
 
 def _resolve_overrides(overrides: dict[str, Any], *, model_id: str) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Returns empty overrides unchanged (no parser built). Otherwise builds
+    # the argument parser and coerces each override value to the type the parser declares for it,
+    # allowing only per-policy args and those model-definition args the parser actually declares;
+    # the error context names the model id. Returns the coerced mapping.
     if not overrides:
         return overrides
 
@@ -432,16 +527,28 @@ def _resolve_overrides(overrides: dict[str, Any], *, model_id: str) -> dict[str,
 
 
 def get_megatron_arg_parser() -> argparse.ArgumentParser:
+    # [FUNCTION DOC]
+    # Obtains the full argument parser (Megatron's plus the project's extras) without parsing real
+    # arguments: calls Megatron's parse-args with an extra-args provider that adds the project's
+    # arguments to the parser and then deliberately raises a private exception carrying the parser;
+    # the function catches it and returns the parser. If parse-args returns without calling the
+    # provider, raises an assertion error. Local imports avoid a cycle. Heavy: builds a throwaway
+    # parser each call, and parse-args may touch global state.
     # TODO: revisit once the args refactor lands; this throwaway construction may then be optimized
     from miles.backends.megatron_utils.arguments import parse_args
     from miles.utils.arguments import get_miles_extra_args_provider
 
     class ParserCaptured(Exception):
+        # [CLASS DOC] HELPER: Control-flow exception used to smuggle the built parser out of the
+        # parse call; holds the parser as an attribute.
         def __init__(self, parser: argparse.ArgumentParser) -> None:
+            # [FUNCTION DOC] HELPER: Stores the parser and sets a fixed message.
             super().__init__("the throwaway parser was captured before anything was parsed")
             self.parser = parser
 
     def capture(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+        # [FUNCTION DOC] HELPER: Extra-args provider: adds the project's extra arguments to the given
+        # parser and always raises the capture exception with it (never returns).
         raise ParserCaptured(get_miles_extra_args_provider()(parser))
 
     try:

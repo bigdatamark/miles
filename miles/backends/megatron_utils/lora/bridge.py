@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Builds a LoRA-equipped, DDP-wrapped Megatron model through Megatron-Bridge. The main function
+# creates a bridge and a model provider from the HF checkpoint, copies the parallelism, recompute,
+# fusion and MoE router settings from the args onto the provider (with overrides required for
+# multi-LoRA), finalizes it, registers pre-wrap hooks (one that injects LoRA adapters at resolved
+# target modules, and for value models one that swaps the output layer for a one-output value
+# head), builds the distributed-data-parallel config, and asks the provider for the wrapped model.
+# Also validates multi-adapter-on-MoE constraints. Bridge imports are local (optional dependency).
 """Bridge / LoRA model setup helpers.
 
 Extracted from ``model.py`` to keep the main training module focused on
@@ -31,6 +39,9 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class _BridgeWrapperConfig:
+    # [CLASS DOC] HELPER: Plain data holder with three boolean fields: value-model flag (default
+    # false), wrap-with-DDP flag (default true) and use-distributed-optimizer flag (default true).
+    # KNOWN ISSUE: not referenced anywhere in the code base (dead code).
     """Configuration for Megatron-Bridge module wrapping."""
 
     is_value_model: bool = False
@@ -39,16 +50,28 @@ class _BridgeWrapperConfig:
 
 
 def _ensure_model_list(model):
+    # [FUNCTION DOC] HELPER: Returns the input unchanged if it is a list, else a one-element list
+    # containing it.
     return model if isinstance(model, list) else [model]
 
 
 def _make_value_model_hook(hidden_size: int):
+    # [FUNCTION DOC] HELPER: Returns a pre-wrap hook function (closure over the hidden size) that
+    # turns a model into a value model. Imports of Megatron parallel state and the value-head
+    # linear class are local.
     """Create a pre-wrap hook that replaces the output layer with a value head."""
     from megatron.core import parallel_state
 
     from ..model_provider import LinearForLastLayer
 
     def hook(model):
+        # [FUNCTION DOC] HELPER: Determines, per model chunk, whether that chunk is on the last
+        # pipeline stage: with pipeline parallelism above one and virtual pipeline stages in use,
+        # one entry per virtual stage (not ignoring virtual stages); otherwise a single entry for
+        # the plain last-stage check. Asserts the entry count matches the number of model chunks.
+        # For each chunk on the last stage, replaces its output layer with a value-head linear
+        # (input size = hidden size, output size 1, using the chunk's config). Mutates the chunks;
+        # returns nothing.
         model_post_process = []
         if (
             parallel_state.get_pipeline_model_parallel_world_size() > 1
@@ -75,10 +98,21 @@ def _make_value_model_hook(hidden_size: int):
 
 
 def _get_model_config_from_wrapped(model):
+    # [FUNCTION DOC] HELPER: Returns the config attribute of the model through any wrappers
+    # (DDP/Float16 wrappers), failing if it is absent.
+    # KNOWN ISSUE: unused anywhere in the code base (dead code).
     return get_attr_wrapped_model(model, "config", allow_none=False)
 
 
 def _validate_multi_lora_moe_support(args: Namespace, provider) -> None:
+    # [FUNCTION DOC] HELPER: Validation for multi-adapter training on MoE models, run after the
+    # provider is finalized. Returns silently for non-MoE providers (no expert count). If the HF
+    # LoRA targets include no expert leaves, logs that experts stay frozen and returns. Otherwise
+    # raises assertion errors unless: expert tensor parallel size (provider value, treating none as
+    # 1) is 1; grouped GEMM is on; no fp8 or fp4; the expert projection set is consistent: the set of
+    # last name components of targets (a fused gate-up target counts as gate and up) must either
+    # contain none of gate/up/down projection names or all three (sglang only wraps a fused MoE
+    # layer when both are targeted); pad-expert-input-to-capacity is off; permute fusion is off.
     """Reject MoE configs the multi-slot grouped-expert adapter cannot serve (checked
     post-finalize because they depend on the resolved provider, not the CLI)."""
     if not getattr(provider, "num_moe_experts", None):
@@ -121,6 +155,27 @@ def _validate_multi_lora_moe_support(args: Namespace, provider) -> None:
 
 
 def _setup_lora_model_via_bridge(args: Namespace) -> list:
+    # [FUNCTION DOC] HELPER:
+    # Returns the list of DDP-wrapped model chunks with adapters applied. Steps: load the HF config;
+    # create the auto bridge from the HF checkpoint (remote code trusted) and a provider without
+    # weights; copy from args onto the provider: tensor/pipeline/expert/expert-tensor/virtual-
+    # pipeline/context parallel sizes, sequence parallel, gradient accumulation fusion, recompute
+    # granularity/method/num layers/modules, saved-activation distribution, attention backend, RoPE
+    # fusion (then turned off if incompatible per the bridge's check), bias-activation fusion
+    # (from the swiglu fusion flag), MoE router dtype and torch-matmul flag; force variable
+    # sequence lengths, alltoall MoE token dispatch and no router load balancing. Multi-LoRA:
+    # asserts MTP training is off and clears MTP layers; when experts are targeted also disables
+    # permute fusion (logged if it was on). Optional first/last pipeline stage layer counts are
+    # copied if set. Applies DSA backend args, finalizes the provider, and validates multi-LoRA MoE
+    # support. Picks the multi-slot adapter factory or the single-adapter factory; asserts
+    # multi-LoRA is not combined with canonical LoRA type. Prepares the bridge's weight-mapping and
+    # pretrained references. Registers the adapter pre-wrap hook (see inner function) and, for
+    # sequence/token-classification architectures, the value-head hook sized by the (text) config
+    # hidden size. Distributed optimizer is used unless the optimizer name contains muon, and is
+    # forced off for multi-LoRA (plain all-reduce keeps full gradients on each rank). Builds the DDP
+    # config (grad reduce in fp32 per args) and finalizes it; when train offload is on, patches the
+    # parameter and gradient buffer for colocated-mode LoRA; finally asks the provider for the
+    # DDP-wrapped distributed model and returns it. Side effects: network/disk reads, global patches.
     """Build Megatron model with LoRA using Megatron-Bridge.
 
     This handles:
@@ -199,6 +254,15 @@ def _setup_lora_model_via_bridge(args: Namespace) -> list:
     hf_mapping = HfWeightMapping.from_config(hf_config)
 
     def apply_lora_hook(model_chunks):
+        # [FUNCTION DOC] HELPER: Pre-wrap hook that injects adapters. Collects the set of global
+        # parameter names across all pipeline ranks from the bridge; adds names for weights of
+        # column-parallel linears whose weight is absent (tied output layers still may carry an
+        # adapter). All-gathers the name sets across every rank and unions them so tied layers and
+        # experts owned by other pipeline/expert ranks are visible. Resolves the Megatron LoRA target
+        # modules from the HF targets, the bridge's mapping registry, the names, the HF weight
+        # mapping and whether canonical LoRA is requested. Creates the adapter object and applies it
+        # to the chunks in training mode; for multi-LoRA marks every top-k router as having a frozen
+        # expert bias; records which params to save; returns the transformed chunks.
         parameter_names = set(model_bridge._megatron_global_param_names_all_pp_ranks(model_chunks))
         # Tied output layers own no weight but can still carry an independent adapter.
         for vp_stage, chunk in enumerate(model_chunks):

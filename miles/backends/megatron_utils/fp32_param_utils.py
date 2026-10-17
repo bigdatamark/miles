@@ -1,3 +1,8 @@
+# [MODULE DOC] HELPER:
+# Utilities letting model definitions pin selected parameters to a specific dtype (typically
+# float32) even though Megatron's half-precision wrapper casts all floating parameters to bf16/fp16
+# at wrap time. Model code marks a parameter with a private attribute; after the model is built,
+# the enforcement function re-casts the marked parameters in place.
 import logging
 from collections.abc import Sequence
 
@@ -12,11 +17,20 @@ FORCED_PARAM_DTYPE_ATTR = "_miles_forced_param_dtype"
 
 
 def mark_param_dtype(param: torch.nn.Parameter, dtype: torch.dtype) -> None:
+    # [FUNCTION DOC] HELPER: Sets the forced-dtype attribute on the parameter object to the dtype.
+    # Mutates the parameter's attributes only.
     """Mark a parameter with its required runtime dtype."""
     setattr(param, FORCED_PARAM_DTYPE_ATTR, dtype)
 
 
 def enforce_marked_param_dtypes(model_chunks: Sequence[torch.nn.Module]) -> list[str]:
+    # [FUNCTION DOC]
+    # Iterates all named parameters of all chunks; for those carrying the forced-dtype attribute,
+    # replaces the parameter's data in place with a copy cast to the target dtype when it differs
+    # (keeping the parameter object identity so optimizer and DDP maps stay valid). Returns the
+    # names of all marked parameters (including those already of the right dtype), in iteration
+    # order. Logs the count on rank zero (rank zero assumed when distributed is not initialized)
+    # only when something was marked.
     """Apply dtype overrides declared on parameters via ``mark_param_dtype``.
 
     This keeps the policy in model definitions and avoids model-name checks in

@@ -1,3 +1,11 @@
+# [MODULE DOC] HELPER:
+# LoRA utilities for the Megatron backend: detection of LoRA models and adapter parameter names,
+# a gradient sum across tensor/expert-parallel groups for replicated adapter parameters, a global
+# patch making the parameter/gradient buffers skip host backup (for colocated LoRA with train
+# offload), the factory for the Bridge LoRA / canonical LoRA transforms, and native rank-sharded
+# adapter checkpoint save/load (one adapter file and one optional training-state file per global
+# rank, plus an adapter config or HF adapter export). Re-exports three helpers from the shared
+# LoRA utilities (config builder, enabled check, rollout-enabled check).
 """LoRA utilities for Megatron backend using Megatron-Bridge PEFT integration."""
 
 import json
@@ -25,6 +33,17 @@ _marked_lora_grad_params_cache: dict[int, list] = {}
 
 
 def reduce_marked_lora_grads(model: Sequence[torch.nn.Module]) -> None:
+    # [FUNCTION DOC]
+    # Sums, across the tagged process group, the partial gradients of LoRA parameters that are
+    # replicated over tensor-parallel or expert-parallel ranks (parameters carrying a group tag of
+    # "tp" or "ep"), to be done before the data-parallel reduce-scatter. The list of tagged,
+    # trainable (parameter, tag) pairs is computed once per model (cache keyed by the identity of
+    # the first chunk; 0 for an empty model) and reused, so it goes stale if the model's parameters
+    # change later. Returns at once if nothing is tagged. For each of "tp" then "ep": skip when the
+    # group size is 1; collect each tagged parameter's main gradient buffer (else its gradient;
+    # skip when none); for each dtype in sorted-by-name order (sorted so all ranks agree): if a
+    # single gradient, all-reduce sum in place; else flatten them into one buffer, all-reduce sum,
+    # and copy the results back. In-place mutation of gradients; collective over each group.
     """Sum partial grads of replicated LoRA params over their tagged group ("tp"|"ep"), before the DP reduce-scatter."""
     from megatron.core import parallel_state as ps
 
@@ -70,6 +89,9 @@ def reduce_marked_lora_grads(model: Sequence[torch.nn.Module]) -> None:
 
 
 def is_lora_model(model: Sequence[torch.nn.Module]) -> bool:
+    # [FUNCTION DOC] True if any chunk's inner module has a PEFT config attribute, or any parameter
+    # name in any chunk contains "lora_" or "adapter". Assumes each chunk has an inner module
+    # attribute. The name test is broad: any parameter whose name contains "adapter" counts.
     """Check if model has LoRA layers applied."""
     for model_chunk in model:
         if hasattr(model_chunk.module, "peft_config"):
@@ -81,6 +103,8 @@ def is_lora_model(model: Sequence[torch.nn.Module]) -> bool:
 
 
 def _is_adapter_param_name(name: str) -> bool:
+    # [FUNCTION DOC] HELPER: True if the name contains "lora_", or contains ".adapter." together with
+    # "linear_in" or "linear_out". Narrower than the model-level detection above.
     """Check if a parameter name belongs to a LoRA adapter (Megatron internal naming)."""
     return "lora_" in name or (".adapter." in name and ("linear_in" in name or "linear_out" in name))
 
@@ -89,6 +113,12 @@ _param_grad_buffer_patched = False
 
 
 def patch_param_grad_buffer_for_colocate_mode_lora() -> None:
+    # [FUNCTION DOC]
+    # Idempotent global patch (module-level flag set before patching, so a failed first attempt is
+    # not retried). Wraps the constructor of Megatron's parameter-and-gradient buffer class so
+    # that, before the original runs, the DDP config (found as the keyword argument or the first
+    # positional argument) gets both host-backup-disabling flags (parameter buffers and gradient
+    # buffers) set to true; this mutates the caller's config object. Logs once.
     """Patch _ParamAndGradBuffer to use disable_param_buffers_cpu_backup=True.
 
     In colocate mode with offload_train, torch_memory_saver.pause(tag="default")
@@ -111,6 +141,9 @@ def patch_param_grad_buffer_for_colocate_mode_lora() -> None:
     _original_init = _ParamAndGradBuffer.__init__
 
     def _patched_init(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Replacement constructor; sets the two flags on the DDP config then
+        # delegates to the original constructor with unchanged arguments. Raises an attribute error
+        # if no config can be found (neither keyword nor positional).
         # Megatron reads these flags from ddp_config (its first ctor argument).
         ddp_config = kwargs.get("ddp_config", args[0] if args else None)
         ddp_config.disable_param_buffers_cpu_backup = True
@@ -127,6 +160,13 @@ def patch_param_grad_buffer_for_colocate_mode_lora() -> None:
 
 
 def create_lora_instance(args: Namespace, *, target_modules):
+    # [FUNCTION DOC]
+    # Chooses the canonical LoRA class when args.lora_type (default "lora", case-insensitive) equals
+    # "canonical_lora", else the standard LoRA class (Bridge imports are local). Builds keyword
+    # arguments: target modules, rank, alpha, dropout, and A/B init methods (defaults xavier and
+    # zero). If the class declares a share-expert-adapters field, sets it false. If the
+    # shared-outer-expert-LoRA option is set, asserts the standard class is in use and enables it.
+    # Logs and returns the constructed transform.
     """Create a LoRA adapter with resolved Megatron target modules."""
     from megatron.bridge.peft.canonical_lora import CanonicalLoRA
     from megatron.bridge.peft.lora import LoRA
@@ -177,10 +217,22 @@ def save_lora_checkpoint(
     opt_param_scheduler: Any | None = None,
     iteration: int | None = None,
 ) -> str:
-    """Collectively save native adapter shards, training state, and optional HF adapter weights."""
+    # [FUNCTION DOC]
+    # Collective. Writes the checkpoint directory at save_dir through the directory writer and
+    # returns the path as text. Inner writer content: each rank saves its adapter parameters (CPU
+    # copies, keyed by name) to a file named by its global rank; if an optimizer is given, each rank
+    # also saves a training-state file with the iteration, the optimizer state (none when no-save-
+    # optim is set) and scheduler state (none when absent). In raw conversion mode global rank zero
+    # writes an adapter config json (adapter targets config plus the shared-outer-expert flag and
+    # the format label "megatron_rank_sharded"); in other modes the publisher writes the HF adapter
+    # into the directory, and any exception there is logged as a warning and swallowed (native
+    # shards still saved). Global rank is zero when torch distributed is not initialized.
+    # KNOWN ISSUE: the publisher is typed optional and is dereferenced in non-raw mode without a
+    # check, so a none publisher is silently swallowed by the exception handler as a failed export.
     global_rank = dist.get_rank() if dist.is_initialized() else 0
 
     def write_shards(checkpoint_dir: Path):
+        # [FUNCTION DOC] HELPER: Writer passed to the directory helper; see the outer function.
         adapter_state = {
             name: param.detach().cpu()
             for model_chunk in model
@@ -225,6 +277,19 @@ def load_lora_adapter(
     opt_param_scheduler: Any | None = None,
     load_optimizer: bool = True,
 ) -> tuple[bool, int | None, bool]:
+    # [FUNCTION DOC]
+    # Returns (loaded flag, saved iteration or none, optimizer-restored flag). Resolves the adapter
+    # path; if it does not exist warns and returns (false, none, false). Looks for this global rank's
+    # native shard file; if absent: raises file-not-found if shards of other ranks exist (different
+    # parallel layout), else falls back to a legacy shard named by tensor- and pipeline-parallel
+    # ranks (warns; only valid when expert parallel size does not exceed tensor parallel size). If a
+    # native file is found: loads it on CPU with safe (weights-only) loading, compares its names to
+    # the model's adapter parameter names (raises runtime error listing missing and unexpected names
+    # on any difference), copies each tensor into the matching parameter in place on its device,
+    # logs, then restores training state (see helper) and returns (true, iteration, restored flag).
+    # If no native file but an HF PEFT adapter file (safetensors or bin) exists, warns that direct
+    # loading is unsupported and returns (false, none, false). Otherwise warns that nothing was
+    # found and returns (false, none, false).
     """Restore native adapter shards and optional optimizer/scheduler state.
 
     HF adapters cannot be loaded into Bridge models through this path.
@@ -292,6 +357,13 @@ def _load_training_state(
     opt_param_scheduler: Any | None,
     load_optimizer: bool = True,
 ) -> tuple[int | None, bool]:
+    # [FUNCTION DOC] HELPER: Returns (iteration or none, optimizer-restored flag). Returns (none,
+    # false) if no optimizer is given or this rank's training-state file is absent. Otherwise
+    # loads the file on CPU with full unpickling (state dicts contain non-tensor objects, so this
+    # trusts the file), then: if load_optimizer is false logs that the fresh optimizer is kept; else
+    # if a saved optimizer state exists, loads it into the optimizer and sets the flag. If a
+    # scheduler is given and saved scheduler state exists, loads it. Returns the saved iteration
+    # (logged when present).
     """Restore optimizer/scheduler state saved alongside a LoRA adapter checkpoint."""
     if optimizer is None:
         return None, False

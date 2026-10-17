@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# NVFP4 quantizer for converted Hugging Face tensors. Only routed-expert linears of the main
+# language decoder are quantized (attention, dense and shared MLPs, MTP layers and modality towers
+# stay in high precision), subject to an ignore/exclude policy from the quantization config
+# (literal module names with dotted-prefix semantics, or "re:"-prefixed regular expressions).
+# Each quantized weight yields three tensors: packed FP4 data, per-block scales, and a global
+# second-level scale. Gate and up projections of an expert must be quantized together so they share
+# one global scale. Weights need a last dimension divisible by the NVFP4 group size (16).
 import re
 from functools import lru_cache
 
@@ -14,6 +22,9 @@ GATED_PAIR_SUFFIXES = {
 
 
 def _get_ignore_rules(quantization_config) -> list[str]:
+    # [FUNCTION DOC] HELPER: Collects the config's "ignore" rules (none or a single string accepted
+    # and normalized to a list) followed by the "exclude_modules" rules not already present, as one
+    # list preserving order.
     ignore_rules = quantization_config.get("ignore", []) or []
     if isinstance(ignore_rules, str):
         ignore_rules = [ignore_rules]
@@ -25,6 +36,9 @@ def _get_ignore_rules(quantization_config) -> list[str]:
 
 @lru_cache(maxsize=16)
 def _literal_ignore_rules(ignore_rules: tuple[str, ...]) -> frozenset[str] | None:
+    # [FUNCTION DOC] HELPER: Memoized (16 entries) by the tuple of rules. Returns none if any rule
+    # is a regular-expression rule (prefix "re:"), forcing the ordered slow path; otherwise the
+    # frozen set of rules for fast prefix lookup.
     # Preserve the original ordered matching (including short-circuit behavior)
     # for regex policies. Snapshot keys also invalidate after config mutations.
     if any(rule.startswith("re:") for rule in ignore_rules):
@@ -33,6 +47,11 @@ def _literal_ignore_rules(ignore_rules: tuple[str, ...]) -> frozenset[str] | Non
 
 
 def _is_ignored(name: str, ignore_rules: list[str], literal_rules: frozenset[str] | None = None) -> bool:
+    # [FUNCTION DOC] HELPER: True if the module/parameter name is covered by a rule. Fast path (all
+    # rules literal): checks the name, then repeatedly drops the last dotted component and
+    # rechecks, until a rule matches (true) or no dot remains (false). Slow path: in order, a "re:"
+    # rule matches by anchored-at-start regular expression on the name; a literal rule matches when
+    # the name equals it or begins with it followed by a dot.
     if literal_rules is not None:
         while True:
             if name in literal_rules:
@@ -51,6 +70,15 @@ def _is_ignored(name: str, ignore_rules: list[str], literal_rules: frozenset[str
 
 
 def quantize_params_nvfp4(args, megatron_name, converted_named_params, quantization_config):
+    # [FUNCTION DOC]
+    # Asserts the config is an NVFP4 one (algo NVFP4 or method nvfp4). Raises not-implemented if the
+    # args request FP4 parameter storage or FP4 parameter gather. Returns the input unchanged if a
+    # name in args' extra high-precision layer list is a substring of the Megatron name, or the
+    # Megatron name is not a main language-model decoder layer (the pattern tolerates repeated
+    # "module." prefixes and an optional "language_model." segment; MTP and vision layers fall out),
+    # or the layer is in the bf16 head/tail range (first-last-layers-bf16 flag with start and end
+    # counts). For routed expert linears (linear_fc1/linear_fc2) delegates to the MoE quantization
+    # with the ignore rules; everything else is returned unchanged. The args object may be none.
     assert quantization_config is not None
     assert quantization_config.get("quant_algo") == "NVFP4" or quantization_config.get("quant_method") == "nvfp4"
     if args is not None and bool(getattr(args, "fp4_param", False) or getattr(args, "fp4_param_gather", False)):
@@ -96,6 +124,15 @@ def quantize_params_nvfp4(args, megatron_name, converted_named_params, quantizat
 
 
 def _quantize_moe_params(converted_named_params, ignore_rules):
+    # [FUNCTION DOC] HELPER:
+    # Pass 1: for each pair whose name ends with a gate or up suffix (gate_proj/up_proj, or w1/w3)
+    # and should be quantized, records it under its base name and role; raises value error on a
+    # duplicate role for a base. Then for each base, requires both gate and up (value error naming
+    # the roles found otherwise) and quantizes the pair jointly so they share one global scale,
+    # remembering outputs by name. Pass 2 builds the result in input order: pairs that should not be
+    # quantized pass through; quantized ones emit (name, packed data), (name with ".weight" replaced by
+    # ".weight_scale", block scales) and (".weight_scale_2", global scale), using the joint result
+    # for gate/up and the individual quantizer otherwise (e.g. down projections).
     # Build/hash the policy once per conversion batch, not once per weight check.
     literal_rules = _literal_ignore_rules(tuple(ignore_rules))
     gated_candidates = {}
@@ -143,6 +180,9 @@ def _quantize_moe_params(converted_named_params, ignore_rules):
 
 
 def _should_quantize_param(name, weight, ignore_rules, literal_rules=None):
+    # [FUNCTION DOC] HELPER: False if the name is ignored by the rules, does not end with ".weight",
+    # the dtype is not half/bfloat16/float32, or it has fewer than 2 dimensions. Otherwise raises a
+    # value error if the last dimension is not divisible by the NVFP4 group size, else true.
     if ignore_rules and _is_ignored(name, ignore_rules, literal_rules):
         return False
     if not name.endswith(".weight"):
@@ -157,6 +197,9 @@ def _should_quantize_param(name, weight, ignore_rules, literal_rules=None):
 
 
 def _split_gated_pair_name(name: str):
+    # [FUNCTION DOC] HELPER: If the name ends with one of the gate/up suffixes, returns (name without
+    # the suffix, "gate" or "up"); otherwise (none, none). The first matching suffix in table order
+    # wins.
     for suffix, role in GATED_PAIR_SUFFIXES.items():
         if name.endswith(suffix):
             return name[: -len(suffix)], role
@@ -166,6 +209,9 @@ def _split_gated_pair_name(name: str):
 def _quantize_nvfp4_1d(
     weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Makes the 2-D weight contiguous, raises value error if the column
+    # count is not divisible by the group size, and delegates to the project's 1-D NVFP4 quantizer.
+    # Returns (packed data, block scales, global scale) as described below.
     """
     NVFP4 1D quantization (tile shape = 1x16).
 
@@ -185,6 +231,10 @@ def _quantize_nvfp4_1d(
 def quantize_nvfp4(
     weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Quantizes a 2-D weight directly; for a 3-D weight (stack of matrices, e.g.
+    # grouped experts) quantizes each slice along axis 0 independently and stacks the data, block
+    # scales and global scales along a new axis 0 (one global scale per slice). Raises value error
+    # for other ranks. Returns (packed data, block scales, global scale(s)).
     if weight.dim() == 2:
         return _quantize_nvfp4_1d(weight)
     if weight.dim() == 3:

@@ -1,9 +1,20 @@
+# [MODULE DOC]
+# Megatron-to-Hugging Face converters for Kimi vision-language models (Kimi-VL and Kimi-K2.5).
+# Both wrap a shared language-model converter (DeepSeek-V3-style multi-latent attention with MoE,
+# HF names under "language_model.model") and handle the vision parts by prefix renaming only: the
+# vision encoder and the multimodal projector keep their sub-names under model-specific prefixes
+# (Kimi-VL: vision_model -> vision_tower, multi_modal_projector unchanged; Kimi-K2.5: vision_tower
+# and mm_projector unchanged), with the double "module." wrapper prefix dropped.
 import re
 
 import torch
 
 
 def convert_kimivl_to_hf(args, name, param):
+    # [FUNCTION DOC] Kimi-VL entry. Names starting with the double "module." plus "vision_model."
+    # are renamed with prefix "vision_tower."; those starting with "module.module.multi_modal_
+    # projector." are renamed with prefix "multi_modal_projector."; each returns a one-pair list with
+    # the tensor unchanged. All other names go to the language-model converter.
     if name.startswith("module.module.vision_model."):
         hf_name = "vision_tower." + name[len("module.module.vision_model.") :]
         return [(hf_name, param)]
@@ -16,6 +27,9 @@ def convert_kimivl_to_hf(args, name, param):
 
 
 def convert_kimi_k25_to_hf(args, name, param):
+    # [FUNCTION DOC] Kimi-K2.5 entry. Names starting with the double "module." plus "vision_tower."
+    # or "mm_projector." keep those prefixes with the wrapper prefix removed (one-pair list, tensor
+    # unchanged). All other names go to the language-model converter.
     if name.startswith("module.module.vision_tower."):
         hf_name = "vision_tower." + name[len("module.module.vision_tower.") :]
         return [(hf_name, param)]
@@ -28,6 +42,25 @@ def convert_kimi_k25_to_hf(args, name, param):
 
 
 def convert_language_model_to_hf(args, name, param):
+    # [FUNCTION DOC]
+    # Language-model converter shared by both Kimi variants. Output names are under
+    # "language_model." (head) or "language_model.model." (everything else). Exact names (which must
+    # include the "language_model." segment after the wrapper prefix): embedding, output head, final
+    # norm. Head size is kv_channels (or hidden over heads if absent/unset) and queries per group is
+    # heads over query groups. Decoder layers (the "language_model." segment is optional in the
+    # pattern): routed experts (first linear split in halves along axis 0 into gate then up; second
+    # linear as down; other kinds raise value error); shared experts likewise; output projection;
+    # query projection (no low-rank), query down projection to q_a_proj, the query up-projection
+    # layer norm to q_a_layernorm, query up projection to q_b_proj; fused QKV bias split per group
+    # into q, k, v biases (flattened); dense MLP first linear split into gate/up, second to down;
+    # fused-QKV layer norm weight and the input layernorm to input layernorm; MLP fused layer norm
+    # and pre-MLP layernorm to post-attention layernorm; KV down projection to the MQA kv_a
+    # projection, KV up-projection layer norm and weight to kv_a_layernorm and kv_b_proj; router
+    # weight and expert bias to the gate and its score-correction bias. Unknown names raise a value
+    # error.
+    # KNOWN ISSUE: the three exact-name cases require the "language_model." segment, while the layer
+    # pattern treats it as optional, so a name without the segment works for layers but not for the
+    # embedding, head or final norm.
     if name == "module.module.language_model.embedding.word_embeddings.weight":
         return [("language_model.model.embed_tokens.weight", param)]
     if name == "module.module.language_model.output_layer.weight":

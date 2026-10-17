@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Checkpoint loading and saving for the Megatron backend. Load dispatches on checkpoint format:
+# a Megatron (torch distributed) checkpoint goes through Megatron's loader (after freshness checks
+# for DeepSeek-V4 and linear-attention layouts), anything else is treated as a Hugging Face
+# checkpoint loaded through Megatron-Bridge or, in raw conversion mode, the mbridge package. LoRA
+# adapters are loaded or saved separately. Import-time side effect (inside a guarded import): the
+# torch sharded-tensor machinery is monkey-patched to skip the expensive non-overlapping shard
+# metadata validation, by making the sharding-spec post-init a no-op and replacing the sharded
+# tensor constructor-from-local-shards-and-metadata with a version that does no cross-rank checks.
+# If those torch internals are unavailable, the patch is silently skipped. Public names: load,
+# save with LoRA, and the re-exported Megatron save.
 import logging
 import os
 import re
@@ -33,6 +44,8 @@ try:
     from torch.distributed._shard.sharding_spec.api import EnumerableShardingSpec
 
     def __post_init__(self):
+        # [FUNCTION DOC] HELPER: Replacement for the enumerable sharding spec's post-initialization
+        # validation; deliberately does nothing, skipping the slow non-overlap check.
         pass
 
     EnumerableShardingSpec.__post_init__ = __post_init__
@@ -46,6 +59,17 @@ try:
         init_rrefs=False,
         sharding_spec=None,
     ) -> ShardedTensor:
+        # [FUNCTION DOC] HELPER: Class-level replacement (bound as a class method) that builds a
+        # sharded tensor from this rank's local shards and the global metadata with no validation of
+        # shard overlap or cross-rank consistency. Steps: normalize the process group; take the
+        # global rank; scan the metadata's shards and collect those placed on this rank (the
+        # collected list is not used afterwards); infer the sharding spec from the shards metadata
+        # if none is given; allocate an uninitialized sharded tensor object with the metadata's
+        # size, dtype, layout, pinned-memory and requires-grad properties; assign the local shards;
+        # prepare it for the process group (with RPC references flag) and run post-initialization.
+        # Returns the sharded tensor. Mirrors torch's own method minus validation.
+        # KNOWN ISSUE: the list of local shard metadatas is computed but never used, and the
+        # local_shards argument is trusted without any check against it.
         """
         Initialize a ShardedTensor with local shards and a global
         ShardedTensorMetadata built on each rank.
@@ -105,6 +129,21 @@ __all__ = ["save_checkpoint", "save_checkpoint_with_lora", "load_checkpoint"]
 
 
 def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_context, skip_load_to_model_and_opt):
+    # [FUNCTION DOC]
+    # Loads a checkpoint from the load path in the global Megatron args. Returns a tuple: the
+    # underlying loader's result (iteration, floating-point operations so far) followed by a
+    # boolean saying whether the native optimizer state was restored through the LoRA adapter load.
+    # Steps: unless an in-memory local checkpoint manager is present in the checkpointing context
+    # (then disk validation is skipped), asserts the load path exists and is a non-empty directory.
+    # If a local manager is present or the path looks like a Megatron checkpoint (tracker file
+    # present, or directory named iter_ plus seven digits): for non-local loads of DeepSeek-V4
+    # models asserts the checkpoint is current, and for models with linear attention buffers
+    # asserts the linear-attention layout is current (raises value error if stale); then calls
+    # Megatron's loader. Otherwise loads from Hugging Face format. Then, if LoRA is enabled and an
+    # adapter path attribute is set, loads the adapter (optionally with optimizer state unless
+    # no-load-optim): on success logs and, if the adapter yields an iteration, replaces the
+    # iteration in the result; on failure warns that training starts with fresh adapter weights.
+    # Side effects: reads disk, mutates model/optimizer/scheduler.
     # ref: how megatron `load_checkpoint` gets directory
     args = get_args()
 
@@ -167,6 +206,12 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
 def save_checkpoint_with_lora(
     iteration, model, optimizer, opt_param_scheduler, *, publisher: SnapshotPublisher | None = None
 ):
+    # [FUNCTION DOC]
+    # Saves a checkpoint for the iteration. For a LoRA model: asserts a snapshot publisher is
+    # provided unless conversion mode is raw, then writes the adapter checkpoint (with publisher,
+    # optimizer, scheduler, iteration) into the save directory under a seven-digit zero-padded
+    # iteration folder named iter_NNNNNNN, subfolder adapter, and logs it. For a non-LoRA model
+    # delegates to Megatron's save. Reads the Megatron global args for the save directory.
     """Extended save that handles LoRA adapters separately."""
     args = get_args()
 
@@ -190,6 +235,11 @@ def save_checkpoint_with_lora(
 
 
 def publish_as_release(save_dir: str) -> None:
+    # [FUNCTION DOC]
+    # Computes the base directory of iteration 1 (non-release) and of the release slot under the
+    # save directory using Megatron's naming, deletes any existing release directory (ignoring
+    # errors), and moves iteration 1's directory to the release path. Side effects: file deletion
+    # and rename. Raises a file-not-found-type error from the move if iteration 1 does not exist.
     """Rename this run's iteration directory to ``release``, replacing an earlier conversion.
 
     ``shutil.move`` into an existing directory nests rather than replaces, which would leave the
@@ -205,10 +255,20 @@ LINEAR_ATTN_LAYOUT_KEY = "weight_layout_version"
 
 
 def _has_linear_attention(ddp_model) -> bool:
+    # [FUNCTION DOC] HELPER: True if any buffer name in any model chunk contains the linear-attention
+    # layout version key (which marks models using the shared linear-attention layer).
     return any(LINEAR_ATTN_LAYOUT_KEY in name for chunk in ddp_model for name, _ in chunk.named_buffers())
 
 
 def assert_linear_attn_checkpoint_is_current(load_dir: str) -> None:
+    # [FUNCTION DOC]
+    # Validates a distributed (torch_dist) checkpoint directory. If a tracker file named
+    # latest_checkpointed_iteration.txt exists, reads its text: either "release" or an integer
+    # step, resolving the checkpoint subdirectory (release, or iter_ plus seven-digit step). Returns
+    # silently if the resolved path is not a directory. Reads the checkpoint metadata and requires
+    # at least one stored tensor key ending with the layout version key; otherwise raises a value
+    # error telling the user to re-convert from the HF checkpoint. Reads disk only. Raises a
+    # value error if the tracker contents are not an integer or "release".
     """Reject torch_dist checkpoints written before the shared linear-attention layer (group-major GDN
     q/k/v and conv rows, Kimi-K3 KDA under linear_attn.*). Megatron skips tensors a checkpoint lacks, so
     such a checkpoint would load scrambled or half-initialized instead of failing."""
@@ -231,6 +291,8 @@ def assert_linear_attn_checkpoint_is_current(load_dir: str) -> None:
 
 
 def _is_megatron_checkpoint(path: str | Path) -> bool:
+    # [FUNCTION DOC] HELPER: True if the directory has the Megatron tracker file, or the directory's
+    # own name is iter_ followed by exactly seven digits (a specific iteration directory).
     return (Path(path) / "latest_checkpointed_iteration.txt").is_file() or bool(
         re.fullmatch(r"iter_\d{7}", Path(path).name)
     )
@@ -238,6 +300,10 @@ def _is_megatron_checkpoint(path: str | Path) -> bool:
 
 @contextmanager
 def _hide_critic_value_head_from_hf_load(ddp_model):
+    # [FUNCTION DOC] HELPER: Context manager. On entry, finds in each unwrapped model chunk every
+    # direct child module that is the critic value head (last-layer linear class) and removes it
+    # from the chunk, so HF weight loading does not try to load or complain about it. On exit
+    # (even on error) reattaches each head under its original name. Mutates the model temporarily.
     value_heads = [
         (chunk, name, head)
         for chunk in unwrap_model(ddp_model)
@@ -254,6 +320,11 @@ def _hide_critic_value_head_from_hf_load(ddp_model):
 
 
 def _load_hf_weights_with_mbridge(ddp_model, args, load_path: str) -> None:
+    # [FUNCTION DOC] HELPER: Imports (lazily) the mbridge plugin registrations and AutoBridge. When
+    # train offload is on, disables the memory saver while loading (staging copies must not be
+    # tracked). Logs, then with the critic value head hidden, builds a bridge from the pretrained
+    # path (trusting remote code) and loads the HF weights into the model in memory-efficient mode;
+    # finally synchronizes CUDA. Mutates model weights; reads disk.
     """Raw-mode HF load through mbridge for models Megatron-Bridge lacks; staging copies bypass the memory saver."""
     from contextlib import nullcontext
 
@@ -276,6 +347,13 @@ def _load_hf_weights_with_mbridge(ddp_model, args, load_path: str) -> None:
 
 
 def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str):
+    # [FUNCTION DOC] HELPER: Loads HF-format weights into the model. If the conversion mode is not
+    # "bridge", uses the mbridge path; otherwise uses Megatron-Bridge's AutoBridge from a
+    # pretrained HF path (trusting remote code), with the model temporarily patched for the bridge
+    # and the critic value head hidden. Then, when optimizer exists and fp16 or bf16 is on, asserts
+    # main params are not loaded from checkpoint and asks the optimizer to refresh its main
+    # parameters from the model parameters. Returns the tuple (iteration 0, floating-point
+    # operation count 0), matching what Megatron reports for such loads.
     if args.megatron_to_hf_mode != "bridge":
         _load_hf_weights_with_mbridge(ddp_model, args, load_path)
     else:
@@ -300,5 +378,6 @@ def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str):
 
 
 def _is_dir_nonempty(path):
+    # [FUNCTION DOC] HELPER: True if the directory has at least one entry (scans lazily).
     with os.scandir(path) as it:
         return any(it)

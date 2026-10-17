@@ -1,8 +1,23 @@
+# [MODULE DOC]
+# Megatron-to-Hugging Face converter for dense Qwen2 / Qwen3 models (also reused by MiMo): maps one
+# Megatron parameter (double "module." prefix) to a list of (HF name, tensor) pairs: embeddings,
+# head, final norm, attention (fused QKV weight and bias split per query group; output projection;
+# optional QK layernorms), SwiGLU MLP (fused first linear split in halves) and layernorms.
 import re
 import torch
 
 
 def convert_qwen2_to_hf(args, name, param):
+    # [FUNCTION DOC]
+    # Exact names: embedding, output head, final norm. Head size is kv_channels (or hidden over
+    # heads if absent/unset); queries per group is heads over query groups. Decoder layers: output
+    # projection to o_proj; fused QKV weight viewed as (query groups, queries-per-group + 2, head
+    # size, hidden) and split along axis 1 into q, k, v (each reshaped to (rows, hidden)); fused QKV
+    # bias viewed as (groups, per-group size) and split along axis 1 into (queries-per-group * head
+    # size, head size, head size), made contiguous and flattened; first MLP linear split into gate
+    # then up halves along axis 0; second to down; QKV-fused layer norm weight or the input layernorm
+    # to input layernorm; MLP-fused layer norm weight or pre-MLP layernorm to post-attention
+    # layernorm; query/key layernorms to q_norm/k_norm. Unknown names raise a value error.
     if name == "module.module.embedding.word_embeddings.weight":
         return [("model.embed_tokens.weight", param)]
     if name == "module.module.output_layer.weight":

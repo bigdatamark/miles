@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Device-mesh and parallel-state construction for the FSDP backend. The backend is pure data
+# parallel (optionally hybrid-sharded: replicate groups times shard groups), so this module builds
+# the data-parallel mesh and the FSDP2 shard mesh and wraps them, plus single-rank groups for every
+# other parallelism axis, in the shared ParallelState structure used by the training utilities.
 import logging
 from argparse import Namespace
 
@@ -16,6 +21,14 @@ def build_fsdp_meshes(
     world_size: int,
     dp_replicate_size: int,
 ) -> dict[str, DeviceMesh]:
+    # [FUNCTION DOC]
+    # Creates a one-dimensional "dp" mesh over all ranks. The FSDP mesh is that same mesh unless
+    # dp_replicate_size is above one, in which case it is a two-dimensional mesh with named axes
+    # "dp_replicate" (size dp_replicate_size) and "dp_shard" (world size divided by it, integer
+    # division; the caller must ensure divisibility). The two-dimensional mesh is obtained by
+    # unflattening the dp mesh when the library supports that, else by initializing a fresh mesh.
+    # Returns a mapping with keys "dp" and "fsdp". Side effect: device-mesh initialization (a
+    # collective operation that creates process groups).
     """Build the data-parallel view and the FSDP2 shard mesh."""
     dp_mesh = init_device_mesh(
         device_type,
@@ -44,6 +57,14 @@ def build_fsdp_meshes(
 
 
 def create_fsdp_parallel_state(args: Namespace) -> ParallelState:
+    # [FUNCTION DOC]
+    # Reads world size and rank from the initialized default process group, builds the meshes on
+    # CUDA using args.dp_replicate_size, logs the mesh layout, and creates a one-rank process group
+    # containing only this rank (a collective call: all ranks create theirs). Returns a parallel
+    # state where: intra-dp uses the dp mesh's group with world-size ranks; intra-dp-with-cp uses the
+    # world group plus the project's gloo group; context, tensor, pipeline, expert, expert-tensor and
+    # independent-dp axes are all size one, rank zero, on the one-rank group; the meshes mapping is
+    # attached. Raises whatever the distributed library raises if the process group is not initialized.
     """Create a ParallelState instance for FSDP configuration."""
     world_size = dist.get_world_size()
     rank = dist.get_rank()

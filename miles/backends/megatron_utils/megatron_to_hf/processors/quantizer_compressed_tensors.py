@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Quantizer for the compressed-tensors checkpoint format. For each converted weight whose base name
+# is listed as a packed weight in the target checkpoint, replaces the weight with packed 4-bit
+# data plus scale (and zero point / shape) tensors: either MXFP4 (via the project's MXFP4
+# quantizer) or group-wise symmetric/asymmetric int4 simulated through a CUDA fake-quantization
+# kernel and then packed eight values per 32-bit integer. Other tensors pass through. Also
+# contains an AWQ-style 4-bit packed linear module and several int-packing helpers. The CUDA
+# kernel module is an optional import (none if unavailable, failing only when int4 packing runs).
 import logging
 import math
 import re
@@ -19,7 +27,18 @@ __all__ = ["quantize_params_compressed_tensors"]
 
 
 class WQLinear_GEMM(nn.Module):
+    # [CLASS DOC] HELPER:
+    # AWQ-style 4-bit weight-only linear layer container: registers integer buffers holding packed
+    # quantized weights (in_features rows, out_features/8 packed columns, 32-bit), packed zero
+    # points (groups by out_features/8) and half-precision scales (groups by out_features), plus an
+    # optional half-precision bias. A group size of -1 means one group over all input features.
+    # KNOWN ISSUE: not used by the quantizer function in this module (only constructed by its own
+    # class method), so it appears to be vestigial.
     def __init__(self, w_bit, group_size, in_features, out_features, bias, dev, training=False):
+        # [FUNCTION DOC] Only 4-bit supported (raises not-implemented otherwise). Resolves group
+        # size, asserts in_features divisible by it and out_features divisible by 8, and registers
+        # zero-initialized buffers on the given device; bias buffer exists only if requested (else
+        # the attribute is none). The training argument overwrites the module's training flag.
         super().__init__()
 
         if w_bit not in [4]:
@@ -73,6 +92,18 @@ class WQLinear_GEMM(nn.Module):
 
     @classmethod
     def from_linear(cls, linear, w_bit, group_size, init_only=False, scales=None, zeros=None):
+        # [FUNCTION DOC]
+        # Builds an instance sized like the given linear layer (on its weight's device). With
+        # init_only returns it empty. Otherwise requires scales and zeros (assertion error), copies
+        # scales (as half) and bias, then on the current CUDA device: expands scales (and tensor
+        # zeros) per group along the input axis, quantizes the weight as round(weight / scale +
+        # zero), transposes to (in, out), regroups output columns in blocks of eight and packs them
+        # into 32-bit integers using the AWQ interleaved nibble order [0,4,1,5,2,6,3,7]; stores as
+        # the weight buffer. Zero points are packed the same way when given as a tensor; when a
+        # scalar, a packed constant value filled across groups is used. Returns the instance.
+        # KNOWN ISSUE: the scalar-zero branch builds its fill from the scales' shape as if scales
+        # were (groups, out) while the pack count assumes eight per word, and the nibble order map
+        # has eight entries so only 4-bit works (enforced by the constructor).
         awq_linear = cls(
             w_bit,
             group_size,
@@ -140,6 +171,14 @@ def pack_to_int32(
     packed_dim=1,
     sym=False,
 ):
+    # [FUNCTION DOC] HELPER:
+    # Packs a matrix of small integers into 32-bit integers, 32 // num_bits values per word, lowest
+    # index in the lowest bits. Raises value error if num_bits is above 8 or below 1. If sym is set,
+    # first adds 2^(num_bits-1) to shift signed values to unsigned (as unsigned 8-bit). If the packed
+    # dimension is 0, transposes first (and back at the end). Pads the packed axis with zeros up to
+    # a multiple of the pack factor, views as (rows, words, pack factor), casts to 32-bit signed,
+    # shifts each position by index times num_bits and sums over the pack axis. Returns the packed
+    # int32 matrix (rows, words), transposed back for dim 0.
     # if value.dtype is not torch.int8:
     #     raise ValueError("Tensor must be quantized to torch.int8 before packing")
 
@@ -185,6 +224,8 @@ def round_to_quantized_type_dtype(
     dtype,
     cast_to_original_dtype=False,
 ):
+    # [FUNCTION DOC] HELPER: Clamps the tensor to the integer range of the target integer dtype,
+    # rounds to nearest, and casts to that dtype; optionally casts back to the input dtype.
     original_dtype = tensor.dtype
     iinfo = torch.iinfo(dtype)
     rounded = torch.round(torch.clamp(tensor, iinfo.min, iinfo.max)).to(dtype)
@@ -200,6 +241,13 @@ def quantize(
     zero_point,
     dtype=torch.int8,
 ):
+    # [FUNCTION DOC] HELPER (no gradient tracking): Group-wise quantization of the last axis. Group
+    # size = last size of x divided by last size of the scale (integer division). Splits the last
+    # axis into (groups, group size), divides by the scale (broadcast over the group axis), adds the
+    # zero point (cast to x dtype, in place on the scaled copy) when given, then rounds and clamps
+    # to the integer dtype range and flattens the last two axes back. Returns a tensor of the
+    # target dtype (default signed 8-bit) with the same shape as x.
+    # KNOWN ISSUE: the initial zero-filled output allocation is dead code (immediately replaced).
     group_size = x.shape[-1] // scale.shape[-1]
     output_dtype = dtype
     output = torch.zeros_like(x).to(output_dtype)
@@ -226,6 +274,8 @@ def quantize(
 
 
 def if_quant(name, patterns):
+    # [FUNCTION DOC] HELPER: True if any regular expression in the list is found anywhere in the
+    # name. KNOWN ISSUE: not used in this module.
     for pattern in patterns:
         if re.search(pattern, name):
             return True
@@ -233,6 +283,21 @@ def if_quant(name, patterns):
 
 
 def pack_layer(weight, group_size, sym=True):
+    # [FUNCTION DOC] HELPER:
+    # Input: 2-D weight (rows, cols; cols divisible by group size), group size, symmetric flag.
+    # Calls the CUDA fake-int4 kernel (one group of rows by group-size columns) to get fake-
+    # quantized values, scales and zero points; reshapes each to (rows, 1, groups, ...); dequantizes
+    # back to weight scale (value times scale if symmetric, else (value minus zero point) times
+    # scale) and reshapes to the weight shape; scale becomes (rows, groups) contiguous. For
+    # asymmetric: zero points are transposed, cast to int32 and packed eight per word with the AWQ
+    # nibble order [0,4,1,5,2,6,3,7] (shifts of 4 bits); for symmetric no zero point. Then
+    # re-quantizes the dequantized weight with the scale (and zero point) into signed 8-bit
+    # (symmetric) or unsigned 8-bit (asymmetric) integers and packs them into 32-bit words with 4
+    # bits each (the symmetric case offset by 8). Returns (packed weight, scale, packed zero point
+    # or none).
+    # KNOWN ISSUE: raises an attribute error if the optional CUDA kernel module failed to import
+    # (it is then none); asymmetric zero-point packing assumes the group count is divisible by 8,
+    # and the zero-point passed to the re-quantization step is the unpacked float-valued one.
     w, scale, zp = fake_int4_quant_cuda.fake_int4_quant_cuda(weight, (1, group_size), sym)
     w = w.view(weight.shape[0], 1, weight.shape[1] // group_size, group_size)
     scale = scale.view(weight.shape[0], 1, weight.shape[1] // group_size, 1)
@@ -266,6 +331,14 @@ def pack_layer(weight, group_size, sym=True):
 
 
 def quantize_params_compressed_tensors(converted_named_params, quantization_config, packed_weight_basenames):
+    # [FUNCTION DOC]
+    # Reads the format, group size and symmetric flag from the config's first weight group. For the
+    # "mxfp4-pack-quantized" format asserts float type, 4 bits, uint8 scale dtype and symmetric. For
+    # each (name, tensor): if the name ends with ".weight" and its stem is in the packed base-name
+    # collection, replaces it: MXFP4 gives "<stem>.weight_packed" and "<stem>.weight_scale"; int4
+    # gives (optionally) "<stem>.weight_zero_point" when asymmetric, then ".weight_packed",
+    # ".weight_scale" and ".weight_shape" (original shape as an int32 tensor on the CUDA device);
+    # all other pairs pass through unchanged. Returns the new list in order.
     quant_format = quantization_config["format"]
     w_cfg = quantization_config["config_groups"]["group_0"]["weights"]
     group_size = w_cfg["group_size"]

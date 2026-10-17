@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Independent data parallelism across training cells (fault-tolerant replicas that can join and
+# leave). Provides creation of the cross-cell process groups (torchft NCCL and Gloo groups tagged
+# with a quorum id), reconfiguration when membership changes, and a gradient/loss all-reduce
+# across cells that reports failure through a cell-wide consensus flag instead of raising, so the
+# caller can discard the step. All events are logged in structured form with tag "ft".
 import logging
 from collections.abc import Sequence
 from datetime import timedelta
@@ -26,6 +32,15 @@ def create_indep_dp_group(
     megatron_rank: int,
     megatron_world_size: int,
 ) -> GroupInfo:
+    # [FUNCTION DOC]
+    # Builds the group info for the independent-DP axis. With at most one alive cell, returns a
+    # trivial info (rank 0, size 1, no group) carrying the quorum id as debug info. Otherwise
+    # lazily imports torchft's NCCL and Gloo process-group classes (raises import error with an
+    # install hint if missing) and creates one of each, with a 120-second timeout, configured with
+    # a store address of the form: store address, "/indep_dp/", backend name, quorum id, megatron
+    # rank; replica id = cell index; rank/size = the cell's alive rank/size; quorum id; and group
+    # rank/size = the megatron rank/world size. Logs creation and returns the info with the NCCL
+    # group as the main group and the Gloo group as the gloo group. Network/rendezvous side effects.
     if indep_dp_info.alive_size <= 1:
         return GroupInfo(rank=0, size=1, group=None, debug_info={"quorum": indep_dp_info.quorum_id})
 
@@ -37,6 +52,8 @@ def create_indep_dp_group(
     _TIMEOUT = timedelta(seconds=120)
 
     def _create(pg_cls: type, backend_name: str) -> dist.ProcessGroup:
+        # [FUNCTION DOC] HELPER: Instantiates the given process-group class with the timeout and
+        # configures it for the current quorum (store address includes the backend name); returns it.
         pg = pg_cls(timeout=_TIMEOUT)
         pg.configure(
             store_addr=f"{store_addr}/indep_dp/{backend_name}/{indep_dp_info.quorum_id}/{megatron_rank}",
@@ -78,6 +95,10 @@ def reconfigure_indep_dp_group(
     megatron_rank: int,
     megatron_world_size: int,
 ) -> None:
+    # [FUNCTION DOC]
+    # Logs a start event, shuts down the existing independent-DP main and gloo groups (those that
+    # exist) on the parallel state, creates new groups for the new membership/quorum and assigns
+    # them to the parallel state's independent-DP slot (mutation), then logs an end event.
     """Shut down old indep_dp PGs and create new ones with a fresh quorum_id."""
     old = parallel_state.indep_dp
     log_structured(
@@ -117,6 +138,20 @@ def allreduce_grads_and_losses_across_replicas(
     losses_reduced: list,
     num_rollouts: int | None = None,
 ) -> tuple[bool, dict[str, float]]:
+    # [FUNCTION DOC]
+    # Sums gradients (and aggregates losses) across cells. Asserts per-token loss is off and the
+    # intra-cell data-parallel size is 1 (assertion errors; combining intra and independent DP is
+    # unsupported). Steps: on the last pipeline stage (ignoring virtual stages) aggregates the
+    # reduced training losses (over num_rollouts when given) into a loss mapping; for each model
+    # chunk, for every bucket in its dense and expert-parallel bucket groups, all-reduces the
+    # bucket's gradient data with sum across the independent-DP group through the generic
+    # process-group utility. Any exception during this is caught, logged as an error with the
+    # traceback, and marks failure. Then queries the group for an asynchronous error exactly once
+    # (the query can force a stream sync); if one is reported it marks failure and logs loudly.
+    # Finally takes a cell-wide logical AND of success over the cell-local gloo group so that if any
+    # rank failed all ranks agree. Returns (consensus success flag, loss mapping; empty on non-last
+    # pipeline stages or when the aggregation did not run). Gradients are summed, not averaged.
+    # Gradient buffers may be partially reduced after a failure.
     assert not args.calculate_per_token_loss, "calculate_per_token_loss is not supported with indep_dp yet"
     assert parallel_state.intra_dp.size == 1, (
         f"indep_dp requires intra_dp.size == 1, got {parallel_state.intra_dp.size}. "

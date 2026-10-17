@@ -1,9 +1,18 @@
+# [MODULE DOC]
+# Megatron-to-Hugging Face converter for MiMo models, which are Qwen2 models with additional
+# multi-token-prediction (MTP) layers. Non-MTP names are delegated to the Qwen2 converter; MTP
+# names are handled here (direct norm/projection names under model.mtp_layers.<idx>, with the inner
+# transformer layer converted by proxying through the Qwen2 converter and renaming the layer
+# prefix).
 import re
 import torch
 from .qwen2 import convert_qwen2_to_hf
 
 
 def convert_mimo_to_hf(args, name, param):
+    # [FUNCTION DOC] Entry point: names containing the substring "mtp" go to the MTP converter,
+    # everything else to the Qwen2 converter. Returns a list of (HF name, tensor).
+    # KNOWN ISSUE: the substring test also matches any non-MTP name that merely contains "mtp".
     """
     Convert MiMo model parameters from Megatron to HuggingFace format.
 
@@ -17,6 +26,17 @@ def convert_mimo_to_hf(args, name, param):
 
 
 def convert_mimo_mtp_param(args, name, param):
+    # [FUNCTION DOC]
+    # Input: args, Megatron MTP name of the form module.module.mtp.layers.<idx>.<component>, tensor.
+    # Raises value error if the name does not fit that form. Direct components map to
+    # model.mtp_layers.<idx>: enorm to token_layernorm, hnorm to hidden_layernorm, eh_proj to
+    # input_proj, final_layernorm to final_layernorm. For eh_proj the tensor's two column halves
+    # (split along axis 1) are swapped before returning (the two orders differ between the formats).
+    # Components with prefix "transformer_layer." or "mtp_model_
+    # layer.": the prefix is dropped, the rest is converted as if it were a normal decoder layer of
+    # the same index by the Qwen2 converter, and the resulting HF names have their model.layers.<idx>
+    # prefix rewritten to model.mtp_layers.<idx>. Any other component raises a value error.
+    # Returns a list of (HF name, tensor).
     """
     Convert MTP layer parameters from Megatron to HuggingFace format.
 

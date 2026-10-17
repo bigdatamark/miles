@@ -1,9 +1,26 @@
+# [MODULE DOC]
+# Megatron-to-Hugging Face converter for Qwen3 MoE models: maps one Megatron parameter (double
+# "module." prefix) to a list of (HF name, tensor) pairs. Same attention handling as dense Qwen
+# (fused QKV split per query group, QK layernorms), plus per-expert weights (fused first linear
+# split into gate then up), an optional shared expert with its gate, and the router.
 import re
 
 import torch
 
 
 def convert_qwen3moe_to_hf(args, name, param):
+    # [FUNCTION DOC]
+    # Exact names: embedding, output head, final norm. Head size is kv_channels (or hidden over
+    # heads if absent/unset); queries per group is heads over query groups. Decoder layers: routed
+    # experts (kind and index from the name): first linear split into halves along axis 0 as gate
+    # then up, second linear as down, other kinds raise a value error; shared expert: first linear
+    # split into gate/up, second as down, "gate_weight" to the shared expert gate, others raise a
+    # value error; output projection; fused QKV weight viewed as (groups, queries-per-group + 2,
+    # head size, hidden) and split along axis 1 into q, k, v; fused QKV bias split per group and
+    # flattened; dense MLP first linear split into gate/up, second to down; QKV-fused layer norm
+    # weight to input layernorm; MLP-fused layer norm weight and pre-MLP layernorm to post-attention
+    # layernorm; router weight to gate weight and expert bias to score-correction bias; query/key
+    # layernorms. Unknown names raise a value error.
     if name == "module.module.embedding.word_embeddings.weight":
         return [("model.embed_tokens.weight", param)]
     if name == "module.module.output_layer.weight":

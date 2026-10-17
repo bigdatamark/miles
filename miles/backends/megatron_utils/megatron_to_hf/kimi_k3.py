@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Megatron-to-Hugging Face converter for Kimi K3 (hybrid linear-attention / multi-latent attention,
+# MoE with latent-projected routed experts and attention-residual norms). Table-driven: exact-name
+# table (embeddings, final norm, output head), a table for output-head attention-residual tensors,
+# and a table of per-layer names. Fused first linears (dense MLP, routed experts, shared experts)
+# are split in halves into gate then up. Expert names follow the w1 (gate), w2 (down), w3 (up)
+# convention of the block-sparse MoE module. All HF names live under the "language_model.model"
+# prefix.
 import re
 
 _PREFIX = "language_model.model"
@@ -53,6 +61,19 @@ _LAYER_NAMES = {
 
 
 def convert_kimi_k3_to_hf(args, name, param):
+    # [FUNCTION DOC]
+    # Input: args (ignored), Megatron name (double "module." prefix), tensor. Output: list of (HF
+    # name, tensor). Order of cases: exact names from the direct table; otherwise the name must be a
+    # decoder layer name or a value error is raised. For a layer with index idx (HF prefix
+    # language_model.model.layers.idx): routed expert weights (linear_fc1 or linear_fc2 with expert
+    # index): fc1 split into halves along axis 0 giving w1 (gate) then w3 (up); fc2 becomes w2
+    # (down), all under block_sparse_moe.experts.<expert>; dense MLP first linear split into gate
+    # and up projections; shared expert first linear split into gate and up under the block-sparse
+    # MoE shared experts; output-head attention-residual names (found as layer remainders) map to
+    # model-level names without the layer prefix; everything else must be in the per-layer table
+    # (value error otherwise). Note the pre-MLP layernorm maps to post-attention layernorm, router
+    # names map into the block-sparse MoE gate, and latent projections map to routed-expert
+    # down/up projections.
     del args
 
     if name in _DIRECT_NAMES:

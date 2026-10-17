@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Per-architecture binders that install resolved Hub kernels on model instances. Two binders:
+# GatedDeltaNet modules (Qwen3-Next / Qwen3.5 family; replaces instance attributes holding the
+# recurrence and causal-conv callables) and NemotronH attention mixers (stores the varlen
+# attention callable under the attribute name the packing patch reads). Both return the number of
+# modules touched and leave modules untouched when the kernel slot is inactive. A table maps each
+# slot to its instance-attribute-to-hub-function-name pairs.
 """Bind resolved hub kernels onto constructed model instances.
 
 Rebinding happens on module instances, not on classes: it only replaces callables the HF modeling
@@ -38,6 +45,13 @@ _GDN_KERNEL_SLOTS = (
 
 
 def bind_gated_deltanet(model, hub: HubKernels) -> int:
+    # [FUNCTION DOC]
+    # Finds all submodules whose class name ends with GatedDeltaNet (returns 0 if none). For each
+    # slot in the table, asks the hub state for the slot's functions; inactive slots are skipped.
+    # For an active slot, sets on every found module each listed instance attribute to the hub
+    # function with the paired name (the recurrent attribute maps to the fused-recurrent function).
+    # Returns 0 if no slot was active, else the number of modules (logged). Mutates module instances.
+    # Slots are independent, so one can be bound while another stays native.
     """Point each GatedDeltaNet's kernel handles at the Hub builds; returns modules patched.
 
     `_patch_gdn_forward` in `models/qwen3_5.py` injects the packed-document boundaries into
@@ -65,6 +79,12 @@ def bind_gated_deltanet(model, hub: HubKernels) -> int:
 
 
 def bind_nemotron_h(model, hub: HubKernels) -> int:
+    # [FUNCTION DOC]
+    # Collects the mixer of every submodule whose block type is attention (returns 0 if none), asks
+    # the hub state for the varlen flash-attention slot (returns 0 if inactive), and sets on each
+    # mixer the attribute named by the NemotronH model module's hub-varlen constant to the hub's
+    # varlen attention function. Returns the number of mixers (logged). The import of that constant
+    # is local, deferring the model module load until needed. Mutates mixer instances.
     """Stash the Hub varlen-attention kernel on each NemotronH attention mixer; returns mixers patched.
 
     `_patch_attn_forward` in `models/nemotron_h.py` reads the handle per forward and otherwise

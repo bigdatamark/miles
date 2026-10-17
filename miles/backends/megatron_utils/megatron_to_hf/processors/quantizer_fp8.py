@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# FP8 (e4m3) quantizer for converted Hugging Face tensors. Given a Megatron parameter name and the
+# list of converted (name, tensor) pairs, decides by the Megatron name whether this parameter is an
+# FP8 target (routed and shared expert linears, attention and MLP projections in the supported
+# attention variants, DSA indexer query/key projections) and, if so, replaces each weight with its
+# quantized form plus a scale tensor. Block-wise quantization (with optional UE8M0 scale format
+# when DeepGEMM is in use) when the config has a weight block size, else per-tensor. Non-target
+# parameters pass through unchanged. Only dynamic activation scheme and e4m3 format are accepted.
 import os
 import re
 
@@ -14,6 +22,19 @@ from ...sglang import (
 
 
 def quantize_params_fp8(args, megatron_name, converted_named_params, quantization_config):
+    # [FUNCTION DOC]
+    # Asserts method fp8, format e4m3 (default) and dynamic activation scheme; weight block size is
+    # optional. Finds the decoder layer in the Megatron name (anchored match; or an MTP layer, whose
+    # transformer-layer wrapper segments are dropped); if neither, returns the input unchanged.
+    # Routed experts (names like experts.<kind>.weight<idx>): for kinds linear_fc1/linear_fc2,
+    # quantizes every converted pair except those whose HF name ends with "_scale" (dropped), and
+    # returns. Shared experts: for linear_fc1/linear_fc2 weights quantizes all pairs. Otherwise if
+    # the layer-relative name is in the target list (attention output/QKV, dense MLP linears, MLA
+    # projections, indexer query, linear-attention input/output projections, DeepSeek-V4 kv
+    # projection and indexer query; plus the indexer key weights unless indexer RoPE interleave is
+    # on, since interleaved indexers keep that weight unquantized) quantizes all pairs. Anything else
+    # returns the input unchanged.
+    # KNOWN ISSUE: the layer index and expert index are captured but never used.
     assert quantization_config["quant_method"] == "fp8"
     fmt = quantization_config.get("fmt", "e4m3")
     assert fmt == "e4m3", f"Unsupported FP8 format: {fmt}"
@@ -110,6 +131,18 @@ def quantize_params_fp8(args, megatron_name, converted_named_params, quantizatio
 
 
 def _quantize_param(args, name, weight, weight_block_size):
+    # [FUNCTION DOC] HELPER:
+    # Asserts the name ends with ".weight". Returns two pairs: (name, quantized weight) and
+    # (scale name, scale). With a block size: picks the scale format; "ue8m0" uses the UE8M0 weight
+    # quantizer and transforms its scale for the weight's second-to-last size; else if the environment
+    # variable NVTE_FP8_BLOCK_SCALING_FP32_SCALES equals "0" and the helper cast function exists and
+    # the block size is [128, 128], uses that per-block cast; else the project's block-wise FP8 cast
+    # kernel. Scale name is the weight name with ".weight_scale_inv". Without a block size: per-tensor
+    # scale = max(abs(weight), 1e-12) / FP8 max in float32, weight divided by scale, clamped to the
+    # e4m3 range and cast; scale reshaped to one element; scale name ".weight_scale".
+    # KNOWN ISSUE: reads the environment variable by key access, so it raises a key error if unset
+    # whenever the block-wise path is taken without UE8M0. The 128-by-128 special case is noted as
+    # hacky in the code.
     assert name.endswith(".weight"), f"Expected weight parameter, got {name}"
     FP8_MIN = torch.finfo(torch.float8_e4m3fn).min
     FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
@@ -137,6 +170,11 @@ def _quantize_param(args, name, weight, weight_block_size):
 
 
 def _get_scale_format(args, name, weight_block_size):
+    # [FUNCTION DOC] HELPER: Returns "ue8m0" or none (default fp32 scale). None unless the
+    # DeepGEMM requantization predicate exists and says yes for the block size. Non-expert weights
+    # then use "ue8m0". Expert weights (name contains ".experts.") use "ue8m0" only when the SGLang
+    # MoE runner backend arg is "deep_gemm", or is "auto" with the all-to-all backend arg "deepep" or
+    # "mooncake".
     if not (
         should_deepgemm_weight_requant_ue8m0
         and should_deepgemm_weight_requant_ue8m0(weight_block_size=weight_block_size)

@@ -1,9 +1,31 @@
+# [MODULE DOC]
+# Megatron-to-Hugging Face converter for GLM4 MoE models: maps one Megatron parameter (double
+# "module." prefix) to a list of (HF name, tensor) pairs. Like the dense GLM4 converter (fused QKV
+# split per query group) but with a split gate/up for dense MLPs, routed experts and shared
+# experts, router weight and expert bias, and multi-token-prediction (MTP) layers whose index is
+# shifted by the main layer count.
 import re
 
 import torch
 
 
 def convert_glm4moe_to_hf(args, name, param):
+    # [FUNCTION DOC]
+    # Input: args, Megatron name, tensor. Output: list of (HF name, tensor). Exact names: embedding,
+    # head, final norm. Head size is kv_channels (or hidden over heads if absent/unset); queries
+    # per group is heads over query groups. Decoder layers: routed expert weights (first linear
+    # split into two halves along axis 0 as gate then up; second linear as down; else value error);
+    # shared experts likewise; output projection to o_proj; fused QKV weight viewed as (groups,
+    # queries-per-group + 2, head size, hidden) and split along axis 1 into q, k, v weights; fused
+    # QKV bias split per group into q, k, v biases (flattened); dense MLP first linear split into
+    # gate/up halves, second linear to down; fused-QKV layer norm weight to input layernorm; MLP
+    # fused layer norm weight and the pre-MLP layernorm to post-attention layernorm; post-self-
+    # attention and post-MLP layernorms keep names; router weight to the gate weight and router
+    # expert bias to the score-correction bias; query/key layernorms to q_norm/k_norm. MTP layers
+    # (index plus args.num_layers): eh projection, enorm, hnorm direct; final layernorm to shared
+    # head norm; any other part is renamed into an ordinary decoder layer at the shifted index
+    # (dropping transformer-layer and MTP-model-layer segments) and converted recursively. Unknown
+    # names raise a value error.
     if name == "module.module.embedding.word_embeddings.weight":
         return [("model.embed_tokens.weight", param)]
     if name == "module.module.output_layer.weight":

@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Megatron-to-Hugging Face converter for Qwen3.5 / Qwen3.6 (vision-language-style naming under
+# "model.language_model."; hybrid gated-delta-net linear attention with separate in-projections
+# for qkv, z, b, a, and gated full attention; dense or MoE MLP with grouped fused experts or
+# individual experts; optional multi-token-prediction layers mapped to "mtp." names). The group-
+# major row layout of the linear attention's fused qkv projection and convolution is converted back
+# to HF's flat layout using the head counts read from the HF checkpoint config.
 import re
 
 import torch
@@ -6,6 +13,15 @@ from miles.backends.megatron_utils.megatron_to_hf.linear_attn_layout import gdn_
 
 
 def _convert_mtp_layer(args, name, param, layer_idx):
+    # [FUNCTION DOC] HELPER:
+    # Handles a Megatron name that contains the MTP layers segment; layer_idx is the layer number
+    # text. By substring in the name: enorm to "mtp.pre_fc_norm_embedding.weight", hnorm to
+    # "mtp.pre_fc_norm_hidden.weight", final layernorm to "mtp.norm.weight", eh_proj to
+    # "mtp.fc.weight" (all unindexed). Otherwise if the name contains the transformer-layer or
+    # MTP-model-layer segment: builds a proxy decoder-layer name (replacing the segment path
+    # with decoder.layers.<idx>), converts through the main converter, and rewrites each result name's
+    # "model.language_model.layers.<idx>" prefix to "mtp.layers.<idx>" (names without it are kept).
+    # Returns none when nothing matches, so the caller falls through to the regular logic.
     """Convert MTP layer parameters from Megatron to HuggingFace format."""
     if "enorm.weight" in name:
         return [("mtp.pre_fc_norm_embedding.weight", param)]
@@ -35,6 +51,28 @@ def _convert_mtp_layer(args, name, param, layer_idx):
 
 
 def convert_qwen3_5_to_hf(args, name, param):
+    # [FUNCTION DOC]
+    # MTP names (containing "mtp.layers"): extracts the layer index (the path component after
+    # "layers"; value error if it cannot be found) and tries the MTP helper; a non-none result is
+    # returned, otherwise falls through. Exact names: embedding to model.language_model.embed_tokens,
+    # output head to lm_head, final norm to model.language_model.norm. Head size from kv_channels (or
+    # hidden over heads); queries per group = heads over query groups. For decoder layers (HF prefix
+    # model.language_model.layers.<idx>): grouped-GEMM expert tensors (names ending
+    # experts.linear_fc1 / experts.linear_fc2) map to fused experts gate_up_proj / down_proj without
+    # splitting; individual experts: first linear halves to gate then up, second to down (other kinds
+    # raise value error); shared expert: first linear halves, second linear, and gate_weight to the
+    # shared expert gate (others raise value error); output projection; fused QKV weight viewed as
+    # (groups, rows, head size, hidden) and split along axis 1 into (2 * queries-per-group, 1, 1): the
+    # query part (which holds query and gate rows) is reshaped to (groups, 2, queries-per-group, head
+    # size, hidden), axes 1 and 2 swapped and flattened; key and value flattened; fused QKV bias
+    # split per group into q, k, v biases (sizes queries-per-group*head size, head size, head size);
+    # dense MLP halves and layernorm names; router weight and expert bias; QK layernorms; linear-
+    # attention in-projection for qkv and the convolution weight are converted from group-major to
+    # flat layout with HF-config head counts; the listed self-attention names (input layernorm,
+    # A_log, dt_bias, in_proj_a/b/z, norm, out_proj, and gated-attention q/k/v/o and norms) pass
+    # through with the "self_attention." prefix dropped. Unknown names raise a value error.
+    # KNOWN ISSUE: the QKV weight split treats the query part as twice as wide (query plus gate), but
+    # the fused QKV bias split uses the non-gated widths, which is inconsistent for gated attention.
     """Convert Qwen3.5 model parameters from Megatron to HuggingFace format.
 
     Qwen3.5 uses model.language_model.layers prefix and has separate

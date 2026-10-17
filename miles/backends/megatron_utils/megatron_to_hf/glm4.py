@@ -1,8 +1,27 @@
+# [MODULE DOC]
+# Megatron-to-Hugging Face converter for dense GLM4 models: maps one Megatron parameter (double
+# "module." prefix) to a list of (HF name, tensor) pairs. Covers embeddings, head, final norm, and
+# per-layer attention (fused QKV weight and bias split per query group into separate q/k/v), the
+# fused MLP first linear kept fused as one gate-up projection, and GLM4's extra norms (QK norms and
+# the post-attention and post-MLP "sandwich" norms).
 import re
 import torch
 
 
 def convert_glm4_to_hf(args, name, param):
+    # [FUNCTION DOC]
+    # Input: args (hidden size, attention heads, query groups, optional kv_channels), Megatron name,
+    # tensor. Exact names map to embed tokens, language model head and final model norm. Head size
+    # is kv_channels if set (hidden over heads if absent or unset) and queries-per-group is heads
+    # over query groups. For decoder layer names: output projection to o_proj; fused QKV weight is
+    # viewed as (groups, queries-per-group + 2, head size, hidden) and split along axis 1 into
+    # query-per-group, one key and one value slice, each reshaped to (rows, hidden), giving q, k, v
+    # weights; fused QKV bias is viewed as (groups, per-group size) and split along axis 1 into
+    # (queries-per-group * head size, head size, head size), each made contiguous and flattened;
+    # MLP first linear stays fused as the gate-up projection weight (no split), second linear to down
+    # projection; fused-QKV layer norm weight to the input layernorm; MLP fused layer norm weight to
+    # the post-attention layernorm; query/key layernorm weights to q_norm/k_norm; post-self-attention
+    # and post-MLP layernorm weights keep their names. Anything else raises a value error.
     if name == "module.module.embedding.word_embeddings.weight":
         return [("model.embed_tokens.weight", param)]
     if name == "module.module.output_layer.weight":

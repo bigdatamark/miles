@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Sends and receives an in-memory Megatron checkpoint between training cells through the torchft
+# process-group transport, so a freshly started cell can be healed from a healthy one. The sender
+# snapshots model/optimizer/scheduler state to an in-memory state dict, encodes it so that tensors
+# sharing one underlying storage are transmitted only once, and sends it; the receiver decodes it
+# and wraps it in an in-memory checkpoint manager for Megatron to load. Public functions: send and
+# receive. The torchft import is optional; its absence is reported only when a transport is built.
+# Default timeout is ten minutes (must cover the receiver's model initialization time).
 import logging
 from collections.abc import Sequence
 from datetime import timedelta
@@ -31,6 +39,13 @@ def send_ckpt(
     dst_rank: int,
     timeout: timedelta = _DEFAULT_TIMEOUT,
 ) -> None:
+    # [FUNCTION DOC]
+    # Sender side (keyword-only arguments). Steps: snapshot the training state to an in-memory
+    # state dict for the iteration; encode it into a transport payload (deduplicated storages plus
+    # view metadata); create a transport over the independent-DP process group (raises import
+    # error if torchft is missing); log a structured "start" event; send the payload to the single
+    # destination rank with step number 0 and the timeout; disallow further checkpoint serving on
+    # the transport; log an "end" event. Blocks until sent or timeout. Uses CUDA/NCCL.
     """Send in-memory checkpoint to a destination cell via torchft PGTransport.
 
     Args:
@@ -85,6 +100,12 @@ def recv_ckpt(
     src_rank: int,
     timeout: timedelta = _DEFAULT_TIMEOUT,
 ) -> InMemoryCheckpointManager:
+    # [FUNCTION DOC]
+    # Receiver side (keyword-only arguments). Creates the transport, logs a start event, receives
+    # the payload from the source rank (using the transport's own metadata and step 0), decodes it
+    # to the iteration and state dict, logs an end event, and stores them in a new in-memory
+    # checkpoint manager, which is returned. Requires the Megatron args to be set for in-memory
+    # checkpointing (the manager constructor asserts). Raises import error if torchft is missing.
     """Receive checkpoint from a healthy cell via torchft PGTransport.
 
     Returns an InMemoryCheckpointManager containing the received state_dict,
@@ -125,12 +146,21 @@ def recv_ckpt(
 
 
 class _TransportCodec:
+    # [CLASS DOC] HELPER: Namespace (static methods only) converting between a tensor-aware state
+    # dict plus iteration and a payload mapping suitable for the transport. The payload has four
+    # entries: unique storages, view metadata, the hollow state dict (tensors removed) and the
+    # iteration.
     @staticmethod
     def encode(
         *,
         state_dict: MCoreTensorAwareStateDict,
         iteration: int,
     ) -> dict[str, object]:
+        # [FUNCTION DOC] HELPER: Pops all tensors out of the state dict (mutating it into a hollow
+        # structure), converts any non-plain-tensor (e.g. parameter) objects to detached plain
+        # tensors sharing storage (the transport rejects subclasses), encodes them with the tensor
+        # view codec, and returns the payload mapping with keys for unique storages, view metas,
+        # the hollow state dict and the iteration.
         """Serialize for transport, deduping by underlying storage.
 
         `pop_tensors()` returns ShardedTensor `.data` views. Many of those views share
@@ -163,6 +193,9 @@ class _TransportCodec:
     def decode(
         payload: dict[str, object],
     ) -> tuple[int, MCoreTensorAwareStateDict]:
+        # [FUNCTION DOC] HELPER: Reads the four payload entries, rebuilds the tensor views from the
+        # received storages and metadata, inserts them back into the hollow state dict (in the same
+        # order they were popped), and returns the pair (iteration, restored state dict).
         """Reverse of `encode`: reconstruct per-tensor views from received
         unique_storages using view_metas.
         """
@@ -178,6 +211,9 @@ class _TransportCodec:
 
 
 class _TensorViewCodec:
+    # [CLASS DOC] HELPER: Namespace (static methods) for lossless storage-deduplicated tensor
+    # transfer: each distinct underlying memory block is represented once as a byte tensor and each
+    # input tensor as a record of which block it lives in plus dtype, shape, stride and offset.
     """Encode tensors as (unique_storages, view_metas) and decode back.
 
     Many input tensors may share underlying storage (e.g. Megatron
@@ -190,6 +226,12 @@ class _TensorViewCodec:
 
     @staticmethod
     def encode(tensors: list[torch.Tensor]) -> tuple[list[torch.Tensor], list[dict]]:
+        # [FUNCTION DOC] HELPER: For each tensor, identifies its storage by (device, storage start
+        # address); the first time a storage is seen, wraps the full storage as a byte tensor on
+        # the same device without copying and assigns it the next index. Appends a record with the
+        # storage index, dtype, shape tuple, stride tuple and storage offset (in elements of the
+        # tensor's dtype). Returns (list of unique storage byte tensors, list of records in input
+        # order).
         storage_id_by_key: dict[tuple[torch.device, int], int] = {}
         unique_storages: list[torch.Tensor] = []
         view_metas: list[dict] = []
@@ -213,6 +255,9 @@ class _TensorViewCodec:
 
     @staticmethod
     def decode(unique_storages: list[torch.Tensor], view_metas: list[dict]) -> list[torch.Tensor]:
+        # [FUNCTION DOC] HELPER: For each record, takes its byte-tensor storage, reinterprets the
+        # bytes as the recorded dtype, and returns a strided view with the recorded shape, stride
+        # and offset. Views share memory with the received storages. Output order matches records.
         tensors: list[torch.Tensor] = []
         for vm in view_metas:
             storage_t = unique_storages[vm["storage_id"]]  # uint8 view of received storage
@@ -229,6 +274,9 @@ class _TensorViewCodec:
 
 
 def _create_transport(indep_dp: GroupInfo, timeout: timedelta) -> PGTransport:
+    # [FUNCTION DOC] HELPER: Raises import error if torchft's transport class could not be imported.
+    # Otherwise returns a transport bound to the independent-DP process group, the timeout and the
+    # CUDA device.
     if PGTransport is None:
         raise ImportError("torchft is required for checkpoint transfer but could not be imported.")
     return PGTransport(

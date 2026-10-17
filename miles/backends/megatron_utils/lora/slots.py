@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Small slot-related helpers for multi-adapter LoRA: a factory building the Megatron-Bridge
+# multi-adapter LoRA transform from the launch args, and a function trimming rank-padded adapter
+# tensors (all slots are allocated at the maximum rank) down to a slot's actual rank for export.
 """Slot mechanics for multi-LoRA: model instrumentation, shard addressing, and
 per-slot optimizer state hygiene. Kept deliberately free of any control-plane
 or data-plane logic."""
@@ -11,6 +15,10 @@ logger = logging.getLogger(__name__)
 
 
 def create_multi_lora_instance(args: Namespace, *, target_modules):
+    # [FUNCTION DOC] Returns a Bridge multi-adapter LoRA transform for the target modules, with
+    # the number of adapters from args.multi_lora_n_adapters, rank from lora_rank, alpha from
+    # lora_alpha, dropout (default 0.0), and A/B initialization methods (defaults xavier and zero)
+    # read leniently from args. The Bridge import is local.
     from megatron.bridge.peft.multi_lora import MultiLoRA
 
     return MultiLoRA(
@@ -25,6 +33,14 @@ def create_multi_lora_instance(args: Namespace, *, target_modules):
 
 
 def slice_lora_to_rank(hf_name: str, tensor: torch.Tensor, adapter_rank: int) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Chooses the rank axis by the tensor name: names containing "lora_A" have the rank on the
+    # second-to-last axis, names containing "lora_B" on the last axis (axes counted from the end so
+    # extra leading expert axes are untouched); other names are returned unchanged. If the adapter
+    # rank is below the tensor's size on that axis, asserts the discarded padding region is
+    # entirely zero (assertion error with name, max value, shape and rank otherwise) and returns the
+    # narrowed view (not a copy) of the first adapter-rank entries; if not smaller, returns the
+    # tensor unchanged. The "lora_A" check takes precedence if both substrings occur.
     """Trim a max-rank-padded LoRA tensor to ``adapter_rank`` on the rank axis, addressed
     from the end so packed grouped-expert exports are not sliced on the expert axis."""
     if "lora_A" in hf_name:

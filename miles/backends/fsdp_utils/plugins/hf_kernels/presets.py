@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Defaults for the Hub-kernel plugin: slot name constants (gated delta rule, causal conv1d, flash
+# attention varlen), the three shipped kernel specs (all from the kernels-community Hub
+# organization, pinned by version number), the table of functions each slot must provide, and the
+# provider function returning the shipped slot mapping. A custom mapping provider replaces the
+# whole mapping but each chosen slot must still declare all required functions.
 """Default `slot -> HubKernelSpec` mapping for `--kernel-backend hub`.
 
 A slot is a role in the FSDP forward, not a repo: swap the whole mapping with
@@ -47,6 +53,11 @@ REQUIRED_SLOT_FUNCTIONS = {
 
 
 def default_module_kernels(args) -> dict[str, HubKernelSpec]:
+    # [FUNCTION DOC]
+    # Provider for the default mapping. Returns an empty mapping when either the true-on-policy
+    # flag or the deterministic flag on args is set (those modes own their numerics); otherwise
+    # returns a mapping from the three slot names to the linear-attention, causal-conv and
+    # flash-attention-2 specs.
     """The mapping miles ships. Empty under the bit-exact run modes, which own their numerics."""
     if args.true_on_policy_mode or args.deterministic_mode:
         return {}

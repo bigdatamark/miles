@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Megatron-to-Hugging Face converter for DeepSeek-V4.1, which uses the original (non-"model."
+# prefixed) checkpoint naming: embed, head, norm, layers.N.attn/ffn/hc_*/engram names, experts
+# named w1 (gate), w2 (down), w3 (up). Reuses the DeepSeek-V4 hyper-connection alpha packing
+# helper (and its module-level pending state).
 import re
 
 
@@ -5,6 +10,20 @@ from .deepseekv4 import _packed_alphas
 
 
 def convert_deepseekv4_1_to_hf(args, name, param):
+    # [FUNCTION DOC]
+    # Input: args (unused), Megatron name, tensor. Output: list of (HF name, tensor); empty list
+    # means nothing to emit (dropped or pending). Exact names: embeddings to "embed.weight", output
+    # layer to "head.weight", final norm to "norm.weight"; names starting with the decoder
+    # hyper-connection head prefix are dropped (empty list). Other names must be decoder layers
+    # (value error otherwise); with prefix "layers.<idx>": self-attention and MLP hyper-connection
+    # projection/bias/packed-alpha scale map to hc_attn_* and hc_ffn_* fn/base/scale; engram table
+    # and table scale are dropped; engram wkv linear, q weight and k weight map to engram.* names;
+    # routed experts: first linear halves along axis 0 become w1 (gate) then w3 (up), second linear
+    # becomes w2 (down), other kinds raise value error; shared experts likewise (no expert index);
+    # the remaining names go through a direct-name table (attention projections and norms,
+    # compressor, indexer, attention sink, input layernorm to attn_norm, pre-MLP layernorm to
+    # ffn_norm, router weight to ffn.gate.weight, router expert bias to ffn.gate.bias). Unknown names
+    # raise a value error.
     if name == "module.module.embedding.word_embeddings.weight":
         return [("embed.weight", param)]
     if name == "module.module.output_layer.weight":
