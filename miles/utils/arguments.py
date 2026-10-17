@@ -3520,6 +3520,40 @@ def _resolve_run_uuid(args: argparse.Namespace) -> str:
 
 
 def miles_validate_args(args):
+    # [FUNCTION DOC] Miles-level validation and derivation; mutates the parsed namespace in place
+    # and raises assertion, value or file-not-found errors naming the offending flags. Ordered
+    # stages: (1) overlay values from the custom YAML config (each key overrides the namespace
+    # attribute); check the weight transfer mode and the packed-broadcast constraints; dashboard
+    # validation; resolve fault tolerance components and eval datasets; a train fault tolerance
+    # component forces independent data parallel, delayed data split, local checksums, event
+    # analyzer, witness and local non-persistent checkpoints (atomic algorithm, default directory
+    # /tmp/miles_local_ckpt). (2) Independent data parallel requires Megatron and shrinks the world
+    # size to the per-replica size. (3) Session server, sampling support replay (top-p/top-k rules),
+    # top-k logprob validation and TITO model checks; resolution of the chat template (the
+    # deprecated "autofix" alias becomes unset; named TITO models take their registered template
+    # and kwargs and forbid an explicit path; an explicit path must exist and is copied to the
+    # sglang chat template option). (4) Reference checkpoint existence when KL is used; on-policy
+    # distillation consistency rules. (5) Checkpoint load resolution, eval interval/GPU rules, save
+    # path requirements, LoRA validation, advantage estimator and importance sampling consistency,
+    # dynamic batch size defaults and requirements. (6) Defaults: eps clip high, eval reward key,
+    # debug paths derived from dump details, event data directory under the save path, debug
+    # train-only when loading debug rollout data, CI injection pairing. (7) Critic setup for PPO
+    # (nodes/GPUs copied from the actor, load/lr/save defaults), offload shorthand expansion (the
+    # offload attribute is deleted), debug-rollout-only GPU rearrangement (disables colocation and
+    # offload, zeroes the train memory margin), mutual exclusion of debug modes, CI weight update
+    # check. (8) Weight transfer mode rules (p2p, disk-delta), colocation defaults (offload flags,
+    # prefill CUDA graph backend disabled, rollout GPUs forced to the actor GPU count), inference
+    # engine start flag, offload and disk offload/optimizer streaming validation. (9) Rollout
+    # function resolution, snapshot eval rules, global batch size from steps per rollout, group
+    # std normalization off for one sample per prompt, train entry batch/epoch rules, MTP,
+    # routing replay, external rollout flags and provider path, worker communication backend
+    # resolution, Kubernetes restrictions (Mooncake object store forced), run uuid, indexer
+    # replay, context length defaults, mutual exclusion of external engines with prefill servers
+    # or the sglang config, bshd restrictions, score centering and dumper overrides, API server
+    # port and mini controller resolution, and finally deploy component validation.
+    # KNOWN ISSUE: reference checkpoint existence is tested on the ref-load value even when it is
+    # unset, which raises a type error instead of a clear message. Debug-rollout-only without
+    # colocation takes the minimum with the rollout GPU count, which fails if that is unset.
     if args.custom_config_path:
         data = yaml.safe_load(resolve_file_arg(args.custom_config_path)) or {}
         for k, v in data.items():
@@ -4257,6 +4291,13 @@ def miles_validate_args(args):
 
 
 def validate_skip_actor_forward_only(args) -> None:
+    # [FUNCTION DOC] Asserts the skip-forward-only option is usable: Megatron backend, policy loss
+    # type, advantage computation on; none of a list of incompatible options enabled (kept old
+    # actor, reward KL, distillation, dropouts, MoE jitter and forced routing, sinkhorn balancing,
+    # rollout entropy, true-on-policy, correct-sample logging, several custom hooks, debug train
+    # data without dump details, non-rollout routing/indexer replay), reported together; exactly
+    # one step per rollout; and, unless dynamic global batch size or multi-LoRA, a global batch
+    # size equal to rollout batch size times samples per prompt.
     option = "--skip-actor-forward-only"
     assert args.train_backend == "megatron", f"{option} only supports --train-backend megatron"
     assert args.loss_type == "policy_loss", f"{option} only supports --loss-type policy_loss"
@@ -4322,6 +4363,8 @@ def validate_skip_actor_forward_only(args) -> None:
 
 
 def validate_async_off_policy_correction(args) -> None:
+    # [FUNCTION DOC] No-op unless a critic is used. Asserts at least one of rollout logprobs, TIS
+    # or kept old actor is enabled. Not called inside this module.
     """Require an explicit behavior-policy choice for async PPO training.
 
     In the async train loop the next rollout is generated before the current
@@ -4343,6 +4386,10 @@ def validate_async_off_policy_correction(args) -> None:
 
 
 def _maybe_apply_dumper_overrides(args) -> None:
+    # [FUNCTION DOC] HELPER: No-op unless the dumper is enabled. Then: disables fault tolerance
+    # (clearing components), disables router health checks, defaults the start rollout id to 0,
+    # forces the rollout count to start id plus one, and disables eval and saving (eval interval,
+    # save, save interval and retain interval set to none). Mutates args.
     if not args.dumper_enable:
         return
 
@@ -4370,6 +4417,9 @@ def _maybe_apply_dumper_overrides(args) -> None:
 
 
 def resolve_fsdp_num_layers(hf_config) -> int | None:
+    # [FUNCTION DOC] Takes the text sub-config (via its getter, else a text-config attribute, else
+    # the config itself) and returns its hidden layer count, falling back to the top-level config's
+    # count; None if neither exists.
     """Decoder-layer count for the FSDP path.
 
     ``num_layers`` comes from the Megatron parser, but backend-agnostic code reads it:
@@ -4387,7 +4437,16 @@ def resolve_fsdp_num_layers(hf_config) -> int | None:
 
 
 def hf_validate_args(args, hf_config):
+    # [FUNCTION DOC] Checks the Megatron-derived args against the HF config. Uses the text
+    # sub-config for multimodal models; copies rope theta out of the rope parameters mapping onto
+    # the config (first nested entry that has one) -- this mutates the config. Asserts all-gather
+    # context parallel for DeepSeek V4 with context parallelism. Compares hidden size, attention
+    # heads, layers, FFN sizes, tied embeddings (inverted against the untie flag), norm epsilon
+    # (attribute name depends on the DEPRECATED_MEGATRON_COMPATIBLE environment variable) and
+    # rotary base, skipping the FFN size for Qwen3.5 MoE text and DeepSeek V4 models and any
+    # attribute missing from the HF config. Raises an assertion error listing all mismatches.
     def equal(x, y):
+        # [FUNCTION DOC] HELPER: Plain equality.
         return x == y
 
     errors = []
