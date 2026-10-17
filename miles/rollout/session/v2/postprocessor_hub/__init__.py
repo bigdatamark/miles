@@ -1,3 +1,8 @@
+# [PACKAGE DOC]
+# Built-in post-processor hooks for the v2 session server's sample collection. A post-processor
+# receives the samples kept by the picker plus the session metadata and returns the final training
+# samples (never dropping any). The package re-exports the default post-processor, which resolves
+# shared-prefix loss ownership across branches and applies agent-provided metadata and reward.
 """Post-process hooks for the session samples op — this is the customization point.
 
 Point ``--session-sample-postprocessor-path`` at any ``fn(leaf_samples,

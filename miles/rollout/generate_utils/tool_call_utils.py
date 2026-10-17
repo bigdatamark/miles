@@ -1,3 +1,11 @@
+# [MODULE DOC] HELPER:
+# Utilities for agentic rollouts that call tools. Covers: building a parser for model-emitted tool
+# calls, executing parsed tool calls through a caller-supplied async executor and producing
+# tool-role chat messages, tokenizing those tool messages into the token ids that follow an
+# assistant turn (by diffing chat-template output with and without them), and appending the
+# resulting observation tokens to a sample with the loss mask, log-probs and optional sampling
+# mask / top-k log-prob bookkeeping kept aligned. Module constant: a dummy user message used when
+# building template prefixes.
 """
 Utils to handle tool calls.
 """
@@ -21,6 +29,10 @@ _DUMMY_USER = {"role": "user", "content": "dummy"}
 
 
 def create_tool_call_parser(tool_specs, tool_call_parser):
+    # [FUNCTION DOC]
+    # Build an SGLang function-call parser. The tool specs (a list of OpenAI-style tool definition
+    # mappings) are validated into SGLang tool models (validation errors propagate); the parser
+    # format name selects which model-specific tool-call syntax is parsed. Returns the parser.
     return FunctionCallParser(
         tools=TypeAdapter(list[Tool]).validate_python(tool_specs),
         tool_call_parser=tool_call_parser,
@@ -31,6 +43,11 @@ async def execute_tool_calls(
     tool_calls: list[ToolCallItem | ChatCompletionMessageToolCall],
     execute_one: Callable,
 ) -> list[dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Execute the given tool calls strictly sequentially (in order, awaiting each) with the async
+    # executor callable and return the list of tool messages in the same order. Calls may be either
+    # SGLang parsed items or OpenAI message tool calls; errors from the single-call helper
+    # (unsupported type, bad JSON, non-string result) propagate and abort the remaining calls.
     tool_messages = []
     for call in tool_calls:
         tool_messages.append(await _execute_tool_call(call, execute_one))
@@ -40,6 +57,13 @@ async def execute_tool_calls(
 async def _execute_tool_call(
     call: ToolCallItem | ChatCompletionMessageToolCall, execute_one: Callable
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Execute one tool call and build its tool-role message.
+    # For an OpenAI message tool call: name and id come from the call, arguments are a JSON string
+    # parsed into a mapping (empty mapping when the string is empty). For an SGLang parsed item:
+    # name from the item, parameters JSON string parsed likewise, and a fresh id "call_" followed
+    # by 24 random hex characters is generated. Any other type raises a type error.
+    # The executor is awaited with (name, params) and must return a string (asserted).
+    # Returns a mapping with role "tool", the tool call id, the content string and the name.
     if isinstance(call, ChatCompletionMessageToolCall):
         name = call.function.name
         params = json.loads(call.function.arguments) if call.function.arguments else {}
@@ -58,6 +82,13 @@ async def _execute_tool_call(
 
 
 def update_sample_with_tool_responses(sample: Sample, tool_messages: list[dict[str, Any]], tokenizer):
+    # [FUNCTION DOC]
+    # Append tool outputs to a sample as observation tokens, mutating it in place. Steps: tokenize
+    # the tool messages; if the sample carries a sampling mask, append singleton supports for the
+    # new tokens; pad the rollout top-k log-prob record for the new tokens; then extend the
+    # response text with the decoded tokens, increase the response length, extend the token list,
+    # extend the loss mask with zeros (observations are not trained on) and extend the rollout
+    # log-probs with 0.0 for each new token. Returns nothing.
     next_obs_tokens_ids: list[int] = tokenize_tool_responses(tool_messages, tokenizer=tokenizer)
     if sample.rollout_sampling_mask is not None:
         append_forced_sampling_tokens(sample, next_obs_tokens_ids)
@@ -74,6 +105,11 @@ def tokenize_tool_responses(
     tool_messages: list[dict[str, Any]],
     tokenizer,
 ) -> list[int]:
+    # [FUNCTION DOC]
+    # Return the token ids that the chat template emits for the given tool messages when they
+    # follow an assistant turn, including the trailing generation prompt for the next assistant
+    # turn. Thin wrapper over the postfix tokenizer; its assertion failure (template prefix
+    # mismatch) propagates.
     return _tokenize_postfix_messages(tool_messages, tokenizer)
 
 
@@ -81,6 +117,13 @@ def _tokenize_postfix_messages(
     postfix_messages: list[dict[str, Any]],
     tokenizer,
 ) -> list[int]:
+    # [FUNCTION DOC] HELPER: Tokenize messages that follow an assistant turn by differencing.
+    # Builds a conversation of a dummy user message plus a dummy assistant message that makes one
+    # empty-argument tool call per postfix message. Applies the chat template twice: to the base
+    # (user, assistant) pair without a generation prompt, and to base plus postfix messages with a
+    # generation prompt. Asserts the first token list is an exact prefix of the second (fails for
+    # thinking models or templates that rewrite earlier turns, since the token list must be
+    # append-only) and returns the remaining suffix tokens.
     dummy_assistant = _build_dummy_assistant(postfix_messages)
     base_messages = [_DUMMY_USER, dummy_assistant]
 
@@ -106,6 +149,10 @@ def _tokenize_postfix_messages(
 
 
 def _build_dummy_assistant(tool_responses: list[dict[str, Any]]) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Build an assistant message with empty content, a single-space
+    # reasoning content, and one function tool call per tool response. Each call reuses the
+    # response's tool call id (default "call0000" plus index) and name (default "dummy_func"),
+    # with an empty mapping of arguments. Pure function.
     return {
         "role": "assistant",
         "content": "",

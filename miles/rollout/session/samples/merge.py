@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Assembly of training samples from session records, run on the session server. Three stages used
+# in this order by the caller: build one sample per recorded turn (aligned with the accumulated
+# TITO token sequence), truncate to a total token budget at a turn boundary, then merge turns into
+# a single sample (an alternative merge also assembles the additional routing-replay patches).
 """Training-sample assembly: session records -> per-turn `Sample`s, truncated at turn boundaries.
 
 Owned by the session package so the assembly runs on the owning instance (records never have to leave the session server). The wire codec for the assembled reply lives in `codec`.
@@ -33,6 +38,19 @@ def compute_samples_from_openai_records(
     use_addition_r3: bool = False,
     evaluation: bool = False,
 ) -> list[Sample]:
+    # [FUNCTION DOC]
+    # Build one sample per record, in order. Inputs: launch/config args (uses debug trajectory
+    # save path and others via the per-record helper), records, tokenizer, optional accumulated
+    # token ids of the whole session, the maximum number of trailing tokens that may be trimmed
+    # from non-final turns, and flags for additional routing replay and evaluation.
+    # When accumulated ids are given: for each record the cursor is set to the prompt length, the
+    # record's output ids are greedily matched against the accumulated ids from the cursor; the
+    # unmatched tail count is the trim count, which must not exceed zero for the last turn or the
+    # max trim for others (assertion error with details); the cursor advances by the matched count.
+    # After all records the cursor must equal the accumulated length (assertion error). Each sample
+    # gets lifecycle metadata attached (turn number is one-based, using the previous record). For
+    # the last record, when debug trajectory saving is configured, the request messages plus the
+    # assistant reply are stored in the sample metadata under messages.
     """Convert per-turn session records into training Samples, aligning each
     turn's output tokens against the TITO accumulated token sequence.
 
@@ -110,6 +128,20 @@ def _compute_sample_from_openai_record(
     use_addition_r3: bool = False,
     evaluation: bool = False,
 ) -> Sample:
+    # [FUNCTION DOC] HELPER: Convert one record to a sample. Uses the first choice of the
+    # response. Raises a value error if the request lacks input ids. Output token ids and log-probs
+    # come from the choice's meta info output token log-prob pairs (log-prob first, id second).
+    # If the request asked for the sampling mask, the mask is appended and the log-probs are
+    # replaced by the sampling log-probs (mode from the request, default selected). Sets tokens as
+    # prompt plus output ids, rollout log-probs, decoded response, response length, and a loss mask
+    # of ones. For training only, when the request asked for top log-probs or support-mode
+    # sampling log-probs, appends top-k log-prob data using the configured count. Routed experts
+    # are decoded from the response (none when additional replay is used, as patches are added
+    # later); indexer top-k is decoded; weight versions record the call up to the end of tokens.
+    # If the trim count is positive, that many trailing output tokens are stripped (also from the
+    # per-token data). Status from finish reason: stop and tool calls completed, length truncated,
+    # abort aborted; any other reason leaves the default status. Speculative info is accumulated
+    # when a speculative algorithm is configured; prefix cache info is always accumulated.
     choice = record.response["choices"][0]
     finish_reason = choice.get("finish_reason")
 
@@ -174,6 +206,17 @@ def merge_samples_with_addition_r3(
     records: list[SessionRecord],
     tokenizer,
 ) -> Sample:
+    # [FUNCTION DOC]
+    # Merge per-turn samples with the shared merge function, then (unless no record carries routed
+    # experts, in which case the merged sample is returned as is) fill the merged sample's routed
+    # experts from per-record patches. Required rows is merged token count minus one. Walk records
+    # in order, stopping once at least one chunk exists and enough rows are covered. Each record
+    # must have a routed-experts payload and a start offset in its request equal to the rows
+    # covered so far; its end is prompt length plus output count minus one and must not precede
+    # the start; payload presence must match whether any rows are added. Each patch is decoded
+    # from the response for the delta rows and kept if non-empty (or when no rows are required).
+    # Any violation raises a value error with the record index; insufficient coverage also raises.
+    # The patches are concatenated and cut to the required rows.
     """Merge ordinary fields, then materialize the required append-only R3 prefix."""
     merged = merge_samples(samples, tokenizer)
     if all(record.response["choices"][0]["meta_info"].get("routed_experts") is None for record in records):
@@ -223,6 +266,13 @@ def truncate_samples_by_total_tokens(
     max_seq_len: int,
     tokenizer,
 ) -> list[Sample]:
+    # [FUNCTION DOC]
+    # Return the leading samples that fit a total token budget. Samples within budget are kept in
+    # order. At the first sample exceeding the budget: if cutting the overshoot would leave no
+    # output tokens, it and all later samples are dropped; otherwise its last output tokens are
+    # stripped (mutating that sample), its status becomes truncated, it is kept, and all later
+    # samples are dropped. Note the budget is checked per sample against that sample's own token
+    # count, not a running sum across samples. Returns a new list.
     """Truncate samples so the total token count (prompt + output, including
     env responses) does not exceed ``max_seq_len``.
     """

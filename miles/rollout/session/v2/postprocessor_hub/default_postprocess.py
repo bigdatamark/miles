@@ -1,18 +1,40 @@
+# [MODULE DOC]
+# Default post-processor for v2 session samples. Ensures a completion span shared by several
+# kept leaves is trained only once (by the earliest committed leaf), merges agent-supplied
+# metadata into each sample without overriding server-owned keys, and assigns an optional
+# trajectory reward. Module constant: the sample-metadata keys owned by the server (accumulated
+# token ids, tito session mismatch, leaf descriptor, turn args) that agent metadata may not replace.
 from miles.utils.types import Sample
 
 _SERVER_OWNED_METADATA_KEYS = ("accumulated_token_ids", "tito_session_mismatch", "leaf", "turn_args")
 
 
 def check_input_metadata(agent_metadata: dict) -> dict:
+    # [FUNCTION DOC] Return a copy of the agent metadata mapping without the server-owned keys
+    # (silently dropped, no error despite the name).
     return {key: value for key, value in agent_metadata.items() if key not in _SERVER_OWNED_METADATA_KEYS}
 
 
 def assign_reward(samples: list[Sample], trajectory_reward: float) -> None:
+    # [FUNCTION DOC] Set every sample's reward to the same trajectory reward value (mutates).
     for sample in samples:
         sample.reward = trajectory_reward
 
 
 def default_postprocess(leaf_samples: list[Sample], session_metadata: dict) -> list[Sample]:
+    # [FUNCTION DOC]
+    # Finalize the picked samples in place and return them in the given order.
+    # Inputs: the samples (each with a leaf descriptor in metadata: node id and the ordered ids of
+    # nodes on its path) and the session metadata (tree node table; optional agent mapping with an
+    # optional reward and extra metadata).
+    # Steps: 1. Index tree nodes by id. 2. Determine for each node on any kept leaf's path its
+    # owner: the kept leaf with the smallest id (earliest commit) whose path contains it.
+    # 3. For each sample and each path node it does not own, zero the loss mask over that node's
+    # completion span; spans are positions in the full token list, so they are shifted by the
+    # prompt length (tokens minus response length) and clamped to the response range; empty ranges
+    # are skipped. 4. Sample metadata becomes: existing metadata, overlaid by the agent metadata
+    # (without server-owned keys), overlaid by the sample's own server-owned keys (which win).
+    # 5. If the agent supplied a reward (not null), it is assigned to all samples.
     """Finalize the leaf samples kept by the picker.
 
     A shared completion is trainable only in the earliest committed kept leaf.

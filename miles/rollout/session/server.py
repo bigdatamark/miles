@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Standalone session-server process. Defines the server class (a web app plus one shared async
+# HTTP client that forwards requests to the inference router and returns raw results, converting
+# transport failures into a 502 result) and the subprocess entry points: run_session_server
+# (configures logging and the process title, then serves with uvicorn) and main (parses the
+# config from the command line). Module constant: request header names never forwarded upstream
+# (content length, transfer encoding, host).
 """Standalone session-server process: HTTP chassis + upstream proxy transport.
 
 - ``SessionServer`` is a FastAPI app plus one shared httpx client; ``do_proxy`` forwards a request to the inference router (sglang or miles) — which does the load balancing to worker engines — and returns the raw result, or a 502 JSON error on transport failure.
@@ -27,10 +34,21 @@ _DROP_REQUEST_HEADERS = ("content-length", "transfer-encoding", "host")
 
 
 class SessionServer:
+    # [CLASS DOC]
+    # The web application object and proxy backend of the session server. Attributes: backend url,
+    # the web app, a shared async HTTP client, and the additional-routing-replay flag. It is also
+    # the backend object handed to the session core (which calls its proxy method).
     """Lightweight FastAPI server that manages sessions and proxies inference
     requests through the inference router (sglang or miles)."""
 
     def __init__(self, config: SessionServerConfig):
+        # [FUNCTION DOC] Build the app and HTTP client and register routes. The client allows up
+        # to 1024 connections and uses the config timeout for all phases (none disables it). The
+        # client's close is registered as a shutdown hook to avoid descriptor leaks. The
+        # additional-routing-replay flag is true unless the pause generation mode is retract
+        # (retract may recompute earlier rows so full routing data is needed). Session routes are
+        # installed on the app with this object as backend (routes are skipped when no HF
+        # checkpoint is configured).
         self.backend_url = config.backend_url
         self.app = FastAPI()
 
@@ -48,6 +66,14 @@ class SessionServer:
         setup_session_routes(self.app, self, config, use_addition_r3=self.use_addition_r3)
 
     async def do_proxy(self, request: ProxyRequest, path: str, *, body: bytes, headers: dict) -> dict:
+        # [FUNCTION DOC]
+        # Forward one request to the backend (network I/O). The url is backend url, a slash and
+        # the path, plus the query string if non-empty. Request headers except content length,
+        # transfer encoding and host (case-insensitive) are forwarded, with the body as raw
+        # content. Returns a mapping with request body, response body bytes, status code and
+        # response headers. On an HTTP transport error (connect, timeout, etc.) it logs a warning
+        # and returns status 502 with a JSON error body and JSON content type header instead of
+        # raising; HTTP error statuses from the backend are returned as ordinary results.
         url = f"{self.backend_url}/{path}"
         if request.query:
             url = f"{url}?{request.query}"
@@ -75,6 +101,11 @@ class SessionServer:
 
 
 def run_session_server(config: SessionServerConfig):
+    # [FUNCTION DOC] Process entry point (blocks). Side effects: configures raw logging for the
+    # session server, lowers the http client libraries' log level to warning, sets the process
+    # title so it can be killed by name, constructs the server, logs the bind and backend
+    # addresses, and runs uvicorn on the configured host and port with info logging and access
+    # logs off.
     """Entry point to start the standalone session server as a subprocess."""
     # Spawned as a fresh interpreter, so it inherits no logging config.
     configure_logger_raw("session_server")
@@ -94,6 +125,8 @@ def run_session_server(config: SessionServerConfig):
 
 
 def main(argv: list[str] | None = None) -> None:
+    # [FUNCTION DOC] Parse the server config from the given command line arguments (the process
+    # arguments when none given) and run the server.
     run_session_server(parse_config_argv(SessionServerConfig, argv))
 
 

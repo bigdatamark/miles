@@ -1,27 +1,45 @@
+# [MODULE DOC]
+# Token-overlap F1 scoring for short text answers (SQuAD / HotpotQA style): normalizes both
+# strings and computes F1, precision and recall over word multiset overlap.
 import re
 import string
 from collections import Counter
 
 
 def normalize_answer(s):
+    # [FUNCTION DOC]
+    # Normalize an answer string: lower-case, remove all ASCII punctuation characters, remove the
+    # standalone articles a, an and the, then collapse whitespace runs to single spaces and trim.
+    # Returns the normalized string.
 
     def remove_articles(text):
+        # [FUNCTION DOC] HELPER: Replace whole-word a, an, the (case-sensitive) with a space.
         return re.sub(r"\b(a|an|the)\b", " ", text)
 
     def white_space_fix(text):
+        # [FUNCTION DOC] HELPER: Collapse any whitespace run to one space and trim the ends.
         return " ".join(text.split())
 
     def remove_punc(text):
+        # [FUNCTION DOC] HELPER: Delete every ASCII punctuation character.
         exclude = set(string.punctuation)
         return "".join(ch for ch in text if ch not in exclude)
 
     def lower(text):
+        # [FUNCTION DOC] HELPER: Lower-case the text.
         return text.lower()
 
     return white_space_fix(remove_articles(remove_punc(lower(s))))
 
 
 def f1_score(prediction, ground_truth):
+    # [FUNCTION DOC]
+    # Compute (F1, precision, recall) between a predicted and a reference answer string; returns
+    # the triple of zeros if the prediction is null, there is no word overlap, or a yes/no/noanswer
+    # special answer on either side does not exactly equal the other side after normalization.
+    # Otherwise tokens are whitespace-split normalized words; overlap is the size of the multiset
+    # intersection; precision is overlap over prediction words, recall is overlap over reference
+    # words, and F1 is their harmonic mean. Pure function.
     ZERO_METRIC = (0, 0, 0)
 
     if prediction is None:

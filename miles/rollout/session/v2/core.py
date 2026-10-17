@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# The v2 (tree-of-trajectories) session core. Subclasses the v1 core, inheriting the transport
+# shell (health, create, delete, raw proxy) and overriding the session semantics: metadata is
+# derived from the latest committed generation, get-session returns the records along its path,
+# samples are built per leaf and passed through the user-configurable picker and postprocessor
+# hooks, and chat completion attaches each request under the right tree node and commits the result.
 import json
 import logging
 import time
@@ -31,6 +37,11 @@ logger = logging.getLogger(__name__)
 
 
 class SessionCoreV2(SessionCore):
+    # [CLASS DOC]
+    # Tree-serving session core. Extra attributes beyond the base: the sample picker hook (takes
+    # the list of candidate leaf samples and the session metadata, returns a subset without
+    # duplicates) and the sample postprocessor hook (takes the picked samples and metadata,
+    # returns the final samples).
     """``SessionCore`` with tree serving: overrides the session-semantics
     methods (positioning/commit, metadata, samples op), inherits the
     transport shell (health, create/delete, raw proxy)."""
@@ -38,12 +49,21 @@ class SessionCoreV2(SessionCore):
     def __init__(
         self, backend, registry: SessionRegistryV2, config, session_server_instance_id=None, *, use_addition_r3=False
     ):
+        # [FUNCTION DOC] Initialize the base core, then load the picker and postprocessor
+        # functions from the import paths in the config through the function registry, requiring
+        # them to be resolvable synchronously (registry is process-local, so only import paths
+        # work in production). A failed load propagates.
         super().__init__(backend, registry, config, session_server_instance_id, use_addition_r3=use_addition_r3)
         # Import-path only in production: function_registry is process-local.
         self.sample_picker = load_function(config.session_sample_picker_path, sync_required=True)
         self.sample_postprocessor = load_function(config.session_sample_postprocessor_path, sync_required=True)
 
     def _session_metadata(self, session_id: str, session) -> dict:
+        # [FUNCTION DOC] HELPER: Build the metadata mapping like the base class, but based on the
+        # latest committed generation: optional tito session mismatch (a tokenization error is
+        # logged and ignored), accumulated token ids of the latest generation (empty list if
+        # none), max trim tokens, a tree description block, and the filtered turn args of the latest
+        # generation (empty mapping if none).
         """Mirrors ``core.SessionCore._session_metadata``: token ids come from
         the latest committed generation's path, plus the ``tree`` block."""
         metadata: dict = {}
@@ -62,6 +82,8 @@ class SessionCoreV2(SessionCore):
         return metadata
 
     async def get_session(self, session_id: str) -> Response:
+        # [FUNCTION DOC] Reply HTTP 200 JSON with the session id, the records of the nodes on the
+        # latest committed generation's path (empty list if none) and the metadata.
         """Mirrors ``core.SessionCore.get_session``, serving the records along the
         latest committed generation's path."""
         session = self.registry.get_session(session_id)
@@ -76,6 +98,21 @@ class SessionCoreV2(SessionCore):
     async def collect_samples(
         self, session_id: str, *, max_seq_len: int | None, agent_metadata: dict | None = None
     ) -> Response:
+        # [FUNCTION DOC]
+        # Build samples for the session and reply with the encoded payload. Wire fields: the v2
+        # computed fields, plus the sampling mask field when the session has sampling-support
+        # replay. If agent metadata is given it is stored in the metadata under agent. An empty
+        # tree replies with empty reason "no_records". Candidate samples (one per leaf) are built
+        # from the tree with the config, registry, session id, optional max sequence length and
+        # additional-replay flag; assertion/value errors become HTTP 422 plain text. No candidates
+        # replies empty reason "all_truncated". Hooks: the picker is called with candidates and
+        # metadata and must return a duplicate-free subset of the same sample objects (checked by
+        # identity; otherwise error); then the postprocessor is called with the picked samples and
+        # metadata. Any exception in the hook stage becomes HTTP 422 plain text naming both hook
+        # paths. An empty final list replies empty reason "all_truncated". If a speculative
+        # algorithm is configured, rollout metrics for the session are put in the metadata only
+        # now (after hooks, so hooks cannot alter them). Runs synchronously w.r.t. the event loop
+        # (no awaits) so it cannot interleave with chat commits.
         """Samples op: assemble one raw sample per leaf, then run the
         pick/post-process hook pipeline and encode the result.
 
@@ -135,6 +172,19 @@ class SessionCoreV2(SessionCore):
     async def chat_completions(
         self, session_id: str, *, method: str, query: str, headers: dict, body: bytes
     ) -> Response:
+        # [FUNCTION DOC]
+        # Tree version of chat completion. Raises not found if the session is missing or closing.
+        # Phase 1 (lock): parse the body; prepare the request, which also determines the tree node
+        # to attach under (the parent, or none for a new root); set the additional-replay start
+        # offset relative to the parent's token ids (empty if no parent); serialize the body.
+        # Phase 2 (no lock): proxy to the backend chat path with the routing key header set to the
+        # session id; a non-200 reply passes through unrecorded.
+        # Phase 3: validate the response, post-process the assistant message; under the lock again,
+        # if the session closed meanwhile just reply, else build a record and commit a new
+        # generation node under the parent with the request messages, assistant message, prompt and
+        # completion ids, trim limit, record, response id (empty if missing), finish reason (empty
+        # if missing) and the request as turn args. Unlike the linear core there is no concurrent
+        # state-change check. The reply is built from the stored response as in the base class.
         """Proxy a chat completion through the backend with TITO token tracking.
 
         Flow: prepare pretokenized input_ids (lock held briefly) → proxy to

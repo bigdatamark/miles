@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Evaluation rollout for the inference-based rollout function. Loads (and caches) each configured
+# eval dataset, generates n samples per prompt using per-dataset sampling settings, computes
+# rewards, and returns per-dataset rewards, truncation flags and the samples themselves. Group
+# reward models are not supported for evaluation.
 import asyncio
 import copy
 import logging
@@ -25,6 +30,11 @@ async def run_eval_datasets(
     state: GenerateState,
     prompt_dataset_cache: dict[Any, Dataset],
 ) -> dict[str, dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Evaluate all datasets listed in the launch args, concurrently. Asserts group reward is off.
+    # Each dataset is run by the single-dataset coroutine sharing the prompt dataset cache (which
+    # is mutated). Returns one merged mapping from dataset name to that dataset's result mapping
+    # (rewards, truncated flags, samples); on duplicate names the later dataset wins.
     args = state.args
     assert not args.group_rm, "Group RM is not supported for eval rollout"
 
@@ -40,6 +50,26 @@ async def eval_rollout_single_dataset(
     dataset_cfg: EvalDatasetConfig,
     prompt_dataset_cache: dict[Any, Dataset],
 ) -> dict[str, dict[str, list[Any]]]:
+    # [FUNCTION DOC]
+    # Evaluate one dataset and return a mapping with the single key of the dataset name, whose
+    # value holds three parallel lists sorted by sample index: rewards, truncated flags, samples.
+    # Steps:
+    # 1. Assert group reward is off (the same check as the caller).
+    # 2. Look up the tokenized prompt dataset in the cache by the dataset config's cache key plus
+    #    checkpoint, apply-chat-template flag and chat template path; on a miss load tokenizer and
+    #    processor and build the dataset with the eval max prompt length and the config's input,
+    #    label, metadata and tool keys (disk I/O), then store it.
+    # 3. Build base sampling params from the dataset's own temperature, top-p, top-k and max
+    #    response length.
+    # 4. For every prompt and every repeat (samples per eval prompt), deep-copy the prompt sample,
+    #    assign a running index, inject the dataset config's metadata, set the sample's generate
+    #    function path from the config, give it a random routing key if the routing policy needs
+    #    one, and with deterministic inference use a copy of the params with the seed set to the
+    #    rollout seed plus the repeat number. Start a generate-and-reward task in evaluation mode.
+    # 5. Collect results as tasks finish with a progress bar; log the first result once; flatten
+    #    list results into the output; sort by index.
+    # 6. The reward key is the eval reward key, else the general reward key; if set, the reward of
+    #    each sample is indexed by it, otherwise the reward is used directly.
     args = state.args
     assert not args.group_rm, "Group RM is not supported for eval rollout"
 

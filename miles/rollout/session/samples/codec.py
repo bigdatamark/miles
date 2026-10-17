@@ -1,3 +1,16 @@
+# [MODULE DOC]
+# Wire codec for the sample reply of the session server. A table (field name to value spec)
+# defines which sample fields cross the wire and how: as numpy tensors with a pinned dtype
+# (optionally validated strictly, never converted), as lists reconstructed from tensors, as a
+# ragged sampling mask (ids plus offsets tensors), or as JSON inside a metadata tensor. Tensors
+# are keyed "<field>.<sample index>" (masks: ids and offsets variants); the metadata tensor holds
+# compact UTF-8 JSON with per-sample JSON fields, a list of fields that were null, the session
+# metadata and an optional reason for an empty reply. The payload is serialized with safetensors.
+# Module constants: the v1 table and the v2 table (adds the reward), the sampling-mask field name
+# tuple, the allow-listed field tuples for v1 and v2 (table fields minus the sampling mask, which
+# is added only when replay is on), the set of non-JSON fields, the metadata tensor key, the
+# metadata key for OPD student top log-probs, and the two rollout top-k log-prob field names.
+# Import-time assertions check codec names are known and that all tensor fields are allow-listed.
 """Encode server-computed fields and merge them into driver input samples.
 
 Only fields in `SAMPLES_VALUE_SPEC` cross the wire. `encode_samples` packs them
@@ -21,6 +34,10 @@ from miles.utils.types import Sample, WeightVersionsPerCall
 
 @dataclasses.dataclass(frozen=True)
 class ValueSpec:
+    # [CLASS DOC] Immutable description of one field's wire encoding: codec name (tensor,
+    # tensor_list, sampling_mask or json), the pinned numpy dtype for tensor codecs, a strict flag
+    # (encode only validates the dtype and raises on mismatch instead of converting), and the value
+    # a null-marked field decodes to (copied per sample so instances are never shared).
     """Wire contract of one computed field."""
 
     codec: str  # "tensor" | "tensor_list" | "sampling_mask" | "json"
@@ -75,6 +92,9 @@ _ROLLOUT_TOPK_LOGPROBS_FIELDS = ("rollout_topk_token_ids", "rollout_topk_log_pro
 
 @dataclasses.dataclass
 class SamplesReply:
+    # [CLASS DOC] Decoded reply of the samples operation: the list of samples (copies of the input
+    # sample with server fields overlaid), the server's session metadata mapping, and the reason
+    # the sample list is empty (none when not empty-by-design).
     """Decoded `POST /sessions/{id}/samples` reply."""
 
     samples: list[Sample]
@@ -83,6 +103,9 @@ class SamplesReply:
 
 
 def _asarray_wire(field: str, value, dtype: np.dtype) -> np.ndarray:
+    # [FUNCTION DOC] HELPER: Turn a value into an array of the wire dtype. If already that dtype,
+    # return it as is; otherwise cast and verify the cast array equals the original element-wise,
+    # raising a value error naming the field if values changed (overflow, wrap, truncation).
     """Convert to the wire dtype, refusing any conversion that changes values
     (e.g. a negative loss-mask entry wrapping into uint8)."""
     arr = np.asarray(value)
@@ -101,6 +124,20 @@ def encode_samples(
     *,
     fields: tuple[str, ...] = COMPUTED_FIELDS,
 ) -> bytes:
+    # [FUNCTION DOC]
+    # Serialize samples plus session metadata into one safetensors byte payload. For each sample
+    # and each allow-listed field (looked up in the v2 table, a superset): JSON-codec fields are
+    # converted (status to its string value, weight versions to dictionaries per call, spec info
+    # and prefix cache info to dictionaries) and stored in the per-sample metadata entry. For
+    # tensor-codec fields a null value is skipped silently for the two rollout top-k log-prob
+    # fields (keeps the old wire format) and otherwise recorded in the per-sample list of nulls.
+    # A sampling mask must be the rollout sampling mask type (else a type error) and is stored as
+    # two contiguous tensors (ids, offsets). Other tensors are stored contiguously under
+    # field-dot-index keys: strict fields must already have the pinned dtype (value error
+    # otherwise), the rest are converted without loss (value error if values would change).
+    # The final metadata (samples list, session metadata, empty reason) is dumped as compact JSON
+    # (non-ASCII kept) and stored as a byte tensor under the reserved key. The empty reason is
+    # passed through (e.g. no records, all truncated).
     """Server side: pack assembled samples into one safetensors payload.
 
     ``fields`` selects the wire allowlist (v1 default; the v2 server passes
@@ -160,6 +197,21 @@ def encode_samples(
 def decode_samples_and_merge_input_sample(
     payload: bytes, input_sample: Sample, *, fields: tuple[str, ...] = COMPUTED_FIELDS
 ) -> SamplesReply:
+    # [FUNCTION DOC]
+    # Parse a payload made by the encoder and produce one sample per wire sample, each a deep copy
+    # of the input sample with the allow-listed fields overlaid. Errors: invalid container
+    # propagates the library error; a missing or malformed metadata tensor (must be rank-one
+    # unsigned 8-bit) raises key error / value error; null markers naming non-tensor fields raise
+    # a value error; wrong dtypes raise a value error; a missing promised tensor raises a key
+    # error; leftover tensors not consumed by any sample raise a value error.
+    # If any samples exist, the input sample must pass the defaults check (assertion error).
+    # Per field: JSON fields are converted back (status enum, weight-version objects, spec info,
+    # prefix cache info objects); reward is skipped when the server value is null (driver value
+    # kept); metadata must be an object and is merged into (updates) the sample's existing
+    # metadata. Null-marked tensor fields are set to a copy of the spec's null value. Rollout
+    # top-k log-prob fields absent from the payload are set to none (older producers). Sampling
+    # mask fields are rebuilt from int32 ids and int64 offsets. Other tensors are set as arrays, or
+    # as plain lists for the list codec. Fields not in the given allow-list are ignored.
     """Driver side: overlay each wire sample's computed fields onto a deepcopy of `input_sample`.
 
     ``fields`` must match the server's encode allowlist (v1 default); extra
@@ -237,6 +289,11 @@ def decode_samples_and_merge_input_sample(
 
 
 def assert_input_sample_defaults(input_sample: Sample) -> None:
+    # [FUNCTION DOC] Assertion check (raises assertion errors with explanatory text) that the
+    # driver's input sample has pristine values for the fields the server overlays: empty weight
+    # versions, default prefix cache info, default speculative info, no teacher log-probs and no
+    # OPD reverse-KL, and no OPD student top log-probs key in its metadata (null metadata is
+    # treated as empty). Prevents the overlay from silently replacing existing state.
     """Require input-sample defaults; otherwise merging server fields can corrupt existing sample state."""
     assert input_sample.weight_versions == [], (
         f"input sample must not carry weight_versions (got {input_sample.weight_versions}); "

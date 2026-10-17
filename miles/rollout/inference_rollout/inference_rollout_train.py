@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Training rollout for the inference-based rollout function: pulls prompt groups from the data
+# source, submits them for generation through a submission scheduler, applies dynamic sampling
+# filters until the target number of valid groups is reached, aborts leftover in-flight requests
+# on the inference workers, runs user post-processing hooks, optionally recomputes rollout
+# log-probs via a prefill pass, and returns the groups with collected metrics.
 import asyncio
 import logging
 from argparse import Namespace
@@ -24,6 +30,15 @@ logger = logging.getLogger(__name__)
 
 
 async def abort(state: GenerateState, pendings: set, rollout_id: int) -> list[list[Sample]]:
+    # [FUNCTION DOC]
+    # Abort all in-flight generation and drain the pending group tasks. Asserts the state was not
+    # already aborted, then sets the aborted flag (which makes waiting samples return as aborted).
+    # Fetches the worker urls from the router and posts an abort-all request to each worker
+    # concurrently; failures are logged as warnings, not raised. Then awaits the user agent abort
+    # hook. Then waits for every pending task to finish (consuming each). If partial rollout is
+    # enabled, each finished group is kept: samples with a non-empty response and no recorded
+    # start rollout id get that id set to the current rollout id in their metadata. Returns the
+    # list of kept groups (empty when partial rollout is off, the groups are discarded).
     args = state.args
 
     assert not state.aborted
@@ -61,6 +76,11 @@ async def abort(state: GenerateState, pendings: set, rollout_id: int) -> list[li
 
 
 async def get_worker_urls(args: Namespace):
+    # [FUNCTION DOC]
+    # Ask the router for its registered worker base urls over HTTP. For router package versions up
+    # to 0.2.1, or when the in-repo router is used, query the list-workers endpoint and read the
+    # urls field; otherwise query the workers endpoint and read each worker's url. The result is
+    # normalized by the router base-url helper and returned as a list.
     if parse(sglang_router.__version__) <= parse("0.2.1") or args.use_miles_router:
         response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
         urls = response["urls"]
@@ -75,6 +95,10 @@ def submit_generate_tasks(
     samples: list[list[Sample]],
     sample_done_callback: Callable[[], None] | None = None,
 ):
+    # [FUNCTION DOC]
+    # Start one asyncio task per sample group, each running the group generate-and-reward
+    # coroutine in training mode with its own copy of the state's default sampling params and the
+    # optional per-sample done callback. Returns the list of tasks in group order.
     return [
         asyncio.create_task(
             # submit a group of samples as a single task.
@@ -93,6 +117,31 @@ def submit_generate_tasks(
 async def generate_rollout_async(
     state: GenerateState, rollout_id: int, data_source: Callable[[int], list[list[Sample]]]
 ) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
+    # [FUNCTION DOC]
+    # Run one training rollout. Inputs: generation state, rollout id, and a callable that returns
+    # a requested number of sample groups. Returns a pair: the train output (kept groups sorted by
+    # the first sample's index, plus gathered metrics) and the aborted partial groups to put back
+    # into the data buffer.
+    # Steps:
+    # 1. Assert the global dataset mode; configure the dumper on the inference side; load the
+    #    dynamic sampling filter; create a metric gatherer; the target number of groups is the
+    #    rollout batch size; create a submission scheduler (default group-level).
+    # 2. Loop until enough groups are kept: while the scheduler reports capacity (given pending
+    #    groups and the remaining group budget), fetch over-sampling-batch-size groups, register
+    #    them with the scheduler and start tasks. Then wait for progress; for each finished task,
+    #    log and skip it if it raised; log the first group once; assert the group has the
+    #    configured samples-per-prompt; record it in the list of all groups; feed metrics before
+    #    filtering; apply the dynamic filter, recording drop reason and skipping dropped groups;
+    #    otherwise keep it (only while the kept count is below target) and advance the progress
+    #    bar.
+    # 3. Log the last kept sample, abort leftover requests (collecting partial groups), assert the
+    #    kept count equals the batch size, sort kept and all groups by first-sample index, and
+    #    reset the state's aborted flag.
+    # 4. Run the optional sample filter hook on the kept groups and the optional all-samples hook
+    #    on all groups, the kept groups and the data source (both may mutate in place).
+    # 5. Recompute rollout log-probs by a prefill pass against the router generate endpoint for
+    #    all kept samples (a no-op unless configured).
+    # Multi-sample entries may be nested lists; index access handles one nesting level.
     args = state.args
     assert args.rollout_global_dataset
 

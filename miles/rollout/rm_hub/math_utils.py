@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Math answer checking utilities (from the DeepScaleR project). Two graders are combined by
+# callers: a string-normalizing grader (Hendrycks MATH style) and a symbolic grader that normalizes
+# expressions and tests equality with sympy under safety limits (no tuples mismatch, no unreduced
+# fractions, strict integer matching). Also contains boxed-answer extraction helpers and a verl-
+# style combined grader. Module constants: substrings and patterns that make symbolic evaluation
+# be skipped because sympy might hang, and the bracket characters that delimit tuples/intervals.
 # from https://github.com/agentica-project/deepscaler/blob/e6080ccd974eb64bd3430f0b36108244a6fee330/deepscaler/rewards/math_utils/utils.py
 """
 Answer checker API that uses sympy to simplify expressions and check for equality.
@@ -13,6 +20,10 @@ from sympy.parsing import sympy_parser
 
 # Dan Hendrycks' code
 def mathd_normalize_answer(answer: str | None) -> str | None:
+    # [FUNCTION DOC]
+    # Hendrycks-style answer normalization. Null gives null. Trim whitespace; if the whole answer
+    # is a single text command, unwrap and trim its content; then apply the string cleaner. Any
+    # error during cleaning returns the trimmed (possibly unwrapped) answer as is.
     if answer is None:
         return None
     answer = answer.strip()
@@ -27,7 +38,20 @@ def mathd_normalize_answer(answer: str | None) -> str | None:
 
 
 def _strip_string(string):
+    # [FUNCTION DOC] HELPER: Canonicalize a LaTeX answer string (Hendrycks MATH normalization).
+    # Ordered steps: remove newlines, thin-space-negative commands and doubled backslashes;
+    # turn tfrac and dfrac into frac; remove left/right sizing commands, degree markers, dollar
+    # escapes; remove a trailing units text command (exactly one split allowed, else assertion
+    # error); remove percent escapes; add a leading zero to bare decimals (after space or brace,
+    # or at the start); return early if empty; for an equation with exactly one equals sign whose
+    # left side is at most two characters, keep the right side; add braces to bare square roots;
+    # remove spaces; normalize fractions with bare arguments to braced ones; turn the string 0.5
+    # into one half as a fraction; turn a plain integer over integer into a fraction.
     def _fix_fracs(string):
+        # [FUNCTION DOC] HELPER: Add braces to fractions given as a command followed by one or
+        # two bare characters (e.g. digits). Returns the original string if a fraction piece has
+        # fewer than two characters and is not already braced. An empty piece raises an index error
+        # (caught by the caller of the cleaner).
         substrs = string.split("\\frac")
         new_str = substrs[0]
         if len(substrs) > 1:
@@ -59,6 +83,9 @@ def _strip_string(string):
         return string
 
     def _fix_a_slash_b(string):
+        # [FUNCTION DOC] HELPER: Convert text of the exact form integer slash integer into a
+        # braced fraction command; any other input (including non-canonical integer text such as
+        # leading zeros) is returned unchanged.
         if len(string.split("/")) != 2:
             return string
         a = string.split("/")[0]
@@ -73,6 +100,9 @@ def _strip_string(string):
             return string
 
     def _remove_right_units(string):
+        # [FUNCTION DOC] HELPER: If the string contains a text command that starts with a space
+        # (used for units), keep only the part before it; asserts there is exactly one such
+        # occurrence. Otherwise unchanged.
         # "\\text{ " only ever occurs (at least in the val set) when describing units
         if "\\text{ " in string:
             splits = string.split("\\text{ ")
@@ -82,6 +112,9 @@ def _strip_string(string):
             return string
 
     def _fix_sqrt(string):
+        # [FUNCTION DOC] HELPER: Add braces around a bare single-character argument of each square
+        # root command; already braced arguments are kept. A root command at the very end of the
+        # string (empty remainder) raises an index error.
         if "\\sqrt" not in string:
             return string
         splits = string.split("\\sqrt")
@@ -166,6 +199,9 @@ TUPLE_CHARS = "()[]"
 
 
 def _sympy_parse(expr: str):
+    # [FUNCTION DOC] HELPER: Parse text as a sympy expression, first turning caret into power;
+    # standard transformations plus implicit multiplication/function application are enabled.
+    # Parse errors propagate.
     """Parses an expression with sympy."""
     py_expr = expr.replace("^", "**")
     return sympy_parser.parse_expr(
@@ -175,6 +211,10 @@ def _sympy_parse(expr: str):
 
 
 def _parse_latex(expr: str) -> str:
+    # [FUNCTION DOC] HELPER: Convert LaTeX to plain text a sympy parser can read: tfrac/dfrac to
+    # frac, a space before each frac (so mixed numbers parse), conversion by the latex-to-text
+    # library, then replace unicode root, pi, infinity, union, middle dot and multiplication sign
+    # with sqrt, pi, inf, U, and the star operator; trimmed. Library errors propagate.
     """Attempts to parse latex to an expression sympy can read."""
     expr = expr.replace("\\tfrac", "\\frac")
     expr = expr.replace("\\dfrac", "\\frac")
@@ -193,6 +233,7 @@ def _parse_latex(expr: str) -> str:
 
 
 def _is_float(num: str) -> bool:
+    # [FUNCTION DOC] HELPER: True if the text converts to a float, false on any error.
     try:
         float(num)
         return True
@@ -201,6 +242,8 @@ def _is_float(num: str) -> bool:
 
 
 def _is_int(x: float) -> bool:
+    # [FUNCTION DOC] HELPER: True if the number is within 1e-7 of its nearest integer; false on
+    # any error (e.g. infinity or nan).
     try:
         return abs(x - int(round(x))) <= 1e-7
     except Exception:
@@ -208,10 +251,16 @@ def _is_int(x: float) -> bool:
 
 
 def _is_frac(expr: str) -> bool:
+    # [FUNCTION DOC] HELPER: True if the text looks like a plain fraction: optional minus, digits,
+    # at most one arbitrary character, a slash, optional leading zeros, a nonzero-leading digit
+    # string, and at most one trailing arbitrary character. Note the dots in the pattern are
+    # wildcards, not literal periods.
     return bool(re.search(r"^-?[0-9]+.?/0*[1-9][0-9]*.?$", expr))
 
 
 def _str_is_int(x: str) -> bool:
+    # [FUNCTION DOC] HELPER: True if the text, after removing properly formatted thousands commas,
+    # converts to a float within 1e-7 of an integer; false on any error.
     try:
         x = _strip_properly_formatted_commas(x)
         x = float(x)
@@ -221,12 +270,17 @@ def _str_is_int(x: str) -> bool:
 
 
 def _str_to_int(x: str) -> int:
+    # [FUNCTION DOC] HELPER: Remove all commas, convert to float, truncate toward zero to an
+    # integer. Errors propagate.
     x = x.replace(",", "")
     x = float(x)
     return int(x)
 
 
 def _inject_implicit_mixed_number(step: str):
+    # [FUNCTION DOC] HELPER: Replace a digit, one or more spaces, digit sequence with the two
+    # digits joined by a plus sign (so a mixed number evaluates as a sum). Only the single
+    # digits adjacent to the spaces are matched, non-overlapping.
     """
     Automatically make a mixed number evalable
     e.g. 7 3/4 => 7+3/4
@@ -237,6 +291,9 @@ def _inject_implicit_mixed_number(step: str):
 
 
 def _strip_properly_formatted_commas(expr: str):
+    # [FUNCTION DOC] HELPER: Repeatedly remove commas that are thousands separators (a digit, a
+    # comma, exactly three digits, then end or a non-digit) until no change, leaving tuple commas.
+    # Returns the cleaned text.
     # We want to be careful because we don't want to strip tuple commas
     p1 = re.compile(r"(\d)(,)(\d\d\d)($|\D)")
     while True:
@@ -248,6 +305,16 @@ def _strip_properly_formatted_commas(expr: str):
 
 
 def _normalize(expr: str) -> str:
+    # [FUNCTION DOC]
+    # Normalize an answer expression for symbolic comparison; null gives null. Ordered steps:
+    # unwrap a whole-string text command; unescape percent and dollar then delete both signs;
+    # turn " or " and " and " into " , "; replace million/billion/trillion with a times-power-of-
+    # ten suffix; delete listed unit words (with optional plural endings and exponent) and degree
+    # markers; strip one pair of outer braces; delete thin-space comma escapes; convert a numeric
+    # text close to an integer into the integer text; if it contains a backslash try converting
+    # LaTeX to plain text (failures ignored); tighten spaces after minus signs; join mixed numbers
+    # with plus; remove spaces and all braces; lower-case; finally convert integer-like text
+    # (thousands commas allowed) to canonical integer text.
     """Normalize answer expressions."""
     if expr is None:
         return None
@@ -321,6 +388,8 @@ def _normalize(expr: str) -> str:
 
 
 def count_unknown_letters_in_expr(expr: str):
+    # [FUNCTION DOC] Count distinct alphabetic characters in the text after removing the words
+    # sqrt and frac (case-sensitive); used as a proxy for the number of variables.
     expr = expr.replace("sqrt", "")
     expr = expr.replace("frac", "")
     letters_in_expr = set([x for x in expr if x.isalpha()])
@@ -328,6 +397,10 @@ def count_unknown_letters_in_expr(expr: str):
 
 
 def should_allow_eval(expr: str):
+    # [FUNCTION DOC] Safety gate for symbolic evaluation. Returns false if the expression has
+    # more than two distinct letters, contains a forbidden substring (caret followed by a brace or
+    # parenthesis), or matches a forbidden pattern (chained or multi-digit exponents); true
+    # otherwise.
     # we don't want to try parsing unknown text or functions of more than two variables
     if count_unknown_letters_in_expr(expr) > 2:
         return False
@@ -344,6 +417,9 @@ def should_allow_eval(expr: str):
 
 
 def are_equal_under_sympy(ground_truth_normalized: str, given_normalized: str):
+    # [FUNCTION DOC] Return true if sympy simplifies the difference "(truth) - (given)" to zero.
+    # The expression is only parsed if it passes the safety gate. Any exception (parse errors,
+    # etc.) is swallowed and yields false. May be CPU heavy since simplification has no timeout.
     are_equal = False
     try:
         expr = f"({ground_truth_normalized})-({given_normalized})"
@@ -358,6 +434,11 @@ def are_equal_under_sympy(ground_truth_normalized: str, given_normalized: str):
 
 
 def split_tuple(expr: str):
+    # [FUNCTION DOC] Split a tuple or interval text into element strings. First remove thousands
+    # commas. Empty text gives an empty list. If the text is longer than two characters, starts
+    # and ends with bracket characters (parenthesis or square) and contains no bracket characters
+    # inside, return the comma-split inner parts, each trimmed; otherwise a single-element list
+    # with the whole text.
     """
     Split the elements in a tuple/interval, while handling well-formatted commas in large numbers
     """
@@ -377,6 +458,9 @@ def split_tuple(expr: str):
 
 
 def last_boxed_only_string(string):
+    # [FUNCTION DOC] Return the text of the last boxed (or, if none, last fbox) command, from its
+    # start through the matching closing brace found by brace counting; none if there is no such
+    # command or braces never balance.
     idx = string.rfind("\\boxed")
     if idx < 0:
         idx = string.rfind("\\fbox")
@@ -405,6 +489,9 @@ def last_boxed_only_string(string):
 
 
 def remove_boxed(s):
+    # [FUNCTION DOC] Return the content of a boxed-with-brace string (strip the opening text and
+    # final brace); returns none if the string does not start with the opening text, does not end
+    # with a brace, or is null. Note a fbox string yields none.
     left = "\\boxed{"
     try:
         assert s[: len(left)] == left
@@ -415,6 +502,8 @@ def remove_boxed(s):
 
 
 def extract_boxed_answer(solution: str) -> str:
+    # [FUNCTION DOC] Content of the last boxed command in the text, or none if there is none or
+    # it is malformed.
     """Extract the answer from inside a LaTeX \\boxed{} command"""
     solution = last_boxed_only_string(solution)
     solution = remove_boxed(solution)
@@ -422,6 +511,14 @@ def extract_boxed_answer(solution: str) -> str:
 
 
 def grade_answer_sympy(given_answer: str, ground_truth: str) -> bool:
+    # [FUNCTION DOC]
+    # Symbolic grader: true if the normalized answers are identical, or elementwise equivalent.
+    # Steps: normalize both; false if the truth is null; true if equal; false if the given answer
+    # is empty. Split both into tuple elements. If the truth has more than one element and the
+    # first or last character of the whole strings differ (bracket kinds), or the element counts
+    # differ, the answer is wrong. Otherwise each element pair must pass: two fractions must be
+    # textually equal (no simplification, so unreduced fractions fail); if exactly one side is
+    # integer-like it is wrong; else the sympy equality test applies. All pairs must pass.
     ground_truth_normalized = _normalize(ground_truth)
     given_normalized = _normalize(given_answer)
 
@@ -461,6 +558,8 @@ def grade_answer_sympy(given_answer: str, ground_truth: str) -> bool:
 
 
 def grade_answer_mathd(given_answer: str, ground_truth: str) -> bool:
+    # [FUNCTION DOC] String-based grader: true if both answers are equal after the Hendrycks
+    # normalization (two null results also compare equal).
     ground_truth_normalized_mathd = mathd_normalize_answer(ground_truth)
     given_answer_normalized_mathd = mathd_normalize_answer(given_answer)
 
@@ -471,12 +570,20 @@ def grade_answer_mathd(given_answer: str, ground_truth: str) -> bool:
 
 
 def extract_answer(passage: str) -> str:
+    # [FUNCTION DOC] Return the content of the last boxed command if the passage contains a boxed
+    # marker, else none (so the annotated string return type is not always honored; a malformed
+    # boxed command also yields none).
     if "\\boxed" in passage:
         return extract_boxed_answer(passage)
     return None
 
 
 def grade_answer_verl(solution_str, ground_truth):
+    # [FUNCTION DOC] Combined grader used by the math reward type. False for an empty/falsy
+    # truth. The truth is converted to text and, if boxed, replaced by its boxed content. The given
+    # answer is the boxed content of the solution (false if none). Correct when the string grader
+    # or the symbolic grader accepts. A boxed truth with unextractable content would pass null to
+    # the graders.
     if not ground_truth:
         return False
     ground_truth = str(ground_truth)

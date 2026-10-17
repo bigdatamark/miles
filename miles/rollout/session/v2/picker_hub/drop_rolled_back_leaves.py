@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Picker hook that removes abandoned (superseded) leaf samples from a session tree, plus a helper
+# that compares prompt tokens of two tree nodes. Uses the tree tables in the session metadata
+# (nodes with id, parent, commit time, token count and completion span; leaves with path node ids)
+# and each sample's leaf descriptor and accumulated token ids in its metadata. Ids increase in
+# commit order, so a larger id means a later commit.
 """Pick hook: trim rolled-back leaves."""
 
 import logging
@@ -10,6 +16,20 @@ logger = logging.getLogger(__name__)
 def drop_rolled_back_leaves(
     leaf_samples: list[Sample], session_metadata: dict, *, sibling_prompt_must_match: bool = False
 ) -> list[Sample]:
+    # [FUNCTION DOC]
+    # Return the leaf samples that were not superseded, sorted. Pure selection (samples are not
+    # modified); inputs may be reordered in the output.
+    # Steps: index nodes by id and group node ids by parent (roots grouped under a null parent).
+    # For each sample take its leaf descriptor (node id, parent). The "later" siblings are the
+    # children of the same parent having a larger id. When the parent is null (root level) or
+    # the must-match flag is set, keep only later siblings whose prompt tokens equal this leaf's
+    # prompt tokens (via the prompt comparison helper). No later sibling: keep the sample.
+    # Otherwise drop it, after emitting diagnostics: a warning if any later sibling has an earlier
+    # commit timestamp than this leaf (clock regression; ordering still follows ids), a warning if
+    # this leaf's token count exceeds the largest token count among leaves whose path includes a
+    # later sibling (the maximum over an empty set would raise a value error), and an info log.
+    # Result order: descending by path length (number of nodes on the leaf's path), ties broken by
+    # descending node id.
     """Drop the dead leaves that rollbacks leave behind.
 
     When a generation goes bad, the agent re-sends the message, possibly
@@ -94,6 +114,11 @@ def drop_rolled_back_leaves(
 
 
 def _same_prompt(node_id: int, sample: Sample, leaf_samples: list[Sample], nodes: dict[int, dict]) -> bool:
+    # [FUNCTION DOC] HELPER: True if the given node and the sample's leaf node have identical
+    # prompts. The prompt length of a node is the start of its completion span. Different prompt
+    # lengths give false. Otherwise find the first leaf sample whose path contains the node (none
+    # gives false) and compare the first prompt-length accumulated token ids of that sample and of
+    # the given sample.
     """Whether ``node_id``'s prompt tokens equal those of ``sample``'s leaf.
 
     Tokens come from any leaf sample whose path covers the node; a node that no

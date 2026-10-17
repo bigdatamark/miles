@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Serving policy of the v2 session server over the trajectory tree. A request is attached under
+# the deepest node whose full path is a prefix of the request (a new root if none); a truncated
+# (length-capped) node cannot be extended (conflict error). Provides: the per-session state
+# (lock, closing flag, the tree, evaluation flag, sampling defaults, replay flag), attach point
+# search with a conflict check, request preparation (resolve args against the parent's recorded
+# request, then render prompt tokens by reusing the parent's token snapshot and tokenizing only the
+# new suffix), generation commit with the prefix consistency check, and a registry subclass
+# creating v2 sessions and computing token mismatch diagnostics. Nothing is ever rejected for
+# mismatching history and nothing is deleted. Callers hold the session lock for mutations.
 """Session state over the trajectory tree: always-branch serving.
 
 This module is the serving policy on top. A request is never rejected for mismatching stored history and never
@@ -39,6 +49,9 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class SessionStateV2:
+    # [CLASS DOC] Mutable state of one v2 session: async lock and closing flag (excluded from
+    # repr and comparison), the trajectory tree, evaluation flag, sampling defaults mapping and
+    # sampling-support replay flag.
     """Per-session concurrency container plus the trajectory forest.
 
     The forest is the whole state; ``latest()`` derives the single chain that
@@ -54,6 +67,7 @@ class SessionStateV2:
     sampling_support_replay: bool = False
 
     def latest(self) -> TrajectoryNode | None:
+        # [FUNCTION DOC] The last node created (highest commit order), or none for an empty tree.
         """The most recently committed generation (always a leaf), or ``None``
         before the first commit. Its root->node path is the single-chain view."""
         return self.tree.nodes[-1] if self.tree.nodes else None
@@ -65,6 +79,11 @@ def attach_point_for_request(
     *,
     message_matcher: SessionMessageMatcher | None = None,
 ) -> AttachPoint:
+    # [FUNCTION DOC] Find where the request attaches via the tree search (with the given matcher,
+    # strict by default). If the matched node is a truncated generation, raise a truncated
+    # generation error (HTTP 409 conflict) since extending it is not allowed. If the attach node
+    # is not the latest node, emit a debug log describing the branching. Returns the attach point
+    # (node may be none for a new root). Does not mutate the tree.
     """Where *request_messages* attaches: the deepest node whose path is a
     prefix of the request, ``node=None`` for a new root. Pure; raises 409 when
     that node is a truncated generation."""
@@ -98,6 +117,12 @@ def prepare_token_ids_and_request_args(
     tito_tokenizer: TITOTokenizer,
     message_matcher: SessionMessageMatcher | None = None,
 ) -> tuple[PreparedChatRequest, TrajectoryNode | None]:
+    # [FUNCTION DOC] Resolve the attach node (the parent) from the request messages, prepare the
+    # request arguments against the parent's recorded request (none for a new root) using the
+    # session's evaluation flag, sampling defaults and replay flag, then render prompt token ids
+    # and store them in the prepared body under input ids. Returns the prepared request and the
+    # parent node (none for a new root) for the later commit. Does not mutate the tree; errors
+    # (conflict, validation) propagate.
     """Return the prepared request with `body["input_ids"]` and its parent for `commit_generation`."""
     request_messages = client_args.get("messages", [])
     parent = attach_point_for_request(state, request_messages, message_matcher=message_matcher).node
@@ -123,6 +148,13 @@ def _render_token_ids(
     template_args: dict[str, Any],
     tito_tokenizer: TITOTokenizer,
 ) -> list[int]:
+    # [FUNCTION DOC] HELPER: Return prompt token ids. No parent: tokenize all request messages
+    # with the chat template (generation prompt added). With a parent: the stored messages are the
+    # messages along the parent's path; the request's messages beyond that count are the suffix,
+    # whose roles must be allowed (message validation error otherwise); the effective new message
+    # list is the stored messages plus the suffix; the parent's token snapshot is reused as the
+    # pretokenized prefix and only the suffix is newly tokenized. Note the request's own spelling
+    # of the prefix messages is not checked here (attach search already matched them).
     """Build prompt token IDs for a request extending `parent`.
 
     Use `template_args` for newly rendered tokens.
@@ -154,6 +186,9 @@ def _validate_suffix_roles(
     suffix: list[dict[str, Any]],
     tito_tokenizer: TITOTokenizer,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Raise a message validation error for the first appended message whose
+    # role (missing role counts as none) is not among the tokenizer's allowed append roles; the
+    # message lists allowed roles sorted.
     allowed = set(tito_tokenizer.allowed_append_roles)
     for message in suffix:
         role = message.get("role")
@@ -179,6 +214,13 @@ def commit_generation(
     finish_reason: str,
     turn_args: dict[str, Any] | None = None,
 ) -> TrajectoryNode:
+    # [FUNCTION DOC] Commit a generation as a new tree node and return it (caller holds the lock).
+    # Validates that the parent's token snapshot (empty for a new root) is a prefix of prompt plus
+    # completion ids within the trim tolerance (tokenization error otherwise, nothing added).
+    # The node's delta messages are the request messages beyond the parent's path messages plus
+    # the assistant message; its tokens are prompt plus completion ids; its completion span runs
+    # from the prompt length to the total length; commit time is the record's timestamp. The tree
+    # enforces its node cap (value error when exceeded).
     """Validate and append one generation under *parent* (the request's attach
     node). Prefix validation is byte-identical to the pre-tree checkpoint check.
     ``turn_args`` is the full resolved request for this generation."""
@@ -208,6 +250,9 @@ def commit_generation(
 
 
 class SessionRegistryV2(SessionRegistry):
+    # [CLASS DOC] Session registry whose sessions are v2 states: reuses all base resources and
+    # lookup behavior, overriding session creation and mismatch computation (the base per-session
+    # mismatch method is replaced by one over the latest generation's path).
     """Session ID -> session state mapping with shared tokenizer resources.
 
     The v1 registry shell (CRUD + tokenizer resources) with the session type
@@ -225,6 +270,9 @@ class SessionRegistryV2(SessionRegistry):
         sampling_defaults: dict[str, Any] | None = None,
         sampling_support_replay: bool = False,
     ) -> str:
+        # [FUNCTION DOC] Create a v2 state with the evaluation flag, a copy of the sampling
+        # defaults (empty if none) and the replay flag, register it under a new random 32-character
+        # hex id, and return the id.
         session_id = uuid.uuid4().hex
         self.sessions[session_id] = SessionStateV2(
             evaluation=evaluation,
@@ -240,6 +288,11 @@ class SessionRegistryV2(SessionRegistry):
         *,
         turn_args: dict[str, Any],
     ) -> list[dict] | None:
+        # [FUNCTION DOC] Read-only diagnostic for one path. Returns none for empty token ids.
+        # Renders the messages through the chat template (no generation prompt, tokenized, with
+        # the renderer fields from the recorded turn args) and compares with the given tokens using
+        # the comparator; returns mismatches as dictionaries (empty list if identical). Any
+        # exception is re-raised as a tokenization error.
         """Compare accumulated token IDs against canonical chat template
         output for one path using its leaf's recorded renderer fields. Read-only."""
         if not token_ids:
@@ -259,6 +312,9 @@ class SessionRegistryV2(SessionRegistry):
             raise TokenizationError(f"failed to compute tito_session_mismatch: {e}") from e
 
     def compute_session_mismatch(self, state: SessionStateV2) -> list[dict] | None:
+        # [FUNCTION DOC] Mismatch diagnostic for the latest committed generation: none if the tree
+        # is empty, else the per-path comparison using that node's path messages, token ids and
+        # recorded request args.
         """``compute_mismatch`` over the latest committed generation's path."""
         node = state.latest()
         if node is None:

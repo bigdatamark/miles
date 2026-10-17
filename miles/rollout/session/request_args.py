@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Request-argument resolution for session-server chat requests. A client's chat request mapping is
+# deep-copied and then passed through: (1) server constraints (force log-probs and meta info on,
+# no-stop-trim off, replay outputs per launch flags, LoRA adapter pinned, reject client-supplied
+# token ids / offsets), (2) the session's sampling defaults for omitted fields (training
+# temperature must match), (3) the TITO tokenizer's model-specific rules together with the
+# previous turn's recorded arguments, and (4) for training requests, top-k log-prob and
+# sampling-support request configuration. All client-caused failures are raised as message
+# validation errors (HTTP 400). Also provides body parsing and a filter for recording arguments.
+# Module constant: the keys (token ids and messages) dropped when copying turn args for metadata.
 """Resolve chat arguments before rendering or forwarding a request.
 
 ``prepare_chat_request`` owns a copy of the client's input. Config rules apply
@@ -28,11 +38,16 @@ DEFAULT_TURN_ARGS_DROP_KEYS = ("input_ids", "messages")
 def filter_turn_args(
     turn_args: dict[str, Any], *, drop_keys: tuple[str, ...] = DEFAULT_TURN_ARGS_DROP_KEYS
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] Return a deep copy of the turn-args mapping without the dropped keys (default:
+    # input ids and messages). Keys are filtered before copying so large payloads are not copied.
     """Copy turn args for metadata, omitting payloads before copying their values."""
     return deepcopy({key: value for key, value in turn_args.items() if key not in drop_keys})
 
 
 def parse_chat_request(body: bytes) -> dict[str, Any]:
+    # [FUNCTION DOC] Decode the request bytes as JSON; an empty body gives an empty mapping.
+    # Malformed JSON raises a message validation error (HTTP 400). A valid non-object JSON value
+    # is returned as is (not checked here).
     """Decode the JSON request body, treating an empty body as an empty dict."""
     try:
         return json.loads(body) if body else {}
@@ -42,6 +57,9 @@ def parse_chat_request(body: bytes) -> dict[str, Any]:
 
 @dataclass(frozen=True)
 class ClientResponseIntent:
+    # [CLASS DOC] Immutable record of what the client asked of the reply: whether it wants a
+    # streamed reply and whether it wants log-probs included (taken from the client's own request
+    # before the server forces log-probs on for the backend).
     """What the client's own request asked the response to carry.
 
     The backend request always asks for ``logprobs`` and never streams, because
@@ -55,6 +73,9 @@ class ClientResponseIntent:
 
 @dataclass
 class PreparedChatRequest:
+    # [CLASS DOC] Result of request preparation: the resolved backend request mapping, the chat
+    # template arguments extracted from it (used to render the prompt into token ids), and the
+    # client response intent.
     """Outbound body before adding ``input_ids``, template args to render them,
     and what the client asked the response to carry."""
 
@@ -73,6 +94,19 @@ def prepare_chat_request(
     sampling_defaults: dict[str, Any] | None = None,
     sampling_support_replay: bool = False,
 ) -> PreparedChatRequest:
+    # [FUNCTION DOC]
+    # Produce the resolved backend request for one chat call. Does not mutate the client mapping
+    # or the previous turn's args. Order of precedence: server constraints from config are applied
+    # first on a deep copy; then session sampling defaults fill omitted (null) fields; then the
+    # TITO tokenizer's model rules resolve the request given the previous turn's args (its value
+    # errors become message validation errors); then the sampling log-prob mode field is removed
+    # (the rollout args own it).
+    # Evaluation: replay outputs (sampling mask, routed experts, indexer top-k) are forced off and
+    # the routed-experts start offset is removed. Training: configure the top-k log-prob request
+    # fields, and validate the sampling-support contract using the session's sampling-support
+    # replay flag and the default temperature; value errors become message validation errors; the
+    # sampling-mask flag is set true when required, else removed.
+    # Returns the prepared request with template args extracted from the final request mapping.
     """Resolve an owned request using server rules, session defaults, model rules, and prior turn args.
 
     ``turn_args`` is the continued turn's full request; ``None`` starts a root.
@@ -115,6 +149,10 @@ def prepare_chat_request(
 def apply_session_sampling_defaults(
     request_args: dict[str, Any], sampling_defaults: dict[str, Any], *, evaluation: bool = False
 ) -> None:
+    # [FUNCTION DOC] Mutates the request mapping. For each default key: if the request value is
+    # missing or null, set it to the default; else, when training (not evaluation) and the key is
+    # temperature and the request's value differs from the default, raise a message validation
+    # error. Explicit values for other keys are kept as is.
     """Fill in place the sampling fields the client left unset from the session's defaults.
 
     ``None`` counts as unset. Explicit values are kept, except a training temperature
@@ -132,6 +170,19 @@ def apply_session_sampling_defaults(
 def resolve_request_args_by_config(
     request_args: dict[str, Any], config: SessionServerConfig, *, evaluation: bool = False
 ) -> tuple[dict[str, Any], ClientResponseIntent]:
+    # [FUNCTION DOC]
+    # Enforce server constraints on the request mapping in place; returns the same mapping and the
+    # client response intent (client's log-prob wish, client's stream flag). Effects, in order:
+    # force log-probs and return-meta-info on; force no-stop-trim off; set the routed-experts and
+    # indexer-top-k return flags from the launch replay flags (always false for evaluation);
+    # LoRA: when LoRA rollout is enabled the request's adapter path is set to the fixed adapter
+    # name and a different client-supplied path is rejected, also a model name containing a colon
+    # (adapter spelling) is rejected; when disabled any adapter path is removed. Reject (message
+    # validation error) a client-supplied token id list, a routed-experts start offset (training
+    # only; evaluation silently drops it) and a log-prob start length; the first is removed after
+    # check. Remove the stream and stream options fields (backend stays non-streaming). Reject
+    # template kwargs that are not an object or that contain tools.
+    # Callers own the mapping; no copy is made.
     """Apply server constraints in place and return the same request and the client's response intent.
 
     The caller owns ``request_args``; this function does not copy it.

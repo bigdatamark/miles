@@ -1,3 +1,15 @@
+# [MODULE DOC]
+# Legacy (function-style) default rollout implementation on top of the SGLang router. It exposes
+# generate_rollout (the entry point called with args, rollout id, data source and an evaluation
+# flag) and get_model_url (router url lookup for named models). Contents: a process-wide
+# singleton generation state (tokenizer, processor, concurrency semaphore, default sampling
+# parameters, deterministic seeds, data-parallel rank balancing, pending tasks, abort flag); the
+# default single-sample token-in token-out generate function (multimodal, LoRA, OPD top-k, replay
+# options, partial rollout resume); per-sample and per-group generate-and-reward coroutines; abort
+# of in-flight requests; the training rollout loop with dynamic sampling filters, optional filter
+# hooks, and log-prob recomputation; and the evaluation rollout over configured datasets.
+# The newer class-based implementation lives in the inference rollout package. Module global:
+# a cache of tokenized eval prompt datasets keyed by dataset config and tokenizer settings.
 import asyncio
 import copy
 import logging
@@ -55,6 +67,9 @@ logger = logging.getLogger(__name__)
 
 
 def get_model_url(args: Namespace, model_name: str, endpoint: str = "/generate") -> str:
+    # [FUNCTION DOC] Build "http://ip:port" plus the endpoint for the model's own router if the
+    # launch arg mapping from model name to (ip, port) is non-empty and contains the name;
+    # otherwise use the default router ip and port. Pure.
     """Return the router URL for a named model.
 
     Use this in custom rollout functions to route requests to a specific
@@ -74,11 +89,25 @@ def get_model_url(args: Namespace, model_name: str, endpoint: str = "/generate")
 
 
 class GenerateState(metaclass=SingletonMeta):
+    # [CLASS DOC]
+    # Process-wide singleton (constructing it again returns the first instance, ignoring new
+    # args). Holds: launch args, tokenizer, processor, a semaphore bounding concurrent generations,
+    # default sampling parameters, optional per-sample-in-group sampling seeds (only with
+    # deterministic inference), data-parallel rank usage counts and the last chosen rank, the
+    # count of submitted-but-unfiltered groups, the set of pending group tasks, and the aborted
+    # flag.
     """
     The global state for the generation process.
     """
 
     def __init__(self, args: Namespace) -> None:
+        # [FUNCTION DOC] Load tokenizer and processor from the HF checkpoint (trusting remote code,
+        # using the chat template path); semaphore size is per-server concurrency times the number
+        # of engines (rollout GPUs divided by GPUs per engine, integer division); default sampling
+        # parameters come from the rollout launch args (no-stop-trim true, spaces between special
+        # tokens false); with deterministic inference, group seeds are the rollout seed plus each
+        # index in the group (one per sample per prompt); data-parallel counts start at zero for the
+        # configured number of data-parallel ranks (at least one); then reset.
         # persistent state for the generation process
         self.args = args
         self.tokenizer = load_tokenizer(
@@ -113,6 +142,10 @@ class GenerateState(metaclass=SingletonMeta):
 
     @contextmanager
     def dp_rank_context(self):
+        # [FUNCTION DOC] Context manager yielding a data-parallel rank with the fewest in-flight
+        # generations: picks randomly (numpy) among ranks tied at the minimum count, increments its
+        # count and records it as the current rank, and on exit decrements the count (asserting it
+        # stays non-negative), even on error. The yielded rank is not otherwise used by callers.
         candidates = [i for i, count in enumerate(self.dp_counts) if count == min(self.dp_counts)]
         dp_rank = int(np.random.choice(candidates))
         self.dp_counts[dp_rank] += 1
@@ -124,11 +157,16 @@ class GenerateState(metaclass=SingletonMeta):
             assert self.dp_counts[dp_rank] >= 0
 
     def reset(self) -> None:
+        # [FUNCTION DOC] Clear per-rollout state: remaining batch size to zero, no pending tasks,
+        # not aborted.
         self.remaining_batch_size = 0
         self.pendings = set()
         self.aborted = False
 
     def submit_generate_tasks(self, samples: list[list[Sample]]) -> None:
+        # [FUNCTION DOC] Start one asyncio task per group running the group generate-and-reward
+        # coroutine in training mode with a copy of the default sampling parameters; add the tasks
+        # to the pending set and add the number of groups to the remaining batch size.
         for group in samples:
             self.pendings.add(
                 asyncio.create_task(
@@ -151,6 +189,38 @@ async def generate(
     *,
     evaluation: bool = False,
 ) -> Sample:
+    # [FUNCTION DOC]
+    # Default generate function: one request to the router generate endpoint, appending the
+    # result to the sample (mutated in place and returned). The sampling params mapping is also
+    # mutated (max new tokens reduced when resuming).
+    # Preconditions: in CI test mode the prompt must be a string; sample status must be pending or
+    # aborted (assertion errors otherwise).
+    # Prompt ids: if a processor exists and the prompt is a message list or the sample has any
+    # non-null multimodal inputs, run the processor and take the first row of input ids, storing
+    # the multimodal training inputs on the sample; else encode the text prompt without special
+    # tokens. For a resumed (partial) sample the token budget is reduced by the tokens already
+    # generated (tokens beyond the prompt); a negative budget fails an assertion; a zero budget
+    # marks the sample truncated and returns without a request.
+    # Payload: sampling params; log-prob return on; the sampling-support flag when required; for
+    # on-policy distillation with a positive top-k and a strategy other than only-teacher, request
+    # that many top log-probs; for training, the rollout top-k log-prob request fields; the LoRA
+    # adapter name when LoRA rollout is on; routing replay and indexer replay flags; images (each
+    # encoded for the engine) and audio (base64 data urls) if the sample has them; input ids are
+    # the sample's existing tokens when it already has a response, else the prompt ids (also
+    # initializing the sample's tokens when empty). Routing headers are computed from the sample.
+    # After the post: OPD student top log-probs from the response are appended to the sample
+    # metadata list; output tokens and log-probs are read from the output token log-prob pairs (or
+    # empty); with the sampling mask, the mask is appended and log-probs are replaced by sampling
+    # log-probs. The sample gets extended tokens, response length and response text; for training,
+    # top-k log-prob data is appended; if the sample already has a loss mask (partial rollout with
+    # off-policy masking, asserted) ones are appended for new tokens; rollout log-probs are
+    # extended. Routed experts, when returned (base64 int32), are decoded to an array reshaped as
+    # tokens by layers by top-k, where token count is prompt tokens plus new tokens minus one;
+    # an extra trailing token row from the engine's stop edge is dropped; sizes are asserted and a
+    # payload of all zeros is rejected as a capture failure. Indexer top-k is decoded if present.
+    # Finally the sample's status, weight versions etc. are updated from the response meta info.
+    # KNOWN ISSUE: the routed-experts size assertion message uses the sample's token count after
+    # extension, labeled "unexpanded"; harmless but misleading.
     """Generate using traditional SGLang router with token-based workflow"""
     if args.ci_test:
         assert isinstance(sample.prompt, str)
@@ -305,6 +375,24 @@ async def generate_and_rm(
     sampling_params: dict[str, Any],
     evaluation: bool = False,
 ) -> Sample | list[Sample]:
+    # [FUNCTION DOC]
+    # Generate one sample and compute its reward; returns the sample, or a list of samples when a
+    # custom generate function returns several. The input is really a single sample despite the
+    # annotation.
+    # Steps: for partial rollout with off-policy masking, zero the loss mask of existing response
+    # tokens. A completed or truncated sample is returned after asserting it has a response (and a
+    # reward unless group reward is on). Training mode reports attempt start to the lifecycle
+    # sink. Under the singleton state's semaphore: if aborted, mark aborted, report attempt end
+    # and return. Report generation start; inside a data-parallel rank context, pick the generate
+    # function path from the sample (per-sample override) else the launch arg; a loaded custom
+    # function is called with state, sample, sampling params (not copied) and the evaluation flag,
+    # and its output samples are used; else the default generate function runs. Report attempt end
+    # after generation. With group reward, return now. List result: return early if any is aborted;
+    # else batch-compute rewards for those without one and assign them positionally (a length
+    # mismatch is silently truncated). Single result: return if aborted; else compute the reward
+    # if unset.
+    # KNOWN ISSUE: attempt end is not reported if generation raises (the inference version uses a
+    # finally block); the aborted-early path reports attempt end but then skips the final report.
     # mask previous off-policy generation for partial rollout
     if args.partial_rollout and args.mask_offpolicy_in_partial_rollout and sample.response_length > 0:
         sample.loss_mask = [0] * sample.response_length
@@ -379,6 +467,14 @@ async def generate_and_rm(
 async def generate_and_rm_group(
     args: Namespace, group: list[Sample], sampling_params: dict[str, Any], evaluation: bool = False
 ) -> list[Sample]:
+    # [FUNCTION DOC]
+    # Generate all samples of a prompt group concurrently and return the gathered group (list in
+    # input order). Returns the group unchanged if the state is aborted. With routing-key policies,
+    # assigns a random UUID string routing key to samples lacking one. Each sample runs the
+    # generate-and-reward coroutine with its own copy of sampling params; with deterministic
+    # inference the sampling seed is the state's group seed at the sample's index. After gathering
+    # (no cancellation of siblings if one fails, unlike the inference version), if not aborted
+    # and group reward is on, rewards are computed for the whole group and assigned positionally.
     state = GenerateState(args)
 
     if state.aborted:
@@ -412,6 +508,16 @@ async def generate_and_rm_group(
 
 
 async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
+    # [FUNCTION DOC]
+    # Abort in-flight generation (network I/O) and drain pending tasks. Asserts the state was not
+    # already aborted, sets the aborted flag, lists worker urls from the router (list-workers
+    # endpoint for old router versions or the in-repo router, else the workers endpoint),
+    # posts an abort-all request to every worker concurrently (failures logged as warnings), and
+    # awaits the user agent abort hook. Then repeatedly waits for pending tasks until none remain.
+    # With partial rollout on, each finished group is collected after tagging samples that have a
+    # response and no start rollout id with the current rollout id in their metadata; otherwise
+    # the groups are discarded. Returns the collected groups (empty when partial rollout is off).
+    # A task that raised would propagate its error when its result is read (partial rollout only).
     aborted_samples = []
 
     state = GenerateState(args)
@@ -463,6 +569,24 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
 async def generate_rollout_async(
     args: Namespace, rollout_id: int, data_source: Callable[[int], list[list[Sample]]]
 ) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
+    # [FUNCTION DOC]
+    # Training rollout. Returns (train output with kept groups and metrics, aborted partial
+    # groups). Asserts the global dataset mode. Steps: configure the dumper on the engines; load
+    # the optional dynamic sampling filter; create a metric gatherer; target group count is the
+    # rollout batch size. Loop until enough groups are kept: while submitted-but-unresolved groups
+    # are fewer than the target, fetch over-sampling-batch-size groups from the data source and
+    # submit them; wait for at least one task to finish; for each finished task (errors
+    # propagate, unlike the inference version) log the first group once, assert its size equals
+    # samples-per-prompt, record it in all groups, feed metrics, apply the dynamic filter (a
+    # dropped group decrements the remaining count so that a replacement is fetched and is reported
+    # to the metrics), and keep it while fewer than target are kept.
+    # Then log the last sample, abort leftover requests, assert the kept count, sort kept and all
+    # groups by the first sample's index, reset the state, run the optional sample filter and
+    # all-samples hooks (they may mutate in place; the latter also gets the data source), then
+    # recompute rollout log-probs through a prefill pass at the default model url for all kept
+    # samples (a no-op unless configured).
+    # KNOWN ISSUE: kept groups never decrement the remaining count, so extra groups finishing
+    # after the target is reached are only dropped silently by the length check.
     """An example to implement the generate_rollout function for an rule based rm rollout generation.
 
     Args:
@@ -574,6 +698,11 @@ EVAL_PROMPT_DATASET = {}
 
 
 async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict[str, list[Any]]], list[list[Sample]]]:
+    # [FUNCTION DOC] Evaluate all datasets from the launch args (none if absent or empty)
+    # concurrently and merge their result mappings (later wins on duplicate names). Asserts group
+    # reward is off. Returns a pair: the eval output object holding the merged mapping from
+    # dataset name to its rewards, truncated flags and samples, and an empty list (no aborted
+    # samples). The rollout id is unused.
     assert not args.group_rm, "Group RM is not supported for eval rollout"
 
     coros = []
@@ -589,6 +718,20 @@ async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict
 async def eval_rollout_single_dataset(
     args: Namespace, rollout_id: int, dataset_cfg: EvalDatasetConfig
 ) -> dict[str, dict[str, list[Any]]]:
+    # [FUNCTION DOC]
+    # Evaluate one dataset; returns a mapping with the dataset name as sole key and a mapping of
+    # parallel lists (rewards, truncated flags, samples) sorted by sample index. Asserts group
+    # reward is off. The tokenized prompt dataset is looked up in the module-level cache by the
+    # dataset's cache key plus checkpoint, chat-template flag and template path, and built on a
+    # miss (loads tokenizer and processor; disk I/O). Sampling params come from the dataset's own
+    # temperature, top-p, top-k and max response length, plus the stop settings from launch args.
+    # Every prompt is repeated n times (deep copies with a running index, injected dataset
+    # metadata, the dataset's custom generate function path if any, a random routing key for
+    # routing-key policies, and with deterministic inference a seed of rollout seed plus repeat
+    # number); each runs in evaluation mode as its own task. Results are collected as tasks
+    # complete with a progress bar, logging the first one, flattening list results. The reward
+    # key is the eval reward key else the general one; if set, each reward is indexed by it.
+    # The rollout id is unused.
     """An example to implement the eval_rollout function for an rule based rm rollout generation.
 
     Args:
@@ -696,6 +839,12 @@ async def eval_rollout_single_dataset(
 def generate_rollout(
     args: Namespace, rollout_id: int, data_source: Any, evaluation: bool = False
 ) -> RolloutFnTrainOutput | RolloutFnEvalOutput:
+    # [FUNCTION DOC]
+    # Synchronous public entry point. Asserts the global dataset mode. Evaluation: run the eval
+    # coroutine to completion on the shared async runner and return its output object (the empty
+    # aborted list is discarded). Training: run the async training rollout with the data source's
+    # sample getter, give the aborted partial groups back to the data source, and return the train
+    # output. The third parameter is the data source (the docstring calls it a data buffer).
     """An example to implement the generate_rollout function for an rule based rm rollout generation.
 
     Args:

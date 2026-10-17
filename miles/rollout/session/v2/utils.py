@@ -1,3 +1,7 @@
+# [MODULE DOC] HELPER:
+# Helpers for the v2 session core: a description of the tree structure for session metadata and
+# the construction of one raw merged sample per tree leaf (the "leaf material" that the picker
+# and postprocessor hooks then process).
 import logging
 from argparse import Namespace
 from typing import Any
@@ -17,6 +21,12 @@ logger = logging.getLogger(__name__)
 
 
 def tree_metadata(state: SessionStateV2) -> dict:
+    # [FUNCTION DOC]
+    # Return a mapping with two lists describing the tree. Nodes (in commit order): id and seq
+    # (both the sequence number), parent id (none for roots), truncated flag, wall-clock commit
+    # time, completion span as a two-element list, token count of the node's snapshot, response id,
+    # and the filtered turn args (token ids and messages dropped). Leaves (creation order): the
+    # leaf's node id and the list of node ids on its root-to-leaf path. Read-only.
     """The structural layer: node and leaf tables, index-aligned with commits.
 
     ``response_id`` is the branch<->leaf join key — the agent saw the same id
@@ -51,6 +61,17 @@ def build_leaf_material(
     max_seq_len: int | None,
     use_addition_r3: bool = False,
 ) -> list[Sample]:
+    # [FUNCTION DOC]
+    # Produce one merged sample for each leaf of the tree, in leaf creation order. Per leaf: take
+    # the records of the nodes on its path; compute per-turn samples aligned to the leaf's token
+    # snapshot and the tokenizer trim limit (with the replay and evaluation flags); apply the
+    # optional total token limit; skip the leaf if no turns remain; merge turns into one sample
+    # (with the additional-replay merge when enabled). Then attach metadata to the sample: the
+    # leaf's accumulated token ids (copy), the filtered turn args, a leaf descriptor (node id,
+    # parent id or none, path node ids, response id) and, when computable and not none, the token
+    # session mismatch for the leaf's path (tokenization errors are logged and ignored). The
+    # sample's existing metadata (null counts as empty) is kept and the new keys override it.
+    # Assertion and value errors from assembly propagate to the caller.
     """Merge each leaf's root-to-leaf node records into one raw sample, in commit order.
 
     Leaves whose turns all truncate away are dropped. Each sample's metadata

@@ -1,3 +1,10 @@
+# [PACKAGE DOC]
+# Built-in picker hooks for the v2 session server's sample collection. A picker receives the
+# list of per-leaf raw samples and the session metadata and returns a subset (selection only,
+# order may change, samples must not be rewritten). The package re-exports two pickers: one that
+# drops leaves superseded by a later sibling branch (rollbacks) and one that does so only when
+# the sibling re-sent the same prompt tokens (retries; the default). Selected by an import path in
+# the launch options.
 """Pick hooks for the session samples op — this is the customization point.
 
 Point ``--session-sample-picker-path`` at any ``fn(leaf_samples,

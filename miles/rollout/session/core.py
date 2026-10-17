@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# HTTP-framework-independent logic of the session server (the adapters in the sessions and server
+# modules call into it). Contains the session core class (health, create, get, collect samples,
+# delete, chat completions with token-in token-out tracking, generic proxy) and shared response
+# helpers also used by the v2 core: JSON rendering, fake-stream chunk synthesis, client response
+# shaping, proxy result conversion, validation of backend chat responses and a common-prefix
+# helper. Module constants: the JSON media type string and the tuple of upstream response header
+# names removed before replying (length/framing headers plus server and date, because the local
+# ASGI server emits its own and duplicates break some clients' parsers).
 """Logic layer of the session server: ``SessionCore``.
 
 HTTP-agnostic: the FastAPI adapter (``sessions.py`` + ``server.py``) turns each request into primitives and calls these methods. Owns one ``SessionRegistry`` (per-session TITO/trajectory state) and one proxy ``backend``.
@@ -47,6 +56,8 @@ _DROP_RESPONSE_HEADERS = ("content-length", "transfer-encoding", "content-encodi
 
 @dataclass
 class ProxyRequest:
+    # [CLASS DOC] HELPER: Minimal request carrier handed to the backend proxy: HTTP method and the
+    # raw query string (default empty).
     """Primitive carrier for the proxy backend (replaces fastapi.Request)."""
 
     method: str
@@ -54,11 +65,15 @@ class ProxyRequest:
 
 
 def _render_json(payload) -> bytes:
+    # [FUNCTION DOC] HELPER: Serialize to UTF-8 JSON bytes, compact separators, non-ASCII kept,
+    # and not-a-number / infinity values rejected (raises a value error).
     """Encode like Starlette's JSONResponse (compact, non-ASCII preserved)."""
     return json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
 
 
 def _lcp_len(a: list[int], b: list[int]) -> int:
+    # [FUNCTION DOC] HELPER: Number of leading positions where the two lists agree (zero if the
+    # first elements differ; the shorter length if one is a prefix of the other).
     """Length of the longest common prefix of two token-ID lists."""
     n = min(len(a), len(b))
     for i in range(n):
@@ -68,11 +83,19 @@ def _lcp_len(a: list[int], b: list[int]) -> int:
 
 
 def _samples_response(payload: bytes) -> Response:
+    # [FUNCTION DOC] HELPER: Wrap a binary payload as an HTTP 200 response with the generic binary
+    # media type.
     """The samples-op reply: one safetensors binary payload."""
     return Response(content=payload, status_code=200, media_type="application/octet-stream")
 
 
 def _response_to_stream_chunk(response: dict) -> dict:
+    # [FUNCTION DOC] HELPER: Convert a complete chat completion mapping into one streaming chunk
+    # mapping. Uses the first choice (an empty one if none) and its message. The delta carries the
+    # role (default assistant) and content, the reasoning content only if not null, and all tool
+    # calls with a zero-based index added to each. The chunk copies id, created and model, has
+    # object type chat completion chunk, one choice at index 0 with the delta and the original
+    # finish reason, and includes usage only when present. Meta info is never included.
     """Synthesize the single ``chat.completion.chunk`` for a fake stream.
 
     Adapted from NVIDIA-NeMo/ProRL-Agent-Server (``gateway/server.py::_response_to_stream_chunk``)
@@ -103,6 +126,9 @@ def _response_to_stream_chunk(response: dict) -> dict:
 
 
 def _client_response_body(response: dict, response_intent: ClientResponseIntent) -> dict:
+    # [FUNCTION DOC] HELPER: Return a shallow-copied response mapping whose choices lack the meta
+    # info field, and also lack the log-probs field unless the client's intent asked for log-probs.
+    # The input mapping is not modified.
     """The non-streaming reply without ``meta_info``, and without ``logprobs`` unless the client asked.
 
     The session server asks for logprobs on every turn for TITO, and top-k logprobs for training make
@@ -116,6 +142,11 @@ def _client_response_body(response: dict, response_intent: ClientResponseIntent)
 
 
 def _chat_client_response(result: dict, response: dict, response_intent: ClientResponseIntent) -> Response:
+    # [FUNCTION DOC] HELPER: Build the HTTP reply for a chat completion. Streaming intent: body is
+    # one server-sent-event data line with the synthesized chunk, then a done marker line; fresh
+    # headers (no cache, proxy buffering off), event-stream media type, status copied from the
+    # backend result. Otherwise: the shaped JSON body (meta info and, if not requested, log-probs
+    # removed) with the backend's headers minus the dropped framing headers, JSON media type.
     if response_intent.stream:
         sse = b"data: " + _render_json(_response_to_stream_chunk(response)) + b"\n\ndata: [DONE]\n\n"
         # Fresh headers: upstream's headers describe its JSON body, not this SSE body.
@@ -136,6 +167,10 @@ def _chat_client_response(result: dict, response: dict, response_intent: ClientR
 
 
 def proxy_result_to_response(result: dict) -> Response:
+    # [FUNCTION DOC] Turn a backend proxy result mapping (status code, headers, raw body) into an
+    # HTTP response. Upstream headers minus the dropped ones are forwarded. If the body parses as
+    # JSON it is re-rendered compactly with the JSON media type; otherwise the original bytes are
+    # passed through unchanged with the upstream content type (empty string if absent).
     """Build the client response from a proxy result.
 
     Mirrors the previous ``SessionServer.build_proxy_response``: re-emit JSON
@@ -156,6 +191,14 @@ def proxy_result_to_response(result: dict) -> Response:
 
 
 def extract_completion(result: dict) -> tuple:
+    # [FUNCTION DOC]
+    # Decode the JSON body of a successful backend result and validate it; returns the 4-tuple
+    # (whole response, first choice, its assistant message, list of completion token ids taken as
+    # the second element of each output token log-prob pair). Raises: an upstream aborted error if
+    # the finish reason is abort; an upstream response error if the choice meta info is missing,
+    # not a mapping, or lacks output token log-probs; if the assistant message content is null
+    # (the backend should return an empty string); if the log-prob count differs from the reported
+    # completion token count. A JSON decode error from the body propagates.
     """Decode and validate the backend chat response — shared verbatim by the
     v1 and v2 cores. Returns ``(response, choice, assistant_message,
     completion_token_ids)``; malformed upstream payloads raise
@@ -193,6 +236,12 @@ def extract_completion(result: dict) -> tuple:
 
 
 class SessionCore:
+    # [CLASS DOC]
+    # Logic for all session operations over one registry of sessions and one proxy backend.
+    # Holds the backend, registry, server config, optional server instance id, and the
+    # additional-routing-replay capability flag (derived from the pause generation mode at
+    # startup; session code depends on this flag, not on the weight update mode). Methods return
+    # HTTP response objects and raise typed session errors for the HTTP layer to translate.
     """HTTP session operations over one ``SessionRegistry``."""
 
     def __init__(
@@ -215,6 +264,11 @@ class SessionCore:
     def _maybe_request_addition_r3(
         self, request_body: dict, checkpoint_token_ids: list[int], prompt_token_ids: list[int]
     ) -> None:
+        # [FUNCTION DOC] HELPER: When additional routing replay is enabled and the request asks for
+        # routed experts, set the request's routed-experts start offset (mutating the request
+        # mapping) to the number of rows already stored, which is checkpoint token count minus
+        # one, floored at zero. Asserts the longest common prefix of checkpoint and prompt tokens
+        # is at least that many (assertion error otherwise). Does nothing otherwise.
         """Ask SGLang to return only the R3 rows the session has not retained.
 
         ``checkpoint_token_ids`` is the stored snapshot this request builds on
@@ -232,12 +286,18 @@ class SessionCore:
         request_body["routed_experts_start_len"] = previous_rows
 
     async def health(self) -> Response:
+        # [FUNCTION DOC] Health check: HTTP 200 JSON with status ok, plus the server instance id
+        # when one is configured.
         body = {"status": "ok"}
         if self.instance_id is not None:
             body["session_server_instance_id"] = self.instance_id
         return Response(content=_render_json(body), status_code=200, media_type=JSON_MEDIA_TYPE)
 
     async def create_session(self, *, evaluation: bool = False, sampling_defaults: dict | None = None) -> Response:
+        # [FUNCTION DOC] Register a new session in the registry with the evaluation flag, the
+        # sampling defaults for omitted request fields, and sampling-support replay enabled only
+        # for training sessions when the config enables it. Replies HTTP 200 JSON with the new
+        # session id.
         session_id = self.registry.create_session(
             evaluation=evaluation,
             sampling_defaults=sampling_defaults,
@@ -246,6 +306,11 @@ class SessionCore:
         return Response(content=_render_json({"session_id": session_id}), status_code=200, media_type=JSON_MEDIA_TYPE)
 
     def _session_metadata(self, session_id: str, session) -> dict:
+        # [FUNCTION DOC] HELPER: Build the metadata mapping for inspection and sample assembly:
+        # the TITO session mismatch report (included only if not none; a tokenization error while
+        # computing it is logged and treated as none), the session's accumulated token ids, the
+        # tokenizer's max trim token count, and the filtered turn args (token ids and messages
+        # dropped).
         """The per-session assembly/inspection metadata dict, shared by
         `get_session` (records debug dump) and `collect_samples` (samples op)
         so the two can never drift."""
@@ -263,6 +328,8 @@ class SessionCore:
         return metadata
 
     async def get_session(self, session_id: str) -> Response:
+        # [FUNCTION DOC] Return HTTP 200 JSON with the session id, all recorded turns and the
+        # session metadata. Takes no lock. Unknown session ids raise from the registry.
         session = self.registry.get_session(session_id)
         metadata = self._session_metadata(session_id, session)
         payload = GetSessionResponse(session_id=session_id, records=session.records, metadata=metadata)
@@ -271,6 +338,16 @@ class SessionCore:
         )
 
     async def collect_samples(self, session_id: str, *, max_seq_len: int | None) -> Response:
+        # [FUNCTION DOC]
+        # Build the training samples of a session and reply with the encoded binary payload.
+        # Wire fields: the default computed fields, plus the sampling mask field when the session
+        # has sampling-support replay. No records: reply with an empty sample list and empty
+        # reason "no_records". Otherwise compute per-turn samples from the records (aligned to the
+        # session's accumulated tokens and trim limit; additional replay and evaluation flags
+        # passed), truncate by the optional total token limit (an empty result replies with empty
+        # reason "all_truncated"), then merge into exactly one sample (with the additional-replay
+        # merge when enabled). Assertion errors and value errors during assembly are returned as
+        # HTTP 422 plain text; other errors propagate.
         """Assemble training Samples from this session's records.
 
         Validation failures return 422; unexpected errors propagate.
@@ -306,6 +383,10 @@ class SessionCore:
         return _samples_response(encode_samples(samples, metadata, fields=fields))
 
     async def delete_session(self, session_id: str) -> Response:
+        # [FUNCTION DOC] Delete a session: raises a not-found error if the session is already
+        # closing (so a second delete fails), marks it closing, waits for the session lock so any
+        # in-flight chat completes, removes it from the registry, releases the lock, and replies
+        # HTTP 204 with no body.
         session = self.registry.get_session(session_id)
         if session.closing:
             raise SessionNotFoundError(f"session not found: session_id={session_id}")
@@ -321,6 +402,23 @@ class SessionCore:
     async def chat_completions(
         self, session_id: str, *, method: str, query: str, headers: dict, body: bytes
     ) -> Response:
+        # [FUNCTION DOC]
+        # Handle one chat completion in three phases. Raises a not-found error if the session is
+        # missing or closing (checked again under the lock, and not again after the proxy call).
+        # Phase 1 (under the session lock): parse the JSON body (400 on invalid), prepare the
+        # backend request with pre-tokenized input ids and resolved arguments, optionally set the
+        # additional-replay start offset, serialize the body, remember the assistant message count.
+        # Phase 2 (no lock): add the routing key header equal to the session id and call the
+        # backend chat completions path. A non-200 status is passed through to the client without
+        # recording anything.
+        # Phase 3: validate the response, post-process the assistant message with the tokenizer.
+        # Under the lock again: if the session closed or the assistant count changed meanwhile
+        # (concurrent change), skip the state update (with a debug log / warning) and just reply.
+        # Otherwise preserve server message state in the stored request messages, update the
+        # pre-tokenized state (prompt ids, completion ids, trim limit, turn args = full request),
+        # and append a record with timestamps, method, path, status, request and response.
+        # The reply is built from the stored response: streamed as one chunk if the client asked,
+        # else JSON without meta info and without log-probs unless requested.
         """Proxy a chat completion through the backend with TITO token tracking.
 
         Flow: prepare pretokenized input_ids (lock held briefly) → proxy to
@@ -421,6 +519,9 @@ class SessionCore:
     async def proxy(
         self, session_id: str, path: str, *, method: str, query: str, headers: dict, body: bytes
     ) -> Response:
+        # [FUNCTION DOC] Forward an arbitrary request to the backend untouched (no session state
+        # change, no lock): copy headers adding the routing key header set to the session id, call
+        # the backend proxy for the given path, and convert the result to an HTTP response.
         headers = {**headers, "X-SMG-Routing-Key": session_id}
         result = await self.backend.do_proxy(
             ProxyRequest(method=method, query=query), path, body=body, headers=headers

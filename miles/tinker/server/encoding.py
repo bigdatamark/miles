@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# JSON-side translation between the Tinker SDK wire format and the gateway's internal payloads:
+# validating requests against the SDK's own request models, decoding commands (forward-backward,
+# optimizer step, save/load state, save sampler weights) and sampling requests into internal
+# mappings, building internal datums, decoding tensor data (dense or 1-D sparse), and rendering
+# results back to JSON. Content errors in training commands are not raised but returned as a
+# validation error inside the payload so they fail in sequence order. Module constants: default
+# Adam parameters taken from the SDK, and a mapping from operation name to the SDK request model
+# used to validate its JSON body (forward-backward travels as protobuf or is checked in datum
+# building instead).
 """Translate SDK JSON requests and results.
 
 Datums encode input x and explicit target labels t as x + [t[-1]],
@@ -26,6 +36,9 @@ REQUEST_TYPES = {
 
 
 def validate_against_sdk(request_type, payload: dict) -> None:
+    # [FUNCTION DOC] Validate the payload with the given pydantic request model; on failure raise a
+    # user input error carrying only the first validation problem as "location: message" with the
+    # dotted field location (or the word request if empty), hiding the original error chain.
     """The pinned SDK's request models are the wire contract; reject what they reject."""
     try:
         request_type.model_validate(payload)
@@ -36,14 +49,24 @@ def validate_against_sdk(request_type, payload: dict) -> None:
 
 
 def validate_create_model(payload: dict) -> None:
+    # [FUNCTION DOC] Validate a create-model body with the SDK's model (user input error on failure).
     validate_against_sdk(tinker_types.CreateModelRequest, payload)
 
 
 def validate_create_sampling_session(payload: dict) -> None:
+    # [FUNCTION DOC] Validate a create-sampling-session body with the SDK's model (user input error
+    # on failure).
     validate_against_sdk(tinker_types.CreateSamplingSessionRequest, payload)
 
 
 def decode_command(op: str, payload: dict) -> tuple[str, dict]:
+    # [FUNCTION DOC]
+    # Decode a JSON command body into (operation, internal payload). The body must contain the
+    # model id and sequence id (else a user input error is raised, since the failure could not be
+    # attributed to a queue position). Any user input, key, type, value or index error while
+    # decoding the rest is converted into a payload that holds only the model id, sequence id and a
+    # validation error text, so the command fails in order without running; a forward-backward
+    # command flagged forward-only is reported as the forward-only operation even in that case.
     """Decode content errors into ordered failures when the envelope is identifiable."""
     try:
         envelope = {"model_id": payload["model_id"], "seq_id": payload["seq_id"]}
@@ -58,6 +81,16 @@ def decode_command(op: str, payload: dict) -> tuple[str, dict]:
 
 
 def _decode_command(op: str, payload: dict, decoded: dict) -> tuple[str, dict]:
+    # [FUNCTION DOC]
+    # HELPER: Decode by operation, extending the given envelope mapping in place and returning
+    # (operation, payload). Operations with an SDK model are validated against it first.
+    # Forward-backward: each datum's model input chunks are flattened into tokens and its loss
+    # inputs into lists; datums are built; the loss function name and config (empty if missing)
+    # are added; the operation becomes forward-only if flagged. Optimizer step: Adam parameters are
+    # the SDK defaults overlaid by the given ones. Save state: save options validated; checkpoint
+    # name from the path (may be none) and an overwrite flag (default false). Load state: path,
+    # optimizer flag, optional access token. Save sampler weights: options validated; sampler path
+    # from the path. Unknown operation raises a user input error.
     if (request_type := REQUEST_TYPES.get(op)) is not None:
         validate_against_sdk(request_type, payload)
     if op == "forward_backward":
@@ -90,6 +123,8 @@ def _decode_command(op: str, payload: dict, decoded: dict) -> tuple[str, dict]:
 
 
 def model_input_tokens(model_input: dict) -> list[int]:
+    # [FUNCTION DOC] Concatenate the token lists of the model input's chunks in order. Any chunk
+    # type other than encoded text raises a user input error.
     tokens: list[int] = []
     for chunk in model_input["chunks"]:
         if chunk.get("type") != "encoded_text":
@@ -99,6 +134,15 @@ def model_input_tokens(model_input: dict) -> list[int]:
 
 
 def build_datum(input_tokens: list[int], inputs: dict[str, list], index: int) -> dict:
+    # [FUNCTION DOC]
+    # Build the internal datum from input token ids and a mapping of loss input names to value
+    # lists (index is only for messages). Raises user input errors for unknown input names (only
+    # the known wire loss inputs and target tokens are allowed), for nested (non-1-D) values, and
+    # when the target token count differs from the input token count. The target tokens input is
+    # required (a missing one raises a key error, which the command decoder converts). Result:
+    # tokens are the inputs plus the last target token (so position i scores target i given inputs
+    # up to i), the target length, the target tokens, and each present known loss input converted
+    # to a list of floats under its internal key.
     """One decoded datum (token list + loss_fn_inputs lists) -> internal datum."""
     unknown = set(inputs) - set(LOSS_INPUT_KEYS) - {"target_tokens"}
     if unknown:
@@ -121,10 +165,16 @@ def build_datum(input_tokens: list[int], inputs: dict[str, list], index: int) ->
 
 
 def _decode_inputs(loss_fn_inputs: dict) -> dict[str, list]:
+    # [FUNCTION DOC] HELPER: Convert every tensor-data entry of the loss inputs mapping to a plain
+    # list, keeping names.
     return {name: tensor_data_to_list(value) for name, value in loss_fn_inputs.items()}
 
 
 def tensor_data_to_list(tensor_data) -> list:
+    # [FUNCTION DOC] Convert SDK tensor data to a Python list. A list passes through unchanged. A
+    # non-mapping raises a user input error. A shape with more than one dimension is rejected.
+    # Sparse compressed-row data is expanded to a dense list; otherwise the data field is copied to
+    # a list (missing data raises a user input error).
     if isinstance(tensor_data, list):
         return tensor_data
     if not isinstance(tensor_data, dict):
@@ -140,6 +190,11 @@ def tensor_data_to_list(tensor_data) -> list:
 
 
 def _dense_from_csr(tensor_data: dict) -> list:
+    # [FUNCTION DOC] HELPER: Expand 1-D sparse compressed-row data to a dense list of the shape's
+    # length filled with zeros, placing each value at its column index (strictly paired, so a
+    # length mismatch raises a value error). The row pointer list must have exactly two entries
+    # (user input error). Its content is not otherwise checked; an out-of-range column raises an
+    # index error. A shape that is not one-dimensional raises a value error.
     (length,) = tensor_data["shape"]
     if len(tensor_data["sparse_crow_indices"]) != 2:
         raise UserInputError("1-D CSR expected")
@@ -150,6 +205,11 @@ def _dense_from_csr(tensor_data: dict) -> list:
 
 
 def decode_sample_request(payload: dict) -> dict:
+    # [FUNCTION DOC] Validate a sampling body with the SDK model (user input error on failure) and
+    # return the internal payload: model path, base model, sampling session id, sequence id, number
+    # of samples (default 1), prompt token ids flattened from the prompt, sampling parameters
+    # (empty if missing), prompt log-probs flag as boolean, and the top-k prompt log-prob count
+    # (default 0; null counts as 0). Unsupported prompt chunk types raise a user input error.
     validate_against_sdk(tinker_types.SampleRequest, payload)
     return {
         "model_path": payload.get("model_path"),
@@ -168,6 +228,16 @@ def decode_sample_request(payload: dict) -> dict:
 
 
 def render_result(result: dict) -> dict:
+    # [FUNCTION DOC]
+    # Render a settled internal result mapping as the SDK's JSON response, by its operation.
+    # Forward-backward and forward-only: type forward_backward, output type array record, one entry
+    # per datum with a one-element loss tensor under the loss-sum key and a log-prob tensor, and
+    # total metrics with the summed loss (float). Sample: sequences as is; prompt log-probs with
+    # not-a-number replaced by null; top-k prompt log-probs as per-position lists of (token id,
+    # log-prob) pairs dropping the padding sentinel (token 0 with the mask log-prob), a position
+    # with no pairs becoming null. Create model: model id. Save state: type save_weights with the
+    # path. Save sampler weights: path plus the sampling session id if present. Load state: type
+    # only. Optimizer step: metrics. Unknown operation raises an assertion error.
     op = result["op"]
     if op in ("forward_backward", "forward_only"):
         outputs = result["outputs"]
@@ -215,4 +285,6 @@ def render_result(result: dict) -> dict:
 
 
 def _tensor_json(values: list[float]) -> dict:
+    # [FUNCTION DOC] HELPER: Wire tensor description of a flat float list: 32-bit float dtype, a
+    # one-dimensional shape equal to the length, and the data list.
     return {"dtype": "float32", "shape": [len(values)], "data": values}

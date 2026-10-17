@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Shared machinery for the inference-based rollout functions (train and eval): a generation state
+# object holding tokenizer/processor/concurrency/sampling defaults, the per-sample and per-group
+# generate-then-reward coroutines, the sampling-parameter builder, and the class-based rollout
+# function that dispatches to the train or eval implementation. The train and eval modules import
+# from here, so this module imports them lazily to avoid a cycle.
 import asyncio
 import logging
 import uuid
@@ -29,7 +35,20 @@ logger = logging.getLogger(__name__)
 
 
 class GenerateState:
+    # [CLASS DOC]
+    # Long-lived state shared by all generation calls of one rollout function: launch args,
+    # tokenizer, multimodal processor, a semaphore bounding concurrent generate calls, default
+    # training sampling parameters, the resolved default generate function, and an aborted flag
+    # that is set when the rollout is being torn down and cleared by reset.
     def __init__(self, args: Namespace) -> None:
+        # [FUNCTION DOC]
+        # Build the state from launch args. Loads the tokenizer (with the configured chat template
+        # path, trusting remote code) and processor from the HF checkpoint (disk/network I/O).
+        # The semaphore capacity is the per-server concurrency times the number of rollout engines
+        # (rollout GPUs divided by GPUs per engine, integer division). Default sampling parameters
+        # come from the rollout temperature, top-p, top-k and max response length. The generate
+        # function is loaded from the custom generate function path, falling back to the built-in
+        # single-turn generate when that path yields nothing. Finally calls reset.
         # persistent state for the generation process
         self.args = args
         self.tokenizer = load_tokenizer(
@@ -53,6 +72,7 @@ class GenerateState:
         self.reset()
 
     def reset(self) -> None:
+        # [FUNCTION DOC] Clear the aborted flag so a new rollout or eval can generate.
         self.aborted = False
 
 
@@ -62,6 +82,26 @@ async def generate_and_rm(
     sampling_params: dict[str, Any],
     evaluation: bool = False,
 ) -> Sample | list[Sample]:
+    # [FUNCTION DOC]
+    # Generate one sample (possibly resumed from a partial rollout) and compute its reward.
+    # Returns the resulting sample, or a list of samples when the generate function returns
+    # several (multi-agent). Steps:
+    # 1. Partial rollout with off-policy masking enabled: if the sample already has response
+    #    tokens, zero its whole loss mask so previously generated tokens are not trained on.
+    # 2. If the sample is already completed or truncated, assert it has a response (and a reward
+    #    unless group reward is on) and return it untouched.
+    # 3. For training (not evaluation) create a lifecycle sink and report attempt start; the sink
+    #    reports attempt end in a finally block, even on error or abort.
+    # 4. Under the state's semaphore: if the state is aborted, mark the sample aborted and return
+    #    it. Otherwise report generation start, resolve the generate function (the sample's own
+    #    generate function path overrides the state default), call it with the state, sample, a
+    #    deep copy of the sampling params and the evaluation flag, and take its output samples.
+    # 5. With group reward on, return without computing rewards (done per group later).
+    # 6. For a list result: return early if any entry is aborted; otherwise compute rewards in a
+    #    batch only for entries whose reward is unset, writing them in place.
+    # 7. For a single result: return if aborted; otherwise compute the reward only if unset.
+    # The type annotation says the input may be a list, but the code reads response length and
+    # status from it, so only a single sample is valid input.
     args = state.args
 
     # mask previous off-policy generation for partial rollout
@@ -142,6 +182,19 @@ async def generate_and_rm_group(
     evaluation: bool = False,
     sample_done_callback: Callable[[], None] | None = None,
 ) -> list[Sample]:
+    # [FUNCTION DOC]
+    # Generate all samples of one prompt group concurrently and return the group (the gathered
+    # results, one entry per sample in order). Returns the input group unchanged if the state is
+    # already aborted, and returns the gathered results without group reward if the state became
+    # aborted during generation.
+    # Steps: when the routing policy needs a routing key, assign a fresh random UUID string to any
+    # sample lacking one. For each sample start a task running the per-sample generate-and-reward
+    # coroutine with a copy of the sampling params; with deterministic inference enabled, set the
+    # sampling seed to the rollout seed plus the sample's index in the group. If a done callback is
+    # given it is attached to every task and fires on success, error and cancellation. If gathering
+    # raises (including cancellation), all tasks are cancelled and awaited to settle before the
+    # exception is re-raised. Finally, with group reward on, rewards are computed for the whole
+    # group in a batch, written in place.
     args = state.args
 
     if state.aborted:
@@ -193,6 +246,11 @@ def compute_sampling_params(
     top_k,
     max_new_tokens,
 ):
+    # [FUNCTION DOC]
+    # Build the sampling-parameter mapping sent to the engine. Takes temperature, top-p, top-k and
+    # max new tokens as explicit keyword arguments (so train and eval can differ) and fills the
+    # rest from launch args: stop strings, stop token ids and the skip-special-tokens flag. Always
+    # sets no-stop-trim to true and spaces-between-special-tokens to false. Returns a fresh dict.
     return dict(
         temperature=temperature,
         top_p=top_p,
@@ -207,18 +265,30 @@ def compute_sampling_params(
 
 
 class InferenceRolloutFn(BaseRolloutFn):
+    # [CLASS DOC]
+    # The default class-based rollout function. Owns the data source, a generation state and a
+    # cache of tokenized eval datasets; routes each call to the training or evaluation path.
     def __init__(self, input: RolloutFnConstructorInput):
+        # [FUNCTION DOC] Initialize the base class, keep the data source, create the generation
+        # state from the launch args (loads tokenizer/processor), and start an empty eval prompt
+        # dataset cache.
         super().__init__(input)
         self.data_source = input.data_source
         self.state = GenerateState(input.args)
         self.eval_prompt_dataset_cache = {}
 
     async def __call__(self, input: RolloutFnInput) -> RolloutFnOutput:
+        # [FUNCTION DOC] Dispatch: await the eval path when the input is an evaluation request,
+        # otherwise the train path, and return its output.
         if input.evaluation:
             return await self._call_eval(input)
         return await self._call_train(input)
 
     async def _call_train(self, input: RolloutFnTrainInput) -> RolloutFnTrainOutput:
+        # [FUNCTION DOC] HELPER: Run one training rollout (module imported lazily to avoid an
+        # import cycle). Calls the async train generator with the state, rollout id and the data
+        # source's sample getter, then returns the aborted partial sample groups it reports back to
+        # the data source (side effect on the data buffer) and returns the train output.
         from miles.rollout.inference_rollout.inference_rollout_train import generate_rollout_async
 
         output, aborted_samples = await generate_rollout_async(
@@ -228,6 +298,10 @@ class InferenceRolloutFn(BaseRolloutFn):
         return output
 
     async def _call_eval(self, input: RolloutFnEvalInput) -> RolloutFnEvalOutput:
+        # [FUNCTION DOC] HELPER: Run evaluation over all configured eval datasets (module imported
+        # lazily to avoid an import cycle). Uses the generation state supplied on the input if any,
+        # else this object's own state, runs all datasets with the shared prompt cache (which gets
+        # filled), and returns an eval output whose data maps dataset name to its result mapping.
         # Local: inference_rollout_eval imports GenerateState from this module.
         from miles.rollout.inference_rollout.inference_rollout_eval import run_eval_datasets
 

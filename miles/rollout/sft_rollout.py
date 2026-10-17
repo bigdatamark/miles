@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Rollout function for supervised fine-tuning. No generation happens: each prompt sample from the
+# data buffer already holds a chat (list of messages), which is tokenized with the chat template
+# and given a loss mask that trains only on assistant tokens (per the loss mask type launch arg).
+# The tokenizer, multimodal processor and mask generator are created lazily once and cached in
+# module-level globals, as is a flag so the first example is logged only once per process.
+# The public entry point is generate_rollout. Module-level globals: tokenizer, processor, mask
+# generator (all initially none) and the sample-printed flag.
 import logging
 
 from miles.utils.mask_utils import MultiTurnLossMaskGenerator
@@ -15,6 +23,24 @@ SAMPLE_PRINTED = False
 
 
 def generate_rollout(args, rollout_id, data_buffer, evaluation=False):
+    # [FUNCTION DOC]
+    # Build SFT samples for one rollout step and return them (as the list of groups returned by
+    # the buffer, each group already unwrapped in place). Asserts evaluation is false and the
+    # global dataset mode is on (assertion errors otherwise). The rollout id is unused.
+    # Side effects: first call loads the tokenizer (with chat template path, trusting remote code),
+    # the processor, and the multi-turn loss mask generator using the loss mask type launch arg,
+    # caching them globally. Fetches the rollout batch size worth of groups from the buffer; each
+    # group must contain exactly one sample (unpacking error otherwise). For each sample: the
+    # prompt (a message list) and optional tools from the metadata are passed to the mask
+    # generator, which returns token ids and a full-length loss mask; the response length is
+    # derived from the mask by the generator; the sample gets tokens, response length, reward 0,
+    # and a loss mask trimmed to its last response-length entries. The first sample of the first
+    # call is logged once.
+    # KNOWN ISSUE: the returned list holds the original one-element groups, not the unwrapped
+    # samples (the loop variable is rebound, not the list entries); also a response length of
+    # zero would make the negative slice keep the entire mask; the docstring wrongly describes
+    # the function as a rule-based reward model rollout example, and the unused-parameter list
+    # is stale (data buffer is really a data source).
     """An example to implement the generate_rollout function for an rule based rm rollout generation.
 
     Args:

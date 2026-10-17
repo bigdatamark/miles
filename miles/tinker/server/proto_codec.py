@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Protobuf-side translation for the Tinker SDK wire format: decoding (optionally zstd-compressed)
+# forward-backward requests with binary token and tensor encodings into the gateway's internal
+# payload, and encoding forward-backward and sampling results as protobuf messages with packed
+# little-endian arrays. Module constants: the protobuf content type string, a mapping from protobuf
+# dtypes (32-bit float, 64-bit int, 32-bit int) to numpy dtypes, a mapping from stop reason names
+# to protobuf enum values, and a mapping from result operation names to their encoder functions.
 """Translate Tinker SDK protobuf requests and results, including compressed requests."""
 
 import numpy as np
@@ -20,6 +27,8 @@ _STOP_REASON_TO_PROTO = {
 
 
 def maybe_decompress(body: bytes, content_encoding: str | None) -> bytes:
+    # [FUNCTION DOC] If the content encoding is exactly zstd, decompress the body (the zstandard
+    # library is imported lazily; library errors propagate); otherwise return the body unchanged.
     if content_encoding == "zstd":
         import zstandard
 
@@ -28,6 +37,11 @@ def maybe_decompress(body: bytes, content_encoding: str | None) -> bytes:
 
 
 def decode_forward_backward_request(body: bytes) -> tuple[str, dict]:
+    # [FUNCTION DOC] Parse the serialized request message (a malformed message raises the protobuf
+    # decode error). The operation is forward-only if the message flag is set, else forward-
+    # backward. Content errors (user input, key, type, value, index errors) during datum decoding
+    # are converted to a payload with the model id, sequence id and a validation error text, so the
+    # command fails in order; the operation is still returned.
     """ForwardBackwardRequest proto -> (op, internal payload)."""
     message = public_pb.ForwardBackwardRequest()
     message.ParseFromString(body)
@@ -39,6 +53,13 @@ def decode_forward_backward_request(body: bytes) -> tuple[str, dict]:
 
 
 def _decode_forward_backward(message) -> dict:
+    # [FUNCTION DOC] HELPER: Build the internal payload from a parsed message. Per datum: each
+    # model input chunk must be encoded text (else a user input error); its tokens are raw
+    # little-endian 32-bit integers; loss inputs are decoded to lists by name; the datum is built
+    # with its position. The loss config is the numeric config map, replaced entirely by the
+    # version two map when that one is non-empty; each version two entry holds either a number or
+    # text (neither set raises a user input error). Returns a mapping with model id, sequence id,
+    # datums, loss function name and loss config.
     datums = []
     for index, datum in enumerate(message.data):
         tokens: list[int] = []
@@ -70,6 +91,11 @@ def _decode_forward_backward(message) -> dict:
 
 
 def _decode_tensor(name: str, tensor) -> list:
+    # [FUNCTION DOC] HELPER: Decode a protobuf tensor to a Python list (name is for messages).
+    # Unsupported dtype or more than one dimension raise user input errors. Dense encoding is read
+    # as a raw array of the dtype. Sparse row encoding creates a zero array of the single shape
+    # dimension and sets values at the 64-bit column indices (out-of-range indices raise an index
+    # error; a non-1-D shape raises a value error). No encoding set raises a user input error.
     np_dtype = _PROTO_DTYPE_TO_NUMPY.get(tensor.dtype)
     if np_dtype is None:
         raise UserInputError(f"loss_fn_inputs[{name!r}]: unsupported tensor dtype {tensor.dtype}")
@@ -91,6 +117,13 @@ def _decode_tensor(name: str, tensor) -> list:
 
 
 def encode_forward_backward_output(result: dict) -> bytes:
+    # [FUNCTION DOC]
+    # Serialize a forward-backward or forward-only result to a protobuf message. Sets the output
+    # type name to array record and the total loss metric (sum of per-datum losses). A single record
+    # holds the datum count and two batched 32-bit float fields: loss (one value per datum) and
+    # log-probs (one flat array per datum). Each batched field stores its arrays concatenated as
+    # bytes plus 64-bit cumulative byte offsets (count plus one entries starting at zero); no
+    # trailing shape means each datum is a flat vector. Returns the serialized bytes.
     message = public_pb.ForwardBackwardOutput()
     message.loss_fn_output_type = "ArrayRecord"
     outputs = result["outputs"]
@@ -113,6 +146,12 @@ def encode_forward_backward_output(result: dict) -> bytes:
 
 
 def encode_sample_response(result: dict) -> bytes:
+    # [FUNCTION DOC] Serialize a sampling result to a protobuf message. Each sequence gets a stop
+    # reason enum (unknown names raise a key error), its tokens as raw 32-bit integers and, if
+    # present, log-probs as raw 32-bit floats. Prompt log-probs, if present, are raw 32-bit floats.
+    # Top-k prompt log-probs, if present, set the prompt length and k from the token id array
+    # shape (a two-dimensional array of 32-bit integers) and store token ids and log-probs as raw
+    # bytes. Returns the serialized bytes.
     message = public_pb.SampleResponse()
     for sequence in result["sequences"]:
         out = message.sequences.add()

@@ -1,9 +1,24 @@
+# [MODULE DOC]
+# Configuration of the session server: an immutable, strictly validated model holding every
+# launch setting the server needs (network binding, backend url, tokenizer / chat-template
+# settings, replay feature flags, LoRA settings, session matching and pause modes, user hook
+# paths, log-prob settings), and a function that derives it from the parsed launch args.
 from typing import Any
 
 from miles.utils.pydantic_utils import FrozenStrictBaseModel
 
 
 class SessionServerConfig(FrozenStrictBaseModel):
+    # [CLASS DOC]
+    # Frozen, extra-field-forbidding configuration record (all fields are required, optional ones
+    # may be none). Groups: server (host, port, instance id, backend url, request timeout);
+    # tokenization (HF checkpoint, chat template path, TITO model name, chat template kwargs);
+    # replay (rollout routing replay, indexer replay, sampling-support replay flags, speculative
+    # algorithm, layer count and router top-k for sizing routing data); debugging (debug trajectory
+    # save path); LoRA (rank, adapter path, train-only flag); session behavior (use-session-server
+    # switch which may be a flag or a string, message matcher mode, pause generation mode, sample
+    # picker and postprocessor import paths); sampling (top log-prob count, sampling log-prob mode,
+    # rollout temperature).
     host: str
     port: int
     instance_id: str | None
@@ -36,6 +51,15 @@ class SessionServerConfig(FrozenStrictBaseModel):
 def compute_session_server_config(
     args, *, host: str, port: int, instance_id: str | None, backend_url: str
 ) -> SessionServerConfig:
+    # [FUNCTION DOC]
+    # Build the config from the parsed launch args plus explicit host, port, instance id and
+    # backend url. Mapping: the request timeout comes from the miles router timeout arg. Required
+    # (attribute access raises if missing): HF checkpoint, chat template path, TITO model, chat
+    # template kwargs, the three replay flags, speculative algorithm, debug trajectory path, LoRA
+    # rank and adapter path, top log-prob count, sampling log-prob mode. Optional with defaults
+    # (via attribute lookup): layer count none, router top-k none, LoRA train-only false, use-
+    # session-server none, message matcher "strict", pause mode none, picker and postprocessor
+    # paths none, rollout temperature 1.0. Validation errors from the model propagate.
     return SessionServerConfig(
         host=host,
         port=port,

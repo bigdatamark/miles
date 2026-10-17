@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Data model of the v2 session: an append-only forest of trajectory nodes (each node is the end
+# of one model generation holding the messages it added, the full token snapshot from the root,
+# the span of its sampled completion, commit order, record and finish reason), an attach-point
+# result type, and a tree class with node creation (capped) and a search for the deepest node a
+# request's messages extend. The commit sequence number is the only ordering key; wall-clock
+# time is decoration only. Pure synchronous data; serving policy lives in session_state.
+# Module constant: the maximum number of nodes per tree (1024).
 """Session-as-forest data model: trajectory nodes and attach-point search.
 
 The forest is append-only and ``seq`` (commit order) is the only ordering
@@ -17,6 +25,13 @@ MAX_NODES = 1024
 
 @dataclass
 class TrajectoryNode:
+    # [CLASS DOC]
+    # One generation in the tree. Fields: messages this node added (the request messages beyond the
+    # parent's path plus the assistant reply); the full token list from the root through this
+    # node's completion; the (start, end) span of the sampled completion inside that list; the
+    # commit sequence number; wall-clock commit time (decoration only); the upstream response id;
+    # the recorded exchange; the finish reason; the full resolved request (own copy); parent
+    # (none for a root); child nodes in creation order.
     """End of one model generation (SessionRecord is 1:1 with the node)."""
 
     delta_messages: list[dict[str, Any]]
@@ -34,9 +49,12 @@ class TrajectoryNode:
 
     @property
     def truncated(self) -> bool:
+        # [FUNCTION DOC] Property: true when the generation stopped because of the length limit.
         return self.finish_reason == "length"
 
     def path_nodes(self) -> list["TrajectoryNode"]:
+        # [FUNCTION DOC] Nodes from the root down to this node inclusive, in order (walks the
+        # parent links and reverses).
         nodes: list[TrajectoryNode] = []
         node: TrajectoryNode | None = self
         while node is not None:
@@ -46,11 +64,16 @@ class TrajectoryNode:
         return nodes
 
     def path_messages(self) -> list[dict[str, Any]]:
+        # [FUNCTION DOC] The full message history to this node: the concatenation of the added
+        # messages of every node on the path, root first.
         return [message for node in self.path_nodes() for message in node.delta_messages]
 
 
 @dataclass(frozen=True)
 class AttachPoint:
+    # [CLASS DOC] Immutable result of the attach search: the node to attach under (none means a
+    # new root), how many request messages that node's path consumed, and a diagnostic of the
+    # deepest message overlap seen anywhere, including partially matching nodes.
     """Result of matching a request against the tree."""
 
     node: "TrajectoryNode | None"  # None = new root
@@ -59,13 +82,17 @@ class AttachPoint:
 
 
 class SessionTree:
+    # [CLASS DOC] Append-only forest: the list of root nodes and the list of all nodes in creation
+    # order (a node's position equals its sequence number). Nodes are never removed.
     """Forest of trajectory nodes plus the append-only commit surface."""
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Start with no roots and no nodes.
         self.roots: list[TrajectoryNode] = []
         self.nodes: list[TrajectoryNode] = []  # creation (seq) order
 
     def leaves(self) -> list[TrajectoryNode]:
+        # [FUNCTION DOC] All nodes without children, in creation order.
         return [node for node in self.nodes if not node.children]
 
     def create_node(
@@ -81,6 +108,12 @@ class SessionTree:
         finish_reason: str,
         turn_args: dict[str, Any] | None = None,
     ) -> TrajectoryNode:
+        # [FUNCTION DOC] Append a new node under the parent (none for a new root) and return it.
+        # Raises a value error if the tree already holds the maximum number of nodes (which
+        # usually means the client is not replaying history verbatim). The node copies the delta
+        # messages and token ids lists, deep-copies the turn args (empty mapping if none), takes
+        # sequence number equal to the current node count, and is registered in the node list and
+        # in the roots list or its parent's children.
         if len(self.nodes) >= MAX_NODES:
             raise ValueError(
                 f"node cap reached ({MAX_NODES}): the session cannot branch or extend "
@@ -112,6 +145,17 @@ class SessionTree:
         *,
         message_matcher: SessionMessageMatcher | None = None,
     ) -> AttachPoint:
+        # [FUNCTION DOC]
+        # Depth-first search (explicit stack, roots and children visited in creation order) over
+        # the forest without mutating it. For each visited node with the offset of request
+        # messages consumed by its ancestors, count how many of its added messages match the
+        # request messages starting at the offset (using the matcher, strict by default); track the
+        # best overlap diagnostic as the largest offset plus matched count seen. A node with only a
+        # partial match is not a candidate and its subtree is not searched. A fully matched node
+        # becomes the best candidate if it consumes more request messages than the current best, or
+        # equally many but has a larger sequence number; its children are then searched with the
+        # new offset. Returns the best node with the consumed count, or no node (count zero) when no
+        # root fully matches.
         """Deepest node whose full path messages are a prefix of the request.
 
         Message equivalence is decided by *message_matcher* (defaults to the

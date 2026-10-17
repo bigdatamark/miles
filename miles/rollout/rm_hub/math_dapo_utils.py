@@ -13,11 +13,20 @@
 # limitations under the License.
 # Adapted from https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/hendrycks_math/utils.py
 
+# [MODULE DOC]
+# Reward computation for the DAPO math recipe (adapted from Bytedance verl / EleutherAI harness).
+# Takes the last 300 characters of the solution, extracts the answer after an "Answer:" marker (or
+# a strict boxed answer in strict mode), normalizes it Minerva-style and compares to the ground
+# truth, giving score +1 for correct and -1 for incorrect. Module constants: ordered text
+# substitutions and a list of removable unit/phrase expressions used by the normalizer.
 import re
 import signal
 
 
 def last_boxed_only_string(string: str) -> str | None:
+    # [FUNCTION DOC] Return the substring from the last occurrence of an opening boxed command
+    # through its matching closing brace (nesting counted by braces, scanning from the command
+    # start), or none if there is no such command or the braces never balance.
     """Extract the last LaTeX boxed expression from a string.
 
     Args:
@@ -48,6 +57,9 @@ def last_boxed_only_string(string: str) -> str | None:
 
 
 def remove_boxed(s: str) -> str:
+    # [FUNCTION DOC] Strip the leading boxed-open text and the trailing closing brace and return
+    # the content. Asserts (assertion error with the string) that the string starts with the
+    # boxed-open text and ends with a closing brace.
     """Remove the LaTeX boxed command from a string.
 
     Args:
@@ -63,19 +75,27 @@ def remove_boxed(s: str) -> str:
 
 
 class timeout:
+    # [CLASS DOC] HELPER: Context manager that raises a timeout error in the current thread if the
+    # body runs longer than the given whole seconds, using the process alarm signal (Unix, main
+    # thread only; replaces any existing alarm handler and cancels pending alarms on exit).
+    # KNOWN ISSUE: unused in this module; the previous signal handler is never restored.
 
     def __init__(self, seconds=1, error_message="Timeout"):
+        # [FUNCTION DOC] HELPER: Store the limit in seconds and the message of the raised error.
         self.seconds = seconds
         self.error_message = error_message
 
     def handle_timeout(self, signum, frame):
+        # [FUNCTION DOC] HELPER: Signal handler; raises a timeout error carrying the message.
         raise TimeoutError(self.error_message)
 
     def __enter__(self):
+        # [FUNCTION DOC] HELPER: Install the handler for the alarm signal and arm the alarm.
         signal.signal(signal.SIGALRM, self.handle_timeout)
         signal.alarm(self.seconds)
 
     def __exit__(self, type, value, traceback):
+        # [FUNCTION DOC] HELPER: Cancel the pending alarm; exceptions are not suppressed.
         signal.alarm(0)
 
 
@@ -141,6 +161,15 @@ REMOVED_EXPRESSIONS = [
 
 
 def normalize_final_answer(final_answer: str) -> str:
+    # [FUNCTION DOC]
+    # Normalize an answer string (Minerva style). Steps in order: convert to text; keep only what
+    # follows the last equals sign; apply the ordered substitutions (drops articles "an "/"a ",
+    # spaces, currency and thin-space escapes, converts mbox to text, "and" to comma); delete every
+    # listed unit/phrase expression; if the text contains a dollar-delimited span keep only the
+    # content of the span (greedy-left, wraps it in dollars again); unwrap text, bold-text,
+    # overline and boxed commands (boxed matched greedily); expand shorthand fractions and square
+    # roots without braces (e.g. a fraction followed by two bare characters) into braced forms;
+    # remove dollar signs; if the text without commas is all digits, drop the commas; trim.
     """Normalize a final answer to a quantitative reasoning question.
 
     Args:
@@ -185,6 +214,14 @@ def normalize_final_answer(final_answer: str) -> str:
 def is_correct_minerva(
     solution_str: str, gt: str, gt_need_extract: bool = False, answer_pattern: str = r"(?i)Answer\s*:\s*([^\n]+)"
 ) -> tuple[bool, str]:
+    # [FUNCTION DOC]
+    # Minerva-style check. Take the last match of the answer pattern (default: a case-insensitive
+    # "Answer:" marker followed by the rest of the line) in the solution, or the literal invalid
+    # marker if none, and normalize it as the prediction. The ground truth is normalized, either
+    # directly or (if extraction is requested) after taking the last boxed content, then converted
+    # through float to an integer and back to text (all answers are assumed integers; a
+    # non-numeric ground truth raises a value error, and a missing boxed expression raises a type
+    # error or assertion error). Returns (prediction equals ground truth, normalized prediction).
     """Check if the solution is correct according to Minerva criteria.
 
     Args:
@@ -213,6 +250,12 @@ def is_correct_minerva(
 
 
 def is_correct_strict_box(pred: str, gt: str, pause_tokens_index: list[int] | None = None) -> tuple[int, str | None]:
+    # [FUNCTION DOC]
+    # Strict boxed check. Keeps only the tail of the prediction: the last 100 characters, or, if
+    # pause token indices are given (must be exactly four, else assertion error), the text from 100
+    # characters before the last index onward (a negative start would wrap from the end).
+    # Extracts the last boxed content (none if absent) and returns (1 if it exactly equals the
+    # ground truth else -1, extracted content or none).
     """Check if the prediction is correct using strict boxed answer criteria.
 
     Args:
@@ -240,6 +283,11 @@ def is_correct_strict_box(pred: str, gt: str, pause_tokens_index: list[int] | No
 def verify(
     solution_str: str, answer: str, strict_box_verify: bool = False, pause_tokens_index: list[int] | None = None
 ) -> bool:
+    # [FUNCTION DOC]
+    # Dispatch to the strict boxed check (when strict mode is on) or the Minerva check, and return
+    # a pair (is correct, extracted/normalized prediction).
+    # KNOWN ISSUE: the return annotation and docstring say a single boolean, but both paths return
+    # a two-element tuple, which the caller unpacks.
     """Verify if the solution is correct.
 
     Args:
@@ -265,6 +313,12 @@ def compute_score(
     strict_box_verify: bool = False,
     pause_tokens_index: list[int] | None = None,
 ) -> float:
+    # [FUNCTION DOC]
+    # Reward entry point for the dapo reward type. Keeps only the last 300 characters of the
+    # solution, verifies it, and returns a mapping with keys score (1.0 if correct else -1.0), acc
+    # (the boolean correctness) and pred (the prediction text).
+    # KNOWN ISSUE: the return annotation says float but a mapping is returned; the docstring lists
+    # a config parameter that does not exist and omits the strict box flag.
     """Compute the reward score for a solution.
 
     Args:

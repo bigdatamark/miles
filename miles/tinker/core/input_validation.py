@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Validation of client-supplied Tinker request content against the gateway configuration. Every
+# check raises the user input error type (a client mistake that fails only that request) and
+# returns nothing unless noted. Covers: LoRA model config, batch (forward / backward) payloads
+# including loss function inputs and size limits, sampling payloads, sequence ids, checkpoint path
+# segments, checkpoint metadata and its compatibility with a model, save options, and token ids.
 import math
 import re
 
@@ -12,6 +18,11 @@ from miles.tinker.core.types import (
 
 
 def validate_model_config(lora_config: dict, config: GatewayConfig) -> None:
+    # [FUNCTION DOC] Reject a per-model LoRA config mapping that deviates from the server-wide
+    # layout. A non-null seed is rejected. For each of train attention, train MLP and train
+    # unembed, a non-null requested value must equal what the gateway trains. The rank (default
+    # 32) must be exactly an integer type (booleans rejected) between 1 and the gateway's maximum
+    # rank inclusive.
     """Reject per-model settings that conflict with the fixed server adapter layout."""
     if lora_config.get("seed") is not None:
         raise UserInputError("lora_config.seed is not supported: adapter initialization is not per-model seedable")
@@ -33,6 +44,17 @@ def validate_model_config(lora_config: dict, config: GatewayConfig) -> None:
 
 
 def validate_batch_payload(op: CommandOp, payload: dict, config: GatewayConfig) -> None:
+    # [FUNCTION DOC]
+    # Validate a forward or forward-backward payload; non-batch ops pass without checks. The
+    # payload has a list of datums (internal form: tokens, target tokens, target length, optional
+    # loss inputs) and a loss function name with optional config. Checks in order: datums
+    # non-empty and not above the per-request datum limit; loss function known (its required loss
+    # inputs come from the table); loss function config, if given, must be an object, and for the
+    # ppo and cispo functions (clip thresholds) or dro (beta) any present key must be a finite
+    # number of exact int or float type; then per datum: token ids and target token ids in vocab
+    # range, token count within the per-datum limit, running token total; each required loss input
+    # present and of length equal to the datum's target length; no extra loss inputs that the
+    # function does not read. Finally the total tokens must not exceed the per-request limit.
     if not op.is_batch():
         return
     datums = payload["datums"]
@@ -89,6 +111,9 @@ def validate_batch_payload(op: CommandOp, payload: dict, config: GatewayConfig) 
 
 
 def validate_sample_payload(payload: dict, config: GatewayConfig) -> None:
+    # [FUNCTION DOC] Validate a sampling payload: prompt token ids within vocabulary range; the
+    # number of samples (default 1) an exact integer from 1 to the per-request maximum; the top-k
+    # prompt log-prob count (default 0) an exact nonnegative integer.
     validate_token_ids(payload["prompt_tokens"], config.vocab_size, "prompt")
     num_samples = payload.get("num_samples", 1)
     if type(num_samples) is not int or not 1 <= num_samples <= config.max_samples_per_request:
@@ -99,6 +124,8 @@ def validate_sample_payload(payload: dict, config: GatewayConfig) -> None:
 
 
 def validate_seq_id(value, name: str, minimum: int = 1) -> int:
+    # [FUNCTION DOC] Return the value if it is an integer (booleans pass since they are integers)
+    # not below the minimum (default 1); otherwise raise a user input error naming the field.
     # request seq_ids are 1-based (last_enqueued_seq_id starts at 0); idempotency keys are 0-based
     if not isinstance(value, int) or value < minimum:
         raise UserInputError(f"{name} must be an integer >= {minimum}, got {value!r}")
@@ -106,12 +133,19 @@ def validate_seq_id(value, name: str, minimum: int = 1) -> int:
 
 
 def validate_checkpoint_segment(segment: str) -> None:
+    # [FUNCTION DOC] Accept only segments that start with a letter or digit followed by up to 127
+    # letters, digits, dots, underscores or hyphens (whole-string match), which excludes empty
+    # text, slashes, and dot-only names such as parent directory references.
     """Reject client path segments that could escape the checkpoint root."""
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", segment) is None:
         raise UserInputError(f"invalid checkpoint path segment {segment!r}")
 
 
 def validate_checkpoint_compatibility(meta: dict, record: ModelRecord, config: GatewayConfig, shown_path: str) -> None:
+    # [FUNCTION DOC] Compare checkpoint metadata with the model record and gateway layout on:
+    # base model, LoRA rank, LoRA alpha, and the three train flags. The first difference raises a
+    # user input error naming the key and both values. Assumes the metadata already passed the
+    # metadata validation (missing keys would raise a key error).
     """Reject settings that would change the saved tensors' meaning."""
     expected = {
         "base_model": record.base_model,
@@ -129,6 +163,8 @@ def validate_checkpoint_compatibility(meta: dict, record: ModelRecord, config: G
 
 
 def validate_save_options(payload: dict) -> None:
+    # [FUNCTION DOC] Reject save requests that set the time to live or the user metadata fields
+    # (non-null), since this gateway supports neither.
     if payload.get("ttl_seconds") is not None:
         raise UserInputError("ttl_seconds is not supported: checkpoints on this gateway do not expire")
     if payload.get("user_metadata") is not None:
@@ -136,11 +172,18 @@ def validate_save_options(payload: dict) -> None:
 
 
 def validate_token_ids(tokens: list, vocab_size: int, field: str) -> None:
+    # [FUNCTION DOC] Require every token to be exactly an integer type (booleans rejected) in the
+    # range from 0 up to but excluding the vocabulary size; the error message names the field.
     if any(type(token) is not int or not 0 <= token < vocab_size for token in tokens):
         raise UserInputError(f"{field} must contain integer token IDs in [0, {vocab_size})")
 
 
 def validate_checkpoint_metadata(meta, shown_path: str) -> None:
+    # [FUNCTION DOC] Check the shape of loaded checkpoint metadata: it must be a mapping whose
+    # entries have exactly these types: tenant digest (string), base model (string), LoRA rank
+    # (integer), LoRA alpha (integer or float), and three train flags (booleans); otherwise raise a
+    # user input error saying the metadata is invalid or unsupported. Also the rank must be
+    # positive and alpha finite.
     fields = {
         "tenant_digest": (str,),
         "base_model": (str,),

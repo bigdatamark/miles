@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# HTTP route layer of the session server: one setup function that builds the tokenizers, matcher
+# and core (v1 linear or v2 tree) and registers the endpoints on a web app. Endpoints: health,
+# create session, get session, delete session, OpenAI-style chat completions, an Anthropic
+# messages endpoint (converted to the OpenAI path and back, with fake streaming), samples
+# collection, and a catch-all proxy for any other path under a session. Route registration order
+# matters: specific routes must precede the catch-all. The Anthropic helper names imported
+# here are re-exported for other modules/tests. Optional SGLang Anthropic imports fall back to none.
 """Single-process FastAPI adapter for the session server.
 
 Thin layer: converts each HTTP request to primitive inputs, calls
@@ -56,6 +64,17 @@ logger = logging.getLogger(__name__)
 
 
 def setup_session_routes(app, backend, config: SessionServerConfig, *, use_addition_r3: bool = False):
+    # [FUNCTION DOC]
+    # Install the session routes on the app; returns nothing. If no HF checkpoint is configured,
+    # logs and installs nothing. Otherwise: resolve the message matcher from the config selector
+    # (logs it); load the tokenizer (trusting remote code, with the chat template path); build
+    # the TITO tokenizer for the configured model with the chat template kwargs; determine
+    # whether inline (intermediate) system messages need merging for Anthropic requests (true when
+    # the template does not support inline system messages); choose the core and registry: the
+    # v2 tree implementations (imported lazily) when the use-session-server setting is the string
+    # v2, else the v1 linear ones, both given the instance id and the additional-replay flag.
+    # Registers exception handlers: session errors become JSON error bodies with the error's
+    # status; message matcher errors become JSON status 500.
     if not config.hf_checkpoint:
         logger.info("[session] Skipping session routes (hf_checkpoint not set).")
         return
@@ -88,14 +107,21 @@ def setup_session_routes(app, backend, config: SessionServerConfig, *, use_addit
 
     @app.exception_handler(SessionError)
     async def session_error_handler(request: Request, exc: SessionError):
+        # [FUNCTION DOC] HELPER: Exception handler: reply with the error's status code and a JSON
+        # body holding the error message under an error key.
         return JSONResponse(status_code=exc.status_code, content={"error": str(exc)})
 
     @app.exception_handler(SessionMessageMatcherError)
     async def session_message_matcher_error_handler(request: Request, exc: SessionMessageMatcherError):
+        # [FUNCTION DOC] HELPER: Exception handler: a matcher error is a server-side fault, reply
+        # status 500 with a JSON error body.
         return JSONResponse(status_code=500, content={"error": str(exc)})
 
     @app.get("/health")
     async def health():
+        # [FUNCTION DOC] Route GET /health: take the core's health reply, add a boolean field
+        # saying whether intermediate system messages are supported for Anthropic requests (the
+        # inverse of merge-inline-system), and re-render it with the same status.
         response = await core.health()
         body = json.loads(response.body)
         body["anthropic_intermediate_system_supported"] = not merge_inline_system
@@ -103,6 +129,10 @@ def setup_session_routes(app, backend, config: SessionServerConfig, *, use_addit
 
     @app.post("/sessions")
     async def create_session(request: Request):
+        # [FUNCTION DOC] Route POST /sessions: parse the body (empty means empty object) with the
+        # strict create request model; validation failure replies 400 with the message. Otherwise
+        # creates a session passing the evaluation flag and the non-null sampling defaults
+        # (temperature, top-p, top-k).
         try:
             params = CreateSessionRequest.model_validate_json(await request.body() or b"{}")
         except ValidationError as exc:
@@ -114,14 +144,18 @@ def setup_session_routes(app, backend, config: SessionServerConfig, *, use_addit
 
     @app.get("/sessions/{session_id}")
     async def get_session(session_id: str):
+        # [FUNCTION DOC] Route GET /sessions/{id}: return the core's session dump.
         return await core.get_session(session_id)
 
     @app.delete("/sessions/{session_id}")
     async def delete_session(session_id: str):
+        # [FUNCTION DOC] Route DELETE /sessions/{id}: delete via the core (204 on success).
         return await core.delete_session(session_id)
 
     @app.post("/sessions/{session_id}/v1/chat/completions")
     async def chat_completions(request: Request, session_id: str):
+        # [FUNCTION DOC] Route POST /sessions/{id}/v1/chat/completions: read the raw body and hand
+        # method, query string, headers (as a plain mapping) and body to the core chat handler.
         body = await request.body()
         return await core.chat_completions(
             session_id,
@@ -134,6 +168,23 @@ def setup_session_routes(app, backend, config: SessionServerConfig, *, use_addit
     # Keep before session_proxy: Starlette's first match must not bypass session/TITO.
     @app.post("/sessions/{session_id}/v1/messages")
     async def anthropic_messages(request: Request, session_id: str):
+        # [FUNCTION DOC]
+        # Route POST /sessions/{id}/v1/messages. All errors use Anthropic error shapes.
+        # 1. If the SGLang Anthropic helpers are unavailable reply 501 with a literal Anthropic
+        #    error body (cannot use the helper that builds errors since it may be missing).
+        # 2. Parse and feature-validate the request; separate thinking blocks from the history;
+        #    convert to an OpenAI chat request (merging inline system messages if needed); force
+        #    non-streaming; dump to a mapping dropping null and unset fields and using aliases;
+        #    restore saved reasoning into assistant messages; render JSON. Any value error
+        #    (including conversion failures) becomes a 400.
+        # 3. Call the core chat handler with the OpenAI body. A session error becomes an Anthropic
+        #    error with its status; any other exception becomes a 500 (logged).
+        # 4. A non-200 core reply is converted to an Anthropic error keeping the status, body and
+        #    selected headers.
+        # 5. Parse the OpenAI response; if the client asked to stream, reply with fake server-sent
+        #    events built from the full response (event stream media type, no cache); else reply
+        #    with the converted Anthropic message whose id is the OpenAI response id. Failures
+        #    here are logged and become a JSON 500 (never a partial stream).
         """Serve Anthropic Messages through the OpenAI session path."""
         if (
             anthropic_utils is None
@@ -224,6 +275,10 @@ def setup_session_routes(app, backend, config: SessionServerConfig, *, use_addit
 
     @app.post("/sessions/{session_id}/samples")
     async def collect_samples(request: Request, session_id: str):
+        # [FUNCTION DOC] Route POST /sessions/{id}/samples: parse the body as JSON (empty means an
+        # empty object; invalid JSON raises a decode error and surfaces as a server error, kept
+        # outside assembly's 422 handling), read the optional max sequence length, and ask the
+        # core to collect samples. For v2 the optional agent metadata from the body is also passed.
         # Starlette matches routes in registration order; keep this before session_proxy.
         # Parse here so malformed input is not reported as an assembly error (422).
         body = await request.body()
@@ -236,6 +291,8 @@ def setup_session_routes(app, backend, config: SessionServerConfig, *, use_addit
 
     @app.api_route("/sessions/{session_id}/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
     async def session_proxy(request: Request, session_id: str, path: str):
+        # [FUNCTION DOC] Catch-all route for GET/POST/PUT/DELETE/PATCH under a session: forward the
+        # method, query, headers and raw body to the core proxy for the given sub-path.
         body = await request.body()
         return await core.proxy(
             session_id,
