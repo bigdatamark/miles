@@ -1,3 +1,10 @@
+# [MODULE DOC] Script that installs requirement files in CI without disturbing the container
+# image's heavy runtime. It pins any installed cuDNN packages (nvidia-cudnn for CUDA 12 and 13)
+# to their current versions through a uv override file (falling back to plain pip when no cuDNN
+# package is installed), and before each install runs a dry run whose plan is parsed; if the plan
+# would touch a protected package (torch, triton, apex, kernel packages, packages with known
+# prefixes, or any installed distribution of 100 MiB or more) the script raises an error telling to
+# rebuild the image instead. Command line: one or more requirement file paths.
 """Install CI requirements while retaining the image's cuDNN runtime."""
 
 import argparse
@@ -15,10 +22,16 @@ RUNTIME_PREFIXES = ("nvidia-", "flash-attn", "flashinfer-", "transformer-engine"
 
 
 def package_name(name: str) -> str:
+    # [FUNCTION DOC] HELPER: Normalizes a package name: runs of dash, underscore or dot become one
+    # dash, lower-cased.
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
 def protected_packages() -> set[str]:
+    # [FUNCTION DOC] Scans installed distributions and returns the normalized names that are
+    # protected: in the runtime set, starting with a runtime prefix, or whose installed files total
+    # at least 100 MiB (files with unknown size count as zero; distributions without a file list
+    # count as empty). Reads the environment's package metadata.
     protected = set()
     for distribution in importlib.metadata.distributions():
         name = package_name(distribution.metadata["Name"])
@@ -29,6 +42,11 @@ def protected_packages() -> set[str]:
 
 
 def uv_changes(output: str) -> set[str]:
+    # [FUNCTION DOC] Parses the text of a uv dry-run plan and returns the normalized names of all
+    # added and removed packages. Raises a runtime error (refusing to install) when no count lines
+    # are found and the text is not an explicit no-changes plan, or when a count line appears twice
+    # or the number of plus or minus lines does not match the announced install and uninstall
+    # counts. A no-changes plan with no change lines returns an empty set.
     changes = re.findall(r"^ ([+-]) ([\w.-]+)(?:==| @ ).+$", output, re.MULTILINE)
     counts = re.findall(r"^Would (uninstall|install) (\d+) packages?$", output, re.MULTILINE)
     if not counts:
@@ -45,6 +63,13 @@ def uv_changes(output: str) -> set[str]:
 
 
 def check_install_plan(command: list[str], directory: Path, *, use_uv: bool) -> None:
+    # [FUNCTION DOC] Dry-runs the install command and raises a runtime error if the plan would
+    # change any protected package. With uv: runs the command plus dry-run and no-color flags,
+    # captures and echoes the output, raises on nonzero exit, and parses the plan text. With pip:
+    # runs with dry-run and a JSON report in the given directory (raises on failure), requires the
+    # report version to be "1", and takes the names of packages to install. The block message lists
+    # the sorted intersection and says to rebuild the image. Note that uninstalls reported by uv
+    # also count as changes, while pip's report only lists installs.
     protected = protected_packages()
     if use_uv:
         result = subprocess.run([*command, "--dry-run", "--color", "never"], capture_output=True, text=True)
@@ -66,6 +91,12 @@ def check_install_plan(command: list[str], directory: Path, *, use_uv: bool) -> 
 
 
 def reconcile(requirements: list[str]) -> None:
+    # [FUNCTION DOC] Installs each requirements file in order. First collects pins for the installed
+    # cuDNN packages (CUDA 12 and 13 variants; absent ones skipped). In a temporary directory: if
+    # any pins exist, writes them to an overrides file and uses uv with the current interpreter and
+    # that overrides file (printing the pins); otherwise uses the interpreter's pip module. For each
+    # file builds the install command allowing system packages, runs the plan check (uv mode iff
+    # pins exist), then runs the install (raising on failure).
     pins = []
     for package in ("nvidia-cudnn-cu12", "nvidia-cudnn-cu13"):
         try:

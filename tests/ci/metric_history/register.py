@@ -1,4 +1,13 @@
 # doc-dev: docs/developer/ci/03-metric-history-gate.md
+# [MODULE DOC] Declaration marker and parser for regression gates. A test file calls the no-op
+# marker at top level with literal keyword arguments; the parser reads the syntax tree (no
+# execution), validates each call and produces immutable spec records. Validation: keyword-only,
+# known fields, no duplicates, literal-only values (constants, negative numbers, lists, string-keyed
+# dicts), steps one of "last", "all" or a non-empty list of distinct non-negative integers, and a
+# constraint dict of the four band parameters with at least one written per side. A default table
+# for standard metrics fills omitted steps and constraint before the required-field check. The
+# stored identity keys are canonical JSON of the literals as written (not the filled-in normalized
+# forms), so editing a declaration deliberately resets that coordinate's history.
 """Declare and parse metric-history regression gates.
 
 * `register_ci_gate(...)` is the marker a test file uses to declare a gate.
@@ -46,6 +55,10 @@ def register_ci_gate(
     enforce: bool = False,
     allowlist_reason: str | None = None,
 ):
+    # [FUNCTION DOC] Runtime no-op marker (returns none; arguments are not validated here). The
+    # parser reads the call from source: metric key (required string), steps and constraint
+    # (required unless the default table has the metric), enforce flag (default false) and optional
+    # allowlist reason; enforce and reason are carried as metadata only.
     """Declare one history-gate spec for the test file it sits in.
 
     Parsed via AST (like `register_cuda_ci`); a runtime no-op. Every argument
@@ -121,6 +134,9 @@ GATE_DEFAULTS: dict[str, dict] = {
 
 @dataclass(frozen=True)
 class CiGateSpec:
+    # [CLASS DOC] Immutable parsed gate declaration: filename, metric key, validated steps, the
+    # normalized constraint mapping, canonical JSON identity keys for steps and constraint,
+    # enforce flag and optional allowlist reason.
     """One parsed `register_ci_gate` declaration.
 
     `steps` is the validated selection literal (`"last"` | `"all"` | a list of
@@ -142,10 +158,16 @@ class CiGateSpec:
 
 
 class _ParseError(Exception):
+    # [CLASS DOC] HELPER: Internal error carrying a bare message; callers convert it to a value
+    # error that adds file and field context.
     """Internal: a bare message the caller wraps with file + field context."""
 
 
 def _literal(node: ast.AST) -> object:
+    # [FUNCTION DOC] HELPER: Evaluates a syntax node restricted to literals: any constant; a
+    # negated int or float constant (not boolean); a list of literals; a dict with string-literal
+    # keys and literal values. Raises the internal parse error for dict unpacking, non-string or
+    # duplicate keys, and any other node kind (message names the node type).
     """A Python literal from an AST node: a constant, a negative number, or a
     list / dict of the same. Rejects any non-literal (name, call, expression).
 
@@ -182,6 +204,10 @@ def _literal(node: ast.AST) -> object:
 
 
 def _validate_param(validator: str, value: object) -> object:
+    # [FUNCTION DOC] HELPER: Validates by validator name. Float-nonnegative: must be a non-boolean
+    # number, finite and not below zero; returned as a float. Step-list: must be a non-empty list of
+    # non-boolean integers, each non-negative and unique; returns a copy. Any other validator name
+    # raises the internal parse error; all failures use that error type.
     """Validate one schema param (also the flat `steps` list); return it
     (normalized)."""
     if validator == "float_nonneg":
@@ -207,6 +233,10 @@ def _validate_param(validator: str, value: object) -> object:
 
 
 def _normalize_constraint(raw: object) -> dict:
+    # [FUNCTION DOC] HELPER: Checks the raw constraint is a dict with only schema keys and with at
+    # least one upper-band and one lower-band parameter written, then returns a new dict with every
+    # schema parameter validated (error messages name the parameter) or filled with its default; a
+    # required parameter that is missing raises (none are currently required).
     """Validate the constraint literal against `CONSTRAINT_SCHEMA` and return
     a normalized dict (validated params + filled defaults). Each side needs at
     least one written band param -- an all-default side has band 0 and would
@@ -235,6 +265,8 @@ def _normalize_constraint(raw: object) -> dict:
 
 
 def _validate_steps(value: object) -> str | list[int]:
+    # [FUNCTION DOC] HELPER: Returns the string last or all as is, a valid step list as a copy
+    # (errors prefixed with "steps:"), and raises the internal parse error for anything else.
     """The declaration's `steps` literal: `"last"`, `"all"`, or a step list."""
     if value == "last" or value == "all":
         return value
@@ -247,24 +279,32 @@ def _validate_steps(value: object) -> str | list[int]:
 
 
 def _require_str(value: object, field: str) -> str:
+    # [FUNCTION DOC] HELPER: Returns the value if it is a string, else raises the internal parse
+    # error naming the field.
     if not isinstance(value, str):
         raise _ParseError(f"{field} must be a string")
     return value
 
 
 def _require_bool(value: object, field: str) -> bool:
+    # [FUNCTION DOC] HELPER: Returns the value if it is a boolean, else raises the internal parse
+    # error naming the field.
     if not isinstance(value, bool):
         raise _ParseError(f"{field} must be a boolean")
     return value
 
 
 def _require_opt_str(value: object, field: str) -> str | None:
+    # [FUNCTION DOC] HELPER: Returns the value if it is none or a string, else raises the internal
+    # parse error naming the field.
     if value is not None and not isinstance(value, str):
         raise _ParseError(f"{field} must be a string or None")
     return value
 
 
 def _canonical_key(raw: object) -> str:
+    # [FUNCTION DOC] HELPER: Serializes the literal as JSON with sorted dict keys and no spaces
+    # after separators.
     """Canonical JSON of a declaration literal (the `steps` string/list or
     the `constraint` dict), as the stored identity key: no whitespace, dict
     keys sorted, list order kept as written, a bare string keyword
@@ -280,6 +320,13 @@ def _canonical_key(raw: object) -> str:
 
 
 def _parse_ci_gate_call(call: ast.Call, filename: str) -> CiGateSpec:
+    # [FUNCTION DOC] HELPER: Parses one marker call into a spec. Raises value errors (prefixed with
+    # file and marker name) for positional arguments, double-star arguments, unknown or duplicated
+    # keywords, non-literal values, missing required fields (the message mentions the missing
+    # default entry for steps and constraint), and any field validation failure. Order: read
+    # literals; fill omitted steps and constraint from the default table when the metric key is a
+    # string with an entry; apply required/default rules per field; build the spec with validated
+    # fields and identity keys taken from the raw literals.
     prefix = f"{filename}: {_REGISTER_NAME}()"
     if call.args:
         raise ValueError(f"{prefix} takes only keyword arguments (got {len(call.args)} positional)")
@@ -334,6 +381,10 @@ def _parse_ci_gate_call(call: ast.Call, filename: str) -> CiGateSpec:
 
 
 def parse_ci_gate_specs(filename: str) -> list[CiGateSpec]:
+    # [FUNCTION DOC] Reads and parses the file (relative path; file and syntax errors propagate) and
+    # returns, in source order, a spec for each top-level expression statement that calls the
+    # marker by bare name; other statements are ignored. Value errors from the call parser
+    # propagate.
     """Return every `register_ci_gate` spec declared at top level in `filename`.
 
     Parsed the same way as `register_cuda_ci`: top-level `Expr(Call)` whose

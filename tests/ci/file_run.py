@@ -1,3 +1,10 @@
+# [MODULE DOC] Resolves a single explicitly requested test file (the rerun-test command) into an
+# execution plan of hardware kind, suite, runner labels, container image and timeout, for the
+# resolve job of the file-run workflow. Parses a source snapshot as data (no imports of its
+# modules), refuses symlinks in the discovery roots and label registry, reads the label table by
+# literal evaluation, and requires exactly one enabled CPU or CUDA registration. The main function
+# reads environment variables, writes the plan to the GitHub output file and prints it as JSON.
+# Constraint: only standard library and the dependency-free registry modules may be imported.
 """Resolve one explicitly requested test file to its CI execution plan.
 
 Consumed by the `resolve-file-run` job of `.github/workflows/run-ci-file.yml`,
@@ -34,10 +41,16 @@ _IMAGE_TAG_PATTERN = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
 
 
 class FileRunError(Exception):
+    # [CLASS DOC] Error for any reason an explicit file run cannot be planned; the main function
+    # prints it as a GitHub error annotation and returns exit code 1.
     pass
 
 
 def _discover_regular_ci_files() -> list[str]:
+    # [FUNCTION DOC] HELPER: Walks each discovery root (relative to the current directory) without
+    # following symlinks and returns the sorted POSIX-style paths of files named test_*.py. Raises
+    # a file-run error if any component of a root, any scanned directory, or any matched file is a
+    # symlink. A missing root yields no files (the walk silently ignores it).
     """Discover test files without following symlinks in scanned roots."""
     files = []
     for root in DISCOVERY_ROOTS:
@@ -62,6 +75,13 @@ def _discover_regular_ci_files() -> list[str]:
 
 
 def plan_file_run(all_tests, test_file: str, image_tag: str) -> dict[str, str]:
+    # [FUNCTION DOC] Builds the plan mapping (all string values) for the file. Raises a file-run
+    # error when: the image tag does not fully match the Docker tag pattern; the file has no
+    # registration; it has only ROCm registrations; it has more than one CPU/CUDA registration; it
+    # is disabled (message includes the reason); a CUDA suite has no runner mapping; or a CPU suite
+    # is not one of the two allowed CPU stages. Result keys: hw ("cuda" or "cpu"), suite, runs_on
+    # (JSON list of runner labels for CUDA, empty string for CPU), container_image (repository
+    # prefix plus tag) and timeout_seconds (the larger of 1800 and int(1.25 x estimate)).
     """Map one registered test file to the hw/suite/runner/image that runs it.
 
     An explicit file request is the selection, so domain labels and the
@@ -106,6 +126,11 @@ def plan_file_run(all_tests, test_file: str, image_tag: str) -> dict[str, str]:
 
 
 def _read_snapshot_labels() -> dict[str, str]:
+    # [FUNCTION DOC] HELPER: Reads the label registry file (relative to the current directory)
+    # without importing it: parses the syntax tree, requires exactly one annotated assignment to
+    # the known-labels name and evaluates its value as a literal. Raises a file-run error if the
+    # file is a symlink, unreadable or unparsable, the definition is missing or duplicated, or the
+    # value is not a dictionary of strings to strings. Returns the dictionary.
     path = Path("tests/ci/labels.py")
     if path.is_symlink():
         raise FileRunError(f"CI label registry must not be a symlink: {path}")
@@ -131,6 +156,11 @@ def _read_snapshot_labels() -> dict[str, str]:
 
 
 def collect_snapshot_tests(source_root: str | Path):
+    # [FUNCTION DOC] Resolves the source root (must exist and be a directory, else a file-run
+    # error), temporarily changes the process working directory to it, discovers test files and
+    # collects registrations with sanity checking and the snapshot's own label table, and restores
+    # the previous working directory even on error. Returns the registration list. Side effect:
+    # temporary change of the working directory (not thread-safe).
     """Parse a source snapshot as data, without importing its Python modules."""
     try:
         root = Path(source_root).resolve(strict=True)
@@ -149,10 +179,17 @@ def collect_snapshot_tests(source_root: str | Path):
 
 
 def resolve_file_run(test_file: str, image_tag: str, source_root: str | Path = ".") -> dict[str, str]:
+    # [FUNCTION DOC] Convenience composition: collects the snapshot's registrations and plans the
+    # run for the test file and image tag; returns the plan mapping.
     return plan_file_run(collect_snapshot_tests(source_root), test_file, image_tag)
 
 
 def main() -> int:
+    # [FUNCTION DOC] Entry point driven by environment variables: test file (required), image tag
+    # (default dev when unset or empty) and source root (default current directory). On a file-run
+    # error prints an error annotation to standard error and returns 1. On success appends one
+    # key=value line per plan entry to the GitHub output file (required variable) and prints the
+    # plan as key-sorted JSON; returns 0.
     try:
         plan = resolve_file_run(
             os.environ["TEST_FILE"],

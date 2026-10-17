@@ -1,3 +1,8 @@
+# [PACKAGE DOC] Metric-history subsystem of the CI regression gate. Re-exports the storage contract
+# and record types, the offline SQLite and hosted Neon store backends with the Neon URL environment
+# variable name, and the gate declaration marker with its parsed spec. Gate evaluation, step
+# selection and constraints live in submodules that are deliberately not re-exported; import them
+# directly.
 """Metric-history subsystem for the CI regression gate.
 
 * One import surface for consumers, re-exporting the :class:`MetricHistoryStore`

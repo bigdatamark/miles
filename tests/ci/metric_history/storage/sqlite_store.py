@@ -1,4 +1,9 @@
 # doc-dev: docs/developer/ci/03-metric-history-gate.md
+# [MODULE DOC] In-process SQLite implementation of the metric-history store for offline use and
+# tests. Holds a local schema (a runs table with identity, provenance, creation time text and a
+# trusted integer flag; a metric values table keyed to runs; a composite index for baseline
+# lookups) and the baseline query, which matches Postgres semantics: trusted runs only, plain
+# equality on the whole coordinate, newest first, limited. Trust is stored as 1 or 0.
 """SQLite-backed :class:`MetricHistoryStore` for offline use and tests.
 
 * No network dependency; the store runs entirely in-process. An in-memory
@@ -78,7 +83,10 @@ LIMIT ?
 
 
 class SQLiteMetricHistoryStore(MetricHistoryStore):
+    # [CLASS DOC] Store backed by one long-lived SQLite connection (single-threaded use).
     def __init__(self, database: str = ":memory:"):
+        # [FUNCTION DOC] Opens the database (default: private in-memory), enables foreign key
+        # enforcement and creates the schema if absent.
         # check_same_thread is left at its default; the store is meant for the
         # single-threaded CI gate process and the test suite.
         self._conn = sqlite3.connect(database)
@@ -86,6 +94,8 @@ class SQLiteMetricHistoryStore(MetricHistoryStore):
         self.apply_schema()
 
     def apply_schema(self) -> None:
+        # [FUNCTION DOC] Executes the schema script (idempotent create-if-absent statements) and
+        # commits.
         """Create the tables and index if absent.
 
         This runs once at construction (or when a caller resets a database),
@@ -103,6 +113,10 @@ class SQLiteMetricHistoryStore(MetricHistoryStore):
         trusted: bool,
         values: list[MetricSample],
     ) -> str:
+        # [FUNCTION DOC] Validates that all sample values are finite (value error before any write),
+        # generates a random hex run id, and inside one transaction inserts the run row (trusted
+        # stored as 1 or 0) and all metric rows; the transaction rolls back on error. Returns the
+        # run id.
         validate_finite_values(values)
         run_id = uuid.uuid4().hex
         with self._conn:
@@ -147,6 +161,8 @@ class SQLiteMetricHistoryStore(MetricHistoryStore):
         step: int,
         limit: int,
     ) -> list[float]:
+        # [FUNCTION DOC] Returns up to limit values for the exact coordinate from trusted runs of the
+        # same identity, newest run (by creation time text) first. Read-only.
         rows = self._conn.execute(
             _BASELINE_SQL,
             (test_path, backend, suite, metric_key, steps_key, constraint_key, step, limit),
@@ -160,6 +176,10 @@ class SQLiteMetricHistoryStore(MetricHistoryStore):
         github_run_id: int | None = None,
         commit_sha: str | None = None,
     ) -> int:
+        # [FUNCTION DOC] Sets the trusted flag to 0 on still-trusted runs matching exactly one of run
+        # id, GitHub run id or commit sha (keyword-only; value error unless exactly one is given).
+        # Runs in a transaction and returns the number of rows changed. The column name comes from a
+        # fixed set of three keys.
         keys = {"run_id": run_id, "github_run_id": github_run_id, "commit_sha": commit_sha}
         provided = {name: value for name, value in keys.items() if value is not None}
         if len(provided) != 1:
@@ -176,4 +196,5 @@ class SQLiteMetricHistoryStore(MetricHistoryStore):
             return cursor.rowcount
 
     def close(self) -> None:
+        # [FUNCTION DOC] Closes the SQLite connection; the store is unusable afterwards.
         self._conn.close()

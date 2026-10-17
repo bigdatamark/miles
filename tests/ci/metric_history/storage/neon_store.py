@@ -1,4 +1,9 @@
 # doc-dev: docs/developer/ci/03-metric-history-gate.md
+# [MODULE DOC] Postgres (Neon) implementation of the metric-history store. Holds the environment
+# variable name for the connection string and three SQL statements: the baseline query (trusted
+# runs only, matched by plain equality on the full coordinate, newest first, limited), the run
+# insert and the metric value insert. Each operation opens and closes its own connection, using a
+# lazily imported driver; the schema is created elsewhere and no DDL is issued.
 """Neon (hosted Postgres) backend for the metric-history store.
 
 * The production backend: the CI regression gate writes runs here and reads its
@@ -83,7 +88,13 @@ _INSERT_METRIC_SQL = (
 
 
 class NeonMetricHistoryStore(MetricHistoryStore):
+    # [CLASS DOC] Stateless-per-operation store over Postgres; the only state is the connection
+    # string. Implements the store contract (write a run with its values, query recent trusted
+    # values, mark runs untrusted, close).
     def __init__(self, dsn: str | None = None):
+        # [FUNCTION DOC] Stores the connection string: the argument, or the Neon URL environment
+        # variable when none is given. Raises a runtime error if neither is available. Opens no
+        # connection.
         if dsn is None:
             dsn = os.environ.get(NEON_DATABASE_URL_ENV)
             if not dsn:
@@ -94,6 +105,9 @@ class NeonMetricHistoryStore(MetricHistoryStore):
         self._dsn = dsn
 
     def _connect(self):
+        # [FUNCTION DOC] HELPER: Imports the psycopg driver on first use (so the package imports
+        # without it) and returns a new connection to the stored connection string, with
+        # autocommit off. Network side effect; raises import or connection errors.
         # Lazy import: see module docstring. autocommit stays off so write_run
         # controls its own transaction boundary explicitly.
         import psycopg
@@ -108,6 +122,11 @@ class NeonMetricHistoryStore(MetricHistoryStore):
         trusted: bool,
         values: list[MetricSample],
     ) -> str:
+        # [FUNCTION DOC] Inserts one run row and one row per metric sample in a single transaction
+        # and returns the new run id (random 32-character hex string). Validates first that all
+        # sample values are finite (the validator raises otherwise, before any connection). On any
+        # error the transaction is rolled back and the error re-raised; the connection is always
+        # closed. The run row holds identity, provenance, creation time text and the trusted flag.
         validate_finite_values(values)
         run_id = uuid.uuid4().hex
         conn = self._connect()
@@ -153,6 +172,9 @@ class NeonMetricHistoryStore(MetricHistoryStore):
         step: int,
         limit: int,
     ) -> list[float]:
+        # [FUNCTION DOC] Returns up to limit values of the given coordinate from trusted runs of the
+        # same test path, backend and suite, newest run first (read-only; the connection is always
+        # closed).
         conn = self._connect()
         try:
             with conn.cursor() as cur:
@@ -172,6 +194,11 @@ class NeonMetricHistoryStore(MetricHistoryStore):
         github_run_id: int | None = None,
         commit_sha: str | None = None,
     ) -> int:
+        # [FUNCTION DOC] Marks currently trusted runs as untrusted, selected by exactly one of run
+        # id, GitHub run id or commit sha (keyword-only). Raises a value error unless exactly one
+        # is given. Runs an update restricted to still-trusted rows, commits (rolls back and
+        # re-raises on error) and returns the number of rows changed. The column name is taken from
+        # a fixed set of three keys, never from user input.
         keys = {"run_id": run_id, "github_run_id": github_run_id, "commit_sha": commit_sha}
         provided = {name: value for name, value in keys.items() if value is not None}
         if len(provided) != 1:
@@ -197,6 +224,7 @@ class NeonMetricHistoryStore(MetricHistoryStore):
         return affected
 
     def close(self) -> None:
+        # [FUNCTION DOC] No-op: no connection outlives an operation.
         # No connection outlives an operation; kept for interface symmetry
         # with the SQLite store so callers can close either unconditionally.
         pass

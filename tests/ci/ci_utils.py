@@ -1,3 +1,10 @@
+# [MODULE DOC] Runner for CI test files: executes each test file as a separate python subprocess in
+# its own process group with a per-file timeout (the larger of the given timeout and 1.25 times the
+# estimate), optional retry of failures that look like accuracy or performance flakes, optional
+# reaping of leaked engine and ray processes between files, GitHub Actions log grouping and
+# summaries, and an informational metric-history gate hook run after a passing CUDA file. Also
+# holds the failure classification patterns, environment-derived provenance helpers and store
+# construction. Importing the module configures root logging to print messages at info level.
 import datetime
 import hashlib
 import json
@@ -38,16 +45,25 @@ _LEFTOVER_COMMAND_CHARS = 120
 
 
 def _sanitize_for_path(name: str) -> str:
+    # [FUNCTION DOC] HELPER: Replaces every character outside letters, digits, dot, underscore and
+    # dash with an underscore.
     return re.sub(r"[^A-Za-z0-9._-]", "_", name)
 
 
 def _attempt_record_dir(base_dir: str, filename: str, attempt: int) -> str:
+    # [FUNCTION DOC] HELPER: Returns base_dir / (sanitized filename + dash + first 10 hex chars of
+    # the filename's SHA-1) / "attempt-<n>". Pure; creates nothing.
     """Per-test, per-attempt subdir for CI metric-history records."""
     record_key = f"{_sanitize_for_path(filename)}-{hashlib.sha1(filename.encode()).hexdigest()[:10]}"
     return os.path.join(base_dir, record_key, f"attempt-{attempt}")
 
 
 def _merge_attempt_records(attempt_dir: str, merged_path: str) -> None:
+    # [FUNCTION DOC] HELPER: Merges the per-process JSON-lines files (sorted by name, only names
+    # ending in .jsonl, blank lines skipped) of the attempt directory into one file at merged_path.
+    # Series of the same metric are concatenated, then sorted by step with missing steps last;
+    # output has one JSON line per metric. Does nothing if the directory does not exist. Raises on
+    # malformed JSON or missing keys. Side effect: writes the merged file (overwrites).
     """Merge every per-process JSONL file under `attempt_dir` into one record.
 
     Each per-process file holds lines of `{"metric": key, "series": [[step, value], ...]}`.
@@ -84,6 +100,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class TestFile:
+    # [CLASS DOC] Lightweight description of a test file to run: its path and an estimated runtime
+    # in seconds (default 60). An alternative to a registry record for the runner.
     name: str
     estimated_time: float = 60
 
@@ -120,6 +138,12 @@ NON_RETRIABLE_PATTERNS = [
 
 
 def is_retriable_failure(output: str) -> tuple[bool, str]:
+    # [FUNCTION DOC] Classifies captured test output, case-insensitively. Checks first the
+    # non-retriable patterns (code errors, out-of-memory, crashes), returning false with the
+    # matched pattern; then the retriable patterns (assertion comparisons, accuracy, score,
+    # latency, throughput, timeout), returning true; then a case-sensitive generic assertion error
+    # check, returning true; otherwise false with an unknown-failure reason. Returns a pair of
+    # verdict and reason text.
     """
     Determine if a test failure is retriable based on output patterns.
 
@@ -145,6 +169,8 @@ def is_retriable_failure(output: str) -> tuple[bool, str]:
 
 
 def _kill_process_tree(pgid: int):
+    # [FUNCTION DOC] HELPER: Sends a kill signal to the whole process group. A missing group is
+    # ignored; any other error is logged as a warning, never raised.
     """Kill a process group by its PGID."""
     try:
         os.killpg(pgid, signal.SIGKILL)
@@ -159,6 +185,11 @@ FAILURE_TAIL_LINES = 60
 
 
 def _drain_child_output(stream, tail: deque) -> None:
+    # [FUNCTION DOC] HELPER: Reads the binary stream in 64 KiB chunks until end, writing each chunk
+    # to the process's binary standard output and flushing, and appending it to the tail deque;
+    # oldest chunks are dropped while the remaining bytes (excluding the oldest chunk) still meet
+    # the failure tail size, so the deque holds at least the last 8192 bytes. Blocks until the
+    # child closes the stream.
     """Pass a child's output straight through, keeping only its last bytes for the failure summary."""
     held = 0
     while chunk := stream.read(65_536):
@@ -171,6 +202,8 @@ def _drain_child_output(stream, tail: deque) -> None:
 
 
 def _failure_tail(chunks: deque) -> str:
+    # [FUNCTION DOC] HELPER: Joins the byte chunks, keeps the last 8192 bytes, decodes as UTF-8
+    # with replacement, drops blank lines and returns the last 60 lines joined by newlines.
     text = b"".join(chunks)[-FAILURE_TAIL_BYTES:].decode("utf-8", errors="replace")
     lines = [line for line in text.splitlines() if line.strip()]
     return "\n".join(lines[-FAILURE_TAIL_LINES:])
@@ -182,11 +215,19 @@ def run_with_timeout(
     kwargs: dict | None = None,
     timeout: float = None,
 ):
+    # [FUNCTION DOC] Runs the function in a non-daemon thread and waits up to the timeout (none
+    # means wait forever). Returns the function's return value. Raises a timeout error if the
+    # thread is still alive (the thread is not stopped and keeps running), re-raises the function's
+    # exception if it raised, and raises a runtime error if it finished with neither a value nor
+    # an exception (cannot normally happen).
+    # KNOWN ISSUE: the timeout parameter is annotated as a float but defaults to none.
     """Run a function with timeout."""
     ret_value = []
     exception_holder = []
 
     def _target_func():
+        # [FUNCTION DOC] HELPER: Thread body: calls the function with the arguments and stores the
+        # result or the caught exception in the shared lists.
         try:
             ret_value.append(func(*args, **(kwargs or {})))
         except Exception as e:
@@ -208,6 +249,8 @@ def run_with_timeout(
 
 
 def write_github_step_summary(content: str):
+    # [FUNCTION DOC] Appends the text to the file named by the GITHUB_STEP_SUMMARY environment
+    # variable; does nothing if the variable is unset or empty.
     """Write content to GitHub Step Summary if available."""
     summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_file:
@@ -216,6 +259,9 @@ def write_github_step_summary(content: str):
 
 
 def _gate_pr_number_from_env() -> int | None:
+    # [FUNCTION DOC] HELPER: Takes the part after the last underscore of the commit-name variable;
+    # returns it as an integer, or none if the variable is unset, has no underscore, equals the
+    # non-PR sentinel, or is not an integer.
     """Parse the PR number out of `GITHUB_COMMIT_NAME` (`{sha}_{pr|non-pr}`).
 
     The workflow sets `GITHUB_COMMIT_NAME = {github.sha}_{pr_number||'non-pr'}`.
@@ -234,6 +280,8 @@ def _gate_pr_number_from_env() -> int | None:
 
 
 def _gate_commit_sha_from_env() -> str:
+    # [FUNCTION DOC] HELPER: Returns the commit sha variable if set; else the part before the last
+    # underscore of the commit-name variable; else the whole commit name; else an empty string.
     """The run's commit sha: prefer `GITHUB_SHA`; fall back to the sha encoded
     in `GITHUB_COMMIT_NAME` (`{sha}_{pr|non-pr}`); else empty string."""
     sha = os.environ.get("GITHUB_SHA")
@@ -246,6 +294,8 @@ def _gate_commit_sha_from_env() -> str:
 
 
 def _gate_int_env(name: str) -> int | None:
+    # [FUNCTION DOC] HELPER: Reads the named environment variable as an integer; none when unset,
+    # empty or not parseable.
     raw = os.environ.get(name)
     if raw is None or raw == "":
         return None
@@ -256,6 +306,9 @@ def _gate_int_env(name: str) -> int | None:
 
 
 def gate_provenance_from_env() -> RunProvenance:
+    # [FUNCTION DOC] Builds the run provenance record from environment variables (sha, PR number,
+    # run id, run attempt, event name, ref); missing values become none, or empty for the sha.
+    # Never raises.
     """Build a :class:`RunProvenance` from the GitHub Actions environment.
 
     Reads `GITHUB_SHA` (or the sha embedded in `GITHUB_COMMIT_NAME`),
@@ -276,6 +329,9 @@ def gate_provenance_from_env() -> RunProvenance:
 
 
 def build_store_from_env():
+    # [FUNCTION DOC] Returns a Neon metric-history store when the database URL variable is set and
+    # non-empty; any construction error is logged as a warning and swallowed. Returns none
+    # otherwise (which disables the gate). Side effect: opens a database connection.
     """Return the metric-history store for this environment, or None.
 
     A hosted store is used only when `NEON_DATABASE_URL` is set (CI with the
@@ -296,6 +352,8 @@ def build_store_from_env():
 
 
 def _shadow_verdict_line(filename: str, result) -> str:
+    # [FUNCTION DOC] HELPER: Formats "[CI Gate][shadow] <file>: TRUSTED|NOT-TRUSTED (<n> metric(s))"
+    # from the gate result's trusted flag and metric count.
     """One-line human-readable shadow verdict for a PR run.
 
     Shadow runs never write a row and never change pass/fail; this is the only
@@ -316,6 +374,14 @@ def run_gate_hook(
     provenance: RunProvenance,
     now_iso: str | None = None,
 ) -> None:
+    # [FUNCTION DOC] Evaluates the gate for one passed file and acts, swallowing every exception
+    # (logged as a warning) so it never changes pass/fail. Evaluation uses the merged record, the
+    # store, executing suite and registry. Baseline-writing mode: if no metric results, logs and
+    # returns without writing; otherwise builds a run identity (test path, backend, suite from the
+    # result), a creation time (given or now in UTC ISO form), and samples from results that have a
+    # current value, de-duplicated by (metric key, steps key, constraint key, step); writes the run
+    # with the trusted flag and logs. Otherwise (shadow mode): logs the verdict line and appends it
+    # plus one detail line per metric (key, step, reason) to the GitHub step summary.
     """Evaluate the history gate for one passed CUDA test and act on the verdict.
 
     BASELINE-WRITING run -> persist the run as a trusted/untrusted baseline via
@@ -377,6 +443,8 @@ def run_gate_hook(
 
 
 def _gha_emit_group(title: str) -> None:
+    # [FUNCTION DOC] HELPER: Under GitHub Actions only, prints a group-start workflow command with
+    # the title, escaping percent, carriage return and newline characters.
     if os.environ.get("GITHUB_ACTIONS") != "true":
         return
     safe = title.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
@@ -384,6 +452,7 @@ def _gha_emit_group(title: str) -> None:
 
 
 def _gha_emit_endgroup() -> None:
+    # [FUNCTION DOC] HELPER: Under GitHub Actions only, prints the group-end command.
     if os.environ.get("GITHUB_ACTIONS") != "true":
         return
     print("::endgroup::", flush=True)
@@ -399,6 +468,9 @@ def _gha_emit_summary(
     timeout_after: float | None = None,
     retry_of: int | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Under GitHub Actions only, prints one summary line: index/total,
+    # filename with newlines escaped, status, elapsed whole seconds, and optionally exit code,
+    # timeout seconds and the attempt number this one retries.
     if os.environ.get("GITHUB_ACTIONS") != "true":
         return
     safe_name = filename.replace("\r", "\\r").replace("\n", "\\n")
@@ -425,6 +497,25 @@ def run_unittest_files(
     gate_provenance: RunProvenance | None = None,
     reap_leftovers: bool = False,
 ):
+    # [FUNCTION DOC] Runs each file as "python3 <cwd>/<file>" in a new session, sequentially, and
+    # returns 0 if every file passed, else -1. Per file: effective timeout is the larger of the
+    # given timeout and int(1.25 x estimate). Attempts: one, or up to max_attempts when retry is on
+    # (output is then captured line by line for classification; otherwise it is streamed in
+    # chunks). Before each attempt, leftovers are reaped if requested. Each attempt runs in a
+    # thread bounded by the timeout; a timeout kills the process group, sleeps 5 seconds, records a
+    # failure with no retry. A nonzero exit is retried after the wait only if retry is on, attempts
+    # remain and the output looks retriable. Failures record the tail of output. If the
+    # CI gate record directory variable is set, each attempt gets its own record directory exported
+    # to the child; after a passing attempt the records are merged (errors only logged). After a
+    # pass, a CUDA registry file with a store and a merged record triggers the gate hook (provenance
+    # default from environment). Unless continue_on_error, the loop stops at the first failing file.
+    # Finally logs totals, passed, failed (with output tails), and retried lists, and writes a
+    # step-summary note when retries occurred. GitHub group and summary lines are emitted per
+    # attempt. Unexpected exceptions in an attempt are re-raised after cleanup.
+    # KNOWN ISSUE: the process variable is shared with the worker thread, and on timeout it is
+    # killed by pid used as a group id; this relies on the child being its own session leader.
+    # The Begin/End log lines show the zero-based index against the last index, unlike the group
+    # title which is one-based.
     """
     Run a list of test files.
 
@@ -466,6 +557,12 @@ def run_unittest_files(
         output_tail: deque = deque(maxlen=FAILURE_TAIL_LINES * 8)
 
         def run_one_file(filename, capture_output=False, record_dir=None, _i=i, _estimated_time=estimated_time):
+            # [FUNCTION DOC] HELPER: Runs one test file as a subprocess and returns its exit code.
+            # Resets the shared output tail; logs begin and end lines with elapsed time; when a
+            # record directory is given, creates it and passes it to the child through the gate
+            # record environment variable. With capture on, logs and stores each line (and tail
+            # bytes) while the child runs; otherwise streams chunks through the drain helper. The
+            # process handle and output buffers live in the enclosing function.
             nonlocal process, output_lines, output_tail
             output_tail = deque(maxlen=FAILURE_TAIL_LINES * 8)
 
@@ -705,6 +802,8 @@ def run_unittest_files(
 
 
 def reaping_is_isolated() -> bool:
+    # [FUNCTION DOC] True only when running under CI (the CI variable equals true) and no external
+    # ray cluster variable is set, i.e. when process-wide reaping cannot hit unrelated workloads.
     # The reap below is process-wide, which is only safe inside CI's per-job pid namespace;
     # a local run_suite invocation or an externally managed Ray cluster shares the host, and
     # reaping there kills unrelated Ray/SGLang workloads.
@@ -712,6 +811,10 @@ def reaping_is_isolated() -> bool:
 
 
 def reap_leaked_accelerator_processes() -> None:
+    # [FUNCTION DOC] Kills leftovers from the previous test: runs a forced ray stop, then a
+    # force-kill by command-line pattern for each leftover pattern (each with a 60 second timeout,
+    # output discarded, failures logged as warnings), then waits for them to disappear. Process-wide
+    # side effect; use only when reaping_is_isolated holds.
     # A finished e2e leaves sglang scheduler processes behind: they are grandchildren of the
     # test process, so nothing in the ray or engine teardown path reaches them once the test
     # exits, and they keep holding accelerator memory. The next test file in the same job then
@@ -730,6 +833,12 @@ def reap_leaked_accelerator_processes() -> None:
 
 
 def _wait_until_reaped() -> None:
+    # [FUNCTION DOC] HELPER: Polls once per second for surviving leftover processes until none
+    # remain or 10 seconds pass (always at least one check), then sleeps out the rest of the 10
+    # second window so the driver can free memory, and logs a warning listing survivors if any
+    # were still alive at the last check.
+    # KNOWN ISSUE: the survivors variable reflects the last poll before the extra sleep, so
+    # processes that die during that sleep are still reported only if present at the last poll.
     # Sleeping a fixed time and moving on cannot tell "the device is clean" from "the kill
     # missed and the next file is about to start dirty", which is exactly the failure this
     # whole mechanism exists to stop being misread as a broken test. Poll instead, and say
@@ -757,6 +866,9 @@ def _wait_until_reaped() -> None:
 
 
 def _surviving_leftover_processes() -> list[str]:
+    # [FUNCTION DOC] HELPER: Lists the process table (state and arguments, 30 second timeout) and
+    # returns the first 120 characters of the command of every non-zombie process whose command
+    # contains a leftover pattern. Returns an empty list (with a warning) if listing fails.
     # Deliberately not pgrep: a process killed with SIGKILL stays in the table as a zombie
     # until its parent reaps it, and the job's pid 1 is a shell that never will. pgrep counts
     # those, so it reports every reap as having failed. Read the state column and skip them.

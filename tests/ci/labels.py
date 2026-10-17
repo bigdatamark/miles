@@ -1,3 +1,8 @@
+# [MODULE DOC] Data-only module holding the canonical table of CI domain labels: a mapping from
+# label key to a human description. A test's registration may only use these keys; each key has a
+# matching run-ci-prefixed repository label that selects the tests on a pull request. The file is
+# also parsed as a literal (not imported) by the file-run module, so the table must stay a single
+# annotated literal dictionary assignment of strings to strings.
 """Canonical CI label registry.
 
 Tests declare a domain label set in `register_cuda_ci(..., labels=[...])` and

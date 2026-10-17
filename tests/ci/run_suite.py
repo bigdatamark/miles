@@ -1,3 +1,11 @@
+# [MODULE DOC] Command-line suite runner for CI. Given a hardware backend (cpu, cuda, rocm), a suite
+# name, a cadence and raw PR labels, it discovers and parses all test registrations, resolves the
+# run policy, filters to the registrations that execute in that stage (home stage or dispatched
+# stage, cadence, label selection, not disabled), optionally takes one load-balanced partition,
+# prints the plan, optionally writes a has_tests flag to a GitHub output file, and (unless listing
+# only) runs the tests: CPU suites through one pytest call, other suites file by file through the
+# test-file runner with retry, gate and leftover-reaping options. Exits with the runner's code.
+# Holds the suite inventory per backend (CUDA stages derived from the hardware table).
 import argparse
 import os
 import subprocess
@@ -59,6 +67,10 @@ def runs_in_stage(
     dispatch_arches: frozenset[str] = frozenset(),
     absorb: bool = False,
 ) -> bool:
+    # [FUNCTION DOC] True iff the registration executes in the given suite under the dispatch
+    # policy, ignoring labels. Non-CUDA registrations: suite equality. CUDA: membership of the suite
+    # in the dispatch targets computed from the home suite, supported arches, dispatch arches and
+    # absorb flag.
     """Whether `registration` executes in `suite`, ignoring label selection.
 
     CPU and ROCm registrations have no arch, so their home suite is the only
@@ -85,6 +97,12 @@ def filter_tests(
     dispatch_arches: frozenset[str] = frozenset(),
     absorb: bool = False,
 ) -> tuple[list[CIRegistry], list[CIRegistry]]:
+    # [FUNCTION DOC] Returns (enabled, skipped) lists of registrations for the backend and suite.
+    # Raises a value error if the suite is not in the backend's inventory. Keeps registrations whose
+    # backend matches, that run in the stage under the dispatch policy, and that pass the selection
+    # predicate (nightly admission; no labels, or some label in the include set; a missing label
+    # set means empty). Those with a disabled reason go to skipped, the rest to enabled; order is
+    # preserved.
     """Filter registered tests down to the set that should run.
 
     The base predicate (hw / suite / cadence eligibility / disabled) is applied first.
@@ -122,6 +140,12 @@ def filter_tests(
 
 
 def auto_partition(files: list[CIRegistry], rank, size):
+    # [FUNCTION DOC] Splits the registrations into size groups with balanced total estimated time
+    # and returns group number rank. Algorithm: sort by estimate descending, then filename for
+    # determinism; assign each to the group with the smallest running total (lowest index on ties).
+    # Returns an empty list when there are no files, size is not positive, or rank is not below
+    # size. Negative ranks index from the end of the groups.
+    # KNOWN ISSUE: a negative rank is not rejected here and selects a group from the end.
     """
     Partition files into size sublists with approximately equal sums of estimated times
     using a greedy algorithm (LPT heuristic), and return the partition for the specified rank.
@@ -155,6 +179,10 @@ def pretty_print_tests(
     ci_tests: list[CIRegistry],
     skipped_tests: list[CIRegistry],
 ):
+    # [FUNCTION DOC] Prints a banner with hardware, suite, cadence, continue-on-error and partition
+    # (one-based "n/size" plus the zero-based id, or "full"), then the skipped tests with their
+    # disabled reasons, then either a no-tests notice or the enabled tests with their estimated
+    # times (implicit ones marked) and the total estimate. Output goes to standard output, flushed.
     hw = HW_MAPPING[args.hw]
     suite = args.suite
     if args.auto_partition_size:
@@ -192,6 +220,8 @@ def pretty_print_tests(
 
 
 def build_cpu_pytest_cmd(filenames: list[str], continue_on_error: bool) -> list[str]:
+    # [FUNCTION DOC] Returns the argument list: pytest, the file names sorted (so each directory
+    # appears contiguously), verbose flag, and stop-at-first-failure unless continue_on_error.
     """Build the single pytest invocation for a CPU suite.
 
     `-x` (stop at first failure) is the default regular-run behavior. With
@@ -209,6 +239,17 @@ def build_cpu_pytest_cmd(filenames: list[str], continue_on_error: bool) -> list[
 
 
 def run_a_suite(args):
+    # [FUNCTION DOC] Executes the whole flow for parsed arguments and returns an exit code. Steps:
+    # discover and collect all registrations (sanity checked); resolve the policy from cadence and
+    # labels; include labels are the policy's, plus every known label when match-all is set;
+    # continue-on-error is the flag or the policy's bypass; print the policy; filter tests; take the
+    # partition if sizes are given; print the plan; if a GitHub output path is given append the
+    # has_tests flag (true/false); return 0 if nothing to run or list-only. CPU: run one pytest
+    # subprocess and return its code. Otherwise: timeout is the per-file timeout plus the retry
+    # increase when retry is on; build the metric store and provenance from the environment; for
+    # CUDA with a store and no record directory variable set, create a temporary record directory
+    # and export it in the environment; run the files via the runner with retry options, the
+    # executing suite, baseline-writing flag from the policy, and reaping when isolated.
     hw = HW_MAPPING[args.hw]
     suite = args.suite
     auto_partition_id = args.auto_partition_id
@@ -292,6 +333,13 @@ def run_a_suite(args):
 
 
 def main():
+    # [FUNCTION DOC] Parses the command line and exits the process with the suite's exit code.
+    # Options: hardware (required), suite (required), cadence or nightly alias (mutually
+    # exclusive; default regular), per-file timeout (1800), continue-on-error, partition id and
+    # size, retry switch with attempts (2), wait (60 s) and extra timeout (600 s), list-only,
+    # labels (zero or more), GitHub output path, match-all-labels. Parser errors for: output path
+    # without list-only; only one of partition id and size; non-positive size; id outside the
+    # range.
     parser = argparse.ArgumentParser(description="Run CI test suites from tests/e2e/")
     parser.add_argument(
         "--hw",

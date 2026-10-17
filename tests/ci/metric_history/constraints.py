@@ -1,4 +1,7 @@
 # doc-dev: docs/developer/ci/03-metric-history-gate.md
+# [MODULE DOC] Pure band-constraint logic for the regression gate: a result type holding the verdict
+# and the corridor, the parse-time parameter schema (four non-negative float parameters, all
+# defaulting to zero) consumed by the registration parser, and the evaluation function. No I/O.
 """The band constraint for the CI regression gate.
 
 * A constraint decides whether one extracted scalar `cur` passes against a
@@ -28,6 +31,8 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class ConstraintOutcome:
+    # [CLASS DOC] Immutable result of a constraint check: ok flag, and the lower and upper corridor
+    # bounds (floats) the value was compared with, inclusive on both ends.
     """Whether `cur` passed, and the corridor `[lo, hi]` it was judged against."""
 
     ok: bool
@@ -48,6 +53,11 @@ CONSTRAINT_SCHEMA: dict[str, tuple[str, bool, object]] = {
 
 
 def evaluate_constraint(constraint: dict, cur: float, ref: float) -> ConstraintOutcome:
+    # [FUNCTION DOC] Computes the corridor from the reference: upper bound is ref plus the larger of
+    # (relative-up times absolute ref) and the up floor; lower bound is ref minus the larger of
+    # (relative-down times absolute ref) and the down floor. The constraint mapping must already be
+    # normalized (all four keys present, else a key error). Returns ok when cur lies within the
+    # corridor inclusive. A NaN current value yields not ok (comparisons are false).
     """Apply a normalized constraint dict to `cur` vs `ref`."""
     hi = ref + max(constraint["rel_up"] * abs(ref), constraint["abs_floor_up"])
     lo = ref - max(constraint["rel_down"] * abs(ref), constraint["abs_floor_down"])

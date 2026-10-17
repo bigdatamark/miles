@@ -1,3 +1,9 @@
+# [MODULE DOC] CPU tests enforcing that every disabled CI registration cites a tracking issue or pull
+# request (hash-number or a GitHub issue/pull URL in its disabled reason). A frozen allowlist of
+# (file, suite) pairs spares registrations disabled before the rule; a second test fails when an
+# allowlisted pair is no longer an unlinked disabled registration, so the list can only shrink.
+# Tests collect registrations from the real repository, pinning the working directory to the
+# checkout root. Registered as a CPU test in the first CPU stage.
 """A disabled CI test is a promise to come back; its reason says where that promise is tracked.
 
 ``disabled=`` keeps a registration in the plan as a reported skip instead of
@@ -94,6 +100,9 @@ _UNLINKED_BEFORE_THE_RULE: frozenset[tuple[str, str]] = frozenset(
 
 
 def _unlinked_disabled(monkeypatch) -> list[tuple[str, str]]:
+    # [FUNCTION DOC] HELPER: Changes the working directory to the repository root (restored by the
+    # fixture), collects all registrations, and returns (file, suite) for each disabled one whose
+    # reason matches no tracking-reference pattern. Reads source files from disk.
     """(file, suite) of each disabled registration whose reason cites no issue."""
     # discover_ci_files() globs repo-relative paths, so it reads whatever cwd the
     # runner was started from; pin it to the checkout.
@@ -106,6 +115,9 @@ def _unlinked_disabled(monkeypatch) -> list[tuple[str, str]]:
 
 
 def test_every_disabled_registration_cites_its_tracking_issue(monkeypatch):
+    # [FUNCTION DOC] Asserts that the sorted list of unlinked disabled registrations, after removing
+    # the spared pre-rule pairs, is empty; the failure message explains the required format and
+    # lists the offenders.
     unlinked = sorted(key for key in _unlinked_disabled(monkeypatch) if key not in _UNLINKED_BEFORE_THE_RULE)
     assert unlinked == [], (
         "disabled= must cite the issue or PR that tracks re-enabling the test, "
@@ -114,5 +126,8 @@ def test_every_disabled_registration_cites_its_tracking_issue(monkeypatch):
 
 
 def test_no_spared_entry_outlives_its_reason(monkeypatch):
+    # [FUNCTION DOC] Asserts that every spared pair is still an unlinked disabled registration,
+    # i.e. the sorted set difference (spared minus currently unlinked) is empty; otherwise the
+    # failure tells to delete the stale entries.
     stale = sorted(_UNLINKED_BEFORE_THE_RULE - set(_unlinked_disabled(monkeypatch)))
     assert stale == [], f"these exceptions are re-enabled or now cite an issue; delete them: {stale}"

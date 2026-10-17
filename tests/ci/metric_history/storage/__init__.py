@@ -1,3 +1,6 @@
+# [PACKAGE DOC] Storage layer of the metric-history gate: the abstract store contract with its record
+# types, the offline SQLite backend and the hosted Neon (Postgres) backend, and the name of the
+# environment variable that carries the Neon connection string. Everything is re-exported here.
 """Storage layer for the CI metric-history regression gate.
 
 * Re-exports the :class:`MetricHistoryStore` contract and its record types

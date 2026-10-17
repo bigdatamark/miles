@@ -1,3 +1,12 @@
+# [MODULE DOC] CPU tests for the workflow script that cancels per-file CI runs when a pull request
+# merges. The script is loaded by path as a module (HANDLER). A fake GitHub API callable records
+# calls, serves paged run listings per status and injects errors. Tests cover: cancelling runs in
+# all active states only for the merged PR's file runs; collecting every page before any
+# cancellation and deduplicating runs seen in several states; no calls for non-merge events;
+# tolerating a run that finishes during cancellation; continuing after cancel and request errors
+# and then raising a summary error; failing on the API's result-limit truncation before cancelling
+# anything; the real HTTP request helper's URL, method, auth header and timeout; and text checks
+# of the two workflow files' trust and queue contracts. Registered as a CPU test.
 import importlib.util
 import io
 import json
@@ -25,6 +34,10 @@ PREFIX = "repos/radixark/miles/actions"
 
 
 def file_run(run_id, *, pull=42, status="queued", **overrides):
+    # [FUNCTION DOC] HELPER: Builds a fake workflow-run record for the per-file CI workflow:
+    # id, workflow path, manual-dispatch event, status, and a display title of the rerun-test form
+    # naming a test file derived from the id and the pull request number. Keyword overrides replace
+    # any field.
     return {
         "id": run_id,
         "path": ".github/workflows/run-ci-file.yml",
@@ -36,7 +49,12 @@ def file_run(run_id, *, pull=42, status="queued", **overrides):
 
 
 class FakeAPI:
+    # [CLASS DOC] HELPER: Callable stand-in for the GitHub request function. State: runs grouped by
+    # status, the status returned when a single run is fetched after a conflict, a mapping from
+    # (method, path) to an exception to raise, the ordered list of calls, and the ids cancelled.
     def __init__(self, runs_by_status=None, *, conflict_status=None, errors=None):
+        # [FUNCTION DOC] Stores the arguments (defaulting to empty mappings) and initializes empty
+        # call and cancelled lists.
         self.runs_by_status = runs_by_status or {}
         self.conflict_status = conflict_status
         self.errors = errors or {}
@@ -44,6 +62,13 @@ class FakeAPI:
         self.cancelled = []
 
     def __call__(self, path, *, method="GET"):
+        # [FUNCTION DOC] Records the call and dispatches. A configured error for the exact method and
+        # path is raised. POST: asserts the path is a run-cancel path, records the cancelled id,
+        # returns none. GET without a list query: asserts it is a single-run path and returns a
+        # record whose status is the configured conflict status. GET list: asserts the endpoint is
+        # the per-file workflow's runs, the event filter is manual dispatch, the page size is 100
+        # and no commit filter is used; returns the total count of runs of the requested status and
+        # the requested page of up to 100 runs.
         self.calls.append((method, path))
         if (method, path) in self.errors:
             raise self.errors[method, path]
@@ -66,6 +91,10 @@ class FakeAPI:
 
 
 def test_cancels_all_active_states_and_files_only_for_the_merged_pr():
+    # [FUNCTION DOC] Sets up one run in each of the five active states plus decoys in the queued
+    # list (other PR numbers 420 and 4, a completed run, another workflow path, another event, an
+    # unrelated title, a title with trailing text). Asserts the handler returns and cancels exactly
+    # the five genuine runs for PR 42, in order.
     statuses = ("requested", "waiting", "pending", "queued", "in_progress")
     api = FakeAPI({status: [file_run(i, status=status)] for i, status in enumerate(statuses, 1)})
     api.runs_by_status["queued"] += [
@@ -82,6 +111,9 @@ def test_cancels_all_active_states_and_files_only_for_the_merged_pr():
 
 
 def test_collects_all_pages_before_cancelling_and_deduplicates_state_transitions():
+    # [FUNCTION DOC] Provides 101 pending runs and one in-progress copy of run 1. Asserts the
+    # handler cancels ids 1 to 101 once each, requested a second page, and made all list requests
+    # before the first cancel request.
     runs = [file_run(i) for i in range(1, 102)]
     api = FakeAPI({"pending": runs, "in_progress": [file_run(1, status="in_progress")]})
     assert HANDLER.cancel_merged_file_runs(EVENT, api) == list(range(1, 102))
@@ -93,6 +125,8 @@ def test_collects_all_pages_before_cancelling_and_deduplicates_state_transitions
 
 @pytest.mark.parametrize("action,merged", [("closed", False), ("opened", False), ("synchronize", False)])
 def test_non_merge_events_do_not_call_github(action, merged):
+    # [FUNCTION DOC] Parametrized over closed-unmerged, opened and synchronize events: asserts an
+    # empty result and no API calls at all.
     api = FakeAPI()
     event = {**EVENT, "action": action, "pull_request": {"merged": merged}}
     assert HANDLER.cancel_merged_file_runs(event, api) == []
@@ -100,6 +134,9 @@ def test_non_merge_events_do_not_call_github(action, merged):
 
 
 def test_a_run_finishing_during_cancellation_is_not_an_error():
+    # [FUNCTION DOC] Run 1's cancel request fails with a conflict, and fetching it reports it
+    # completed. Asserts the handler returns and cancels only run 2, no error is raised, and the
+    # status of run 1 was fetched.
     path = f"{PREFIX}/runs/1"
     api = FakeAPI(
         {"in_progress": [file_run(1), file_run(2)]},
@@ -113,6 +150,10 @@ def test_a_run_finishing_during_cancellation_is_not_an_error():
 
 @pytest.mark.parametrize("code", [403, 409, 500, 502])
 def test_cancellation_errors_do_not_prevent_other_runs(code, capsys):
+    # [FUNCTION DOC] Parametrized over HTTP codes 403, 409, 500, 502. Four queued runs; cancel
+    # requests for runs 1 and 3 fail (and a re-fetch shows the run still in progress). Asserts the
+    # handler raises a runtime error naming PR 42 and runs [1, 3], runs 2 and 4 were cancelled,
+    # every run was attempted in order, and a message per failed run with the HTTP error was printed.
     api = FakeAPI(
         {"queued": [file_run(i) for i in range(1, 5)]},
         conflict_status="in_progress",
@@ -135,6 +176,10 @@ def test_cancellation_errors_do_not_prevent_other_runs(code, capsys):
 @pytest.mark.parametrize("method", ["POST", "GET"])
 @pytest.mark.parametrize("error_type", [urllib.error.URLError, TimeoutError])
 def test_request_failures_do_not_prevent_other_runs(method, error_type, capsys):
+    # [FUNCTION DOC] Parametrized over which request fails (the cancel POST or the follow-up GET)
+    # and the error kind (URL error or timeout). Run 1's cancel first conflicts, then the chosen
+    # request raises the error. Asserts a runtime error naming only run 1, that run 2 was still
+    # cancelled, and that the printed output contains the failure message with the error text.
     error = error_type("request failed")
     path = f"{PREFIX}/runs/1"
     errors = {("POST", f"{path}/cancel"): urllib.error.HTTPError(path, 409, "conflict", {}, None)}
@@ -147,6 +192,8 @@ def test_request_failures_do_not_prevent_other_runs(method, error_type, capsys):
 
 
 def test_api_truncation_fails_before_any_cancellation():
+    # [FUNCTION DOC] Provides 1001 queued runs (past the API's 1000-result window). Asserts the
+    # handler raises a runtime error mentioning the limit and that nothing was cancelled.
     api = FakeAPI({"queued": [file_run(i) for i in range(1001)]})
     with pytest.raises(RuntimeError, match="1000-run limit"):
         HANDLER.cancel_merged_file_runs(EVENT, api)
@@ -155,9 +202,16 @@ def test_api_truncation_fails_before_any_cancellation():
 
 @pytest.mark.parametrize("method,status", [("GET", 200), ("POST", 202)])
 def test_http_requests_use_the_scoped_token_and_correct_method(monkeypatch, method, status):
+    # [FUNCTION DOC] Parametrized over GET (status 200) and POST (status 202). Sets a fake token
+    # in the environment and replaces the handler module's URL opener with a checker. Asserts the
+    # real request helper returns the parsed JSON body for GET and none for POST (empty body).
     monkeypatch.setenv("GH_TOKEN", "test-token")
 
     def urlopen(request, *, timeout):
+        # [FUNCTION DOC] HELPER: Fake opener asserting the full URL on the GitHub API host, the
+        # HTTP method, a bearer authorization header with the test token, and a 30 second timeout;
+        # returns an in-memory byte stream with the given status and, for GET, a JSON body saying
+        # the run is completed (empty for POST).
         assert request.full_url == f"https://api.github.com/{PREFIX}/runs/1"
         assert request.get_method() == method
         assert request.get_header("Authorization") == "Bearer test-token"
@@ -172,6 +226,13 @@ def test_http_requests_use_the_scoped_token_and_correct_method(monkeypatch, meth
 
 
 def test_workflow_uses_trusted_code_and_keeps_file_queue_and_identity_contracts():
+    # [FUNCTION DOC] Text-level assertions on the two workflow files. Cancel workflow: triggers on
+    # the base-repository closed pull-request event, runs only when merged, has read contents and
+    # write actions permissions, checks out the base commit without persisted credentials and
+    # sparse-checks-out only the script, runs that script, and never references the pull request
+    # head. File workflow: its run name has the rerun-test form with the test file and PR number
+    # (matching what the handler parses), and its concurrency group is per PR and test file without
+    # cancelling in progress runs and with a maximum-length queue.
     workflow = (ROOT / ".github/workflows/cancel-merged-file-ci.yml").read_text()
     assert "pull_request_target:\n    types: [closed]" in workflow
     assert "if: github.event.pull_request.merged == true" in workflow

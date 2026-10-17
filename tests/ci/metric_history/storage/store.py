@@ -1,4 +1,8 @@
 # doc-dev: docs/developer/ci/03-metric-history-gate.md
+# [MODULE DOC] Abstract storage contract of the metric-history gate: three immutable record types
+# (a metric sample, a run identity, run provenance), a validator rejecting non-finite sample values,
+# and the abstract store interface with three operations: write a run, query recent trusted values,
+# mark runs untrusted. Backends implement it; no I/O happens here.
 """Storage contract for the CI metric-history regression gate.
 
 * The gate compares a candidate run's metrics against a baseline assembled
@@ -28,6 +32,8 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class MetricSample:
+    # [CLASS DOC] Immutable record: metric key, steps key and constraint key (canonical JSON text),
+    # integer step (-1 for whole-series reductions) and float value.
     """One comparison-coordinate value a run contributed.
 
     The coordinate is the declaring gate's literal content plus the point:
@@ -48,6 +54,8 @@ class MetricSample:
 
 @dataclass(frozen=True)
 class RunIdentity:
+    # [CLASS DOC] Immutable record: test path, backend string and suite name; the exact triple
+    # scopes a baseline.
     """The fields that decide whether two runs share a baseline.
 
     A baseline query is scoped to an exact (test_path, backend, suite)
@@ -62,6 +70,8 @@ class RunIdentity:
 
 @dataclass(frozen=True)
 class RunProvenance:
+    # [CLASS DOC] Immutable audit record: commit sha (text), and optional pull request number,
+    # GitHub run id, run attempt, event name and ref.
     """Where a run came from. Recorded for audit and for `mark_untrusted`
     targeting; never used to assemble a baseline."""
 
@@ -74,6 +84,8 @@ class RunProvenance:
 
 
 def validate_finite_values(values: list[MetricSample]) -> None:
+    # [FUNCTION DOC] Raises a value error naming the metric key and step for the first sample whose
+    # value is not finite (not-a-number or infinite); returns nothing otherwise.
     """Reject non-finite sample values before a backend persists anything."""
     for sample in values:
         if not math.isfinite(sample.value):
@@ -84,6 +96,8 @@ def validate_finite_values(values: list[MetricSample]) -> None:
 
 
 class MetricHistoryStore(abc.ABC):
+    # [CLASS DOC] Abstract base class for backends; the three abstract methods below are the whole
+    # required surface. It declares no close method, although both concrete backends provide one.
     """Abstract metric-history store.
 
     Implementations persist runs and their metric values and answer the
@@ -101,6 +115,9 @@ class MetricHistoryStore(abc.ABC):
         trusted: bool,
         values: list[MetricSample],
     ) -> str:
+        # [FUNCTION DOC] Abstract: persist a run with its samples and return a new run id. Contract:
+        # creation time is an ISO timestamp text; non-finite values raise a value error before any
+        # write.
         """Persist one run and its metric values; return the new `run_id`.
 
         `created_at` is an ISO-8601 timestamp string (timestamptz on the
@@ -125,6 +142,8 @@ class MetricHistoryStore(abc.ABC):
         step: int,
         limit: int,
     ) -> list[float]:
+        # [FUNCTION DOC] Abstract: return up to limit values of the exact coordinate from trusted
+        # runs with the exact identity, newest run first.
         """Return up to `limit` baseline values, newest run first.
 
         Only trusted runs matching the exact identity tuple and the exact
@@ -141,6 +160,8 @@ class MetricHistoryStore(abc.ABC):
         github_run_id: int | None = None,
         commit_sha: str | None = None,
     ) -> int:
+        # [FUNCTION DOC] Abstract: revoke trust on runs matching exactly one of run id, GitHub run
+        # id or commit sha; returns the count of runs that changed from trusted to untrusted.
         """Revoke trust on the runs matching exactly one of the given keys.
 
         Returns the number of run rows whose `trusted` flag changed from true

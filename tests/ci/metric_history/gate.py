@@ -1,4 +1,11 @@
 # doc-dev: docs/developer/ci/03-metric-history-gate.md
+# [MODULE DOC] Read-only evaluation of the regression gate. Given a test file, the merged JSON-lines
+# metric record of its passing attempt, and a history store, it parses the file's gate
+# declarations, selects the declared steps from each metric series, fetches the most recent trusted
+# baseline values per coordinate, compares against their mean with the band constraint, and returns
+# per-coordinate verdicts plus a run-level trusted flag. Cold start (no trusted history) counts as
+# inactive and therefore trusted. The only store call is the recent-trusted-values query; nothing
+# is written. Includes the status enum, the two result types, the record parser and helpers.
 """Offline regression gate for the CI metric-history system.
 
 * Consumes one merged per-run JSONL record plus the `register_ci_gate` specs
@@ -49,6 +56,8 @@ _BACKEND_STR: dict[HWBackend, str] = {
 
 
 class GateStatus(Enum):
+    # [CLASS DOC] Enumeration of the per-coordinate outcomes: pass, fail, inactive (no trusted
+    # history yet) and error (metric missing or selection invalid).
     """Outcome of the historical check for one coordinate."""
 
     PASS = "pass"
@@ -59,6 +68,9 @@ class GateStatus(Enum):
 
 @dataclass(frozen=True)
 class MetricGateResult:
+    # [CLASS DOC] Immutable verdict for one comparison coordinate; fields as described in the
+    # docstring below, plus the check status, the number of trusted baseline values used, their
+    # mean (none when inactive or errored) and a human-readable reason string.
     """Per-coordinate verdict.
 
     `(metric_key, steps_key, constraint_key, step)` is the baseline coordinate;
@@ -83,11 +95,16 @@ class MetricGateResult:
 
     @property
     def trusted(self) -> bool:
+        # [FUNCTION DOC] Property: true iff the status is pass or inactive (fail and error are
+        # untrusted).
         return self.historical_status in (GateStatus.PASS, GateStatus.INACTIVE)
 
 
 @dataclass(frozen=True)
 class GateResult:
+    # [CLASS DOC] Immutable run-level result: test path, backend string (lower-case, possibly empty
+    # when unknown), the suite the run executed on, and the list of per-coordinate verdicts
+    # (empty when the file declares no gate).
     """Run-level verdict over every gate spec for one test file."""
 
     test_path: str
@@ -97,6 +114,8 @@ class GateResult:
 
     @property
     def trusted(self) -> bool:
+        # [FUNCTION DOC] Property: true iff every per-coordinate verdict is trusted (vacuously true
+        # for an empty list).
         """The run is trusted iff every per-coordinate verdict is trusted.
 
         An empty metrics list (no gate specs) is vacuously trusted: a file that
@@ -112,12 +131,19 @@ _NONFINITE_MARKERS: dict[str, float] = {"NaN": math.nan, "Infinity": math.inf, "
 
 
 def _decode_value(value: object) -> object:
+    # [FUNCTION DOC] HELPER: Turns the capture-side marker strings for not-a-number and positive or
+    # negative infinity into the matching floats; any other value is returned unchanged.
     if isinstance(value, str) and value in _NONFINITE_MARKERS:
         return _NONFINITE_MARKERS[value]
     return value
 
 
 def parse_merged_record(record_path: str) -> dict[str, list]:
+    # [FUNCTION DOC] Reads the JSON-lines file (blank lines skipped) into a mapping from metric key
+    # to its series, where each series entry that is a list with at least two items becomes a pair
+    # of step and decoded value (extra items dropped); other entries are kept as they are. A later
+    # line for the same metric replaces the earlier one. Raises file or JSON errors, or a key error
+    # for a line missing the metric or series field.
     """Read a merged JSONL record into `{metric_key: series}`.
 
     Each line is `{"metric": key, "series": [[step, value], ...]}`. Non-finite
@@ -140,6 +166,8 @@ def parse_merged_record(record_path: str) -> dict[str, list]:
 
 
 def _registry_for(filename: str) -> CIRegistry:
+    # [FUNCTION DOC] HELPER: Parses the file's registrations and returns the only one. Raises a value
+    # error if there are none or more than one (message names the file and count).
     """The single CIRegistry governing this test file.
 
     A gate needs exactly one (backend, suite) identity. A file with no register
@@ -155,6 +183,8 @@ def _registry_for(filename: str) -> CIRegistry:
 
 
 def _error_result(spec: CiGateSpec, reason: str) -> MetricGateResult:
+    # [FUNCTION DOC] HELPER: Builds an error-status result for the spec with the given reason: no
+    # step, no current value, zero baselines and no mean.
     return MetricGateResult(
         metric_key=spec.metric_key,
         steps_key=spec.steps_key,
@@ -179,6 +209,14 @@ def _evaluate_spec(
     suite: str,
     history_limit: int,
 ) -> list[MetricGateResult]:
+    # [FUNCTION DOC] HELPER: Evaluates one gate spec. If the metric is absent from the record, or
+    # step selection raises a selection error, returns a single error result with an explanatory
+    # reason. Otherwise, for each selected (step, value): queries the store for up to history_limit
+    # recent trusted values at that coordinate (test path, backend, suite, metric key, steps key,
+    # constraint key, step). With none: status inactive with a cold-start reason. With some:
+    # compares the value with their arithmetic mean using the spec's constraint; pass or fail, the
+    # failure reason showing value, mean, count and corridor. Passing and inactive results get a
+    # leading "ok" reason; reasons are joined with semicolons. Returns one result per selection.
     series = by_metric.get(spec.metric_key)
     if series is None:
         return [_error_result(spec, f"required metric {spec.metric_key!r} missing from record")]
@@ -244,6 +282,14 @@ def evaluate_gate(
     registry: CIRegistry | None = None,
     history_limit: int = 20,
 ) -> GateResult:
+    # [FUNCTION DOC] Evaluates all gate specs declared in the test file and returns the run result.
+    # If the file declares no specs, returns an empty (trusted) result without reading the record:
+    # identity comes from the given registry (its filename and backend) or, absent that, the
+    # filename with an empty backend; suite is always the executing suite. Otherwise: uses the
+    # given registry or reparses (value error if none or several), parses the merged record, and
+    # evaluates each spec in order, concatenating results. The identity's path and backend come
+    # from the registry and suite from the executing suite. History limit defaults to 20. Read-only
+    # with respect to the store.
     """Evaluate every `register_ci_gate` spec in `test_filename` against a record.
 
     `test_filename` is the repo-relative test path. Gate identity

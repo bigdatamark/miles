@@ -1,3 +1,8 @@
+# [MODULE DOC] Static taxonomy of CUDA CI hardware: the ordered tuple of known GPU generations
+# (hopper first, which is the auto-dispatch preference), the table of CUDA stages (arch, GPU count
+# and runner labels) that is the single source for suite names, and pure functions that pick a
+# test's default arch, the smallest stage on another arch that can hold a test, and the full set of
+# stages a registration runs on under a dispatch policy. Standard library only.
 """GPU generations a CUDA test can run on, and what each CUDA stage provides.
 
 * An *arch* is a GPU generation, not a SKU: `h100` and `h200` differ in memory,
@@ -31,6 +36,8 @@ KNOWN_ARCHES: tuple[str, ...] = ("hopper", "blackwell")
 
 @dataclass(frozen=True)
 class CudaStage:
+    # [CLASS DOC] Immutable description of one CUDA stage: its GPU arch, GPU count, and the tuple
+    # of runner labels used to select a machine.
     arch: str
     num_gpus: int
     runs_on: tuple[str, ...]
@@ -47,6 +54,8 @@ CUDA_STAGES: dict[str, CudaStage] = {
 
 
 def auto_arch(hardware: list[str]) -> str:
+    # [FUNCTION DOC] Returns the first known arch (in preference order) present in the given
+    # list. Raises a value error if none of the entries is a known arch (including an empty list).
     """The arch a test runs on when nothing asks for a different one."""
     supported = set(hardware)
     for arch in KNOWN_ARCHES:
@@ -56,6 +65,10 @@ def auto_arch(hardware: list[str]) -> str:
 
 
 def target_stage(home_suite: str, arch: str) -> str | None:
+    # [FUNCTION DOC] Returns the home suite itself when the requested arch is the home arch;
+    # otherwise the stage on the requested arch with at least as many GPUs as the home stage and the
+    # fewest GPUs (ties broken by smaller name), or none if there is none. Raises a key error for
+    # an unknown home suite.
     """The stage on `arch` that runs a test homed at `home_suite`.
 
     On the test's own arch that is its home stage. On another arch it is the
@@ -84,6 +97,11 @@ def dispatch_targets(
     dispatch_arches: frozenset[str],
     absorb: bool,
 ) -> set[str]:
+    # [FUNCTION DOC] Computes the set of stages a registration runs on. Arches considered: the
+    # intersection of the supported arches and the requested dispatch arches, or, when no arches
+    # are requested, just the auto arch of the supported ones (value error if none known). For each
+    # arch: the home suite if it is the home arch; otherwise, only when absorb is true, the target
+    # stage on that arch if one exists. Returns a possibly empty set.
     """Every CUDA stage that runs this registration under one dispatch policy.
 
     Empty `dispatch_arches` is AUTO: the test runs once, on `auto_arch`, which

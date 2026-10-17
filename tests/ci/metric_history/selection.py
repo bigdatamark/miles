@@ -1,4 +1,9 @@
 # doc-dev: docs/developer/ci/03-metric-history-gate.md
+# [MODULE DOC] Pure step selection for the gate: from a metric series of step-value pairs, pick the
+# last numeric point, every step, or a named list of steps, as selection records. Non-numeric
+# values (including booleans) are ignored; non-integer steps become unknown; non-finite values at
+# picked coordinates, duplicate steps, missing named steps, unknown steps under "all" and empty
+# series raise the selection error. The "last" selection uses the constant step -1 as identity.
 """Step selection for the CI regression gate.
 
 * `select(series, steps)` pulls the comparison value(s) out of one metric's
@@ -34,11 +39,15 @@ Point = Sequence  # [step, value]
 
 
 class SelectionError(ValueError):
+    # [CLASS DOC] Value-error subclass raised when a selection cannot be made; the gate converts it
+    # into an error verdict for the spec.
     """A required series is absent, empty, or ill-formed for this selection."""
 
 
 @dataclass(frozen=True)
 class Selection:
+    # [CLASS DOC] Immutable record of one picked value: identity step (integer), the step it came
+    # from (or none), and the float value.
     """One comparison value pulled from a series.
 
     `step` is the identity role: step `k` for a per-step value, `-1` for a
@@ -54,6 +63,8 @@ class Selection:
 
 
 def _is_number(value: object) -> bool:
+    # [FUNCTION DOC] HELPER: True for integers and floats that are not booleans (non-finite floats
+    # included).
     """A real int/float (not bool — it sneaks through `isinstance(x, int)`).
 
     Finiteness is deliberately not checked here: non-finite values stay in the
@@ -63,10 +74,14 @@ def _is_number(value: object) -> bool:
 
 
 def _valid_step(step: object) -> bool:
+    # [FUNCTION DOC] HELPER: True for non-boolean integers.
     return isinstance(step, int) and not isinstance(step, bool)
 
 
 def _numeric_points(series: Sequence[Point]) -> list[tuple[int | None, float]]:
+    # [FUNCTION DOC] HELPER: Returns, in order, (step, float value) for each point with at least two
+    # items and a numeric second item; steps that are not valid integers become none; shorter
+    # points and non-numeric values are dropped.
     """(step, value) for each point whose value is a number.
 
     A non-int (or bool) step is normalized to None; the value is kept —
@@ -85,6 +100,9 @@ def _numeric_points(series: Sequence[Point]) -> list[tuple[int | None, float]]:
 
 
 def _select_last(series: Sequence[Point]) -> list[Selection]:
+    # [FUNCTION DOC] HELPER: Picks the last numeric point as a single selection with identity step
+    # -1 and the point's own step as the origin. Raises the selection error if there is no numeric
+    # point or the last value is not finite.
     points = _numeric_points(series)
     if not points:
         raise SelectionError("series has no numeric point")
@@ -95,6 +113,9 @@ def _select_last(series: Sequence[Point]) -> list[Selection]:
 
 
 def _select_all(series: Sequence[Point]) -> list[Selection]:
+    # [FUNCTION DOC] HELPER: One selection per numeric point, in series order, with identity and
+    # origin step both equal to the point's step. Raises the selection error for an empty numeric
+    # series, a point without a step, a repeated step, or a non-finite value.
     points = _numeric_points(series)
     if not points:
         raise SelectionError("series has no numeric point")
@@ -113,6 +134,11 @@ def _select_all(series: Sequence[Point]) -> list[Selection]:
 
 
 def _select_steps(series: Sequence[Point], steps: Sequence[int]) -> list[Selection]:
+    # [FUNCTION DOC] HELPER: Builds a step-to-value map from numeric points (points without a step
+    # are skipped; a repeated step raises the selection error), then returns one selection per
+    # requested step in the requested order. Raises the selection error if a requested step is
+    # missing or its value is not finite. Does not raise for an empty series unless steps are
+    # requested.
     by_step: dict[int, float] = {}
     for step, value in _numeric_points(series):
         if step is None:
@@ -131,6 +157,9 @@ def _select_steps(series: Sequence[Point], steps: Sequence[int]) -> list[Selecti
 
 
 def select(series: Sequence[Point], steps: str | Sequence[int]) -> list[Selection]:
+    # [FUNCTION DOC] Dispatches on the steps literal: "last", "all", or a list/tuple of step
+    # indices; anything else raises the selection error. Returns the selections of the chosen
+    # strategy.
     """Apply a validated `steps` literal to a series."""
     if steps == "last":
         return _select_last(series)
