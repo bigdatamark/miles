@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Metric logging for training. Per-rank metric dictionaries are gathered across the data-parallel x
+# context-parallel group (via CPU/gloo object gather, tolerant of fault-tolerance cell failures),
+# reduced on rank 0 (sum/count tuples or mean/min/max scalars) and sent to the experiment tracker
+# with a namespaced step key. Also covers rollout-data summarization (with CI log-prob sanity
+# checks), multi-turn metrics, perf metrics (delegated), CPU memory, aggregation of per-microbatch
+# training loss metrics, and per-step train logging. Metric values are either floats or
+# (sum, count) tuples that reduce to sum of sums over sum of counts.
 import logging
 from argparse import Namespace
 from math import isclose
@@ -35,6 +43,15 @@ def reduce_gathered_log_dict(
     dp_size: int,
     reduction_by_key: dict[str, str] | None = None,
 ) -> dict[str, float]:
+    # [FUNCTION DOC] Input: list of per-rank metric mappings, the number of ranks (used as the divisor
+    # for scalar means) and an optional mapping from key to reduction name. Returns {} for empty
+    # input. If a reduction mapping is given, all ranks must have identical key sets (value error
+    # otherwise); without it that check is skipped. For each key of rank 0: a reduction other than
+    # mean/min/max raises a value error; a two-tuple value reduces to total sum / total count (0.0 if
+    # count is 0) regardless of the requested reduction; otherwise mean = sum of values / rank
+    # count, min or max over ranks. KNOWN ISSUE: the key-consistency check only happens when a
+    # reduction mapping is passed, so a missing key on another rank raises a key error otherwise;
+    # also the reduction name is validated even for tuple values.
     """Reduce already-gathered per-rank metrics without adding another collective.
 
     ``(sum, count)`` tuples reduce as ``Σsum / Σcount``. Scalars reduce by the
@@ -84,6 +101,13 @@ def gather_log_data(
     log_dict: dict[str, "float | tuple[float, float]"],
     reduction_by_key: dict[str, str] | None = None,
 ) -> dict[str, float] | None:
+    # [FUNCTION DOC] Gather the per-rank log mapping across the effective DP x CP group's gloo groups
+    # (inner to outer) as Python objects, emitting structured fault-tolerance start/end log records;
+    # a runtime error during gather (e.g. a failed cell) is logged as a degraded warning and the
+    # function returns none. On rank 0 of the group: reduce (see the reduce function), prefix keys
+    # with "<metric_name>/", log the info line with rollout id, compute the rollout-based step,
+    # namespace the keys by trainer model id with the step key, send to the tracker, and return the
+    # namespaced mapping. Other ranks return none. Collective communication; tracker side effect.
     """
     Gather per-rank metrics, reduce on the DP source rank, and log.
 
@@ -142,6 +166,11 @@ def aggregate_forward_results(
     args: Namespace,
     store_prefix: str = "",
 ) -> dict[str, list]:
+    # [FUNCTION DOC] Merge per-micro-batch forward results (list of mappings from key to list) into
+    # one mapping from key to a flat list: concatenates each key's lists across micro-batches
+    # (asserting every value is a list). With dynamic batch size enabled and an iterator that has
+    # micro-batch indices, the concatenated values are reordered back to the original sample order
+    # using the flattened indices. Returns {} for empty input. KNOWN ISSUE: store_prefix is unused.
     rollout_data = {}
     if not forward_data_store:
         return rollout_data
@@ -167,6 +196,27 @@ def aggregate_forward_results(
 
 
 def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatch) -> None:
+    # [FUNCTION DOC] On PP-last-stage TP-rank-0 processes: build a mapping of (sum, count) pairs per
+    # rollout key and gather/log it under "rollout". Keys on a skip list (tokens, masks, indices,
+    # ids, metadata, batch bookkeeping, replay data, etc.) are ignored. Lists/tuples of tensors are
+    # concatenated (cloned, moved to the loss mask device); token-level keys (log probs, ref log
+    # probs, rollout log probs, returns, advantages, values, teacher log probs, opd reverse kl,
+    # entropy) use the CP-correct per-sample mean reducer times CP size, with count = the rollout
+    # count share (total rollouts / intra-DP size) if rollout counts exist, else the sample count;
+    # other tensor lists use mean * CP size * count. Lists of numbers (flattening one nesting level)
+    # give (sum, length); non-numeric lists are skipped; bare tensors give (float mean, 1); any other
+    # type raises a value error. In CI test mode (unless the logprob checker is disabled) asserts on
+    # the reduced values: at rollout 0 log probs vs reference log probs close within 5e-3 (rollout
+    # routing replay) else 1e-8; log probs vs rollout log probs within 0.03; entropy in (0, 0.7);
+    # and in true-on-policy mode exact equality of log probs and rollout log probs (rank-local
+    # values). Then logs multi-turn data if enabled. If the log-correct-samples option is on
+    # (same ranks), derives extra entries inside the rollout data (mutating it): lengths of samples
+    # with raw reward exactly 1, per-quantile fraction entries (4 quantiles up to the max response
+    # length, repeated per correct sample) and mean entropy over correct samples (or 0).
+    # KNOWN ISSUE: the two tolerance branches for the sglang-config case and default are identical;
+    # the quantile entries and correct-length data are added to rollout data after logging so they
+    # are not logged by this call; the reduced dict check on rank-local log_dict only runs where it
+    # is defined (reduced result may be none on non-source ranks).
     """
     Summarize rollout fields and log reduced metrics on PP last stage, TP rank 0.
 
@@ -313,6 +363,12 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
             total_lengths = rollout_data["total_lengths"]
 
             def quantile(total_value, n_quantiles, data) -> dict:
+                # [FUNCTION DOC] HELPER: Fraction of data points falling in each of n equal-width
+                # buckets of [0, total_value] (a point goes to the first bucket whose upper cut point
+                # is at least the value; cut points are total_value * i / n with the last forced
+                # exactly to total_value; points above total_value are dropped). Fractions use a tiny
+                # epsilon in the denominator. Returns a mapping "p<percent>" (rounded up, at most
+                # 100) to fraction. Asserts n > 1. Imports math locally.
                 import math
 
                 assert n_quantiles > 1, f"n_quantiles({n_quantiles}) must be greater than 1."
@@ -365,6 +421,11 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
 
 
 def log_multi_turn_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatch) -> None:
+    # [FUNCTION DOC] On PP-last-stage TP-rank-0 processes: from the loss masks compute raw response
+    # length (mask length) mean/max/min and clip ratio (fraction at or above the max response
+    # length), and length without observations (mask sum) mean/max/min; from the round number list
+    # compute mean/max/min. Then gather and log under "multi_turn" with max/min keys reduced as
+    # extrema across ranks. Other ranks do nothing.
     """
     Log multi-turn auxiliary metrics such as raw/observed response lengths and rounds.
 
@@ -411,6 +472,9 @@ def log_multi_turn_data(rollout_id: int, args: Namespace, rollout_data: RolloutB
 
 
 def log_perf_data(rollout_id: int, args: Namespace, extra_metrics: dict | None = None) -> None:
+    # [FUNCTION DOC] Delegates to the perf module's raw logging function. The primary rank is the one
+    # with TP rank 0, on the last pipeline stage and DP x CP rank 0. Provides a callable that turns
+    # sequence lengths into forward TFLOPs per GPU using the world size.
     parallel_state = get_parallel_state()
     perf.log_perf_data_raw(
         rollout_id=rollout_id,
@@ -426,6 +490,8 @@ def log_perf_data(rollout_id: int, args: Namespace, extra_metrics: dict | None =
 
 
 def log_cpu_memory(rollout_id: int, args: Namespace, label: str) -> None:
+    # [FUNCTION DOC] Reads used system memory (GB, decimal) via psutil, logs an info line and sends a
+    # tracker metric named "perf/cpu_memory_<label>_gb" with the rollout-based step. No collective.
     """Log current system CPU memory usage to wandb/tensorboard.
 
     Caller is responsible for ensuring this runs on a single rank only.
@@ -447,6 +513,12 @@ def aggregate_train_losses(
     losses_reduced: list[dict[str, list[str] | torch.Tensor]],
     num_rollouts: int | None = None,
 ) -> dict[str, float]:
+    # [FUNCTION DOC] Sum the "values" tensors of all micro-batch mappings (the first element is a
+    # sample or token count, followed by one value per key), asserting the key count plus one equals
+    # the tensor length. All-reduces (sum) over each group of the effective DP x CP group from
+    # inner to outer. Divides each metric: with num_rollouts given by that count; otherwise by the
+    # reduced count times the CP size multiplier. Returns a mapping from key to float; {} for empty
+    # input. Uses keys of the first micro-batch only.
     """Aggregate loss metrics across micro-batches.
 
     Sums loss values across all micro-batches, performs all-reduce across
@@ -508,6 +580,12 @@ def log_train_step(
     extra_metrics: dict[str, float] | None = None,
     should_log: bool | None = None,
 ) -> dict[str, float]:
+    # [FUNCTION DOC] Build and log the per-step training metrics. Accumulated step id = rollout id *
+    # steps per rollout + step id. Keys are "train/<role>-" prefixed (no prefix for the actor): loss
+    # metrics (tensors reduced by mean to Python floats), the grad norm as float, then extra
+    # metrics. The mapping is namespaced by trainer model id with the "train/step" step key. Logs to
+    # the tracker and an info line only if should_log (default: distributed rank 0). Returns the
+    # namespaced mapping on every rank.
     """Log training metrics for one step.
 
     Formats loss metrics, gradient norm, and extra metrics (e.g., learning rates, MTP loss) for tracking.

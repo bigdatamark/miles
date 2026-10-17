@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# NCCL broadcast weight transfer for non-colocated engines. A protocol class owns the sender decision
+# and the lifecycle of one NCCL group per shard (sender training rank plus all engine GPUs); module
+# functions create/destroy that group via HTTP-driven engine calls, and broadcast buckets after
+# sending tensor metadata over HTTP. Optionally packs a bucket into one flattened byte tensor.
 import socket
 from argparse import Namespace
 from collections.abc import Sequence
@@ -19,6 +24,11 @@ from miles.utils.distributed_utils import init_process_group
 
 
 class UpdateWeightFromDistributed(WeightTransferProtocol):
+    # [CLASS DOC] Broadcast protocol; supports LoRA. Uses the base default required placement.
+    # Sender: the rank with data-replica rank 0; one NCCL group named per shard (pipeline rank, or 0
+    # when pipeline is gathered). With more than one pipeline stage a world-wide ticket lock
+    # serializes broadcasts across stages (participants are intra-DP x CP rank 0 and TP rank 0
+    # processes) to prevent NCCL deadlock; otherwise a no-op context.
     """
     Update distributed engines via NCCL. Each PP rank: group "miles-pp_{pp_rank}",
     only DP=TP=0 broadcasts. Non-expert (TP) and expert (EP) params separate.
@@ -27,6 +37,9 @@ class UpdateWeightFromDistributed(WeightTransferProtocol):
     supports_lora = True
 
     def __init__(self, args: Namespace) -> None:
+        # [FUNCTION DOC] Initialize the base, no NCCL group yet, and build the engine lock from the
+        # global parallel state as described at class level (ticket lock with prefix for weight
+        # update when pp size > 1).
         super().__init__(args)
         self._model_update_groups = None
         parallel_state = get_parallel_state()
@@ -48,6 +61,13 @@ class UpdateWeightFromDistributed(WeightTransferProtocol):
         placement: WeightUpdatePlacement,
         selector: str,
     ) -> None:
+        # [FUNCTION DOC] Store engines, selector and engine GPU counts. The data-replica rank comes
+        # from the shared helper; this rank is the sender iff it is 0. Shard = 0 if pipeline is
+        # gathered else the pipeline rank; the group name becomes "miles-pp_<shard>". On senders:
+        # first tears down any previous group (on engines and locally), then creates a new NCCL group
+        # with all engine GPUs (blocks until joined). Non-senders do nothing more. KNOWN ISSUE: the
+        # docstring says the source is DP=TP=0 and mentions the lock; code decides by replica rank
+        # and the lock is created in the constructor; engine_gpu_offsets is unused.
         """
         Create NCCL "miles-pp_{pp_rank}" if PP source (DP=TP=0). Lock prevents concurrent broadcasts.
         """
@@ -69,6 +89,9 @@ class UpdateWeightFromDistributed(WeightTransferProtocol):
             )
 
     def send_bucket(self, bucket: list[tuple[str, torch.Tensor]]) -> None:
+        # [FUNCTION DOC] Under the engine lock: send metadata and broadcast the bucket's tensors to
+        # the engines using the configured transfer mode (default broadcast), wait for the engines'
+        # HTTP futures, then clear the caller's bucket list in place to free memory.
         """Lock → broadcast → clear → unlock. Lock prevents NCCL deadlock."""
         with self._engine_lock:
             futures = update_weights_from_distributed(
@@ -89,6 +112,13 @@ def connect_rollout_engines_from_distributed(
     rollout_engines: Sequence[SGLangApiClient],
     engine_gpu_counts: Sequence[int] | None = None,
 ) -> dist.ProcessGroup:
+    # [FUNCTION DOC] Create the NCCL group in which the calling training process is rank 0 and every
+    # engine GPU gets a consecutive rank. GPU counts default to the configured GPUs per engine for
+    # every engine. Master address is this node's IP (from Ray); the master port is a free port found
+    # by binding and releasing a socket (small race window). World size = total engine GPUs + 1.
+    # Submits an async init call to each engine client (rank offset starts at 1 and advances by that
+    # engine's GPU count, backend nccl) and concurrently initializes the local process group over a
+    # TCP rendezvous, then waits for all engine futures (raising their errors). Returns the group.
     """
     Create NCCL group: training rank 0 + all engine GPUs. Blocks until joined.
 
@@ -132,6 +162,9 @@ def connect_rollout_engines_from_distributed(
 
 
 def disconnect_rollout_engines_from_distributed(args, group_name, model_update_groups, rollout_engines):
+    # [FUNCTION DOC] Ask every engine client to destroy the named weight update group (async), then
+    # destroy the local process group if one exists; in all cases (finally) wait for the engine
+    # futures. KNOWN ISSUE: the args parameter is unused.
     """
     Destroy NCCL on training and engines.
     """
@@ -151,6 +184,14 @@ def update_weights_from_distributed(
     selector: str = "all",
     transfer_mode: str = "broadcast",
 ) -> list[Future]:
+    # [FUNCTION DOC] Raises a value error unless the transfer mode is broadcast or broadcast_packed.
+    # First prepares the payload (before engines are told to receive, so local failures cannot leave
+    # them waiting): packed mode builds one flattened byte tensor of the whole bucket and tells the
+    # engines to use the flattened-bucket load format; plain mode makes each tensor contiguous (using
+    # the parameter data). Then submits to every engine, asynchronously, an HTTP call with names,
+    # dtypes, shapes, selector and group name. Then issues asynchronous NCCL broadcasts from rank 0
+    # of the group for each payload tensor and waits for them to complete. Returns the engine
+    # futures, which the caller must wait on. Collective on the group.
     """
     Send metadata (HTTP), broadcast tensors (NCCL rank 0 → engines).
     """
@@ -189,6 +230,11 @@ def update_weights_from_distributed(
 
 
 def _flatten_weight_bucket(named_tensors: Sequence[tuple[str, torch.Tensor]]) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Pack the bucket into SGLang's flattened byte tensor, importing the
+    # bucket class lazily. Raises a runtime error if that class lacks mixed-dtype support. Because
+    # the engine concatenates raw bytes without padding, simulates running byte offsets and raises a
+    # value error naming the first tensor whose offset is not a multiple of its element size. Names
+    # and order are preserved; tensors are made contiguous.
     # Keep SGLang optional for callers using the existing per-tensor protocol.
     from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 

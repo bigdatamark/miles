@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Process-local state and lifecycle for the dashboard. Module globals hold the collector actor handle,
+# whether this process is the primary (driver) one, a flag recording that resolving the named actor
+# already failed, and a rate-limited warner. Functions: init (create or find the collector), resolve
+# (look up the named actor with a timeout), non-blocking access, metric push, and shutdown. All remote
+# calls are best effort so telemetry problems never crash training.
 """Dashboard tracking-backend internals and Ray lifecycle glue.
 
 Call matrix of ``init_dashboard`` (design doc §6.1), reached through the
@@ -42,6 +48,15 @@ _warner = RateLimitedWarner(logger)
 
 
 def init_dashboard(args, *, primary: bool = True, router_addr: str | None = None, **kwargs) -> None:
+    # [FUNCTION DOC] Primary (driver) path: marks the process primary; builds the collector
+    # configuration (start timestamp = now); creates the named collector Ray actor hard-pinned (no
+    # soft fallback) to the driver's node, passing a Prometheus handle factory only when forwarding
+    # is enabled; blocks on a ping to ensure it is alive; fires the non-blocking start call; logs where
+    # telemetry goes and how to view it. Non-primary path: resolves the named actor (waiting up to the
+    # timeout); if unavailable returns quietly (telemetry disabled); if router_addr was given
+    # (marking the rollout manager process) attaches the phase sink for the rollout manager role and
+    # the trajectory sink. The router address value itself is not used because the router is not
+    # started yet; it registers later via the hooks module. Extra keyword arguments are ignored.
     global _handle, _is_primary
     import ray
 
@@ -88,6 +103,10 @@ def init_dashboard(args, *, primary: bool = True, router_addr: str | None = None
 
 
 def resolve_collector():
+    # [FUNCTION DOC] Returns the cached handle if present, or none if resolution already failed
+    # (sticky). Otherwise polls the Ray named-actor lookup every 2 seconds until found (cached and
+    # returned) or 60 seconds pass, in which case logs one warning, sets the failure flag and returns
+    # none. Blocks (sleeps) while waiting.
     """This process's collector handle, resolving the named actor on first
     use (train ranks never run init_dashboard themselves). Returns None —
     permanently, after one warning — when the actor cannot be found."""
@@ -113,11 +132,15 @@ def resolve_collector():
 
 
 def current_collector():
+    # [FUNCTION DOC] Returns the cached handle or none; never waits or resolves.
     """The already-resolved handle, or None. Never blocks (hot paths)."""
     return _handle
 
 
 def dashboard_log(metrics: dict, *, step: int | None = None, step_key: str | None = None) -> None:
+    # [FUNCTION DOC] Fire-and-forget push of one metrics record (timestamp now, optional step key and
+    # step, only scalar entries of the mapping) to the collector. Does nothing if there is no handle.
+    # Any exception while sending is swallowed and reported through the rate-limited warner.
     if _handle is None:
         return
     try:
@@ -129,6 +152,10 @@ def dashboard_log(metrics: dict, *, step: int | None = None, step_key: str | Non
 
 
 def finish_dashboard() -> None:
+    # [FUNCTION DOC] Detaches the hooks and flushes them. If this is the primary process with a
+    # handle: synchronously asks the collector to shut down (30 second timeout; failures are logged as
+    # warnings with traceback) so the final flush lands, then kills the actor. Always resets the
+    # handle, primary flag and resolution-failed flag.
     global _handle, _is_primary, _resolution_failed
     hooks.detach_and_flush()
     if _handle is not None and _is_primary:
@@ -149,6 +176,8 @@ def finish_dashboard() -> None:
 
 
 def _prometheus_factory():
+    # [FUNCTION DOC] HELPER: Runs inside the collector actor. Looks up the named Prometheus collector
+    # actor and returns its handle, or none if it does not exist.
     """Resolves the miles prometheus collector from inside the dashboard
     collector actor (its module-global handle is per-process)."""
     import ray
@@ -162,6 +191,10 @@ def _prometheus_factory():
 
 
 def _scalars_only(metrics: dict) -> dict:
+    # [FUNCTION DOC] HELPER: Keeps int, float, string and bool values as is; converts other values
+    # whose type defines float conversion (numpy or torch scalars) to float; drops everything else.
+    # Note booleans pass through the first branch. A multi-element tensor with a float conversion
+    # method would raise on conversion (not caught here).
     """The JSONL store persists plain scalars; tracking payloads can carry
     tensors or numpy values, which are converted or dropped here."""
     out = {}

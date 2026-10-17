@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Command-line options for the dashboard (all in one argument group), startup validation and the
+# conversion of parsed args into the collector configuration, including a curated snapshot of run
+# args saved for the dashboard header.
 """CLI arguments and configuration plumbing for the miles dashboard."""
 
 from __future__ import annotations
@@ -38,6 +42,11 @@ _SNAPSHOT_KEYS = (
 
 
 def add_dashboard_arguments(parser) -> None:
+    # [FUNCTION DOC] Adds the argument group "miles dashboard" to the parser: enable flag
+    # (default off); flush interval seconds (float, default 5.0); GPU sampling interval seconds
+    # (default 1.0); engine scrape interval seconds (default 2.0); scrape mode choice of auto,
+    # router, direct (default auto); optional comma-separated override of the scraped metric names
+    # (default none); flag to also forward dashboard gauges to the Prometheus collector (default off).
     group = parser.add_argument_group("miles dashboard")
     group.add_argument(
         "--use-miles-dashboard",
@@ -71,6 +80,9 @@ def add_dashboard_arguments(parser) -> None:
 
 
 def validate_dashboard_args(args) -> None:
+    # [FUNCTION DOC] No-op unless the dashboard is enabled. Then asserts the dump-details directory
+    # is set (assertion error with explanation), and logs a warning (non-fatal) if rollout entropy
+    # collection is off since the token view will lack entropy.
     if not args.use_miles_dashboard:
         return
     assert args.dump_details is not None, (
@@ -85,6 +97,12 @@ def validate_dashboard_args(args) -> None:
 
 
 def collector_config_from_args(args, *, start_ts: float) -> CollectorConfig:
+    # [FUNCTION DOC] Builds the collector configuration with the given start timestamp. Metric
+    # whitelist: if the override string is given, it is split on commas dropping empty parts (assertion
+    # error if the result is empty), else the default whitelist. Args snapshot: the subset of the
+    # curated keys that exist on args. Dashboard directory = "<dump-details>/dashboard"; run name = the
+    # wandb group or "miles-run"; intervals, scrape mode and prometheus forwarding come from the
+    # parsed options.
     if args.dashboard_sglang_metrics is not None:
         whitelist = tuple(m for m in args.dashboard_sglang_metrics.split(",") if m)
         assert whitelist, f"empty --dashboard-sglang-metrics: {args.dashboard_sglang_metrics!r}"

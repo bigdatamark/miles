@@ -1,3 +1,8 @@
+# [MODULE DOC] HELPER: Support code for the peer-to-peer weight transfer protocol: a static plan
+# mapping trainer ranks to rollout engine ranks, small records describing remote engine memory, a
+# thread-pool manager for background RDMA writes, and helpers to register local pinned memory with the
+# Mooncake transfer engine, create that engine, and query engines for their registered weight memory,
+# parallelism info and server args.
 import dataclasses
 import logging
 from argparse import Namespace
@@ -20,6 +25,9 @@ logger = logging.getLogger(__name__)
 
 @dataclasses.dataclass
 class TransferTaskP2PMeta:
+    # [CLASS DOC] HELPER: Plain record identifying one transfer target: engine index, rank within
+    # that engine (tensor-parallel rank of the engine), and the source pipeline shard index (default
+    # 0).
     """Specifies a engine rollout rank to connect to."""
 
     # The index of the target rollout engine.
@@ -31,15 +39,25 @@ class TransferTaskP2PMeta:
 
 
 class RemoteTransferPlan:
+    # [CLASS DOC] HELPER: Static planner. On construction reads trainer-side pipeline and
+    # data-replica info from the global parallel state and rollout-side sizes from args; exposes the
+    # private fields for pipeline rank/size, gathered data-replica rank/size, rollout GPUs per
+    # engine, engine count and total rollout GPUs, which the P2P protocol reads directly.
     """
     Plans and manages remote weight transfers for p2p backends,
     assuming static training and rollout placements.
     """
 
     def __init__(self, args: Namespace) -> None:
+        # [FUNCTION DOC] Collects parallelism information immediately (needs the global parallel
+        # state to be set).
         self._get_parallelism(args)
 
     def _get_parallelism(self, args: Namespace) -> None:
+        # [FUNCTION DOC] HELPER: Stores the pipeline rank and size; the gathered data-replica rank and
+        # size (from the shared helper with pipeline not gathered); the rollout pipeline size from
+        # args (raises a not-implemented error unless it is 1); GPUs per engine; engine count = total
+        # rollout GPUs integer-divided by GPUs per engine; total rollout GPUs.
         """
         Collect parallelism information for source (trainer) and target (rollout engines).
 
@@ -62,6 +80,15 @@ class RemoteTransferPlan:
         self._rollout_num_gpus = args.rollout_num_gpus
 
     def plan_p2p(self) -> list[TransferTaskP2PMeta]:
+        # [FUNCTION DOC] Deterministic (identical on all ranks) assignment of every (engine index,
+        # engine rank) target, enumerated engine-major, to a source data-replica rank, returning the
+        # tasks of the calling rank (stamped with its pipeline rank as source shard). Step 1: the
+        # first N targets (N = number of source ranks, or fewer if targets are fewer) are assigned
+        # one-to-one in order, and the number assigned is counted. Step 2, for each remaining target:
+        # if some source already holds a target with the same engine rank, choose among those sources
+        # the one with the fewest such assignments (ties go to the lowest source index); otherwise
+        # pick sources round-robin through a separate cursor. Sources with no assignment get an empty
+        # list. Pure computation.
         """
         Plan P2P transfer within each pp_group -> all target engine ranks.
 
@@ -99,6 +126,8 @@ class RemoteTransferPlan:
             assignments[source_rank][engine_rank].append(engine_idx)
 
         def count_engine_index_assignments(engine_rank: int) -> list[int]:
+            # [FUNCTION DOC] HELPER: For each source rank, the number of engines already assigned to
+            # it for the given engine rank (list indexed by source rank).
             return [len(assignments[source][engine_rank]) for source in range(self._gathered_dp_size)]
 
         cur_source_index = 0
@@ -128,6 +157,8 @@ class RemoteTransferPlan:
 
 @dataclasses.dataclass
 class RemoteWeightInfo:
+    # [CLASS DOC] HELPER: Record for one remote transfer session: the session id string and a mapping
+    # from parameter name to (remote address, element count, element size in bytes).
     """
     The remote weight info related to one specific engine_rank.
     """
@@ -137,6 +168,9 @@ class RemoteWeightInfo:
 
 
 class P2PTransferManager:
+    # [CLASS DOC] HELPER: Lazily-started thread pool (size num_workers, default 8) plus a list of all
+    # submitted futures. The timeout (default 30.0 seconds) applies to each future in the bulk wait.
+    # Not thread-safe for concurrent submitters.
     """Generic async task manager for P2P writes.
 
     Accepts arbitrary callables via submit(), runs them in a thread pool,
@@ -144,23 +178,30 @@ class P2PTransferManager:
     """
 
     def __init__(self, num_workers: int = 8, transfer_timeout: float = 30.0):
+        # [FUNCTION DOC] Stores settings; no pool is created yet and the future list is empty.
         self.num_workers = num_workers
         self.transfer_timeout = transfer_timeout
         self.executor: ThreadPoolExecutor | None = None
         self.transfer_futures: list[Future] = []
 
     def ensure_started(self) -> None:
+        # [FUNCTION DOC] Create the thread pool on first use (idempotent).
         if self.executor is None:
             # NOTE: RDMA ops won't be affected by the python GIL
             self.executor = ThreadPoolExecutor(max_workers=self.num_workers)
 
     def submit(self, fn: Callable, *args) -> None:
+        # [FUNCTION DOC] Start the pool if needed, run fn(*args) in it and track the future. Returns
+        # nothing.
         """Submit a callable to the thread pool."""
         self.ensure_started()
         future = self.executor.submit(fn, *args)
         self.transfer_futures.append(future)
 
     def submit_returning_future(self, fn: Callable, *args) -> torch.Future:
+        # [FUNCTION DOC] Same as submit but returns the tracked future. KNOWN ISSUE: the return
+        # annotation names the torch future type, but the object returned is a standard concurrent
+        # futures future.
         """Submit a callable and return its future (also tracked for bulk waiting)."""
         self.ensure_started()
         future = self.executor.submit(fn, *args)
@@ -168,6 +209,10 @@ class P2PTransferManager:
         return future
 
     def wait_transfers(self) -> None:
+        # [FUNCTION DOC] Waits on each tracked future in submission order with the per-future
+        # timeout. Any exception, including a timeout, is only logged as an error (not raised), then
+        # the future list is cleared. KNOWN ISSUE: failed or timed-out background writes do not
+        # propagate; callers cannot detect transfer failure from this call.
         """Wait for all submitted tasks to complete."""
         for future in self.transfer_futures:
             try:
@@ -179,12 +224,17 @@ class P2PTransferManager:
 
 
 def create_server_args_from_dict(data_dict: dict) -> ServerArgs:
+    # [FUNCTION DOC] Build an SGLang server args object from a mapping, silently dropping keys that
+    # are not fields of the server args record.
     valid_fields = set(_record_field_names(ServerArgs))
     filtered_data = {k: v for k, v in data_dict.items() if k in valid_fields}
     return ServerArgs(**filtered_data)
 
 
 def register_cpu_memory(params_dict: dict, transfer_engine) -> dict:
+    # [FUNCTION DOC] For each named tensor, registers its memory (address and byte size) with the
+    # transfer engine; a nonzero return code raises a runtime error naming the weight. Returns a
+    # mapping from name to (address, element count, element size).
     """Register CPU pinned memory with the transfer engine."""
     weight_dict = {}
 
@@ -202,6 +252,9 @@ def register_cpu_memory(params_dict: dict, transfer_engine) -> dict:
 
 
 def create_transfer_engine():
+    # [FUNCTION DOC] Lazily imports the Mooncake transfer engine class, creates an instance and
+    # initializes it with this node's IP (from Ray), the peer handshake metadata mode, the RDMA
+    # protocol and an empty device filter. Returns the engine. Network/RDMA side effects.
     from mooncake.engine import TransferEngine
 
     transfer_engine = TransferEngine()
@@ -214,6 +267,13 @@ def query_remote_weight_infos(
     rollout_engines: Sequence[SGLangApiClient],
     targets,
 ) -> tuple[dict, dict, dict]:
+    # [FUNCTION DOC] For each unique (engine index, engine rank) in the targets (iterated in set
+    # order, so not deterministic), blocks on three engine calls: transfer-engine info (session id
+    # and per-parameter memory mapping), parallelism info for that rank, and server info (filtered
+    # into a server args object). Returns three mappings: session id to (weights info, parallelism
+    # info); (engine index, engine rank) to session id; session id to server args. KNOWN ISSUE: the
+    # check that the session id is not none comes after it was already used as a key for server
+    # args, so a missing id is stored before the assertion fires.
     """Query remote rollout engines for weight info, session IDs, and server args."""
     remote_weight_infos_by_session_id = {}
     targets_to_session_id = {}

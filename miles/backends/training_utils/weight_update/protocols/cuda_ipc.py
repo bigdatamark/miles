@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Colocated weight transfer: training and inference engines share GPUs, so each training rank
+# serializes its bucket as CUDA-IPC handles of a flattened tensor bucket, gathers them (Gloo
+# object gather) to its engine's source rank, which hands them to the engine over HTTP. Hybrid
+# deployments with extra non-colocated engines also broadcast over NCCL via the broadcast module.
 import asyncio
 import logging
 from argparse import Namespace
@@ -32,6 +37,12 @@ logger = logging.getLogger(__name__)
 
 
 class UpdateWeightFromTensor(WeightTransferProtocol):
+    # [CLASS DOC] Colocated CUDA-IPC protocol. Requires a full gather over pipeline (tensor and
+    # expert always gathered), supports LoRA (not for hybrid deployments). Every rank covered by a
+    # colocated engine is a sender, because the per-engine object gather is collective among the
+    # group's members. State: per-rank Gloo gather group and its source rank, the engine client
+    # for this rank's colocated engine, optional distributed tail engines, the NCCL group and
+    # source-rank flag for the tail, and whether the base weights must be re-pushed for LoRA.
     """
     Colocated transfer: every training rank serializes its bucket to CUDA-IPC
     handles and gather_objects them to its engine group's src rank, which hands
@@ -43,6 +54,13 @@ class UpdateWeightFromTensor(WeightTransferProtocol):
     supports_lora = True
 
     def __init__(self, args: Namespace) -> None:
+        # [FUNCTION DOC] Collective over the whole world. Sets the default group name
+        # "miles-colocate" (overwritten with "miles" when a distributed tail exists). Partitions all
+        # ranks into consecutive blocks of the configured GPUs per engine and creates a Gloo group
+        # for every block (every rank must create every group); this rank remembers the group it
+        # belongs to and the block's first rank as gather source. KNOWN ISSUE: the engine ids in
+        # connect later assume possibly different layouts; these initial groups are recreated only
+        # for ranks without an engine.
         """
         Create IPC Gloo groups (rollout_num_gpus_per_engine ranks/group).
         """
@@ -68,6 +86,24 @@ class UpdateWeightFromTensor(WeightTransferProtocol):
         placement: WeightUpdatePlacement,
         selector: str,
     ) -> None:
+        # [FUNCTION DOC] Steps: (1) default engine GPU counts to the configured per-engine value and
+        # offsets to densely packed cumulative counts. (2) Count colocated engines: leading engines
+        # whose GPU range lies within the actor GPU total (nodes * GPUs per node); stop at the first
+        # one that does not. (3) A distributed tail exists if there are more engines than colocated
+        # ones; combined with LoRA rollout this raises a not-implemented error. With a tail, split the
+        # engine list, set the group name to "miles", and on the distributed source rank (intra-DP x
+        # CP, TP and PP ranks all 0) tear down any old NCCL group and create a new one to the tail
+        # engines. (4) Compute the set of ranks covered by colocated engines; covered ranks create
+        # a Gloo group per engine only if they have no group yet (groups are created by every covered
+        # rank for all engines, a collective); uncovered ranks clear their gather group and source.
+        # (5) Find this rank's colocated engine client by GPU range. (6) Sender = has a gather group.
+        # (7) Base re-push for LoRA is needed if the weight checker option is on, or base weights do
+        # not persist; they persist when there is a distributed tail, or LoRA CPU backup is enabled,
+        # or colocated with rollout offload disabled.
+        # KNOWN ISSUE: the first-time group recreation test relies on a group from the constructor
+        # being none, but the constructor assigns a group for every rank, so in practice it never
+        # recreates for covered ranks (matching layouts are assumed); also the uncovered branch
+        # discards a group that was created collectively in the constructor.
         """
         Split colocated/distributed engines. Global source rank (DP=TP=PP=0) creates NCCL
         for distributed. Map ranks to colocated IPC engines.
@@ -168,6 +204,12 @@ class UpdateWeightFromTensor(WeightTransferProtocol):
         self.needs_base_resync_for_lora = self.args.check_weight_update_equal or not base_persists
 
     def send_bucket(self, bucket: list[tuple[str, torch.Tensor]]) -> None:
+        # [FUNCTION DOC] Sends the bucket to this rank's colocated engine via the IPC helper (a
+        # collective among the gather group). On the distributed source rank of a hybrid
+        # deployment, also broadcasts the bucket to the tail engines and merges the futures. Waits
+        # for all futures and checks the engine responses (the check is told the sync is not LoRA).
+        # Finally drops the references that kept the IPC tensors alive. KNOWN ISSUE: the LoRA flag
+        # for the response check is hard-coded false although this protocol supports LoRA.
         futures, long_lived_tensors = _send_to_colocated_engine(
             hf_named_tensors=bucket,
             ipc_engine=self._ipc_engine,
@@ -189,6 +231,8 @@ class UpdateWeightFromTensor(WeightTransferProtocol):
         del long_lived_tensors
 
     def after_engines_resumed(self) -> None:
+        # [FUNCTION DOC] Release CUDA IPC resources: collect expired IPC handles, then empty the
+        # CUDA caching allocator cache.
         torch.cuda.ipc_collect()
         torch.cuda.empty_cache()
 
@@ -201,6 +245,17 @@ def _send_to_colocated_engine(
     ipc_gather_group,
     selector: str = "all",
 ) -> tuple[list[Future], Any]:
+    # [FUNCTION DOC] HELPER: Keyword-only after the tensor list. Returns (futures, objects that must
+    # stay alive until the engine has copied). Ranks without a gather group return empty results
+    # immediately (they skip the collective). Otherwise: if the bucket class supports mixed dtypes,
+    # use one flattened bucket for all tensors, else group tensors by dtype into one bucket per
+    # dtype. For each bucket, flatten to a single tensor with metadata, keep it alive, and serialize
+    # it (handles, as a string). Gather all ranks' serialized lists to the group's source rank
+    # (Gloo object gather, collective among group members). On the source rank only, for each dtype
+    # index, submit an async call to the engine with the serialized tensors of all ranks, the
+    # flattened-bucket load format and the selector, serialized through one lock so engine calls
+    # for different dtypes do not interleave; the futures are returned. Non-source ranks return no
+    # futures.
     # Placeholder ranks (GPU slots reserved but no engine) have no gather group.
     # gather_object is only collective among group members, so we skip entirely.
     if ipc_gather_group is None:
@@ -255,5 +310,7 @@ def _send_to_colocated_engine(
 async def _update_weights_from_tensor_gated(
     gate: asyncio.Lock, api_client: SGLangApiClient, kwargs: dict[str, Any]
 ) -> Any:
+    # [FUNCTION DOC] HELPER: Coroutine that acquires the lock, awaits the engine client's update from
+    # tensor call with the keyword arguments, and returns its response.
     async with gate:
         return await api_client.update_weights_from_tensor(**kwargs)

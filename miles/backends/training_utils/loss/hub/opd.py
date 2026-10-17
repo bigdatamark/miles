@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# On-policy distillation (OPD) helper: folds a reverse-KL penalty between the old student policy and
+# a teacher policy into per-token advantages, independent of the base advantage estimator.
 from argparse import Namespace
 
 import torch
@@ -11,6 +14,21 @@ def apply_opd_kl_to_advantages(
     advantages: list[torch.Tensor],
     student_log_probs: list[torch.Tensor] | None,
 ) -> None:
+    # [FUNCTION DOC] Mutates the advantages list in place: each per-token advantage becomes
+    # advantage - opd_kl_coef * reverse_kl, and stores the reverse kl list in the rollout data under
+    # the key for the reverse kl (for logging). Returns nothing; does nothing when student log probs
+    # are none. Two sources of reverse kl: (a) if the rollout data already holds precomputed reverse
+    # kl values (tensors or numbers/lists convertible to float32 tensors), they are detached, moved
+    # to the advantage's device, length- and shape-checked and used; the stored list is replaced by
+    # the converted tensors. (b) otherwise it requires the teacher log probs entry: detaches them and
+    # stores the detached versions back in rollout data, moves them to the first student tensor's
+    # device, checks list lengths and per-sample shapes (student vs teacher, advantage vs student),
+    # and computes reverse kl = detached old student log prob - teacher log prob.
+    # Raises value errors for a missing teacher entry, length mismatches and shape mismatches
+    # (messages mention that per-token advantages are required). The error text for a missing
+    # teacher entry reads the opd type attribute from args.
+    # KNOWN ISSUE: the docstring says args holds the use_opd flag but this function does not read
+    # it; only the coefficient and (for the error text) the type are read.
     """Apply on-policy distillation KL penalty to advantages.
 
     Computes reverse KL (student_logp - teacher_logp) and adds weighted penalty

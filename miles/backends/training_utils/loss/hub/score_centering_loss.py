@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Glue between the score-centering estimator and the Miles training loop. Given a micro-batch of
+# rollout data and the model logits, it (1) computes trainer log probs of the sampled token and of
+# the sampler's candidate (top-k / sampling-support) tokens aligned to response positions, (2) slices
+# the sampler-side candidate data to the local context-parallel rows, (3) evaluates the
+# score-centering loss, and (4) adds optional entropy and KL regularization and diagnostics. The
+# sampler data comes from the batch keys for rollout top-k token ids, top-k log probs, top-k
+# lengths and the sampling-mask ids/offsets.
 """Integrate score centering with response alignment and Miles loss reduction."""
 
 from argparse import Namespace
@@ -22,6 +30,11 @@ from miles.utils.types import RolloutBatch
 
 
 def _candidate_ids(batch: RolloutBatch, sample: int, indices: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Candidate token ids [positions, width] for one sample at the given
+    # response positions. If the batch holds dense top-k token ids, index them directly (cast to
+    # 64-bit ints). Otherwise rebuild them from the ragged sampling-support storage: per-position
+    # lengths and offsets into a flat id array; the width is that of the top-k log probs; slots
+    # beyond a position's length are filled with -1 (padding).
     if batch.get("rollout_topk_token_ids") is not None:
         return torch.as_tensor(batch["rollout_topk_token_ids"][sample])[indices].long()
     lengths = torch.as_tensor(batch["rollout_topk_lengths"][sample])[indices]
@@ -36,6 +49,18 @@ def _candidate_ids(batch: RolloutBatch, sample: int, indices: torch.Tensor) -> t
 
 
 def _candidate_log_probs(args: Namespace, batch: RolloutBatch, logits: torch.Tensor) -> dict[str, list[torch.Tensor]]:
+    # [FUNCTION DOC] HELPER: Compute trainer-side log probs per sample. Returns a mapping with
+    # "selected" (per sample [positions, 1 + candidates]: column 0 sampled token, rest candidates),
+    # optionally "kl_log_probs" (column 0 per sample, when the KL loss is on) and "entropy" (when the
+    # entropy coefficient is nonzero or entropy observation is on). For each response chunk (from the
+    # shared response chunk iterator), it builds ids by prepending the sampled tokens to the
+    # candidate ids and calls the selected-log-prob function with the tensor-parallel group (if TP
+    # size > 1), configured vocab size, rollout temperature and log prob chunk size. Replay mode
+    # (sampling-support replay flag): if KL loss is off, "support only" scoring normalizes over the
+    # support in the function itself; if KL loss is on, the full-vocab scores are kept for the KL
+    # column and the candidate columns are renormalized over the valid candidates here (and entropy
+    # recomputed from them). When all-gather-CP is enabled with CP size > 1, redistributes the
+    # results across CP ranks via the shared helper. Mutates nothing in the batch.
     parallel = get_parallel_state()
     result = {"selected": []}
     if args.use_kl_loss:
@@ -98,6 +123,11 @@ def _candidate_log_probs(args: Namespace, batch: RolloutBatch, logits: torch.Ten
 
 
 def _local_candidates(args: Namespace, batch: RolloutBatch, key: str, device: torch.device) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Gather sampler candidate data for the rows owned by this context-parallel
+    # rank. For each sample, slice either the candidate ids (rebuilt via the ids helper at sliced
+    # response positions) when the key is the rollout top-k token ids, or the batch tensor under the
+    # given key, using the CP slicing helper with the qkv format and optional padded length; slicing
+    # happens on CPU, then the piece is moved to the device. Returns the concatenation over samples.
     values = []
     for i, (total, response) in enumerate(zip(batch["total_lengths"], batch["response_lengths"], strict=True)):
         maximum = batch["max_seq_lens"][i] if batch.get("max_seq_lens") is not None else None
@@ -121,6 +151,17 @@ def _regularization(
     reduce: Callable[[torch.Tensor], torch.Tensor],
     kl_log_probs: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    # [FUNCTION DOC] HELPER: Optional entropy and KL regularization. Returns (scalar loss term,
+    # metrics mapping). Entropy (if given): reduced with the supplied reducer; loss -= entropy_coef *
+    # reduced; metric "entropy_loss" (detached). KL (if enabled): reference log probs are the
+    # concatenated detached batch reference log probs; the actor log probs are kl_log_probs when
+    # given, else log_probs. A token is valid if active, actor and reference are finite and their
+    # difference is at most 40 in magnitude (and, with unbiased KL, the log ratio of log_probs to
+    # rollout log probs is finite and at most 40). Invalid entries are zeroed before exponentiation;
+    # the approximate KL (type from args) is computed with an optional importance ratio, nan/inf
+    # cleaned, zeroed where invalid and reduced; loss += kl_loss_coef * kl when the coefficient is
+    # nonzero; metrics "kl_loss" and "kl_invalid_fraction" (reduced fraction of active but invalid
+    # tokens), detached.
     loss = log_probs.new_zeros(())
     metrics = {}
     if entropy is not None:
@@ -160,6 +201,17 @@ def score_centering_loss_function(
     logits: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    # [FUNCTION DOC] Loss function entry point for score centering. Inputs: configuration, the
+    # micro-batch, local logits and a reducer that turns per-token values into a loss-scaled scalar
+    # (sum of per-sample means). Steps: compute trainer log probs (see helper); build the active
+    # mask from local response loss masks; take detached rollout log probs and advantages (zeroed
+    # on inactive tokens); get local sampler candidate ids and log probs; build the estimator inputs
+    # (head mask = valid candidate id and active) with importance mode and clip/bounds from args;
+    # run the score-centering loss and reduce its token loss; add regularization. Returns (total
+    # loss = policy term plus regularization, mapping of detached logging scalars: loss, pg_loss,
+    # regularization metrics, all score-centering metrics reduced, mean absolute difference between
+    # trainer and rollout log prob of the sampled token, and a low-variance KL estimate between
+    # rollout and trainer on the sampled token (nan/inf cleaned, inactive tokens zero)).
     probabilities = _candidate_log_probs(args, batch, logits)
     selected = torch.cat(probabilities["selected"])
     active = torch.cat(

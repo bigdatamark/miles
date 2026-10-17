@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Peer-to-peer (RDMA-style) weight transfer to rollout engines. Each sender training rank builds, for
+# every engine rank it targets, a CPU model replica (SGLang model on CPU, dummy-initialized) that
+# mirrors that engine rank's sharding; all replicas share ONE set of pinned CPU parameter buffers.
+# Incoming HF-named tensors are staged until a full SGLang parameter's shards are available, loaded
+# into each replica in turn (converting to the engine's layout) and written from the pinned buffers
+# to the remote engine memory by a transfer engine. Transfers to the last replica run in the
+# background; all others complete before the shared buffer is reused.
 import logging
 from argparse import Namespace
 from collections.abc import Callable, Iterator, Sequence
@@ -36,12 +44,22 @@ logger = logging.getLogger(__name__)
 
 
 class _ReplicaTarget(NamedTuple):
+    # [CLASS DOC] HELPER: Record for one engine rank: the CPU model replica mirroring its sharding,
+    # the list of remote sessions (session id plus remote weight address info) to write to, and the
+    # engine rank's parallelism config used while loading weights.
     model_replica: torch.nn.Module
     remote_weight_infos: list[RemoteWeightInfo]
     parallelism_config: RankParallelismConfig
 
 
 class UpdateWeightP2P(WeightTransferProtocol):
+    # [CLASS DOC] Peer-to-peer protocol (uses the base default placement and the session frame).
+    # Senders are the ranks whose gathered data-parallel rank is below the rollout GPU count (as
+    # decided by the transfer plan). State: the transfer plan, global Gloo rank, whether pinned
+    # memory has been registered with the transfer engine, a mapping of SGLang parameter name to the
+    # number of shards still missing, a mapping of SGLang parameter name to staged (HF name, tensor)
+    # pairs, and a transfer manager (worker count default 4 and timeout default 30.0 seconds from
+    # args) for background writes.
     """P2P weight transfer over the updater's bucketed all-gather + HF conversion,
     and a single set of shared CPU pinned buffers for P2P writes.
 
@@ -53,6 +71,8 @@ class UpdateWeightP2P(WeightTransferProtocol):
     """
 
     def __init__(self, args: Namespace) -> None:
+        # [FUNCTION DOC] Builds the remote transfer plan from args, records this process's rank in
+        # the Gloo group, and initializes empty staging state and the transfer manager.
         super().__init__(args)
         self.transfer_plan = RemoteTransferPlan(args)
         self.global_rank = dist.get_rank(group=get_gloo_group())
@@ -66,6 +86,9 @@ class UpdateWeightP2P(WeightTransferProtocol):
         )
 
     def after_base_weights(self) -> None:
+        # [FUNCTION DOC] Non-senders return. Senders wait for all background writes to finish and
+        # assert that no shard counters and no staged tensors remain (incomplete parameters would
+        # mean a lost transfer); the assertion message lists the leftovers.
         """Wait for all background P2P writes to complete."""
         if not self.is_sender:
             return
@@ -78,6 +101,11 @@ class UpdateWeightP2P(WeightTransferProtocol):
     def begin_sync(
         self, weight_version: int, iter_buckets: Callable[..., Iterator[list[tuple[str, torch.Tensor]]]]
     ) -> bool:
+        # [FUNCTION DOC] On senders, the first time only: registers the shared pinned parameter
+        # buffers with the transfer engine and keeps the returned registry (parameter name to
+        # address, element count, element size). Always returns true. KNOWN ISSUE: the registered
+        # flag is never reset when connect rebuilds the replicas and transfer engine, so after a
+        # reconnect the new buffers would not be registered.
         """Register shared CPU pinned memory with P2P on the first sync."""
         if self.is_sender and not self._model_registered:
             self._weight_memory_registry = register_cpu_memory(self._shared_params_dict, self._transfer_engine)
@@ -85,6 +113,15 @@ class UpdateWeightP2P(WeightTransferProtocol):
         return True
 
     def send_bucket(self, converted_named_tensors: list[tuple[str, torch.Tensor]]) -> None:
+        # [FUNCTION DOC] Does nothing on non-senders or for an empty bucket. Otherwise determines
+        # which SGLang parameters are now complete (see the staging helper) and, if any: for each
+        # replica target in order, loads the complete HF tensors into that replica under its
+        # parallelism context (this converts into the shared pinned buffers), then writes the ready
+        # parameters to each of the target's remote sessions: for the last target the writes are
+        # submitted fire-and-forget to the background manager (the buffer will not be overwritten
+        # again within this bucket); for earlier targets the writes are submitted and each waited
+        # (re-raising failures) before the buffer is reused. Finally clears the caller's list in
+        # place. KNOWN ISSUE: the parameter name differs from the base class (bucket).
         """Stage incoming tensors; when all shards for a param are collected,
         load into shared buffer and P2P-write per engine rank.
 
@@ -137,6 +174,16 @@ class UpdateWeightP2P(WeightTransferProtocol):
         placement: WeightUpdatePlacement,
         selector: str,
     ) -> None:
+        # [FUNCTION DOC] Stores engines. Sender iff the plan's gathered DP rank is below its rollout
+        # GPU count. Senders: group name "miles-p2p_<gathered dp rank>"; get the targets from the plan;
+        # query remote engines for per-session weight info, a target-to-session mapping and session
+        # server args; group targets by engine rank; create ONE transfer engine; for each engine rank
+        # (in order): take the first target's session, build the rank parallelism config from the
+        # remote info, create a CPU replica (the first replica owns pinned buffers; later replicas
+        # alias them); the first replica also defines the shared parameter dictionary and the
+        # parameter name mapper; build the list of remote sessions for all targets of that rank; append
+        # a replica target record. GPU counts, offsets, placement and selector are ignored. The
+        # shared state is reset on every connect, but see the registration issue in begin_sync.
         """``connect`` here will:
 
         - Create a transfer plan that maps each training rank to its target
@@ -208,6 +255,14 @@ class UpdateWeightP2P(WeightTransferProtocol):
         server_args: ServerArgs,
         first_engine_rank: bool = False,
     ) -> torch.nn.Module:
+        # [FUNCTION DOC] HELPER: Builds a dummy-weight SGLang model on CPU laid out for the given
+        # remote parallelism config. Sets the global server args, initializes MoE and fp8/fp4 GEMM
+        # configs, temporarily replaces the loader module's post-load function with a no-op while
+        # building the model (restored in a finally block; this mutates a module global and is not
+        # thread-safe) and also no-ops the model's own post-load method if it has one, since those
+        # may need CUDA and the engine runs them itself after the transfer. Then, for the first engine
+        # rank, pins every parameter's memory; for later ones, makes each parameter share the first
+        # replica's tensor (asserting the name exists). Returns the model.
         """Create a CPU model replica that loads the right shard and skips post_load_weights."""
         load_config = LoadConfig(
             load_format="dummy",
@@ -256,6 +311,16 @@ class UpdateWeightP2P(WeightTransferProtocol):
     def _get_transfer_ready_params(
         self, converted_named_tensors: list[tuple[str, torch.Tensor]]
     ) -> tuple[list[str], list[tuple[str, torch.Tensor]]]:
+        # [FUNCTION DOC] HELPER: For each incoming HF tensor, map its name to an SGLang parameter
+        # name plus its shard count and local expert count with the mapper; if the SGLang name is not
+        # in the shared parameter dictionary, log a warning and drop the tensor. Expected count =
+        # experts * shards when experts is positive, else shards. The tensor is staged under its
+        # SGLang name. If expected is 1 the parameter is ready immediately; otherwise a countdown is
+        # kept (initialized to expected - 1 on first sight, then decremented) and the parameter is
+        # ready when it reaches 0. Returns the ready SGLang names and the concatenated staged HF
+        # tensors of those parameters, removing them from the staging and countdown state.
+        # KNOWN ISSUE: a parameter appearing again after becoming ready within the same stream would
+        # restart its countdown (not observed to be guarded).
         """Determine which sglang params have all shards present, returning their accumulated tensors.
 
         Some parameters are trained separately on the training side but fused into a
@@ -310,6 +375,13 @@ class UpdateWeightP2P(WeightTransferProtocol):
         return transfer_ready_params, ready_hf_tensors
 
     def _do_p2p_write_one_session(self, remote_session: RemoteWeightInfo, names: list[str]) -> None:
+        # [FUNCTION DOC] HELPER: For the given SGLang parameter names, look up each one's registered
+        # local address, element count and element size (assertion error if unregistered) to build
+        # source pointers and byte lengths; returns immediately if none. Target pointers are the
+        # remote session's registered addresses for names it knows (names it lacks are skipped), and
+        # an assertion error is raised if the pointer counts differ. Performs one batched synchronous
+        # transfer write to the session; a negative return code raises a runtime error naming the
+        # session and code. Runs in a transfer manager worker thread.
         """P2P write from shared CPU pinned buffers to a single remote session.
 
         Used by the parallelized submission path where each session within an

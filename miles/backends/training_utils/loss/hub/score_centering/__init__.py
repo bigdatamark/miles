@@ -1,3 +1,7 @@
+# [PACKAGE DOC]
+# Score-centering policy-gradient loss package. Re-exports the loss function with its input and
+# metric dataclasses (estimator), the importance weight function (importance_sampling) and the
+# selected-token log-prob helpers (selected_log_probs). Internal mask helpers live in masks.
 """Score centering from arXiv:2609.20807, Appendix A."""
 
 from miles.backends.training_utils.loss.hub.score_centering.estimator import (

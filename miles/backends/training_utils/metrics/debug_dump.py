@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Debug dump of policy-loss inputs/outputs to disk. When the dump-details directory option is set,
+# each call writes one file per call per rank under a policy-loss-debug subdirectory, containing
+# per-sample tensors and finiteness flags. Uses a module-global call counter.
 from argparse import Namespace
 from pathlib import Path
 
@@ -22,6 +26,16 @@ def maybe_dump_policy_loss_debug(
     ppo_kl: torch.Tensor,
     pg_loss: torch.Tensor,
 ) -> None:
+    # [FUNCTION DOC] Keyword-only. No-op when the dump-details option is unset or this process is not
+    # tensor-parallel rank 0 (TP peers hold identical data; CP ranks hold different slices so they
+    # all dump). Otherwise increments the global call counter and creates (parents included) the
+    # file path "<dump dir>/policy_loss_debug/rank_<global rank>_call_<counter>.pt" and saves a
+    # mapping with: rank, call counter, a list of per-sample mappings (index, total length, response
+    # length, and CPU float32 detached train log probs, old log probs, advantages, local loss mask;
+    # plus rollout log probs and, when shapes match, the absolute train-minus-rollout difference if
+    # rollout log probs are provided), CPU ppo kl and pg loss, and a mapping of booleans telling
+    # whether ppo kl, pg loss, and all train log probs, old log probs and advantages are finite.
+    # Side effects: directory creation, file write, global counter increment.
     dump_dir = getattr(args, "dump_details", None)
     if dump_dir is None:
         return
@@ -38,6 +52,7 @@ def maybe_dump_policy_loss_debug(
     path.parent.mkdir(parents=True, exist_ok=True)
 
     def to_cpu(tensor: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Detach, cast to float32 and copy to CPU.
         return tensor.detach().float().cpu()
 
     samples = []

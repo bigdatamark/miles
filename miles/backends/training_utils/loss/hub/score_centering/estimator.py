@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Score-centering estimator: a per-token policy-gradient loss for a policy trained on a truncated
+# candidate set ("head": top candidate tokens) where the remaining probability mass is the "tail".
+# It combines an importance-weighted sampled-token term with a head correction term built from the
+# difference between trainer and sampler head distributions. Sampler quantities are constants:
+# weights and head residual are computed without gradient.
 """Score centering from arXiv:2609.20807, Appendix A.
 
 The sampler distribution is fixed data. Both the importance weights and the
@@ -19,6 +25,13 @@ from miles.backends.training_utils.loss.hub.score_centering.masks import (
 
 @dataclass(frozen=True)
 class ScoreCenteringInputs:
+    # [CLASS DOC] Immutable bundle of tensors and settings for the loss. Per-token 1-D tensors:
+    # trainer log prob of the sampled token, sampler (rollout) log prob of it, and advantage. Head
+    # tensors of shape [tokens, candidates]: trainer and sampler log probs of the head candidates
+    # and a boolean mask of valid candidate slots. Settings: importance weighting mode (none, tis
+    # or mis; default none), truncation clip for tis (default 2.0), lower and upper bounds for mis
+    # (defaults 0.5 and 5.0), and a small epsilon (default 1e-6) flooring tail masses. Construction
+    # validates shapes and raises a value error on any mismatch.
     """Sample tensors are [tokens]; head tensors and mask are [tokens, candidates]."""
 
     train_log_probs: torch.Tensor
@@ -34,6 +47,9 @@ class ScoreCenteringInputs:
     eps: float = 1e-6
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Validate shapes: the three sample tensors must be 1-D with equal
+        # shape; the trainer head log probs must be 2-D with the same number of tokens; sampler head
+        # log probs and the head mask must match the trainer head shape. Raises a value error.
         if (
             self.train_log_probs.ndim != 1
             or self.rollout_log_probs.shape != self.train_log_probs.shape
@@ -48,6 +64,9 @@ class ScoreCenteringInputs:
 
 @dataclass(frozen=True)
 class ScoreCenteringMetrics:
+    # [CLASS DOC] Immutable bundle of per-token diagnostic tensors (all [tokens]): head correction
+    # value, trainer head probability mass, sampler head probability mass, tail mass ratio and the
+    # sampled-token importance weight.
     """Detached per-token diagnostics before the training loss reducer."""
 
     correction: torch.Tensor
@@ -57,11 +76,25 @@ class ScoreCenteringMetrics:
     importance_weight: torch.Tensor
 
     def as_log_dict(self) -> dict[str, torch.Tensor]:
+        # [FUNCTION DOC] Return a mapping from "sc_" plus each field name to the field tensor (same
+        # storage, no copy).
         """Map existing log names to the tensors without copying their storage."""
         return {f"sc_{field.name}": getattr(self, field.name) for field in fields(self)}
 
 
 def score_centering_loss(inputs: ScoreCenteringInputs) -> tuple[torch.Tensor, ScoreCenteringMetrics]:
+    # [FUNCTION DOC] Compute the per-token loss and metrics. Steps: build the importance sampling
+    # scheme for the mode (validating parameters); mark tokens active where the detached advantage is
+    # nonzero; sanitize the head log probs of trainer and sampler (inactive tokens get replaced so no
+    # nan leaks). Without gradient: head probabilities p (trainer) and q (sampler) with masses p_mass
+    # and q_mass; tail ratio rho = max(1 - q_mass, eps) / max(1 - p_mass, eps); tail scale alpha from
+    # the scheme; residual = scheme head mass (from p, q and the log ratio of trainer minus sampler
+    # head) minus alpha * p; sampled-token weight from the scheme applied to the log ratio of trainer
+    # minus sampler log prob of the sampled token (inactive tokens' nan replaced by 0). With gradient:
+    # correction = sum over candidates of residual times the scored (trainer) head log probs; loss =
+    # -detached advantage * (weight * scored sampled log prob - correction). Returns (loss [tokens],
+    # metrics with detached correction and the no-grad quantities). Raises value errors from the
+    # scheme for invalid parameters or nan log ratios.
     """Return unreduced token losses and detached token metrics.
 
     Inputs have shape [tokens], except head tensors/mask [tokens, candidates].

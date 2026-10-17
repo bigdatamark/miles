@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Prepares rollout replay tensors (per-sample routing indices of shape [tokens - 1, streams, top-k],
+# padded with -1) for consumption by replay objects inside the model. It replays the training data
+# iterator in the same micro-batch order as the forward passes, pads each sample by one trailing
+# position, slices/pads according to the sequence layout (padded "bshd" or packed "thd"), context
+# parallelism and sequence parallelism, and hands each micro-batch's tensor to a registration
+# function that maps streams to modules.
 from typing import Protocol
 
 import torch
@@ -7,10 +14,20 @@ from miles.backends.training_utils.parallel import get_parallel_state
 
 
 class RegisterReplayListFunc(Protocol):
-    def __call__(self, replay_list: list, replay_data: torch.Tensor, **kwargs) -> None: ...
+    # [CLASS DOC] Structural type of the registration callbacks: called with the list of replay
+    # objects, the local replay tensor for one micro-batch and extra keyword arguments (the models);
+    # returns nothing and records data into the replay objects.
+    def __call__(self, replay_list: list, replay_data: torch.Tensor, **kwargs) -> None:
+        # [FUNCTION DOC] Protocol method; no implementation (body is an ellipsis).
+        ...
 
 
 def register_replay_list_sequential(replay_list, replay_data, **_kwargs):
+    # [FUNCTION DOC] Default registration. For each replay object in order, picks stream index =
+    # its own stream index when set, else its position in the list; raises an assertion error if
+    # that index is outside the number of streams (second dimension) of the replay tensor; then
+    # tells the replay object to record the corresponding column slice (all tokens, that stream).
+    # Extra keyword arguments are ignored.
     """Map replay streams to registered modules.
 
     Each replay records `replay_data[:, replay.stream_idx]` if `stream_idx` is
@@ -40,6 +57,23 @@ def fill_replay_data(
     if_sp_region=True,
     indices_are_token_positions=False,
 ):
+    # [FUNCTION DOC] Keyword-only. Raises a value error if the data key is missing from the rollout
+    # data. Resets all data iterators, then for each micro-batch in total (sum of the per-iterator
+    # micro-batch counts) pulls the next batch (replay tensors, tokens, padded lengths) from the
+    # first iterator and asserts each replay tensor has exactly one fewer token than its token
+    # tensor. Each sample is padded with one trailing -1 position. Layout handling: padded layout
+    # (bshd): with all-gather CP and CP > 1, pad each sample to the batch's padded length (which
+    # must be divisible by CP size) and take this CP rank's contiguous block; otherwise slice with
+    # the CP slicing helper; stack samples and flatten batch and sequence into one token dimension.
+    # Packed layout (thd): pad multiple = TP size * the data pad multiplier; with all-gather CP and
+    # CP > 1, concatenate samples, pad to a multiple of CP size * pad multiple and take this rank's
+    # chunk; otherwise slice each sample with CP, optionally (when indices are token positions) add
+    # the running token offset to every non -1 entry so indices refer to packed positions,
+    # concatenate and pad to the pad multiple. If sequence parallelism is on (and the flag for an
+    # SP region is true), asserts the length is divisible by TP size and keeps this TP rank's
+    # contiguous part. Finally calls the registration function with the replay list, the tensor and
+    # the models. After all micro-batches deletes the data key from the rollout data (mutation) and
+    # resets the iterators again. Padding values are -1. Returns nothing.
     """Load rollout replay tensors into module replay queues.
 
     `rollout_data[data_key]` contains one tensor per sample with shape
@@ -61,6 +95,8 @@ def fill_replay_data(
     qkv_format = args.qkv_format
 
     def pad_func(data, pad):
+        # [FUNCTION DOC] HELPER: Append "pad" rows of -1 (same dtype and device) to a tensor of shape
+        # [tokens, layers, top-k] along the token dimension; returns the new tensor.
         _, num_layers, topk = data.shape
         pad_tensor = torch.full(
             (pad, num_layers, topk),

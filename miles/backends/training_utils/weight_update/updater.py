@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Single class driving trainer-to-engine weight synchronization independent of the training backend
+# and transfer protocol. It combines three collaborators: a transfer protocol (how bytes move), an
+# HF weight iterator (what is sent, in size-bounded buckets, built against the protocol's required
+# placement) and a connection status manager (when to reconnect). A sync runs on every training
+# rank in lockstep: global rank 0 acts as the "driver" for engine-side session RPCs; sender ranks
+# transmit buckets; non-sender ranks only join the gathers.
 """Backend-neutral weight-update driver.
 
 The updater owns the lifecycle: it builds the HF weight iterator against the
@@ -41,6 +48,10 @@ logger = logging.getLogger(__name__)
 
 
 class WeightUpdater:
+    # [CLASS DOC] Public entry point for weight sync. Holds args, the parallel state, the protocol
+    # chosen by args, the connection status manager, the HF weight iterator, a weights getter, the
+    # current weight version (starts at 0, incremented once per executed sync), LoRA settings and the
+    # set of adapter names already registered on the current engines (cleared on every connect).
     def __init__(
         self,
         args: Namespace,
@@ -54,6 +65,11 @@ class WeightUpdater:
         is_lora: bool,
         lora_sync_config: dict | None = None,
     ) -> None:
+        # [FUNCTION DOC] Creates the protocol from args and asserts it supports LoRA if is_lora is
+        # set (message names the transfer mode). Builds the iterator by calling the factory with
+        # args, model, the protocol's required placement (keyword), model name and quantization
+        # config. The weights getter returns backend-native named weights or none (live model).
+        # If is_lora, a LoRA sync config mapping is required (assertion error otherwise).
         self.args = args
         self.parallel_state = parallel_state
         self.protocol = get_weight_transfer_protocol(args)
@@ -82,6 +98,10 @@ class WeightUpdater:
         engine_gpu_counts: Sequence[int] | None = None,
         engine_gpu_offsets: Sequence[int] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Connects the protocol to the engines with the iterator's placement and
+        # weight update selector; asserts the protocol set its sender flag; clears the set of
+        # registered adapters (new engines know no adapters). May be collective, depending on the
+        # protocol.
         self.protocol.connect(
             rollout_engines,
             engine_gpu_counts,
@@ -94,12 +114,18 @@ class WeightUpdater:
         self._registered_adapters.clear()
 
     def reconnect_if_needed(self, info: "UpdatableEngines") -> bool:
+        # [FUNCTION DOC] Asks the status manager whether the engines' snapshot cell id to hash mapping
+        # differs, the trainer is stale or no connection was made; if so reconnects and returns true,
+        # else returns false. Must be called on all ranks consistently since reconnect is collective.
         if not self.conn_status.needs_reconnect(info.snapshot_cell_id_to_hashes):
             return False
         self.reconnect(info)
         return True
 
     def reconnect(self, info: "UpdatableEngines") -> None:
+        # [FUNCTION DOC] Connects using the engines, GPU counts and offsets in the info, records the
+        # reconnect (and the snapshot hashes) in the status manager, and barriers all ranks on the
+        # Gloo group.
         self.connect_rollout_engines(
             info.rollout_engines,
             engine_gpu_counts=info.engine_gpu_counts,
@@ -109,6 +135,10 @@ class WeightUpdater:
         dist.barrier(group=get_gloo_group())
 
     def verify_engine_version(self, rollout_engines: Sequence[SGLangApiClient]) -> None:
+        # [FUNCTION DOC] CI check. Does nothing if there are no engines or no sync has happened yet
+        # (version 0). Otherwise queries one randomly chosen engine's weight version (blocking) and
+        # raises a runtime error if its string form differs from the updater's version string. Only
+        # one engine is sampled, so it is a spot check.
         if not rollout_engines or self.weight_version == 0:
             return
         engine = random.choice(list(rollout_engines))
@@ -117,11 +147,29 @@ class WeightUpdater:
             raise RuntimeError(f"Weight version mismatch! Engine: {engine_version}, Updater: {self.weight_version}")
 
     def pop_metrics(self) -> dict[str, float]:
+        # [FUNCTION DOC] Delegates to the protocol's drain of accumulated metrics.
         """Return and clear the protocol's metrics; the actor drains them onto the step log."""
         return self.protocol.pop_metrics()
 
     @torch.no_grad()
     def update_weights(self) -> None:
+        # [FUNCTION DOC] Runs without autograd; collective on all training ranks. Steps: (1) protocol
+        # begin-sync hook with the next version number and the base bucket iterator factory; if it
+        # returns false return without changing the version; else increment the version. (2) Base
+        # weights are synced unless this is LoRA and the protocol does not need a base resync. The
+        # adapters to push come from the adapter helper. (3) If the protocol uses the session frame,
+        # rank 0 (the driver) pauses the engines, registers new adapters, and opens a weight update
+        # session on the iterator's selector; then all ranks barrier. (4) When LoRA checksum checking
+        # is on, builds a per-adapter checksum mapping (asserting the iterator gathers pipeline). (5)
+        # Inside a timer: senders show a progress bar; iterate the iterator's buckets (base weights
+        # if enabled, adapters, materializing only on senders so others merely join the gathers);
+        # on senders the driver records LoRA checksums, then the protocol sends the bucket; after the
+        # stream call the protocol's after-base-weights hook and barrier. (6) Inside a timer: the
+        # protocol finalize hook with the version; with sessions, the driver ends the session
+        # (passing checksums), sets the engine weight version and resumes engines; barrier; then the
+        # protocol's after-engines-resumed hook. KNOWN ISSUE: the docstring omits the begin-sync
+        # skip path; checksums are recorded only on the driver, which is only guaranteed to hold the
+        # full adapter when the sender and driver coincide (hence the assertion).
         """Run one weight sync: session frame + base-bucket stream + adapter pushes for LoRA."""
         protocol = self.protocol
         if not protocol.begin_sync(self.weight_version + 1, self._iter_base_buckets):
@@ -171,9 +219,13 @@ class WeightUpdater:
         protocol.after_engines_resumed()
 
     def _iter_base_buckets(self, *, materialize: bool):
+        # [FUNCTION DOC] HELPER: Bucket iterator factory handed to the protocol's begin-sync: base
+        # weights only (no adapters) from the current weights getter, with the given materialize flag.
         return self._hf_weight_iterator.iter_hf_weights(self.weights_getter(), materialize=materialize)
 
     def _get_updated_adapters(self) -> list[tuple[str, object]]:
+        # [FUNCTION DOC] HELPER: Empty list when not LoRA; otherwise a single pair of the default
+        # LoRA adapter name and none (meaning the live adapter).
         """``(lora_name, adapter_or_None)`` pairs for this sync; the push set is
         identical on every rank so the iterator's collectives align."""
         if not self.is_lora:
@@ -181,6 +233,10 @@ class WeightUpdater:
         return [(LORA_ADAPTER_NAME, None)]
 
     def _register_new_lora_adapters(self, rollout_engines, adapters: list[tuple[str, object]]) -> None:
+        # [FUNCTION DOC] HELPER: Called on the driver only. For each adapter name not yet registered:
+        # config = the LoRA sync config, extended with the adapter's rank ("r") and alpha
+        # ("lora_alpha") when an adapter object is given; registers it on every engine (raising on
+        # failure) and records the name as registered.
         """Register adapters the current engine set has not seen, with their
         per-adapter config; eager so the engine validates rank before any bytes move."""
         for lora_name, adapter in adapters:

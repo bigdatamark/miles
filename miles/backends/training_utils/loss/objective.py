@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Training objective orchestration. Two stages: (1) compute_advantages_and_returns turns rollout
+# log probs / rewards / values into per-sample advantages and returns (with KL shaping, optional
+# on-policy distillation penalty and optional whitening) stored back into the rollout data; (2)
+# loss_function dispatches to the configured loss from the loss hub, then rescales it for Megatron's
+# gradient accumulation and packs a logging mapping. Also a helper to emit an audit event with the
+# computed advantages.
 from argparse import Namespace
 import torch
 from torch.utils.checkpoint import checkpoint
@@ -16,6 +23,9 @@ from miles.utils.types import RolloutBatch
 
 
 def _detach_rollout_tensor_list(rollout_data: RolloutBatch, key: str) -> list[torch.Tensor] | None:
+    # [FUNCTION DOC] HELPER: If the rollout data has a list of tensors under the key, replace it in
+    # place by the detached tensors (dropping autograd history) and return the new list; if the key
+    # is absent or none, return none and leave the data unchanged.
     tensors = rollout_data.get(key)
     if tensors is None:
         return None
@@ -29,6 +39,19 @@ def compute_advantages_and_returns(
     args: Namespace,
     rollout_data: RolloutBatch,
 ) -> None:
+    # [FUNCTION DOC] Fills "advantages" and "returns" in the rollout data. Steps: read the log-prob
+    # list (rollout log probs when the use-rollout-logprobs flag is on, else trainer log probs),
+    # reference log probs, rewards, values, lengths and masks. Return without changes if this is not
+    # the last pipeline stage, or if there are neither log probs nor values (unless the actor
+    # forward pass is skipped and rollout log probs are not used). Detach the stored log-prob lists
+    # (log probs, rollout, reference, teacher) in the rollout data. KL: if there are neither log
+    # probs nor values, zeros shaped like the local response masks; if the kl coefficient is 0 or
+    # log probs are empty, zeros shaped like the log probs (or values); otherwise the approximate
+    # KL (type from args) between log probs and reference log probs per sample. Then compute
+    # advantages and returns via the estimator selected in args, apply the OPD penalty when enabled,
+    # and optionally whiten advantages across the data-parallel group. KNOWN ISSUE: the empty-log-prob
+    # test is falsy for an empty list, so an empty list of log probs with a nonzero coefficient also
+    # takes the zero-KL branch (probably intended).
     """Compute advantages and returns in-place based on `args.advantage_estimator`.
 
     This function extracts rewards, log-probs, values, and masks from
@@ -133,6 +156,26 @@ def loss_function(
     apply_megatron_loss_scaling: bool = False,
     num_rollouts: int | None = None,
 ) -> tuple[torch.Tensor, int | torch.Tensor, dict]:
+    # [FUNCTION DOC] Compute the loss for one micro-batch and rescale it. Steps: number of tokens =
+    # sum over samples of the loss mask sum clamped to at least 1; build the per-sample-mean reducer
+    # (honoring per-token loss mode, qkv format, optional padded lengths and optional rollout mask
+    # sums as denominators); look up the loss function from args and the batch's loss function name;
+    # call it directly or through activation checkpointing when recompute-loss is on. With CP > 1
+    # and all-gather-CP, add a zero-valued term depending on the logits so autograd visits the whole
+    # graph on every rank. The normalizer is num_rollouts if given, else the dynamic global batch
+    # size from the batch (asserting the dynamic-batch flag matches presence of that key) or the
+    # configured global batch size; it is forced to 1 when multi-LoRA is enabled. Scaling: without
+    # per-token loss, with Megatron scaling: loss * num_microbatches / normalizer * the DP (times CP,
+    # or DP only for true-on-policy with Ulysses CP) size; without Megatron scaling: loss /
+    # normalizer * intra-DP size. With per-token loss: multiplied by CP size only under Megatron
+    # scaling. A per-datum entry is popped from the log mapping only if a Tinker loss name is set.
+    # Returns (loss, token count tensor or tensor 1, mapping with optional per-datum, "keys" and
+    # "values" = tensor of [sample count (or token count if per-token), metrics in key order]).
+    # KNOWN ISSUE: the docstring says the normalizer is a plain int 1 when not per-token, but a
+    # tensor is returned in both cases; the comment about Tinker losses carrying their own
+    # normalization sits above code that checks multi-LoRA, not the Tinker loss name. The tensor
+    # constructor is applied to a tensor token count (copy warning). The docstring omits that the
+    # parameter apply_megatron_loss_scaling exists.
     """Dispatch to the configured loss and rescale for Megatron integration.
 
     Selects "policy_loss", "score_centering", "value_loss", "sft_loss", or a custom loss
@@ -230,6 +273,9 @@ def loss_function(
 
 
 def log_train_advantage_computation_event(rollout_data: RolloutBatch) -> None:
+    # [FUNCTION DOC] Audit hook: if the event logger is initialized and the rollout data has both
+    # advantages and witness ids, log one advantage-computation event with both converted to nested
+    # Python lists (no console print). Otherwise does nothing.
     if not is_event_logger_initialized():
         return
 

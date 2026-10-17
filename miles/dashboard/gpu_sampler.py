@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Per-node GPU telemetry sampler. Two thin provider classes adapt the NVIDIA (pynvml) and AMD (amdsmi)
+# management libraries to one interface of three methods: initialize (returns device handles and
+# UUIDs), read one device (utilization percent, used memory in MiB, power in watts) and read the
+# processes holding GPU memory (pid, name, MiB). The sampler class picks a provider (injected or
+# auto-detected, NVIDIA first), samples all devices on a background thread, buffers records and pushes
+# batches via injected callables. All library failures degrade gracefully (warning, skipped tick).
 """Per-node GPU utilization sampler feeding the dashboard timeline.
 
 One instance runs per GPU node (the collector spawns it as a Ray actor with
@@ -32,6 +39,7 @@ logger = logging.getLogger(__name__)
 
 
 def _text(value) -> str:
+    # [FUNCTION DOC] HELPER: Decode bytes to text, or convert any other value to its string form.
     return value.decode() if isinstance(value, bytes) else str(value)
 
 
@@ -39,13 +47,17 @@ def _text(value) -> str:
 
 
 class _NvmlProvider:
+    # [CLASS DOC] HELPER: Provider over the NVML Python module (name "NVML", module name "pynvml").
     name = "NVML"
     module = "pynvml"
 
     def __init__(self, api):
+        # [FUNCTION DOC] HELPER: Store the NVML-like module object (real or injected fake).
         self._api = api
 
     def initialize(self) -> tuple[list, list[str]]:
+        # [FUNCTION DOC] HELPER: Initializes the library, counts devices (raises a runtime error if
+        # zero) and returns the list of device handles (by physical index) plus their UUID strings.
         self._api.nvmlInit()
         count = self._api.nvmlDeviceGetCount()
         if count == 0:
@@ -54,12 +66,18 @@ class _NvmlProvider:
         return handles, [_text(self._api.nvmlDeviceGetUUID(handle)) for handle in handles]
 
     def read_device(self, handle) -> tuple[int, int, int]:
+        # [FUNCTION DOC] HELPER: Returns (GPU utilization percent, used memory in MiB computed by
+        # shifting bytes right 20 bits, power in whole watts from milliwatts by integer division).
+        # Any library error propagates.
         util = int(self._api.nvmlDeviceGetUtilizationRates(handle).gpu)
         mem_mb = int(self._api.nvmlDeviceGetMemoryInfo(handle).used) >> 20
         power_w = int(self._api.nvmlDeviceGetPowerUsage(handle)) // 1000
         return util, mem_mb, power_w
 
     def read_processes(self, handle) -> list[tuple[int, str, int]]:
+        # [FUNCTION DOC] HELPER: For each compute process on the device returns (pid, process name,
+        # GPU memory in MiB, zero when unreported). If the name lookup fails (process gone), the name
+        # is "pid <pid>". Only compute processes are listed.
         processes = []
         for proc in self._api.nvmlDeviceGetComputeRunningProcesses(handle):
             pid = int(proc.pid)
@@ -72,13 +90,18 @@ class _NvmlProvider:
 
 
 class _AmdSmiProvider:
+    # [CLASS DOC] HELPER: Provider over the AMD SMI Python module (name "AMD SMI", module name
+    # "amdsmi"), with the same three-method interface as the NVML provider.
     name = "AMD SMI"
     module = "amdsmi"
 
     def __init__(self, api):
+        # [FUNCTION DOC] HELPER: Store the AMD SMI-like module object.
         self._api = api
 
     def initialize(self) -> tuple[list, list[str]]:
+        # [FUNCTION DOC] HELPER: Initializes the library, gets processor handles (raises a runtime
+        # error if there are none) and returns them in slot order with their device UUID strings.
         self._api.amdsmi_init()
         handles = self._api.amdsmi_get_processor_handles()
         if not handles:
@@ -87,6 +110,8 @@ class _AmdSmiProvider:
         return list(handles), [_text(self._api.amdsmi_get_gpu_device_uuid(handle)) for handle in handles]
 
     def read_device(self, handle) -> tuple[int, int, int]:
+        # [FUNCTION DOC] HELPER: Returns (graphics activity percent, VRAM used already in MiB, socket
+        # power in watts). Power read errors of any kind are swallowed and reported as 0 watts.
         util = int(self._api.amdsmi_get_gpu_activity(handle)["gfx_activity"])
         # Unlike NVML, AMD SMI reports VRAM usage in MiB already.
         mem_mb = int(self._api.amdsmi_get_gpu_vram_usage(handle)["vram_used"])
@@ -97,6 +122,10 @@ class _AmdSmiProvider:
         return util, mem_mb, power_w
 
     def read_processes(self, handle) -> list[tuple[int, str, int]]:
+        # [FUNCTION DOC] HELPER: For each listed process computes VRAM in MiB by shifting a byte count
+        # right 20 bits and skips processes holding zero VRAM (bystander pids). Returns (pid, name or
+        # "pid <pid>" when the name is missing or "N/A", MiB). The per-process VRAM value is treated
+        # as bytes here (unlike the device-level value, which is already MiB).
         processes = []
         for proc in self._api.amdsmi_get_gpu_process_list(handle):
             mem_mb = int((proc.get("memory_usage") or {}).get("vram_mem") or 0) >> 20
@@ -109,6 +138,10 @@ class _AmdSmiProvider:
 
 
 def _amd_socket_power(power: dict) -> int:
+    # [FUNCTION DOC] HELPER: Given the power info mapping, tries the keys socket power, current
+    # socket power and average socket power in that order and returns the first value that is not the
+    # string "N/A" and lies in [0, 65535) as an int. Raises a value error if none qualifies (a
+    # non-numeric non-"N/A" value would raise a type error on comparison).
     # Prefer MI300+ socket power, then split fields; unavailable sensors use "N/A" or 0xFFFF.
     for field in ("socket_power", "current_socket_power", "average_socket_power"):
         value = power.get(field, "N/A")
@@ -118,6 +151,11 @@ def _amd_socket_power(power: dict) -> int:
 
 
 class GpuSampler:
+    # [CLASS DOC] Samples every GPU visible to the management library on this node. Class constants:
+    # flush interval 5 seconds and process-sample interval 5 seconds. State: push callables, node name,
+    # sample interval, provider, device handles, UUIDs, two lock-protected buffers (device samples and
+    # process samples), stop event, thread, a rate-limited warner and a public availability flag. Plain
+    # Python (no Ray) so it is testable; the collector wraps it in an actor.
     FLUSH_INTERVAL_SECONDS: ClassVar[float] = 5.0
     # per-process memory breakdown is a coarser, heavier SMI call (enumerates
     # every process) than the plain util/mem read, so it samples on its own,
@@ -134,6 +172,12 @@ class GpuSampler:
         push_processes: Callable[[str, list[GpuProcessSample]], None] | None = None,
         amdsmi=None,
     ):
+        # [FUNCTION DOC] Keyword-only. push: callable taking (node, list of GPU samples); node: node
+        # name string; interval: seconds between samples (default 1.0, must be positive, assertion
+        # error otherwise); nvml / amdsmi: optional injected library modules (at most one, assertion
+        # error otherwise); push_processes: optional callable for per-process records (without it
+        # the process sampling never runs). Initializes the provider at construction; the result is
+        # stored as the availability flag.
         assert interval > 0, f"{interval=}"
         assert nvml is None or amdsmi is None, "inject only one GPU telemetry backend"
         self._push = push
@@ -152,6 +196,13 @@ class GpuSampler:
         self.available = self._init_provider(nvml=nvml, amdsmi=amdsmi)
 
     def _init_provider(self, *, nvml, amdsmi) -> bool:
+        # [FUNCTION DOC] HELPER: Candidate providers: the injected NVML module, else the injected AMD
+        # module, else auto-detect (NVML then AMD SMI, importing each library by name). For each
+        # candidate, tries to build the provider and initialize it; any exception (import error, driver
+        # error, no devices) is recorded, logged at debug level, and the next candidate is tried. On the
+        # first success stores the provider (handles and UUIDs are stored by the attempt) and returns
+        # true. If all fail logs exactly one warning (naming the single failure, or all failures
+        # joined) and returns false.
         if nvml is not None:
             candidates = [(_NvmlProvider, nvml)]
         elif amdsmi is not None:
@@ -184,9 +235,12 @@ class GpuSampler:
     # ------------------------------ lifecycle -------------------------------
 
     def gpu_uuids(self) -> list[str]:
+        # [FUNCTION DOC] Copy of the device UUID list in device order (empty if unavailable).
         return list(self._uuids)
 
     def start(self) -> bool:
+        # [FUNCTION DOC] Returns false without starting if unavailable. Otherwise asserts it has not
+        # started, starts the daemon thread "dashboard-gpu-sampler" and returns true.
         """Begin sampling; returns False (and stays inert) when no SMI backend is usable."""
         if not self.available:
             return False
@@ -196,12 +250,19 @@ class GpuSampler:
         return True
 
     def stop(self) -> None:
+        # [FUNCTION DOC] Signals the thread to stop, joins it with a timeout of the sample interval
+        # plus the flush interval, then flushes buffered records synchronously.
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=self.interval + self.FLUSH_INTERVAL_SECONDS)
         self.flush()
 
     def _run(self) -> None:
+        # [FUNCTION DOC] HELPER: Thread body (monotonic deadlines for flush and process sampling,
+        # both 5 s ahead). Loop until stopped: sample all devices with the wall-clock time; if a
+        # process push callable exists and its deadline passed, sample processes and reschedule; if
+        # the flush deadline passed, flush and reschedule; then wait one interval (or the stop signal).
+        # Exceptions from the push callables propagate and end the thread.
         next_flush = time.monotonic() + self.FLUSH_INTERVAL_SECONDS
         next_process_sample = time.monotonic() + self.PROCESS_SAMPLE_INTERVAL_SECONDS
         while not self._stop_event.is_set():
@@ -217,6 +278,10 @@ class GpuSampler:
     # -------------------------------- sampling ------------------------------
 
     def sample_once(self, ts: float) -> int:
+        # [FUNCTION DOC] Returns 0 if unavailable. For each device by index, reads utilization, memory
+        # and power; a failure logs a rate-limited warning and skips that device for this tick. Each
+        # success appends a GPU sample (timestamp, node, gpu index, util, MiB, watts) to the buffer
+        # under the lock. Returns the number of samples taken.
         """Sample every device once into the buffer. Returns the sample count."""
         if not self.available:
             return 0
@@ -237,6 +302,10 @@ class GpuSampler:
         return count
 
     def sample_processes_once(self, ts: float) -> int:
+        # [FUNCTION DOC] Returns 0 if unavailable. For each device reads its process list (failure:
+        # rate-limited warning, skip device) and appends one process record (timestamp, node, gpu,
+        # pid, name, MiB) per process to the process buffer under the lock. Returns the number of
+        # records added.
         """Per-process VRAM breakdown once per GPU: who is actually holding
         the memory, not just the per-GPU aggregate ``sample_once`` reports."""
         if not self.available:
@@ -259,6 +328,9 @@ class GpuSampler:
         return count
 
     def flush(self) -> None:
+        # [FUNCTION DOC] Atomically takes both buffers under the lock, then (outside it) pushes the
+        # sample batch if non-empty and the process batch if non-empty and a process push callable
+        # exists. Without a process push callable the taken process records are discarded.
         with self._buffer_lock:
             batch, self._buffer = self._buffer, []
             process_batch, self._process_buffer = self._process_buffer, []

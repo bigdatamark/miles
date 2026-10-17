@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Read side of the detail dumps written during a run. Layout under the dump directory: rollout dumps
+# (one file per rollout id, with an "eval_" prefix for evaluation) hold every Sample; train dumps (one
+# file per rollout id and trainer rank) hold that rank's data-parallel shard of per-token tensors
+# plus sample indices, and optionally context-parallel rank/size, qkv format and rank. The module
+# joins them into per-sample train rows (handling pipeline, tensor and context parallel duplication
+# and slicing, and multiple "leaf" samples sharing one sample index, keyed by (index, occurrence)),
+# and offers cached per-sample summary tables, per-group tables, per-step aggregates, trajectory
+# sidecar lookups and per-token payloads. Files still being written by a live run are hidden or raise
+# a dedicated exception. Uses polars for tables and torch for loading.
 """Lazy reader for ``--dump-details`` directories: discovery, loading, join.
 
 ``rollout_data/{rid}.pt`` holds the full sample batch of one rollout step;
@@ -35,6 +45,8 @@ from miles.utils.types import LEGACY_WEIGHT_VERSIONS_KEY, Sample, WeightVersions
 
 
 class DumpStillWriting(Exception):
+    # [CLASS DOC] Raised when a dump file exists but cannot be loaded yet because it is probably being
+    # written; the message is the file path. The server maps it to an HTTP 503.
     """A dump file exists but cannot be used yet (``torch.save`` in progress)."""
 
 
@@ -53,6 +65,10 @@ STEP_AGGREGATE_METRICS = (
 
 
 def _weight_version_summary(sample: Sample) -> tuple[list[str], int | None]:
+    # [FUNCTION DOC] HELPER: Returns (list of weight version strings, number of calls). If the sample
+    # has per-call weight versions: the versions of all its flattened spans, and the number of
+    # per-call entries. Otherwise falls back to the legacy field (empty list if absent): its list and
+    # its length, with a zero length reported as none.
     if sample.weight_versions:
         return [span.version for span in sample.all_weight_version_spans], len(sample.weight_versions)
     legacy = list(getattr(sample, LEGACY_WEIGHT_VERSIONS_KEY, None) or [])
@@ -60,11 +76,15 @@ def _weight_version_summary(sample: Sample) -> tuple[list[str], int | None]:
 
 
 def _min_numeric_version(versions: list[str] | None) -> int | None:
+    # [FUNCTION DOC] HELPER: Smallest version among entries whose text form is all digits; none if the
+    # input is none/empty or has no numeric entry.
     numeric = [int(v) for v in versions or [] if str(v).isdigit()]
     return min(numeric) if numeric else None
 
 
 def _tool_call_count(sample: Sample) -> int | None:
+    # [FUNCTION DOC] HELPER: Number of message mappings whose role is "tool" when the prompt is a list
+    # of messages; none when the prompt is not a list (plain string prompt).
     """Tool messages in a chat-style prompt; None for plain-string prompts
     (single-turn math runs have no message structure to count)."""
     if not isinstance(sample.prompt, list):
@@ -76,6 +96,8 @@ SampleKey = tuple[int, int]
 
 
 def _sample_keys(samples: list[Sample]) -> list[SampleKey]:
+    # [FUNCTION DOC] HELPER: Produces one key per sample in order: (integer sample index, how many
+    # earlier samples had the same index). Asserts every sample has an index.
     """Return ``(Sample.index, occurrence)`` keys in rollout order.
 
     TITO v2 may emit multiple leaf samples for one rollout execution. Those
@@ -100,6 +122,9 @@ def _matching_train_locations(
     total_length: int,
     tokens: Any,
 ) -> list[tuple[int, int]]:
+    # [FUNCTION DOC] HELPER: Keyword-only lengths and tokens. From candidate (shard, row) locations,
+    # keeps those whose stored response length, total length and token tensor (exact shape and
+    # values) equal the expected rollout row. Returns the matching locations in input order.
     """Select the physical-rank replicas of one logical rollout row.
 
     Older train dumps only record ``sample_indices``. When TITO produces more
@@ -123,12 +148,18 @@ def _matching_train_locations(
 
 @dataclass
 class RolloutIds:
+    # [CLASS DOC] Sorted lists of visible rollout ids: training and evaluation.
     train: list[int]
     eval: list[int]
 
 
 @dataclass
 class TrainRow:
+    # [CLASS DOC] Mutable per-sample record of the trainer-side data: sample index, rank it came from,
+    # tokens, response and total lengths, normalized reward, loss mask, and optional per-token tensors
+    # (log probs, rollout log probs, reference log probs, entropy, reference entropy, advantages,
+    # returns) that are none when not dumped, the batch-global raw reward (supplied by the caller),
+    # truncated flag, weight versions, and a flag meaning slices were dumped but could not be placed.
     """Per-sample slice of one rank's train dump.
 
     Required columns fail loudly when absent; columns that legitimately depend
@@ -163,7 +194,14 @@ class TrainRow:
 
     @classmethod
     def from_columns(cls, columns: dict, row: int, *, rank: int, raw_reward) -> TrainRow:
+        # [FUNCTION DOC] Class-method constructor from a shard's column mapping and a row number.
+        # Required columns (sample indices, tokens, response lengths, total lengths, rewards, loss
+        # masks) raise a key error if absent; optional columns (log probs, rollout log probs, reference
+        # log probs, entropy, reference entropy, advantages, returns, truncated, weight versions) are
+        # none when the column is absent. The rank and raw reward are passed in. Per-token tensors are
+        # taken as stored (possibly a context-parallel slice; the resolve step fixes that later).
         def optional(key: str):
+            # [FUNCTION DOC] HELPER: Row value of the column, or none if the column is absent.
             values = columns.get(key)
             return None if values is None else values[row]
 
@@ -203,6 +241,10 @@ _CP_SHARDED_FIELDS = (
 def _cp_layout(
     handles: list[dict], locations: list[tuple[int, int]], total_length: int, response_length: int
 ) -> tuple[int, dict[int, int], bool]:
+    # [FUNCTION DOC] HELPER: Determine context-parallel layout for one sample. If any shard recorded a
+    # cp rank: mapping shard to that rank (for shards that recorded one), size = the first location's
+    # recorded cp size (default 1), and ok = the number of distinct recorded ranks equals the size.
+    # Otherwise infers the layout with the legacy recovery function.
     """Resolve `(cp_size, {shard: cp_rank}, ok)` once per sample and reuse it for
     every field; `ok` is False when slices exist but could not be placed."""
     recorded = {
@@ -217,6 +259,13 @@ def _cp_layout(
 def _recover_cp_layout_legacy(
     handles: list[dict], locations: list[tuple[int, int]], total_length: int, response_length: int
 ) -> tuple[int, dict[int, int], bool]:
+    # [FUNCTION DOC] HELPER: Uses the rollout log probs column as a probe. Holders = locations whose
+    # shard has that column, ordered by (rank or shard number). With no holders returns (1, every shard
+    # mapped to rank 0, ok). Otherwise groups holders by identical probe tensors (same length and
+    # values) in first-seen order; group number becomes the cp rank and the number of groups the cp
+    # size. One group: ok. Several groups: ok only if the widths match the expected context-parallel
+    # slicing (otherwise returns an empty mapping and not-ok). Assumes TP-duplicate shards have equal
+    # slices and different cp ranks differ.
     """Infer the layout for dumps written before cp_rank/cp_size were recorded.
 
     `rollout_log_probs` is the probe (present on every rank, varies along the
@@ -252,6 +301,10 @@ def _recover_cp_layout_legacy(
 
 
 def _cp_widths_match(widths: list[int], total_length: int, response_length: int, cp_size: int) -> bool:
+    # [FUNCTION DOC] HELPER: True only if the widths sum to the response length and, for each cp rank
+    # (index in the list), the width equals the total length of that rank's response-side logits
+    # ranges computed by the context-parallel offset helper in packed layout (ranges clipped at
+    # zero length).
     """Chunk size derives from the total length, prompt included -- which is what
     makes rank 0's slice shorter than its siblings'."""
     if sum(widths) != response_length:
@@ -266,6 +319,10 @@ def _cp_widths_match(widths: list[int], total_length: int, response_length: int,
 
 
 def _build_train_row(handles: list[dict], locations: list[tuple[int, int]], *, raw_reward) -> TrainRow:
+    # [FUNCTION DOC] HELPER: Takes the first location as primary. Asserts every other location agrees
+    # with it on response length and total length (message names both ranks and the sample). Builds
+    # the row from the primary shard's columns with its rank (recorded rank or shard number) and the
+    # given raw reward, then resolves per-token fields across all locations.
     """One sample's train row: per-token fields resolve per field, since PP decides
     who computed a field and CP who holds which slice."""
     shard, row_no = locations[0]
@@ -291,6 +348,16 @@ def _build_train_row(handles: list[dict], locations: list[tuple[int, int]], *, r
 
 
 def _resolve_per_token_fields(row: TrainRow, handles: list[dict], locations: list[tuple[int, int]]) -> TrainRow:
+    # [FUNCTION DOC] HELPER: Mutates and returns the row. Resolves the context-parallel layout and
+    # sets the alignment-failed flag when not ok. The qkv format comes from the primary shard (default
+    # "thd") and the padded sequence length from its optional padded-lengths column. For each sliced
+    # field (log probs, rollout log probs, reference log probs, entropy, reference entropy,
+    # advantages, returns): shards that hold the column are the holders; none: field set to none (only
+    # the last pipeline stage computes it). Collect one chunk per cp rank (first replica wins). If cp
+    # size is 1 the field is the single chunk. Otherwise if not every cp rank has a chunk the field is
+    # set to none and alignment marked failed; else the slices are reassembled into a full-response
+    # tensor by the context-parallel assembly helper. Finally any field whose length differs from the
+    # response length is set to none and alignment marked failed.
     """Fill every per-token field of `row` at full response length.
 
     One place decides which shard answers for a field, so pipeline parallelism
@@ -344,6 +411,9 @@ def _resolve_per_token_fields(row: TrainRow, handles: list[dict], locations: lis
 
 @dataclass
 class JoinedRollout:
+    # [CLASS DOC] One rollout step joined: id, evaluation flag, all samples in dump order, and a
+    # mapping from (sample index, occurrence) to the train row (empty for evaluation dumps; samples
+    # the trainer did not dump are absent).
     rollout_id: int
     evaluation: bool
     samples: list[Sample]
@@ -352,10 +422,19 @@ class JoinedRollout:
 
     @property
     def train_coverage(self) -> float:
+        # [FUNCTION DOC] Property: fraction of samples that have a train row; 0.0 when there are no
+        # samples.
         return len(self.train_rows) / len(self.samples) if self.samples else 0.0
 
 
 class DumpReader:
+    # [CLASS DOC] Lazy reader for one dump directory. Constants: minimum age (10 s) before an
+    # unaccompanied fresh rollout file is trusted; fresh window (60 s) within which load failures mean
+    # still-being-written; summary cache version (7); declared summary column order. Instance state:
+    # dump directory, rollout and train subdirectories, cache directory (default
+    # "<dump>/dashboard/cache"), number of joined rollouts to keep in memory (default 2), and three
+    # LRU caches (joined rollouts, memory-mapped train shards limited to 4, trajectory sidecars
+    # limited to 4) plus a lazily loaded tokenizer. Not thread-safe.
     # A fresh rollout file is only trusted once its train companion exists
     # (written strictly after it) or it has stopped changing for this long.
     MIN_AGE_SECONDS: ClassVar[float] = 10.0
@@ -405,6 +484,7 @@ class DumpReader:
     )
 
     def __init__(self, dump_dir: Path | str, *, cache_dir: Path | str | None = None, tensor_lru: int = 2):
+        # [FUNCTION DOC] Stores paths and empty caches; performs no I/O.
         self.dump_dir = Path(dump_dir)
         self.rollout_dir = self.dump_dir / "rollout_data"
         self.train_dir = self.dump_dir / "train_data"
@@ -418,6 +498,10 @@ class DumpReader:
         self._tokenizer_loaded = False
 
     def rollout_ids(self) -> RolloutIds:
+        # [FUNCTION DOC] Lists rollout files (all .pt files in the rollout directory; empty result
+        # if the directory is missing). A file named with the "eval_" prefix is evaluation; the rest of
+        # the stem must be an integer id (a non-integer name raises a value error). Keeps only visible
+        # files (see the visibility helper) and returns sorted train and eval id lists.
         ids = RolloutIds(train=[], eval=[])
         if not self.rollout_dir.is_dir():
             return ids
@@ -432,6 +516,17 @@ class DumpReader:
         return ids
 
     def load_joined(self, rollout_id: int, *, evaluation: bool = False) -> JoinedRollout:
+        # [FUNCTION DOC] Uncached load. Loads the rollout dump (asserting its stored id matches),
+        # rebuilds Sample objects and their (index, occurrence) keys, and counts samples per index. For
+        # train (non-evaluation) rollouts: loads every rank's train dump in rank order; asserts that a
+        # raw reward column, when present, has one entry per sample (the last shard having one is
+        # used); asserts every train sample index exists in the rollout dump; builds a map from sample
+        # index to (shard, row) locations. Then for each sample in order: takes its index's locations;
+        # if several samples share the index, narrows locations to those matching this sample's
+        # lengths and tokens; samples with no location get no train row; otherwise builds the train row
+        # with the raw reward taken at the sample's position in the rollout dump. Raises the
+        # still-writing exception for fresh unreadable files, a file-not-found error for missing
+        # files. Returns the joined rollout.
         name = f"eval_{rollout_id}.pt" if evaluation else f"{rollout_id}.pt"
         pack = self._torch_load(self.rollout_dir / name)
         assert pack["rollout_id"] == rollout_id, f"{pack['rollout_id']=} != {rollout_id=} in {name}"
@@ -490,6 +585,9 @@ class DumpReader:
         return JoinedRollout(rollout_id=rollout_id, evaluation=evaluation, samples=samples, train_rows=train_rows)
 
     def joined(self, rollout_id: int, *, evaluation: bool = False) -> JoinedRollout:
+        # [FUNCTION DOC] Cache lookup keyed by (id, evaluation); a hit moves the entry to most
+        # recent. A miss loads, stores, and evicts least recently used entries beyond the configured
+        # capacity. Note an exception from loading is not cached.
         """LRU-cached :meth:`load_joined`. A completed rollout's dumps never
         change, so entries stay valid; the LRU (``tensor_lru`` ids resident)
         bounds memory since one id holds every per-token tensor of its step."""
@@ -505,6 +603,8 @@ class DumpReader:
 
     @property
     def tokenizer(self):
+        # [FUNCTION DOC] Property, loaded at most once (even if the attempt finds nothing): loads the
+        # tokenizer from the "tokenizer" subdirectory of the dump directory if it exists, else none.
         """Tokenizer persisted by the run's data source, or None if absent."""
         if not self._tokenizer_loaded:
             self._tokenizer_loaded = True
@@ -518,6 +618,14 @@ class DumpReader:
     # ------------------------------- L1 views -------------------------------
 
     def summary(self, rollout_id: int, *, evaluation: bool = False) -> pl.DataFrame:
+        # [FUNCTION DOC] Cache files: "<cache dir>/rollout_[eval_]<id>.parquet" and a sources JSON next
+        # to it holding the summary version and the modification time of each source dump file. If both
+        # exist and the stored stamps equal the current ones, reads and returns the parquet. Otherwise
+        # joins the rollout, builds one summary row per sample (with its train row if any), builds a
+        # frame (non-strict typing; if there are no rows, a frame of null-typed columns using the
+        # declared column list), writes parquet atomically (temporary file named with the process id,
+        # then rename), writes the stamps file, and returns the frame. Creates the cache directory.
+        # Stat errors on missing source files propagate.
         """Per-sample summary table (one row per Sample), parquet-cached under
         ``cache_dir`` and invalidated on source mtime or SUMMARY_VERSION change."""
         stem = f"rollout_{'eval_' if evaluation else ''}{rollout_id}"
@@ -555,6 +663,11 @@ class DumpReader:
         return df
 
     def groups(self, rollout_id: int, *, evaluation: bool = False) -> pl.DataFrame:
+        # [FUNCTION DOC] From the summary table, groups by group index and computes: row count, mean
+        # and standard deviation of the reward (raw reward for training, plain reward for evaluation),
+        # mean response length, and mean truncated fraction. Adds a zero-std flag that is true when the
+        # reward mean is not null and the std (null treated as 0) is at most 1e-12 (so single-sample
+        # groups are degenerate, and groups without reward data are not flagged). Sorted by group index.
         """Per-GRPO-group aggregates; ``zero_std`` flags degenerate groups
         (all samples got the same reward, so advantages vanish)."""
         reward_column = "reward" if evaluation else "raw_reward"
@@ -578,6 +691,12 @@ class DumpReader:
         )
 
     def step_aggregates(self) -> pl.DataFrame:
+        # [FUNCTION DOC] For each visible train rollout id (ascending), computes from its summary and
+        # group tables one row: id, sample count, mean and std of raw reward, mean response length,
+        # truncated fraction, fraction of zero-std groups, mean absolute log-prob difference, mean
+        # entropy and fraction of mixed-version samples. Returns the frame (non-strict typing).
+        # KNOWN ISSUE: with no train rollouts the frame has no columns at all, unlike the declared
+        # metric names; callers must handle an empty frame.
         """Dump-derived per-step series: the L0 fallback when no metrics.jsonl
         exists. First call computes (and parquet-caches) every step's summary."""
         rows = []
@@ -603,6 +722,11 @@ class DumpReader:
     def trajectory_messages(
         self, rollout_id: int, sample_index: int, *, sample_occurrence: int = 0, evaluation: bool = False
     ) -> dict:
+        # [FUNCTION DOC] Loads (and caches, keeping the 4 most recent) the JSON-lines trajectory file
+        # "trajectory/[eval_]<id>.jsonl" from the dump directory, keyed by (sample index, occurrence)
+        # via the keying helper. Returns the row for the requested sample (occurrence default 0).
+        # Raises a file-not-found error if the file is missing, and a key error with a descriptive
+        # message if the sample has no recorded conversation.
         """Sidecar row for one sample; missing file or sample raises (-> 404),
         which is how the frontend learns the run recorded no conversation."""
         cache_key = (rollout_id, evaluation)
@@ -625,6 +749,9 @@ class DumpReader:
 
     @staticmethod
     def _keyed_trajectory_rows(file_rows: list[dict]) -> dict:
+        # [FUNCTION DOC] HELPER: Static. Maps (sample index, occurrence) to each file row. The
+        # occurrence is the row's stored occurrence field if present, else the number of earlier file
+        # rows with the same index. Later rows with an identical key overwrite earlier ones.
         """Key sidecar rows by the same (index, occurrence) numbering as summary().
 
         The sidecar holds one row per sample that recorded a conversation
@@ -663,6 +790,13 @@ class DumpReader:
     def _rollout_columns(
         self, rollout_id: int, sample_index: int, *, sample_occurrence: int, evaluation: bool
     ) -> dict:
+        # [FUNCTION DOC] HELPER: Reads one sample's rollout-side columns (sample index, lengths,
+        # tokens, loss mask, rollout log probs) from the columnar mirror file
+        # "dashboard_columns/rollout_[eval_]<id>.parquet" under the dump directory. If the mirror is
+        # missing or its column set differs from the expected one, rebuilds it from the rollout dump
+        # (the loader may raise the still-writing exception). Filters by sample index and picks the row
+        # at the given occurrence; raises a key error if the occurrence is out of range. The returned
+        # mapping also includes the count of rows sharing that index under a private key.
         stem = ("eval_" if evaluation else "") + str(rollout_id)
         path = self.dump_dir / "dashboard_columns" / f"rollout_{stem}.parquet"
         if not path.exists() or set(pl.read_parquet_schema(path)) != set(self.ROLLOUT_COLUMNS):
@@ -681,6 +815,11 @@ class DumpReader:
         return row
 
     def _train_row_lazy(self, rollout_id: int, sample_index: int, rollout_columns: dict) -> TrainRow | None:
+        # [FUNCTION DOC] HELPER: On first use per rollout id, memory-maps every rank's train dump (rank
+        # order) and indexes sample index to (shard, row) locations; keeps the 4 most recent rollout
+        # entries. Looks up the sample's locations (none: return none). When several rollout rows
+        # share the index (count from the rollout columns), narrows locations by lengths and tokens;
+        # none left: return none. Otherwise builds the train row without a raw reward.
         """One sample's train columns via mmap'd shards: opening a shard reads
         only its pickle graph; slicing a row faults in ~contiguous KBs."""
         if rollout_id not in self._shard_cache:
@@ -723,6 +862,19 @@ class DumpReader:
         end: int | None = None,
         evaluation: bool = False,
     ) -> dict:
+        # [FUNCTION DOC] Builds the token view for one sample over token positions [start, end). The
+        # range is clamped to [0, total]; end defaults to the total length; an empty range raises a
+        # value error. Prompt length = total - response length; response-relative bounds a and b are
+        # the range shifted by the prompt length and clipped at 0. The train row is fetched lazily (not
+        # for evaluation). The loss mask (when a train row exists) marks positions: statistics at
+        # positions with mask not positive are null. Returned mapping: identifying fields, total and
+        # prompt length, start, end, response offset within the slice, token ids, decoded token texts
+        # (none without a tokenizer; one decode call per token), rollout log probs (from the rollout
+        # columns if present, else from the train row), loss mask slice, train log probs, reference
+        # log probs, log-prob difference (train minus rollout), importance ratio (exp of that
+        # difference), entropy, reference entropy, advantages and returns; each statistic is a list over
+        # the response overlap or none when unavailable. For evaluation (no train row) no mask applies,
+        # so only the rollout log probs and token fields are populated, unmasked.
         """Per-token payload for one sample over token positions [start, end).
 
         Token ids/text cover the whole requested slice; per-token stat arrays
@@ -750,6 +902,8 @@ class DumpReader:
         mask = None if row is None else row.loss_mask > 0
 
         def response_slice(values) -> list[float | None] | None:
+            # [FUNCTION DOC] HELPER: None if values is none; else, for response positions a up to b,
+            # the float value, or none where the loss mask is present and not positive.
             if values is None:
                 return None
             return [float(values[i]) if mask is None or bool(mask[i]) else None for i in range(a, b)]
@@ -791,16 +945,34 @@ class DumpReader:
     # ------------------------------- internals ------------------------------
 
     def _decode_tokens(self, token_ids: list[int]) -> list[str] | None:
+        # [FUNCTION DOC] HELPER: Decodes each id on its own (one string per id); none if there is no
+        # tokenizer.
         if self.tokenizer is None:
             return None
         return [self.tokenizer.decode([token_id]) for token_id in token_ids]
 
     def _source_stamps(self, rollout_id: int, *, evaluation: bool) -> dict:
+        # [FUNCTION DOC] HELPER: Mapping with the summary version under a private key plus file name to
+        # modification time for the rollout dump and (for training) every train shard file; used to
+        # validate the summary cache. Raises an OS error if a file is missing.
         rollout_path = self.rollout_dir / (f"eval_{rollout_id}.pt" if evaluation else f"{rollout_id}.pt")
         paths = [rollout_path] + ([] if evaluation else self._train_paths(rollout_id))
         return {"_summary_version": self.SUMMARY_VERSION, **{p.name: p.stat().st_mtime for p in paths}}
 
     def _summary_row(self, sample: Sample, row: TrainRow | None, *, rollout_id: int, sample_occurrence: int) -> dict:
+        # [FUNCTION DOC] HELPER: Builds one summary mapping. Rollout-side columns: index, occurrence,
+        # group, status text, remove flag, response length, total length (token count), reward as
+        # float (none if not numeric), latest weight version, minimum numeric version, mixed-version
+        # flag (more than one distinct version; none when no versions), staleness (rollout id minus
+        # the oldest numeric version), number of turns (calls), tool message count, non-generation
+        # time, speculative accept rate (correct over proposed drafts, none if none proposed) and
+        # prefix cache hit rate (cached over prompt tokens, none if zero). Without a train row the
+        # train-side columns are none, truncated is derived from the sample status and alignment
+        # failed is false. With a train row: raw reward (none if absent), normalized reward, truncated
+        # (the dumped flag if present else from status), dumped rank; log-prob difference = train minus
+        # rollout log probs when both exist; over loss-masked-in positions only: mean and max entropy,
+        # reference entropy mean, mean and max absolute difference, mean exp of difference (importance
+        # ratio), advantage mean and standard deviation, return mean; and the alignment-failed flag.
         spec = sample.spec_info
         cache_info = sample.prefix_cache_info
         versions, turns = _weight_version_summary(sample)
@@ -871,15 +1043,25 @@ class DumpReader:
         )
 
     def _train_paths(self, rollout_id: int) -> list[Path]:
+        # [FUNCTION DOC] HELPER: Train shard files "<id>_<rank>.pt" in the train directory, ordered by
+        # integer rank (the part after the last underscore).
         return sorted(self.train_dir.glob(f"{rollout_id}_*.pt"), key=lambda p: int(p.stem.rsplit("_", 1)[1]))
 
     def _visible(self, path: Path, rollout_id: int, *, evaluation: bool, now: float) -> bool:
+        # [FUNCTION DOC] HELPER: A rollout file is visible if it was last modified more than the
+        # minimum age before "now"; otherwise only if it is a training file and at least one train shard
+        # for that id exists (those are written after the rollout file). Evaluation files younger than
+        # the minimum age are hidden.
         if now - path.stat().st_mtime > self.MIN_AGE_SECONDS:
             return True
         # any rank number: with pp > 1 the dumping ranks no longer include global rank 0
         return not evaluation and any(self.train_dir.glob(f"{rollout_id}_*.pt"))
 
     def _torch_load(self, path: Path, *, mmap: bool = False):
+        # [FUNCTION DOC] HELPER: Loads a dump with torch to CPU with unrestricted unpickling,
+        # optionally memory-mapped. A missing file raises file-not-found as is. Any other failure on a
+        # file modified less than 60 seconds ago is raised as the still-writing exception (chained to
+        # the original); on older files the original error propagates.
         try:
             return torch.load(path, weights_only=False, map_location="cpu", mmap=mmap)
         except FileNotFoundError:
@@ -894,6 +1076,8 @@ class DumpReader:
 
 
 def _masked(values: torch.Tensor | None, mask: torch.Tensor) -> torch.Tensor | None:
+    # [FUNCTION DOC] HELPER: Returns none if values is none; else the float32-or-wider selection of
+    # values where the boolean mask is true, or none if nothing is selected.
     """Loss-masked positions (tool outputs, removed samples) are excluded from
     all summary statistics; an empty selection yields None, not NaN."""
     if values is None:
@@ -903,12 +1087,16 @@ def _masked(values: torch.Tensor | None, mask: torch.Tensor) -> torch.Tensor | N
 
 
 def _mean(values: torch.Tensor | None) -> float | None:
+    # [FUNCTION DOC] HELPER: Mean as a Python float, or none for none input.
     return None if values is None else float(values.mean())
 
 
 def _max(values: torch.Tensor | None) -> float | None:
+    # [FUNCTION DOC] HELPER: Maximum as a Python float, or none for none input.
     return None if values is None else float(values.max())
 
 
 def _std(values: torch.Tensor | None) -> float | None:
+    # [FUNCTION DOC] HELPER: Sample standard deviation as a Python float (not-a-number for a single
+    # element), or none for none input.
     return None if values is None else float(values.std())

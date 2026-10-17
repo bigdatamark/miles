@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Numerical building blocks for RL losses on Megatron-style (tensor/context parallel) training:
+# approximate KL estimators, PPO clipped policy loss, off-policy sequence masking, GSPO sequence KL,
+# effective-sample-size contribution, vocab-parallel log-prob and entropy computation (including a
+# "true on policy" path that gathers the full vocabulary), and return/advantage estimators (GRPO,
+# REINFORCE++, REINFORCE++ baseline, GAE in vanilla and chunked-parallel forms).
+# Many functions are context-parallel (CP) aware: they gather per-rank chunks to full response
+# tensors, compute, then slice back to the local chunk. Importing this module needs the parallel
+# state and context-parallel helpers; the megatron package is imported lazily where needed.
 # Adapt from https://github.com/OpenRLHF/OpenRLHF/blob/10c733694ed9fbb78a0a2ff6a05efc7401584d46/openrlhf/models/utils.py
 # and https://github.com/OpenRLHF/OpenRLHF/blob/10c733694ed9fbb78a0a2ff6a05efc7401584d46/openrlhf/trainer/ppo_utils/experience_maker.py
 
@@ -19,6 +28,10 @@ _LOG_RATIO_EXP_CLAMP = 20.0
 
 
 def _safe_clamp_log_ratio(log_ratio: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Sanitize a log ratio before exponentiation. Converts to float32,
+    # replaces not-a-number with zero, positive infinity with the clamp bound and negative infinity
+    # with the negative bound, then clamps all values to plus/minus the module clamp constant (20).
+    # Returns a float32 tensor of the same shape. No side effects.
     log_ratio = torch.nan_to_num(
         log_ratio.float(),
         nan=0.0,
@@ -29,6 +42,9 @@ def _safe_clamp_log_ratio(log_ratio: torch.Tensor) -> torch.Tensor:
 
 
 def _safe_exp_neg_ppo_kl(ppo_kl: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Convert a per-token ppo kl (old log prob minus new log prob) into the
+    # importance ratio by negating it, sanitizing/clamping via the safe clamp helper, and
+    # exponentiating. Returns a float32 tensor of the same shape; always finite.
     return _safe_clamp_log_ratio(-ppo_kl).exp()
 
 
@@ -41,6 +57,19 @@ def compute_ess_ratio_contribution(
     max_seq_lens: list[int] | None,
     calculate_per_token_loss: bool,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Compute the (batch-summed) effective-sample-size ratio contribution of the local
+    # rank. Inputs: concatenated local per-token ppo kl for all samples (detached internally), the
+    # full per-sample response loss masks, total/response lengths per sample, the qkv layout name,
+    # per-sample padded lengths (only for the padded layout under context parallelism) and whether
+    # the loss is averaged per token. Steps: slice the loss masks to the local CP chunk, split the
+    # importance weights (exp of negative kl, safely clamped) per sample, compute per sample the
+    # masked sum of weights and sum of squared weights, all-reduce those over the CP group when CP
+    # size > 1, then per sample ESS ratio = (sum w)^2 / (valid tokens * max(sum w^2, 1e-8)), where
+    # valid tokens is the full mask sum clamped to at least 1. With per-token loss the ratio is
+    # weighted by the valid token count. Only CP rank 0 keeps the result (others multiplied by
+    # zero) so later CP summation does not double count. Returns a scalar float32 tensor.
+    # Raises a value error if a sample's weight count differs from its local mask length.
+    # Performs an all-reduce collective when CP size > 1.
     """Return an ESS contribution compatible with ``aggregate_train_losses``.
 
     ESS needs full-sample sums before applying the nonlinear ratio.  Under CP we
@@ -89,6 +118,14 @@ _TOP_LOGPROB_BWD_DUMP_COUNTER = 0
 
 
 def _maybe_dump_top_logprob_backward(name: str, tensor: torch.Tensor) -> None:
+    # [FUNCTION DOC] HELPER: Debug aid. If the environment variable for the logprob backward debug
+    # directory is set and the tensor requires grad, register a backward hook on the tensor that,
+    # when its gradient is computed, collects stats (rank, name, shape, dtype, element count, counts
+    # of finite/nan/inf values, and min/max/max-abs over finite values or none if no finite value)
+    # and saves them with the CPU gradient to a file named by rank, a module-global running counter
+    # and the tensor name inside that directory (created if missing), then prints a line. The hook
+    # returns the gradient unchanged. Otherwise does nothing. Side effects: global counter increment,
+    # file I/O, stdout. The surrounding try/except around reading the environment is redundant.
     dump_dir = None
     try:
         import os
@@ -100,6 +137,8 @@ def _maybe_dump_top_logprob_backward(name: str, tensor: torch.Tensor) -> None:
         return
 
     def hook(grad: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Backward hook; dumps gradient statistics and the gradient itself to
+        # disk (see the enclosing function) and returns the gradient unmodified.
         global _TOP_LOGPROB_BWD_DUMP_COUNTER
         rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
         stats = {
@@ -142,6 +181,13 @@ def compute_approx_kl(
     kl_loss_type: str,
     importance_ratio: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Per-token approximate KL between current and base log probs (compiled with
+    # dynamic shapes). Computes log ratio = log_probs - base in float32, then by estimator type:
+    # k1 = log ratio; k2 = half the squared log ratio; k3 and low_var_kl = exp(-r) - 1 + r with
+    # r the log ratio (the sign is flipped first; low_var_kl additionally sanitizes/clamps the
+    # flipped ratio to plus/minus 20 first). If an importance ratio is given, the kl is multiplied
+    # by it elementwise. For low_var_kl the final result is clamped to [-10, 10]. Returns a float32
+    # tensor shaped like the inputs. Raises a value error for an unknown estimator name.
     """
     Compute the approximate KL divergence between two distributions.
     Schulman blog: http://joschu.net/blog/kl-approx.html
@@ -187,6 +233,16 @@ def compute_opsm_mask(
     advantages: list[torch.Tensor],
     loss_masks: list[torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Build the OPSM per-token keep mask. For each sample: sequence kl = masked sum of
+    # (old log prob - current log prob) divided by the mask sum (clamped to at least 1). A sequence
+    # is masked out (all its tokens get 0) when its advantage is negative and the sequence kl exceeds
+    # the configured opsm delta; otherwise tokens get 1. The clip fraction accumulates, per sample,
+    # the mask indicator summed over the advantage elements divided by the mask sum. The advantage is
+    # compared elementwise so a per-token advantage tensor yields a per-token mask. Returns the
+    # concatenated keep mask over samples and the scalar accumulated clip fraction (tensor on the
+    # advantages' device). KNOWN ISSUE: the docstring says the second output counts masked
+    # sequences, but it is a sum of masked fractions of tokens, normalized by the mask sum per sample
+    # and not by the number of samples.
     """Compute Off-Policy Sequence Masking (OPSM) mask.
 
     Args:
@@ -227,6 +283,11 @@ def compute_gspo_kl(
     local_log_probs: list[torch.Tensor],
     loss_masks: list[torch.Tensor],
 ) -> torch.Tensor:
+    # [FUNCTION DOC] GSPO sequence-level kl. For each sample computes the masked mean of
+    # (old log prob - current log prob) over the loss mask (denominator clamped to at least 1),
+    # expands that scalar to the length of the matching local log prob tensor, and concatenates
+    # across samples. Returns a 1-D tensor of per-token kl where every token in a sample holds the
+    # same value. Samples are paired without length checking.
     """Compute GSPO-style per-sequence KL divergence.
 
     Args:
@@ -258,6 +319,14 @@ def compute_policy_loss(
     eps_clip_high: float,
     eps_clip_c: float | None = None,
 ):
+    # [FUNCTION DOC] PPO clipped policy loss per token (compiled, dynamic shapes). The ratio is the
+    # safely clamped exponential of negative ppo kl. Loss1 = -ratio * advantage; loss2 uses the ratio
+    # clamped to [1 - eps_clip, 1 + eps_clip_high]; the clipped loss is the elementwise maximum.
+    # The clip fraction is 1 where loss2 exceeds loss1, else 0 (float). If eps_clip_c (dual-clip) is
+    # given, it must be greater than 1 (assertion failure otherwise); for negative advantages the
+    # loss is further capped at the minimum of the clipped loss and -eps_clip_c * advantage, while
+    # non-negative advantages keep the clipped loss. Returns (per-token loss, per-token clip
+    # fraction), unreduced.
     ratio = _safe_exp_neg_ppo_kl(ppo_kl)
     pg_losses1 = -ratio * advantages
     pg_losses2 = -ratio.clamp(1 - eps_clip, 1 + eps_clip_high) * advantages
@@ -287,6 +356,18 @@ def compute_log_probs(
     sampling_mask: torch.Tensor | None = None,
     debug_unified_grad_fused_logprob: bool = False,
 ):
+    # [FUNCTION DOC] Log probability of target tokens under vocab-parallel logits. Inputs: logits of
+    # shape [rows, local vocab], target tokens [rows], the tensor-parallel process group, and
+    # options. First applies the optional sampling mask (masked-out logits become negative infinity;
+    # in place unless true-on-policy mode). In true-on-policy mode: gathers the full vocabulary
+    # across the group (optionally truncated to vocab_size), log-softmaxes, and gathers the target
+    # token log prob. Otherwise uses Megatron's fused vocab-parallel cross entropy (imported lazily;
+    # negated to give log probs) after adding a batch dimension; the fused op may mutate its input.
+    # In the debug flag case with grad disabled, it recomputes with grad enabled on a detached copy
+    # and returns a detached result. Returns a tensor of shape [rows] (fused path: [rows, 1] result
+    # of the cross entropy layout, not squeezed). Raises a value error via the mask helper on shape
+    # mismatch. KNOWN ISSUE: the fused path returns the cross-entropy output shape [rows, 1] while
+    # the true-on-policy path returns [rows]; callers must tolerate either.
     logits = _apply_sampling_mask(logits, sampling_mask, inplace=not true_on_policy_mode)
     if true_on_policy_mode:
         full_logits = _gather_true_on_policy_full_logits(logits, process_group, vocab_size=vocab_size)
@@ -316,6 +397,10 @@ def _apply_sampling_mask(
     *,
     inplace: bool = False,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Restrict logits to the sampling support. Returns the logits unchanged if
+    # no mask is given; raises a value error if mask and logits shapes differ; otherwise sets logits
+    # where the mask is false to negative infinity, either in place (mutating and returning the
+    # input) or on a copy.
     if sampling_mask is None:
         return logits
     if sampling_mask.shape != logits.shape:
@@ -330,6 +415,9 @@ def _prepare_true_on_policy_full_logits(
     *,
     vocab_size: int | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Turn either one tensor or a list/tuple of vocabulary shards into one
+    # contiguous full-vocabulary logits tensor (shards are concatenated along the last dimension).
+    # If vocab_size is given and the last dimension is larger, trailing padded columns are dropped.
     if isinstance(logits_or_shards, (list, tuple)):
         full_logits = torch.cat([shard.contiguous() for shard in logits_or_shards], dim=-1)
     else:
@@ -347,6 +435,11 @@ def _gather_true_on_policy_full_logits(
     *,
     vocab_size: int | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Return full-vocabulary logits for the true-on-policy path. With no
+    # process group or a group of size 1 the local logits are already complete. Otherwise all-gathers
+    # the vocabulary shards across the group with the custom autograd function whose backward takes
+    # the local slice of the gradient (no reduce-scatter), then pads are trimmed by vocab_size.
+    # Collective communication across the tensor-parallel group.
     if process_group is None:
         return _prepare_true_on_policy_full_logits(logits, vocab_size=vocab_size)
 
@@ -365,6 +458,11 @@ def _split_replicated_loss_gather_grad(
     world_size: int,
     local_last_dim: int,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Backward rule for the replicated-loss gather: given the gradient with
+    # respect to the gathered full (padded) vocabulary, return this rank's slice along the last
+    # dimension (start = rank * local width, length = local width). With world size <= 1 returns
+    # the gradient contiguous. Raises a runtime error if the gradient's last dimension is not local
+    # width times world size.
     if world_size <= 1:
         return grad_output.contiguous()
 
@@ -379,6 +477,10 @@ def _split_replicated_loss_gather_grad(
 
 
 class _ReplicatedLossAllGatherLastDim(torch.autograd.Function):
+    # [CLASS DOC] HELPER: Autograd function that all-gathers vocabulary shards along the last
+    # dimension across a process group, for losses computed identically on every rank. Its backward
+    # keeps only the local slice of the incoming gradient instead of reduce-scattering, avoiding a
+    # gradient scale-up by the group size. Needs Megatron's gather helper at runtime.
     """All-gather vocab shards for a loss replicated on every TP rank.
 
     Megatron's standard all-gather autograd uses reduce-scatter in backward,
@@ -390,6 +492,12 @@ class _ReplicatedLossAllGatherLastDim(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, input_: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
+        # [FUNCTION DOC] Save the group, local last-dimension width and world size on the context.
+        # With world size 1 returns the input contiguous. Otherwise all-gathers along a new leading
+        # concatenation (the first dimension is multiplied by the world size) using Megatron's
+        # distributed all-gather function, then splits that dimension into one chunk per rank and
+        # concatenates the chunks along the last dimension, giving the full vocabulary in rank order.
+        # Communication across the group.
         world_size = group.size()
         ctx.group = group
         ctx.local_last_dim = input_.shape[-1]
@@ -408,6 +516,8 @@ class _ReplicatedLossAllGatherLastDim(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
+        # [FUNCTION DOC] Return this rank's slice of the gradient along the last dimension and no
+        # gradient for the process group. Raises a runtime error on a width mismatch.
         return (
             _split_replicated_loss_gather_grad(
                 grad_output,
@@ -421,12 +531,23 @@ class _ReplicatedLossAllGatherLastDim(torch.autograd.Function):
 
 # from https://github.com/volcengine/verl/blob/0bdf7f469854815177e73dcfe9e420836c952e6e/verl/utils/megatron/tensor_parallel.py#L99
 class _VocabParallelEntropy(torch.autograd.Function):
+    # [CLASS DOC] HELPER: Autograd function computing the entropy of the softmax distribution over a
+    # vocabulary that is sharded across a tensor-parallel group, memory-efficiently (in-place
+    # operations, softmax reused as the gradient buffer).
 
     @staticmethod
     def forward(ctx, vocab_parallel_logits: torch.Tensor, process_group: dist.ProcessGroup) -> torch.Tensor:
+        # [FUNCTION DOC] Entropy per row of local logits [rows, local vocab]. Steps: global max via
+        # max all-reduce; subtract max; exponentiate in place; global sum of exps via all-reduce;
+        # divide in place to get softmax; global sum of softmax*logits (compiled helper) via
+        # all-reduce; entropy = max + log(sum exp) - sum(softmax*logits). Saves logits, softmax and
+        # the weighted sum for backward. Returns [rows]. Mutates the normalized copy (not the input
+        # logits). Three collectives on the group.
 
         @torch.compile(dynamic=True)
         def mul_reduce(a, b):
+            # [FUNCTION DOC] HELPER: Elementwise product of two same-shaped tensors summed over the
+            # last dimension, keeping that dimension with size 1.
             return (a * b).sum(dim=-1, keepdim=True)
 
         logits_max = vocab_parallel_logits.max(dim=-1, keepdim=True).values
@@ -444,6 +565,10 @@ class _VocabParallelEntropy(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] Gradient of entropy w.r.t. local logits: -softmax * (logits - E[logit]) *
+        # upstream grad, computed in place by temporarily shifting the saved logits and reusing the
+        # saved softmax buffer as the output (mutating saved tensors; logits are restored). Returns
+        # the gradient for the logits and none for the process group.
         vocab_parallel_logits, softmax_logits, sum_softmax_times_logits = ctx.saved_tensors
         # reuse softmax_logits as grad
         vocab_parallel_logits.sub_(sum_softmax_times_logits)
@@ -456,6 +581,9 @@ class _VocabParallelEntropy(torch.autograd.Function):
 
 
 def compute_entropy_from_logits(logits: torch.Tensor, process_group) -> torch.Tensor:
+    # [FUNCTION DOC] Entropy per row of vocab-parallel logits [rows, local vocab] across the given
+    # tensor-parallel group; thin wrapper over the custom autograd function. Returns [rows], is
+    # differentiable, and performs collectives.
     return _VocabParallelEntropy.apply(logits, process_group)
 
 
@@ -463,6 +591,9 @@ def get_grpo_returns(
     rewards: torch.Tensor,
     kl: list[torch.Tensor],
 ):
+    # [FUNCTION DOC] GRPO returns: for each sample, a tensor shaped like that sample's kl tensor
+    # filled with the sample's scalar reward. Returns a list of tensors. The kl values are used only
+    # for shape (and dtype/device).
     returns = []
     for i in range(len(rewards)):
         returns.append(torch.ones_like(kl[i]) * rewards[i])
@@ -478,6 +609,14 @@ def get_reinforce_plus_plus_returns(
     kl_coef: float,
     gamma: float,
 ) -> list[torch.Tensor]:
+    # [FUNCTION DOC] Per-sample discounted returns for REINFORCE++. For each sample: if CP size > 1,
+    # gather the local kl chunks to the full response kl; token rewards = -kl_coef * kl; add the
+    # sample's scalar reward at the last position where the loss mask is nonzero (assertion fails if
+    # the whole mask is zero); accumulate returns backwards G_t = r_t + gamma * G_{t+1} over the full
+    # response; if CP size > 1, slice back to the local chunk. Returns a list of local return
+    # tensors. Inputs are not mutated (the token reward tensor is a fresh product).
+    # KNOWN ISSUE: masked positions still receive the kl penalty term and take part in the discounted
+    # accumulation; the mask is only used to locate the last trainable token.
     """
     Calculates discounted returns for REINFORCE++ (https://arxiv.org/pdf/2501.03262)
 
@@ -539,6 +678,10 @@ def get_reinforce_plus_plus_baseline_advantages(
     loss_masks: list[torch.Tensor],
     kl_coef: float,
 ) -> list[torch.Tensor]:
+    # [FUNCTION DOC] REINFORCE++-baseline advantages before whitening: for each sample, the scalar
+    # (baseline-subtracted) reward broadcast to every token minus kl_coef times the per-token kl.
+    # Returns a list of tensors shaped like each kl tensor. KNOWN ISSUE: the loss_masks parameter is
+    # unused.
     """
     Calculates the unwhitened advantages for the REINFORCE++-baseline algorithm.
     Broadcasting the scalar (reward - group_baseline) to each token.
@@ -571,6 +714,13 @@ def get_advantages_and_returns(
     gamma: float,
     lambd: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Single-sample GAE. Gathers the local per-token rewards and values to full
+    # response tensors when CP size > 1, then runs the backward recursion
+    # delta_t = r_t + gamma * V_{t+1} - V_t (value after the last step is 0) and
+    # A_t = delta_t + gamma * lambda * A_{t+1}; returns = advantages + values. With CP the results
+    # are sliced back to the local chunk. Returns (advantages detached, returns), 1-D tensors.
+    # Uses a Python loop over the response length and builds the advantage tensor from a Python list
+    # (slow, host sync per element).
     """Function that computes advantages and returns from rewards and values.
     Calculated as in the original PPO paper: https://arxiv.org/abs/1707.06347
     Note that rewards may include a KL divergence loss term.
@@ -634,6 +784,17 @@ def get_advantages_and_returns_batch(
     lambd,
     chunked: bool = True,
 ):
+    # [FUNCTION DOC] Batched GAE over trainable (loss-masked-in) tokens, under no-grad. Validates
+    # that all per-sample lists have the batch length; with CP > 1 and the padded layout requires
+    # per-sample padded lengths. Steps: (1) with CP > 1 gather local values and rewards to full
+    # response tensors per sample; (2) per sample, find indices where the loss mask (cut to the
+    # response length) is nonzero; (3) pack values and rewards of trainable tokens into zero-padded
+    # [batch, max trainable count] tensors and add the terminal reward to the last trainable slot;
+    # (4) if no sample has trainable tokens, produce empty [batch, 0] outputs, else run vanilla
+    # (when chunked is false) or chunked GAE; (5) scatter the results back to full response length
+    # (zero at masked positions) and, with CP > 1, slice to the local chunk. Returns (list of
+    # advantages, list of returns), each tensor on the values' device/dtype. See the docstring for
+    # masking semantics. Assertion errors on length mismatches. Collectives under CP.
     """
     Batched GAE with CP support, computed over trainable tokens only.
 
@@ -797,6 +958,10 @@ def vanilla_gae(
     gamma: float,
     lambd: float,
 ):
+    # [FUNCTION DOC] Reference batched GAE on [batch, time] rewards and values: sequential backward
+    # loop over time with delta_t = r_t + gamma * V_{t+1} - V_t (value after last step is 0) and
+    # A_t = delta_t + gamma * lambda * A_{t+1}. Returns (advantages, returns = advantages + values),
+    # both [batch, time].
     B, T = rewards.shape
     device = rewards.device
     dtype = rewards.dtype
@@ -822,6 +987,15 @@ def chunked_gae(
     lambd: float,
     chunk_size: int = 128,
 ):
+    # [FUNCTION DOC] Chunked-parallel GAE equal in result to the vanilla version. Algorithm: compute
+    # deltas (value after the last step is 0); reverse time so the recursion is a forward scan
+    # S[i] = delta[i] + w * S[i-1] with w = gamma * lambda; zero-pad time to a multiple of chunk_size
+    # and reshape into chunks; within each chunk compute all local scans by one matrix product with
+    # an upper-triangular matrix whose entry (i, j) is w^(j-i) (identity when w is 0); then iterate
+    # over chunks, adding the previous chunk's final state times w^(t+1) (power vector) to each
+    # position and carrying the last state forward; drop padding and flip back. Returns
+    # (advantages, advantages + values), each [batch, time]. Asserts that inputs are 2-D with equal
+    # shape. Note the docstring names the lambda argument lam but the parameter is lambd.
     """
     Compute Generalized Advantage Estimation (GAE) using a FlashLinearAttention-
     inspired algorithm: parallel prefix scan within chunks and recurrent state
@@ -959,6 +1133,9 @@ def chunked_gae(
 
 
 def _upcast_chunk_to_fp32(logits_chunk: torch.Tensor, temperature: float) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Return a float32 copy of a logits chunk (a copy is required because the
+    # tensor-parallel cross entropy mutates its input), divided in place by the temperature when
+    # the temperature is positive and not 1.
     # copy=True: the TP cross-entropy mutates its input. Scaling after the upcast
     # keeps the division in fp32 when the caller hands model-precision logits.
     chunk = logits_chunk.to(torch.float32, copy=True)
@@ -980,6 +1157,16 @@ def calculate_log_probs_and_entropy(
     temperature: float = 1.0,
     debug_unified_grad_fused_logprob: bool = False,
 ):
+    # [FUNCTION DOC] Compute target-token log probs and optionally entropy for local vocab-parallel
+    # logits [rows, local vocab]. In true-on-policy mode (temperature must already be 1, asserted;
+    # scaling is done by the caller) delegates to the true-on-policy implementation. Otherwise:
+    # makes logits contiguous; when there are no rows returns empty float32 outputs; if chunk_size is
+    # positive splits rows (and tokens, sampling mask) into equal-count chunks of at most that size
+    # and computes log probs per chunk then concatenates, else processes all rows at once. Each
+    # chunk is upcast to float32 (copy) and divided by temperature before the log-prob call.
+    # Entropy (if requested) is computed per chunk from the upcast scaled logits, with or without
+    # autograd tracking according to entropy_requires_grad. Returns (log_probs, entropy or none).
+    # Collectives over the tensor-parallel group.
     if true_on_policy:
         assert temperature == 1.0, "true-on-policy scales logits in _iter_response_chunks"
         return _calculate_log_probs_and_entropy_true_on_policy(
@@ -997,6 +1184,8 @@ def calculate_log_probs_and_entropy(
     entropy = None
 
     def compute_entropy(logits_chunk: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Entropy of one chunk, after fp32 upcast and temperature scaling;
+        # computed under no-grad on a detached input when entropy_requires_grad is false.
         if entropy_requires_grad:
             return compute_entropy_from_logits(_upcast_chunk_to_fp32(logits_chunk, temperature), tp_group)
         with torch.no_grad():
@@ -1057,6 +1246,15 @@ def _calculate_log_probs_and_entropy_true_on_policy(
     vocab_size: int | None = None,
     sampling_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    # [FUNCTION DOC] HELPER: True-on-policy log prob and entropy. Empty input returns empty outputs.
+    # Otherwise: apply the sampling mask for log prob logits, gather full-vocab logits across the
+    # tensor-parallel group (trimmed to vocab_size); if entropy is wanted and a sampling mask was
+    # used, gather the unmasked logits separately for entropy (entropy is over the full vocab).
+    # Optionally split rows into chunks of chunk_size; per chunk log-softmax, gather the target
+    # token's log prob, and entropy = -sum(p * log p); when entropy does not need grad the log probs
+    # are detached and the product is formed in place. Debug dump hooks are registered on
+    # intermediate tensors when the debug environment variable is set. Returns (log probs [rows],
+    # entropy [rows] or none).
     """True-on-policy log-prob and entropy computation matching SGLang's scoring contract.
 
     Args:

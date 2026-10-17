@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Turns stored dashboard data into a list of human-readable advisories with a level (critical,
+# warning or info). Tiering: liveness alarms come first (stalled phases, abort storms in engines,
+# degenerate rollout reward groups, truncation, unreadable per-token columns); only if none fires, a
+# tuning tier runs (low MFU, low concurrency, low prefix cache hit rate, data-parallel imbalance).
+# Thresholds are module constants. Inputs are a metric store, an optional dump reader, an optional
+# time window and optional precomputed MFU summary. Pure reads; no side effects.
 """Heuristic run-health alarms and sglang config-tuning suggestions.
 
 v2 orders the rules by what they claim: pipeline-liveness alarms first
@@ -52,6 +59,7 @@ MFU_MIN_STEPS = 3
 
 @dataclass
 class Advisory:
+    # [CLASS DOC] One advisory: a level string (critical, warning or info) and message text.
     level: str  # "critical" | "warning" | "info"
     message: str
 
@@ -65,6 +73,11 @@ def compute_advisories(
     mfu: dict | None = None,
     low_mfu: float = DEFAULT_LOW_MFU,
 ) -> list[Advisory]:
+    # [FUNCTION DOC] Entry point. The run's recorded args mapping comes from the store's metadata
+    # (empty mapping if no metadata). Collects stall alarms, engine alarms (windowed by t0 and t1
+    # where used) and, if a dump reader is given, rollout alarms. If any alarm exists returns only
+    # those; otherwise returns the tuning advisories (using the optional MFU summary and the low-MFU
+    # threshold, default 0.15). Returns a list, possibly empty.
     args = store.meta.args if store.meta else {}
     alarms = _stall_advisories(store)
     alarms += _engine_alarm_advisories(store, args, t0, t1)
@@ -76,6 +89,8 @@ def compute_advisories(
 
 
 def _fmt_duration(seconds: float) -> str:
+    # [FUNCTION DOC] HELPER: Format seconds as hours with one decimal and suffix h (at least 3600),
+    # minutes rounded to integer with suffix min (at least 60), else integer seconds with suffix s.
     if seconds >= 3600:
         return f"{seconds / 3600:.1f}h"
     if seconds >= 60:
@@ -84,6 +99,15 @@ def _fmt_duration(seconds: float) -> str:
 
 
 def _stall_advisories(store: MetricStore) -> list[Advisory]:
+    # [FUNCTION DOC] HELPER: Returns [] if the store has no time range. The reference time is the
+    # newest data timestamp. Considers only phase events starting at or after the current attempt's
+    # start timestamp (negative infinity if no metadata). An open event is ignored if a closed event
+    # with the same node, rank, name and start exists. Per phase name collects closed durations and
+    # the ages (reference time minus start) of still-open events. Names with fewer than 3 closed
+    # durations are skipped (no baseline). For the rest, the oldest open age must exceed the larger of
+    # 6 times the median closed duration and 1800 seconds, else no alarm. Emits one critical advisory
+    # per such name (sorted by name) giving age, number of ranks, ratio to the median and the median;
+    # the train-wait phase gets an extra hint about starved training.
     """Open phases far beyond their own median closed duration.
 
     Judged at the newest data timestamp over the whole run (not the query
@@ -132,6 +156,12 @@ def _stall_advisories(store: MetricStore) -> list[Advisory]:
 
 
 def _counter_delta(series: list[dict], *, since: float = float("-inf")) -> float:
+    # [FUNCTION DOC] HELPER: Input: list of series mappings each with parallel "ts" and "value" lists
+    # of equal length. For each series, for each consecutive pair of values whose end timestamp is at
+    # or after "since" (keyword, default negative infinity), adds max(after - before, 0). Negative
+    # steps (counter resets) therefore count as zero. The strict zip raises a value error if the
+    # timestamp list (minus first) and the pair list differ in length, i.e. if ts and value lengths
+    # differ. Returns the total.
     """Total increase of a cumulative counter over ``engine_series`` results.
 
     Summed per interval, dropping the negative ones: an engine restarting on
@@ -148,6 +178,16 @@ def _counter_delta(series: list[dict], *, since: float = float("-inf")) -> float
 
 
 def _engine_alarm_advisories(store: MetricStore, args: dict, t0: float | None, t1: float | None) -> list[Advisory]:
+    # [FUNCTION DOC] HELPER: Returns [] when the store has no engine series stream. Abort storm
+    # check: over the last 1800 seconds before the newest engine scrape (not the query window), sum
+    # increases of the total-request and aborted-request counters; if requests >= 100 and the aborted
+    # fraction exceeds 5%, emits a warning with the windowed and whole-run ratios, plus, if the
+    # recorded args give samples per prompt, a note that one aborted sample discards its whole group.
+    # KV-bound check (over the query window t0..t1): peak of running requests (max) and mean token
+    # usage; if token usage exceeds 0.90 and a max-running-requests arg exists and peak is below half
+    # of it, warns that concurrency is bound by the KV pool and suggests raising the static memory
+    # fraction (not lowering the cap); else if usage exceeds 0.95, warns that KV usage is
+    # consistently high. Returns the advisories.
     if not store.has_stream(Stream.ENGINE_SERIES):
         return []
     out = []
@@ -213,6 +253,13 @@ def _engine_alarm_advisories(store: MetricStore, args: dict, t0: float | None, t
 
 
 def _rollout_advisories(reader: DumpReader, args: dict) -> list[Advisory]:
+    # [FUNCTION DOC] HELPER: Looks at the newest train rollout id (none: return []). Among groups with
+    # a non-null reward mean, if the fraction with zero reward standard deviation is at least 0.5,
+    # warns (adding that every reward is zero when the largest absolute group mean is below 1e-12). On
+    # the sample summary (empty: return what has been found), if the truncated fraction is at least
+    # 0.25, warns, referencing the configured max response length if present. If the summary has a
+    # failed-alignment column with any true, emits an info advisory with the count of unreadable
+    # samples (context-parallel slices could not be placed because the dump lacks cp_rank/cp_size).
     """Degenerate-signal checks on the newest completed train rollout."""
     train_ids = reader.rollout_ids().train
     if not train_ids:
@@ -265,6 +312,9 @@ def _rollout_advisories(reader: DumpReader, args: dict) -> list[Advisory]:
 
 
 def _aggregate(series: list[dict], *, agg: str) -> float | None:
+    # [FUNCTION DOC] HELPER: Flattens all value lists of all series; returns None if there are no
+    # values, the maximum if agg is "max", otherwise (anything else, including a misspelling) the
+    # arithmetic mean.
     """One scalar across every engine/value in a ``MetricStore.engine_series``
     result — ``agg`` is "max" or "mean"."""
     values = [v for s in series for v in s["value"]]
@@ -274,6 +324,9 @@ def _aggregate(series: list[dict], *, agg: str) -> float | None:
 
 
 def _dp_rank_means(series: list[dict]) -> dict[str, dict[str, float]]:
+    # [FUNCTION DOC] HELPER: Builds a mapping from engine address to a mapping from data-parallel
+    # rank label to the mean of the series values; series lacking the rank label or with no values
+    # are skipped.
     """Per-engine ``{dp_rank: mean(value)}`` from a ``per_dp_rank`` result;
     series without a dp_rank label (non-dp engines) are skipped."""
     out: dict[str, dict[str, float]] = {}
@@ -286,6 +339,10 @@ def _dp_rank_means(series: list[dict]) -> dict[str, dict[str, float]]:
 
 
 def _dp_spread_hint(args: dict) -> str:
+    # [FUNCTION DOC] HELPER: Returns text naming the setting that controls request spreading across
+    # data-parallel ranks: with the Miles router, the engine load-balance method; if the router is not
+    # dp-aware, the dp-aware router flag; else, for the "manual" policy (sglang router policy arg, else
+    # router policy arg), the assignment mode, otherwise the router policy.
     """Which knob actually decides how requests spread across dp ranks. Only a
     dp-aware sglang router routes per rank; otherwise the engine looks like one
     worker and sglang's own dp controller dispatches."""
@@ -303,6 +360,11 @@ def _dp_spread_hint(args: dict) -> str:
 
 
 def mfu_summary(store: MetricStore) -> dict | None:
+    # [FUNCTION DOC] Reads the MFU series and the peak TFLOPs series (x axis = rollout step). Drops
+    # the first MFU point as warm-up; returns none if nothing is left. Otherwise returns a mapping
+    # with the latest value, the mean, the number of steps and the last peak TFLOPs value. KNOWN
+    # ISSUE: if MFU values exist but the peak series is empty, taking its last element would raise an
+    # index error.
     series = store.metric_series([MFU_KEY, MFU_PEAK_KEY], x_key=MFU_STEP_KEY)
     steady = series[MFU_KEY]["y"][1:]
     if not steady:
@@ -316,6 +378,9 @@ def mfu_summary(store: MetricStore) -> dict | None:
 
 
 def _mfu_advisories(summary: dict | None, low_mfu: float) -> list[Advisory]:
+    # [FUNCTION DOC] HELPER: Returns [] if the threshold is not positive, there is no summary, fewer
+    # than 3 steps, or the mean MFU reaches the threshold. Otherwise one warning stating the mean as a
+    # percentage of the device peak TFLOP/s over the step count and likely causes.
     if low_mfu <= 0 or summary is None or summary["steps"] < MFU_MIN_STEPS:
         return []
     mean_mfu, peak = summary["mean"], summary["peak"]
@@ -344,6 +409,15 @@ def _tuning_advisories(
     mfu: dict | None = None,
     low_mfu: float = DEFAULT_LOW_MFU,
 ) -> list[Advisory]:
+    # [FUNCTION DOC] HELPER: Start with the MFU advisory (using the provided summary or computing one
+    # from the store). If there is no engine stream, return that. Otherwise add: an info advisory when
+    # peak running requests is below 30% of the configured max running requests (suggest lowering it,
+    # mentioning memory for training when colocated); an info advisory when not colocated and the mean
+    # prefix cache hit rate is below 0.10 (suggest raising the static memory fraction when known); and
+    # for each engine (sorted by address) with at least two dp-rank means, a warning when the busiest
+    # rank has mean running requests of at least 1.0 and the idlest is below 25% of it, listing the
+    # per-rank means (sorted by integer rank) and the spreading hint. Window t0..t1 applies to the
+    # engine series.
     out: list[Advisory] = _mfu_advisories(mfu if mfu is not None else mfu_summary(store), low_mfu)
     if not store.has_stream(Stream.ENGINE_SERIES):
         return out

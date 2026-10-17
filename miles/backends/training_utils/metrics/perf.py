@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Performance metric logging: turns the global Timer's recorded durations into tracker metrics,
+# including TFLOPs, tokens per second, MFU and train wait ratios.
 import logging
 from argparse import Namespace
 from collections.abc import Callable
@@ -18,6 +21,16 @@ def log_perf_data_raw(
     compute_total_fwd_flops: Callable,
     extra_metrics: dict | None = None,
 ) -> None:
+    # [FUNCTION DOC] Snapshot (deep copy) and reset the global Timer on every rank (so timers do
+    # not accumulate), then, on the primary rank only: build metrics "perf/<name>_time" from the
+    # timer; merge extra metrics; if the actor train time is present and a flops callable is given,
+    # compute total forward flops from the timer's sequence lengths (passed as keyword), and add
+    # log-probs and ref-log-probs TFLOPs (forward flops / time), and, when actor train time > 0,
+    # actor train TFLOPs (3x forward flops / time), tokens per second (sum of sequence lengths /
+    # time), plus peak TFLOPs (args override or detected device peak bf16) and MFU = achieved /
+    # peak, when a peak is known. If both train wait and train times exist and their sum is
+    # positive, adds step time and wait ratio. Logs an info line and sends namespaced metrics with
+    # the rollout-based step to the tracker.
     timer_instance = Timer()
     log_dict_raw = deepcopy(timer_instance.log_dict())
     timer_instance.reset()

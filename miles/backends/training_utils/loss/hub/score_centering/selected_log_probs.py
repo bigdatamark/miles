@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Log probabilities (and optionally entropies) of chosen token ids computed from logits whose
+# vocabulary dimension is sharded across a tensor-parallel group, communicating only per-row scalars.
+# Two custom autograd functions: one normalizing over the real (unpadded) full vocabulary, one
+# normalizing over only the supplied candidate support (sampling-support replay). The public entry
+# points validate inputs and process rows in chunks.
 """Selected-token log-probabilities from vocabulary-sharded logits."""
 
 from typing import Any
@@ -7,6 +13,9 @@ import torch.distributed as dist
 
 
 class _SelectedLogProbs(torch.autograd.Function):
+    # [CLASS DOC] HELPER: Autograd function giving, for logits [rows, local vocab] and token ids
+    # [rows, K] (global ids, -1 means padding), the log softmax at those ids over the real
+    # vocabulary, plus per-row entropy. Backward writes the gradient directly into the local slice.
     """Vocabulary-sharded log-softmax gather with a replicated loss on TP ranks.
 
     Only selected logits and normalization scalars are communicated. Backward
@@ -23,6 +32,15 @@ class _SelectedLogProbs(torch.autograd.Function):
         vocab_size: int,
         with_entropy: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC] Inputs: local logits, global token ids, group (none means unsharded), the
+        # real vocab size and an entropy flag. Steps: this rank owns ids in [rank*width,
+        # (rank+1)*width); ids are valid when non-negative and local when owned; columns beyond the
+        # real vocab (padding) are set to negative infinity; row max (max all-reduce); exp of shifted
+        # logits and their row sum (sum all-reduce); the selected logit is gathered for locally owned
+        # ids (zero otherwise) and summed across ranks; probabilities = exp / sum; entropy (if
+        # requested) = -sum p log p with zero for p = 0, summed across ranks. Returns (log probs
+        # [rows, K] = selected - max - log sum, zero for padding ids; entropy [rows], zeros when not
+        # requested). Saves probabilities and index masks for backward. Collectives on the group.
         rank = dist.get_rank(group) if group is not None else 0
         width = logits.shape[-1]
         valid = token_ids >= 0
@@ -54,6 +72,11 @@ class _SelectedLogProbs(torch.autograd.Function):
     def backward(
         ctx: Any, grad_output: torch.Tensor, grad_entropy: torch.Tensor
     ) -> tuple[torch.Tensor, None, None, None, None]:
+        # [FUNCTION DOC] Gradient w.r.t. local logits: -probabilities * (sum over K of upstream
+        # grad, zeroed at padding ids) plus the upstream grad scattered onto locally owned selected
+        # columns; if entropy was computed, subtracts entropy-grad * p * (log p + entropy). No
+        # communication, so each rank's slice gets the full (not TP-multiplied) gradient. Returns the
+        # logits gradient and none for the other inputs.
         probabilities, local_ids, local, valid, entropy = ctx.saved_tensors
         grad = grad_output.masked_fill(~valid, 0.0)
         grad_logits = probabilities * (-grad.sum(-1, keepdim=True))
@@ -65,6 +88,9 @@ class _SelectedLogProbs(torch.autograd.Function):
 
 
 class _SupportLogProbs(torch.autograd.Function):
+    # [CLASS DOC] HELPER: Autograd function for sampling-support replay. Column 0 of the token ids is
+    # the sampled token and the remaining columns are the complete support; the distribution is
+    # renormalized over the support only (not the full vocab). Saves only K-sized probabilities.
     """Score the sampled token and complete support without saving vocabulary-sized probabilities."""
 
     @staticmethod
@@ -76,6 +102,14 @@ class _SupportLogProbs(torch.autograd.Function):
         temperature: float,
         with_entropy: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC] Inputs: local logits, global ids [rows, 1 + support], group, temperature and
+        # an entropy flag. Gathers the logit of each locally owned id (float32, or float64 for
+        # float64 logits), divides by temperature, sums across ranks. Support columns are valid when
+        # id is non-negative; a row has support if any support column is valid. The normalizer is the
+        # log-sum-exp over valid support columns (0 when none). Log probs = selected - normalizer,
+        # zero where the id is invalid or the row has no support. Entropy (if requested) is the
+        # entropy of the support distribution, else zeros. Returns (log probs [rows, 1 + support],
+        # entropy [rows]). Saves support probs for backward. One sum collective on the group.
         rank = dist.get_rank(group) if group is not None else 0
         width = logits.size(-1)
         valid = token_ids >= 0
@@ -108,6 +142,11 @@ class _SupportLogProbs(torch.autograd.Function):
         grad_output: torch.Tensor,
         grad_entropy: torch.Tensor,
     ) -> tuple[torch.Tensor, None, None, None, None]:
+        # [FUNCTION DOC] Builds a zero gradient of the logits' shape, scatters into it the upstream
+        # gradient at locally owned columns (sampled and support), plus the softmax term for the
+        # support columns (-probs times the summed upstream gradient, with the entropy term when
+        # enabled), then divides by the temperature. Returns the logits gradient and none for the
+        # other inputs. No communication.
         probabilities, local_ids, local, valid, entropy = ctx.saved_tensors
         grad = grad_output.masked_fill(~valid, 0.0)
         head_grad = probabilities * (-grad.sum(-1, keepdim=True))
@@ -130,6 +169,8 @@ def selected_log_probs(
     temperature: float = 1.0,
     chunk_size: int = -1,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Convenience wrapper returning only the log probs of the combined function
+    # (no entropy), with the same arguments minus the entropy and support options.
     """Log-probabilities at global IDs [T, K] from local logits [T, V/TP].
 
     -1 is a padding ID and produces zero with zero gradient. The true vocabulary
@@ -151,6 +192,15 @@ def selected_log_probs_and_entropy(
     with_entropy: bool = False,
     sampling_support: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Public entry. Defaults: vocab size = local width times group size (no
+    # padding); the group size comes from the process group (1 when none). Raises a value error
+    # for non-positive temperature, vocab size outside (0, padded vocab], inputs not 2-D or with
+    # different row counts, or token ids below -1 or at/above the vocab size. With zero rows returns
+    # empty-shaped results derived from the logits (a sum of the logits expanded to the id shape, and
+    # a per-row sum). Otherwise splits rows into chunks of chunk_size (non-positive means a single
+    # chunk), and for each chunk uses the support function (when sampling_support) or the full-vocab
+    # function (logits cast to float32/float64 and divided by temperature), then concatenates.
+    # Returns (log probs [rows, K], entropy [rows]); entropy is zeros unless requested.
     """Selected logprobs and optional entropy of the same unpadded distribution.
 
     With sampling_support, column zero is the sampled token and remaining
