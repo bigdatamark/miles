@@ -1,3 +1,12 @@
+# [MODULE DOC] Self-executing launcher for GRPO training of a Qwen3-VL model on the geo3k image
+# dataset with the multi-turn scoring-tool rollout of this package, colocated on the local GPUs.
+# Configuration is read from environment variables at import time: MILES_SCRIPT_MODEL_NAME
+# (default Qwen3-VL-2B-Instruct; must be one of the 2B, 4B, 8B Instruct or Thinking models),
+# MILES_SCRIPT_NUM_GPUS (default 4), MILES_SCRIPT_EXTERNAL_RAY (default 0) and
+# MILES_SCRIPT_TRAIN_BACKEND (megatron by default, or fsdp); invalid model or backend names fail an
+# assertion at import. Paths are fixed under /root. Running the script downloads the model and
+# dataset (prepare) and then submits the training job (execute).
+# KNOWN ISSUE: the external-Ray setting is read but never used.
 import os
 
 from miles.utils.external_utils import command_utils
@@ -23,12 +32,20 @@ TRAIN_DATA_PATH = os.path.join(DATA_ROOT, "train.parquet")
 
 
 def get_megatron_model_type(model_name: str) -> str:
+    # [FUNCTION DOC] Maps a vision-language model name to the Megatron text model type name: removes
+    # the "-Instruct" and "-Thinking" suffixes, turns the "Qwen3-VL-" prefix into "qwen3-" and the
+    # size "-2B" into "-1.7B" (the 2B vision model has a 1.7B text backbone). Example: the 4B
+    # Instruct model gives "qwen3-4B". Pure string function.
     model_type = model_name.replace("-Instruct", "").replace("-Thinking", "")
     model_type = model_type.replace("Qwen3-VL-", "qwen3-")
     return model_type.replace("-2B", "-1.7B")
 
 
 def prepare():
+    # [FUNCTION DOC] Creates /root/models and /root/datasets, downloads the model from the Qwen hub
+    # organization into /root/models/<model name>, downloads the dataset into its data root if the
+    # train parquet file does not exist, and raises a file-not-found error if the train file is still
+    # missing afterwards. Side effects: shell commands, network, disk.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -40,6 +57,25 @@ def prepare():
 
 
 def execute():
+    # [FUNCTION DOC] Builds the training arguments and submits the job. Blocks: checkpoint (HF
+    # checkpoint at /root/models/<model name>); W&B flags only if WANDB_API_KEY is set (project
+    # miles-dev, group geo3k_vlm_multi_turn, key placed on the command line); rollout (train parquet,
+    # input key problem, label key answer, image column mapping, math reward type, chat template,
+    # this package's multi-turn generate function and its config file, shuffle, 3000 rollouts, batch
+    # 64, 8 samples per prompt, response length 4096, temperature 1, global batch 512); GRPO with zero
+    # KL and entropy coefficients and clip 0.2 / 0.28 (the KL-loss flag is not passed); Adam optimizer
+    # (1e-6 constant, weight decay 0.1, betas 0.9/0.98); SGLang (1 GPU per engine, memory fraction
+    # 0.6, a CUDA graph batch size list of 1, 2, 4, 8 and 16 to 256 in steps of 8); backend flags:
+    # Megatron (tensor parallel 4 with sequence parallel, other parallel sizes 1, full uniform
+    # recompute, dynamic batch 4096 tokens per GPU, flash attention, bridge conversion mode, load from
+    # the model dir; also sets the environment variable MODEL_ARGS_ROTARY_BASE to 5000000 in this
+    # process and derives the Megatron model type from the model name) or FSDP (gradient
+    # checkpointing, fa3 attention, 512 MiB weight update buffer, no Megatron model type); misc (one
+    # actor node, GPUs from the environment setting, rollout GPUs equal to the same count, colocated).
+    # Passes the W&B key through the job environment if set. Submits via the default backend's
+    # execute-train. Evaluation arguments exist only as commented-out code.
+    # KNOWN ISSUE: the rollout GPU count is passed together with the colocate flag, although it is
+    # ignored when colocated; the tensor parallel size is fixed at 4 regardless of the GPU count.
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME} "
 
     wandb_args = (

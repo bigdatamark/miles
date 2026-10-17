@@ -1,3 +1,10 @@
+# [MODULE DOC] Daytona provider module for per-episode sandboxes. It only supplies the
+# Daytona-specific pieces to the shared sandbox backend: a throttle classifier, a function that
+# starts one sandbox for a task, and the create-concurrency and retry knobs read with the DAYTONA
+# prefix (environment variables OPENENV_DAYTONA_CREATE_CONCURRENCY and
+# OPENENV_DAYTONA_CREATE_MAX_RETRIES, defaults 4 and 8, read once at import). It exposes the
+# module-level backend object plus the episode function (for direct-drive callers) and the run
+# function (the Miles agent function entry point), both bound to that backend.
 """Daytona-sandbox variant of the OpenEnv tbench2 agent function.
 
 A drop-in alternative to ``openenv_agent_function.run`` for
@@ -68,6 +75,11 @@ logger = logging.getLogger(__name__)
 # Creates are capped per rollout and retried with jittered backoff when Daytona
 # throttles (429) or reports the org out of capacity (OPENENV_DAYTONA_CREATE_* knobs).
 def _is_throttle_error(exc: BaseException) -> bool:
+    # [FUNCTION DOC] HELPER: Decides whether a failed sandbox create is transient and should be
+    # retried. True if the error is the Daytona SDK's rate-limit error type (imported lazily on the
+    # failure path; a missing SDK is tolerated) or if the error message, lowercased, contains one of
+    # the shared throttle phrases or the Daytona-specific phrases "throttler" or "limit exceeded"
+    # (the latter covers quota exhaustion reported as a validation error). Otherwise false.
     """True when a sandbox create failed only because Daytona would not seat it yet.
 
     The SDK normalizes HTTP 429 to DaytonaRateLimitError; the text match is a
@@ -93,6 +105,10 @@ def _is_throttle_error(exc: BaseException) -> bool:
 
 
 def _start_sandbox(task_id: str, tasks_dir: str) -> tuple[Any, str]:
+    # [FUNCTION DOC] HELPER: Blocking start hook for the shared backend. Creates a Daytona client,
+    # builds and starts the sandbox for the task directory (tasks_dir joined with task_id) via the
+    # Daytona materialization module, and returns a pair: a zero-argument close function that
+    # deletes that sandbox, and the base url of the env server inside it. Runs in a worker thread.
     daytona = tb2_sandbox_daytona.make_daytona()
     sandbox, url = tb2_sandbox_daytona.create_task_sandbox(daytona, Path(tasks_dir) / task_id)
     return (lambda: daytona.delete(sandbox)), url

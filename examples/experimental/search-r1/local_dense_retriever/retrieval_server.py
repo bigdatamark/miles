@@ -15,6 +15,13 @@
 # limitations under the License.
 # Adapted from https://github.com/PeterGriffinJin/Search-R1/blob/main/search_r1/search/retrieval_server.py
 
+# [MODULE DOC] Local retrieval web server for the Search-R1 example. Provides retrievers (a BM25
+# one using a Lucene index, and a dense one using a FAISS index plus a transformer encoder on GPU)
+# behind a common base, a corpus loader, and a single POST /retrieve endpoint that accepts a batch
+# of query strings and returns the top documents for each (optionally with scores). When run as a
+# script it parses the index path, corpus path, top-k (3), retriever name (e5) and model path
+# (intfloat/e5-base-v2) and GPU-index flag, builds one global retriever (half precision, query
+# length 256, batch size 512, mean pooling) and serves on all interfaces at port 8000.
 import argparse
 import json
 import warnings
@@ -31,16 +38,23 @@ from transformers import AutoModel, AutoTokenizer
 
 
 def load_corpus(corpus_path: str):
+    # [FUNCTION DOC] HELPER: Loads a JSON-lines corpus file as the train split of a Hugging Face
+    # dataset using 4 processes and returns the dataset (indexable by integer position).
     corpus = datasets.load_dataset("json", data_files=corpus_path, split="train", num_proc=4)
     return corpus
 
 
 def load_docs(corpus, doc_idxs):
+    # [FUNCTION DOC] HELPER: Returns the list of corpus records at the given positions (each
+    # converted to an integer), in order, one lookup at a time.
     results = [corpus[int(idx)] for idx in doc_idxs]
     return results
 
 
 def load_model(model_path: str, use_fp16: bool = False):
+    # [FUNCTION DOC] HELPER: Loads a transformer encoder (remote code trusted) in evaluation mode
+    # onto the current CUDA device, converting to half precision if requested, and loads the fast
+    # tokenizer. Returns the pair of model and tokenizer. Requires a GPU.
     model = AutoModel.from_pretrained(model_path, trust_remote_code=True)
     model.eval()
     model.cuda()
@@ -51,6 +65,10 @@ def load_model(model_path: str, use_fp16: bool = False):
 
 
 def pooling(pooler_output, last_hidden_state, attention_mask=None, pooling_method="mean"):
+    # [FUNCTION DOC] HELPER: Reduces token embeddings (batch, length, hidden) to sentence embeddings
+    # (batch, hidden). Mean: zeroes padded positions using the attention mask (required) and divides
+    # the sum over tokens by the number of real tokens. Cls: the first token's vector. Pooler: the
+    # model's pooled output as is. Any other method raises a not-implemented error.
     if pooling_method == "mean":
         last_hidden = last_hidden_state.masked_fill(~attention_mask[..., None].bool(), 0.0)
         return last_hidden.sum(dim=1) / attention_mask.sum(dim=1)[..., None]
@@ -63,7 +81,12 @@ def pooling(pooler_output, last_hidden_state, attention_mask=None, pooling_metho
 
 
 class Encoder:
+    # [CLASS DOC] Text encoder wrapping a transformer on GPU. Stores the model name (used to choose
+    # prefix and normalization rules), path, pooling method, maximum token length and half
+    # precision flag, and holds the loaded model and tokenizer.
     def __init__(self, model_name, model_path, pooling_method, max_length, use_fp16):
+        # [FUNCTION DOC] Stores the settings, loads the model and tokenizer (GPU required) and puts
+        # the model in evaluation mode.
         self.model_name = model_name
         self.model_path = model_path
         self.pooling_method = pooling_method
@@ -75,6 +98,14 @@ class Encoder:
 
     @torch.no_grad()
     def encode(self, query_list: list[str], is_query=True) -> np.ndarray:
+        # [FUNCTION DOC] Encodes texts to a float32 C-contiguous array of shape (count, dimension)
+        # without gradients. A single string is wrapped into a list. Prefixes by model name (case-
+        # insensitive substring): names containing e5 get "query: " (queries) or "passage: "
+        # (documents); names containing bge get the retrieval instruction prefix for queries only.
+        # Tokenizes with padding and truncation to the maximum length and moves inputs to the GPU.
+        # T5-type models: runs with a single zero decoder start token and takes the first decoder
+        # hidden state. Others: pools with the configured method and, unless the model name contains
+        # dpr, L2-normalizes. Copies to CPU, frees GPU tensors and empties the CUDA cache.
         # processing query for different encoders
         if isinstance(query_list, str):
             query_list = [query_list]
@@ -121,7 +152,11 @@ class Encoder:
 
 
 class BaseRetriever:
+    # [CLASS DOC] Abstract retriever. Holds the config and copies the retrieval method name,
+    # default top-k, index path and corpus path from it. Subclasses implement the single-query and
+    # batch search methods; the public methods delegate to them.
     def __init__(self, config):
+        # [FUNCTION DOC] Stores the config and the fields listed in the class description.
         self.config = config
         self.retrieval_method = config.retrieval_method
         self.topk = config.retrieval_topk
@@ -130,20 +165,34 @@ class BaseRetriever:
         self.corpus_path = config.corpus_path
 
     def _search(self, query: str, num: int, return_score: bool):
+        # [FUNCTION DOC] HELPER: Abstract single-query search; raises a not-implemented error.
         raise NotImplementedError
 
     def _batch_search(self, query_list: list[str], num: int, return_score: bool):
+        # [FUNCTION DOC] HELPER: Abstract batch search; raises a not-implemented error.
         raise NotImplementedError
 
     def search(self, query: str, num: int = None, return_score: bool = False):
+        # [FUNCTION DOC] Searches one query by delegating to the subclass; returns the documents
+        # (and the scores as a second item when return_score is true). num none means default top-k.
         return self._search(query, num, return_score)
 
     def batch_search(self, query_list: list[str], num: int = None, return_score: bool = False):
+        # [FUNCTION DOC] Searches many queries by delegating to the subclass; returns a list of
+        # per-query document lists (and a list of per-query score lists as a second item when
+        # return_score is true).
         return self._batch_search(query_list, num, return_score)
 
 
 class BM25Retriever(BaseRetriever):
+    # [CLASS DOC] Sparse retriever over a Lucene BM25 index (pyserini imported lazily). Documents
+    # come from the index itself when it stores raw documents, otherwise from the separately loaded
+    # corpus dataset looked up by document id.
     def __init__(self, config):
+        # [FUNCTION DOC] Opens the Lucene index at the index path, checks whether the index stores
+        # raw documents (by reading document zero), loads the corpus dataset only if it does not,
+        # and sets a process-count attribute to 8.
+        # KNOWN ISSUE: the process-count attribute is never used.
         super().__init__(config)
         from pyserini.search.lucene import LuceneSearcher
 
@@ -154,9 +203,17 @@ class BM25Retriever(BaseRetriever):
         self.max_process_num = 8
 
     def _check_contain_doc(self):
+        # [FUNCTION DOC] HELPER: True if the raw stored document at id zero exists in the index.
         return self.searcher.doc(0).raw() is not None
 
     def _search(self, query: str, num: int = None, return_score: bool = False):
+        # [FUNCTION DOC] HELPER: Runs one BM25 query for num hits (default top-k). No hits: returns
+        # empty documents (and an empty score list when scores are requested). Scores are taken from
+        # all hits; if fewer than num hits came back a warning is emitted, else hits are cut to num.
+        # Documents: when the index stores raw documents, each is parsed from its stored JSON and
+        # converted to a mapping with title (first content line stripped of double quotes), text
+        # (remaining lines) and contents; otherwise records are loaded from the corpus by document
+        # id. Returns the documents, plus the scores when requested.
         if num is None:
             num = self.topk
         hits = self.searcher.search(query, num)
@@ -190,6 +247,9 @@ class BM25Retriever(BaseRetriever):
             return results
 
     def _batch_search(self, query_list: list[str], num: int = None, return_score: bool = False):
+        # [FUNCTION DOC] HELPER: Runs the single-query search sequentially for each query (always
+        # requesting scores) and returns the list of document lists, plus the list of score lists
+        # when requested.
         results = []
         scores = []
         for query in query_list:
@@ -203,7 +263,13 @@ class BM25Retriever(BaseRetriever):
 
 
 class DenseRetriever(BaseRetriever):
+    # [CLASS DOC] Dense retriever: a FAISS index of passage embeddings, the corpus dataset, and an
+    # encoder for queries. Scores are the index's similarity values.
     def __init__(self, config):
+        # [FUNCTION DOC] Reads the FAISS index from disk; if the GPU option is set, copies it to all
+        # GPUs sharded with half-precision storage. Loads the corpus, builds the encoder from the
+        # config (method name as model name, model path, pooling method, query max length, half
+        # precision flag), and takes top-k and batch size from the config.
         super().__init__(config)
         self.index = faiss.read_index(self.index_path)
         if config.faiss_gpu:
@@ -224,6 +290,9 @@ class DenseRetriever(BaseRetriever):
         self.batch_size = config.retrieval_batch_size
 
     def _search(self, query: str, num: int = None, return_score: bool = False):
+        # [FUNCTION DOC] HELPER: Encodes the query, searches the index for num nearest passages
+        # (default top-k), loads the corresponding corpus records and returns them, plus the scores
+        # as a plain list when requested.
         if num is None:
             num = self.topk
         query_emb = self.encoder.encode(query)
@@ -237,6 +306,11 @@ class DenseRetriever(BaseRetriever):
             return results
 
     def _batch_search(self, query_list: list[str], num: int = None, return_score: bool = False):
+        # [FUNCTION DOC] HELPER: Batched dense search. A single string becomes a one-item list; num
+        # defaults to top-k. Processes queries in chunks of the configured batch size (with a
+        # progress bar): encode, search the index, flatten the index ids, load all records, regroup
+        # them per query into groups of num, and release GPU memory. Returns the list of per-query
+        # record lists, plus the per-query score lists when requested.
         if isinstance(query_list, str):
             query_list = [query_list]
         if num is None:
@@ -270,6 +344,8 @@ class DenseRetriever(BaseRetriever):
 
 
 def get_retriever(config):
+    # [FUNCTION DOC] Factory: returns a BM25 retriever when the config's retrieval method is
+    # "bm25", otherwise a dense retriever. Loads indexes and models (heavy side effects).
     if config.retrieval_method == "bm25":
         return BM25Retriever(config)
     else:
@@ -282,6 +358,11 @@ def get_retriever(config):
 
 
 class Config:
+    # [CLASS DOC] HELPER: Plain settings holder standing in for parsed arguments. Attributes (with
+    # defaults): retrieval method (bm25), top-k (10), index path, corpus path, dataset path, data
+    # split (train), faiss-on-GPU flag (true), encoder model path, pooling method (mean), query
+    # maximum length (256), half precision flag (false), batch size (128).
+    # KNOWN ISSUE: the dataset path and data split attributes are never read.
     """
     Minimal config class (simulating your argparse)
     Replace this with your real arguments or load them dynamically.
@@ -302,6 +383,7 @@ class Config:
         retrieval_use_fp16: bool = False,
         retrieval_batch_size: int = 128,
     ):
+        # [FUNCTION DOC] HELPER: Stores each argument as an attribute of the same name.
         self.retrieval_method = retrieval_method
         self.retrieval_topk = retrieval_topk
         self.index_path = index_path
@@ -317,6 +399,8 @@ class Config:
 
 
 class QueryRequest(BaseModel):
+    # [CLASS DOC] Request body of the retrieve endpoint: a list of query strings, an optional top-k
+    # (none or zero falls back to the server default), and a flag to return scores (default false).
     queries: list[str]
     topk: int | None = None
     return_scores: bool = False
@@ -327,6 +411,17 @@ app = FastAPI()
 
 @app.post("/retrieve")
 def retrieve_endpoint(request: QueryRequest):
+    # [FUNCTION DOC] POST /retrieve handler. Uses the module-level config and retriever globals
+    # that exist only when the file runs as a script. If top-k is unset or zero, sets it on the
+    # request to the config default. Runs batch retrieval for all queries (with scores if
+    # requested), then builds the response: a mapping with key "result" holding, per query, either
+    # a list of {"document": record, "score": value} items (when scores were produced) or the
+    # plain record list.
+    # KNOWN ISSUE: results are separated from scores by trying to unpack the return value into two
+    # parts; when scores are not requested and exactly two queries are sent, the unpacking succeeds
+    # by accident and the second query's records are treated as scores, producing wrong or failing
+    # output. Also the docstring shows a doubled nested mapping for scored items that does not
+    # match the actual output.
     """
     Endpoint that accepts queries and performs retrieval.
 

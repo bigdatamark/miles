@@ -1,3 +1,14 @@
+# [MODULE DOC] Modal-specific part of the sandbox recipe. Provides: sandbox sizing from the task
+# config; the recipe as a Modal image with one layer per recipe command; a lazily looked-up shared
+# app handle; the tunnel-based env server url; a diagnostic helper reporting why a server failed
+# to start; a sandbox close helper; and the per-episode create (builds or reuses the image on a
+# scoped thread with a deadline, starts the env server as the sandbox entrypoint, waits for the
+# TCP readiness probe, the tunnel and the health check). All settings are read once at import
+# from environment variables: OPENENV_MODAL_APP (app name, default openenv-tbench2),
+# OPENENV_MODAL_SANDBOX_TTL_S (hard lifetime ceiling, 1800), OPENENV_MODAL_IDLE_TIMEOUT_S (300),
+# OPENENV_MODAL_CREATE_TIMEOUT_S (1800), OPENENV_MODAL_READY_TIMEOUT_S (300) and
+# OPENENV_MODAL_BUILD_LOGS (any non-blank value enables build log output; debug only). The tunnel
+# wait is fixed at 60 seconds and the env server port at 8000.
 """Modal materialization of the per-task Terminal-Bench-2 sandbox recipe.
 
 The recipe itself — the shell layers that turn a task's official image into a
@@ -104,6 +115,9 @@ _ENV_SERVER_PORT = 8000
 
 
 def task_resources(task_dir: Path) -> dict[str, float | int]:
+    # [FUNCTION DOC] Returns keyword arguments for the sandbox create: cpu as a float and memory in
+    # MB, both from the recipe's floored task resources (storage is dropped since Modal sizes disk
+    # itself).
     """Sandbox size from ``task.toml [environment]``.
 
     Modal bills per second on ``max(request, actual)``, so the request is the
@@ -117,6 +131,10 @@ def task_resources(task_dir: Path) -> dict[str, float | int]:
 
 
 def task_image(task_dir: Path, docker_image: str | None = None):
+    # [FUNCTION DOC] Builds the Modal image definition: starts from the registry image resolved for
+    # the task (explicit override or the task config's image) and appends one run-command layer per
+    # recipe command in order. Imports the SDK lazily. Returns the image object; building happens
+    # at sandbox creation. Computing the recipe commands may call git and read the env package.
     """The recipe as a Modal Image, one layer per recipe command.
 
     Deliberately not one collapsed layer: Modal caches per layer, so editing
@@ -143,6 +161,9 @@ _app_lock = threading.Lock()
 
 
 def get_app():
+    # [FUNCTION DOC] Returns the shared app handle for the configured app name, looking it up
+    # (creating it if missing, network call) on first use under a lock and caching it in a module
+    # global afterwards.
     """The shared App handle, looked up once per process.
 
     ``App.lookup`` is a network round-trip; a rollout fans out many episodes
@@ -159,6 +180,9 @@ def get_app():
 
 
 def base_url(sandbox, *, tunnel_timeout_s: float | None = None) -> str:
+    # [FUNCTION DOC] Returns the public tunnel url of port 8000 for the sandbox, waiting up to the
+    # tunnel timeout (default 60 seconds, converted to whole seconds) for the tunnel to be
+    # routable. The SDK raises if it does not become available.
     """The env server's externally reachable URL on port 8000.
 
     Modal's tunnel terminates TLS and forwards at L4, so one host serves both
@@ -174,6 +198,9 @@ def base_url(sandbox, *, tunnel_timeout_s: float | None = None) -> str:
 
 
 def _exit_detail(sandbox) -> str:
+    # [FUNCTION DOC] HELPER: Returns an empty string if the sandbox is still running (reading its
+    # output would block). If it has exited, returns a text with the exit code and the last 2000
+    # characters of its output. Any exception while inspecting yields an empty string.
     """Why the server never came up, when the answer is already available.
 
     The env server IS the sandbox's main process, so a server that failed to
@@ -193,6 +220,8 @@ def _exit_detail(sandbox) -> str:
 
 
 def close_sandbox(sandbox) -> None:
+    # [FUNCTION DOC] Terminates the sandbox and always detaches the client-side connection, even if
+    # termination raised (the error then propagates).
     """Terminate one sandbox and release its client-side connection."""
     try:
         sandbox.terminate()
@@ -209,6 +238,19 @@ def create_task_sandbox(
     ttl_s: int = _SANDBOX_TTL_S,
     idle_timeout_s: int = _IDLE_TIMEOUT_S,
 ):
+    # [FUNCTION DOC] Blocking create of one episode sandbox; returns the sandbox and the tunnel
+    # base url. Parameters default to the module settings (command timeout from the recipe, ready,
+    # create, lifetime and idle timeouts). Computes the server start command (default task id is the
+    # directory name). The sandbox create (image build included) runs on a scoped thread bounded by
+    # the create timeout (a timeout raises the standard timeout error; a sandbox that appears
+    # later is reclaimed by the idle timeout). The sandbox runs the server through a shell as its
+    # entrypoint, in the shared app, with an encrypted port 8000, lifetime and idle timeout in whole
+    # seconds, the recipe's ownership tags, a TCP readiness probe on port 8000 and the task
+    # resources; when build logs are enabled the create runs inside the SDK's output context.
+    # Then: wait until ready (at least 1 second), get the tunnel url, wait for the health check
+    # within the ready timeout. On failure it collects exit diagnostics, tries to close the sandbox
+    # (ignoring errors) and re-raises: a runtime error naming the task with the diagnostics if any
+    # (chained to the original), else the original error. The caller must close the sandbox.
     """Create ONE per-episode sandbox for *task_dir*.
 
     Returns ``(sandbox, base_url)``. Caller must ``close_sandbox(sandbox)`` when
@@ -233,6 +275,9 @@ def create_task_sandbox(
     cmd = server_cmd(command_timeout_s, default_task_id=task_dir.name)
 
     def _create():
+        # [FUNCTION DOC] HELPER: Builds the keyword arguments for the SDK sandbox create and calls
+        # it with a shell running the server command; wraps the call in the SDK output context when
+        # build logs are enabled. Returns the new sandbox.
         kwargs = dict(
             app=get_app(),
             image=task_image(task_dir),

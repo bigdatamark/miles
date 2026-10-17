@@ -1,3 +1,7 @@
+# [MODULE DOC] Pre-train-step hook for the Workplace example that asserts multi-token-prediction
+# (MTP) auxiliary heads are completely absent from the Megatron model and that training starts
+# from a fresh state initialized from the original HF checkpoint. Intended to be registered as the
+# before-train-step hook; failures are assertion errors that abort the run.
 """Fail before a Workplace policy update if an auxiliary MTP head is present."""
 
 import json
@@ -20,6 +24,17 @@ def before_train_step(
     optimizer: Any,
     opt_param_scheduler: Any,
 ) -> None:
+    # [FUNCTION DOC] Hook called before each training step with the parsed args, rollout and step
+    # ids, the list of model chunks, and the optimizer and scheduler (the last two unused). For each
+    # chunk it unwraps nested wrapper modules (following the inner module attribute repeatedly) to
+    # the base model and asserts: the config's MTP layer count is unset; MTP forward processing is
+    # not active; there is no MTP submodule; no parameter name contains "mtp" (case-insensitive).
+    # Then asserts the args do not enable MTP training. On the very first step (rollout 0, step 0)
+    # it additionally asserts: start rollout id is unset or zero; finetune is on and optimizer and
+    # RNG state loading are disabled; the load path equals the HF checkpoint path. It then logs a
+    # marker line with the distributed rank, no MTP layers, zero MTP parameters and a fresh-HF flag.
+    # Returns nothing; raises assertion errors on any violation. Requires torch distributed to be
+    # initialized when the logging branch runs.
     """Check the constructed model, including heads omitted from CLI config."""
     for chunk in model:
         module = chunk

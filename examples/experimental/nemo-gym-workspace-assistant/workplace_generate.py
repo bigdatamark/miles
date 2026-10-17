@@ -1,3 +1,8 @@
+# [MODULE DOC] Custom generate function and reward function for the Workplace Assistant example.
+# The generate function wraps the generic agentic tool-call generator and then validates every
+# produced sample, aborting invalid episodes and raising on structurally broken ones so that bad
+# data never reaches the optimizer. The reward function simply returns the native Workplace
+# verifier reward that the agent function stored in sample metadata.
 """Validate Workplace episodes before they can enter an optimizer batch."""
 
 import math
@@ -11,6 +16,21 @@ from miles.utils.types import Sample
 
 
 async def generate(input: GenerateFnInput) -> GenerateFnOutput:
+    # [FUNCTION DOC] Runs the generic agentic generator on the input, then post-validates each
+    # returned sample (the output may hold a single sample or a list; both are handled) and returns
+    # the original output object. Per sample, in order:
+    #  1. metadata lacks a truthy "workplace_episode_valid": mark the sample aborted and skip it.
+    #  2. status already aborted: skip it.
+    #  3. run the sample's own validation; raise a value error if the loss mask is missing or all
+    #     zero; raise if there is more than one turn and the loss mask is all ones (tool
+    #     observations must be masked out); raise if rollout log probs are missing or contain any
+    #     non-finite value.
+    #  4. if rollout routing replay is enabled in args: routed experts must exist with shape
+    #     (number of tokens minus one, num_layers, moe_router_topk), else raise; the dtype must be
+    #     32-bit integer and every index within [0, num_experts), else raise.
+    #  5. if the recorded stop reason is truncated, response_budget, context_limit or turn_limit,
+    #     set the sample status to truncated.
+    # Side effect: mutates sample status in place. Raises value errors as described.
     output = await agentic_generate(input)
     samples = output.samples if isinstance(output.samples, list) else [output.samples]
     for sample in samples:
@@ -45,6 +65,11 @@ generate.add_arguments = agentic_generate.add_arguments
 
 
 async def reward_func(args: Any, sample: Sample, **kwargs: Any) -> float:
+    # [FUNCTION DOC] Custom reward hook. Reads the native reward from sample metadata (key
+    # workplace_reward) and returns it as a float. Raises a value error if the episode was not
+    # marked valid (invalid episodes are aborted by the generate function and must not reach here)
+    # or if the reward is anything other than exactly 0.0 or 1.0. args and extra keyword arguments
+    # are unused.
     if not sample.metadata.get("workplace_episode_valid"):
         raise ValueError("An invalid episode reached the reward hook")
     value = sample.metadata["workplace_reward"]

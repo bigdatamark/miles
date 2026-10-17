@@ -1,3 +1,10 @@
+# [MODULE DOC] Self-executing launcher for GRPO training of GLM-4.7-Flash on Terminal-Bench 2 with
+# the Harbor Terminus 2 agent and trajectory compaction, on one colocated 8-GPU node. Reuses the
+# agent function, reward function and rollout class of the swe-agent-harbor-docker example (that
+# directory is put on the python path of the job) and enables session server v2 so every
+# summarization-created trajectory segment is kept. The argument string is assembled from small
+# private builder functions, one per block; main optionally converts the checkpoint, then submits
+# the training job. Paths default under the model dir and the output dir/run id.
 """Train GLM-4.7-Flash with Terminus 2 trajectory compaction.
 
 This one-node recipe uses Harbor for Terminal-Bench 2 environments and Miles'
@@ -32,6 +39,16 @@ _HARBOR_PIPELINE_DIR = command_utils.repo_base_dir / "examples" / "swe-agent-har
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC] Launcher configuration (extends the shared train config). Groups: mode (normal or
+    # rollout-only debug), run id (generated per instance), model identity (glm4.7-flash, 8 GPUs
+    # per node); paths (skip-prepare flag, model dir, model name, and optional overrides for HF
+    # checkpoint, reference load, save dir and trace dump dir, all derived when empty; prompt data
+    # file listing the 89 tasks); training scale (max sequence length 32768, response length 8192,
+    # 100 rollouts, 4 prompts per step, 8 samples per prompt, global batch 32, save interval 100);
+    # agent settings (server url from AGENT_SERVER_URL else http://127.0.0.1:11000, model name from
+    # AGENT_MODEL_NAME else "model", trial timeout 7200 s, session server external host, host ip
+    # from MILES_HOST_IP, session server bind ip from MILES_SESSION_SERVER_IP); and Prometheus
+    # settings (enabled, port 9090). Environment defaults are read when an instance is created.
     mode: Literal["normal", "debug_rollout_only"] = "normal"
     run_id: str = field(default_factory=command_utils.create_run_id)
     megatron_model_type: str = "glm4.7-flash"
@@ -69,22 +86,30 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
 
 def _hf_checkpoint(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: Returns the explicit HF checkpoint path, else model dir joined with the
+    # model name.
     return args.hf_checkpoint or str(Path(args.model_dir) / args.model_name)
 
 
 def _ref_load(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: Returns the explicit reference load path, else model dir joined with
+    # "<model name>_torch_dist".
     return args.ref_load or str(Path(args.model_dir) / f"{args.model_name}_torch_dist")
 
 
 def _save_dir(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: Returns the explicit save dir, else <output dir>/<run id>/checkpoints.
     return args.save_dir or str(Path(args.output_dir) / args.run_id / "checkpoints")
 
 
 def _save_traces_dir(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: Returns the explicit trace dump dir, else <output dir>/<run id>/details.
     return args.save_traces_dir or str(Path(args.output_dir) / args.run_id / "details")
 
 
 def _checkpoint_args(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: Returns the checkpoint flags: HF checkpoint, reference load, save path
+    # and save interval.
     return (
         f"--hf-checkpoint {_hf_checkpoint(args)} "
         f"--ref-load {_ref_load(args)} "
@@ -94,6 +119,10 @@ def _checkpoint_args(args: ScriptArgs) -> str:
 
 
 def _rollout_args(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: Returns the rollout flags: prompt data with input key prompt and
+    # metadata key metadata, shuffle, rollout count, rollout batch size, samples per prompt,
+    # temperature 0.8 (fixed), response length limit, max sequence length, global batch size and
+    # data balancing.
     return (
         f"--prompt-data {args.prompt_data} "
         "--input-key prompt "
@@ -111,6 +140,11 @@ def _rollout_args(args: ScriptArgs) -> str:
 
 
 def _performance_args(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: Returns the parallelism and memory flags: tensor parallel 4 with
+    # sequence parallel, pipeline 1, context 1, expert parallel equal to the whole world size
+    # (nodes times GPUs per node), expert tensor 1, full uniform recompute of 1 layer, dynamic batch
+    # size with 16384 tokens per GPU, CPU optimizer offload with overlap and the precision-aware
+    # optimizer.
     world_size = args.num_nodes * args.num_gpus_per_node
     return (
         "--tensor-model-parallel-size 4 "
@@ -131,6 +165,8 @@ def _performance_args(args: ScriptArgs) -> str:
 
 
 def _grpo_args() -> str:
+    # [FUNCTION DOC] HELPER: Returns fixed GRPO flags: GRPO advantage estimator, KL loss with
+    # coefficient 0.01 and low-variance type, zero entropy coefficient, clip range 0.2 / 0.28.
     return (
         "--advantage-estimator grpo "
         "--use-kl-loss "
@@ -143,6 +179,8 @@ def _grpo_args() -> str:
 
 
 def _optimizer_args() -> str:
+    # [FUNCTION DOC] HELPER: Returns fixed optimizer flags: Adam, learning rate 1e-6 constant,
+    # weight decay 0.1, betas 0.9 and 0.98.
     return (
         "--optimizer adam "
         "--lr 1e-6 "
@@ -154,6 +192,8 @@ def _optimizer_args() -> str:
 
 
 def _sglang_args() -> str:
+    # [FUNCTION DOC] HELPER: Returns fixed SGLang flags: 1 GPU per engine, static memory fraction
+    # 0.7, glm47 tool call parser, glm45 reasoning parser, router port 31000.
     return (
         "--rollout-num-gpus-per-engine 1 "
         "--sglang-mem-fraction-static 0.7 "
@@ -164,6 +204,10 @@ def _sglang_args() -> str:
 
 
 def _agent_args(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: Returns the agent flags: the agentic tool-call generator, the Harbor
+    # example's agent function, reward function and rollout class (resolved through the python path),
+    # the no-aborted dynamic sampling filter, glm47 TITO model, session server v2, the bind ip flag
+    # only if set, the external host flag only if set, port 30000 and 32 workers.
     bind_arg = f"--session-server-ip {args.session_server_ip} " if args.session_server_ip else ""
     external_host_arg = (
         f"--session-server-external-host {args.session_server_external_host} "
@@ -186,6 +230,10 @@ def _agent_args(args: ScriptArgs) -> str:
 
 
 def _misc_args(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: Returns miscellaneous flags: dropouts off, fp32 gradient accumulation
+    # and softmax, flash attention, training entropy observation, multi-turn logging, colocated
+    # mode, actor nodes and GPUs per node, GPUs per node, and the rollout-only debug flag in debug
+    # mode.
     debug_arg = "--debug-rollout-only " if args.mode == "debug_rollout_only" else ""
     return (
         "--attention-dropout 0.0 "
@@ -204,6 +252,10 @@ def _misc_args(args: ScriptArgs) -> str:
 
 
 def _observability_args(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: Returns monitoring flags: Prometheus (enable, port, run name equal to
+    # the run id) only if enabled; details dump to the trace dir; the dashboard; rollout entropy;
+    # and the default W&B flags (active only when a key is set in the environment) with the
+    # run name prefix terminus-compaction and the run id.
     prometheus_args = ""
     if args.use_prometheus:
         prometheus_args = (
@@ -219,6 +271,9 @@ def _observability_args(args: ScriptArgs) -> str:
 
 
 def _build_train_args(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: Concatenates the flag blocks in the order checkpoint, rollout,
+    # optimizer, GRPO, observability, performance, SGLang, agent, misc (no separators; each block
+    # ends with a space) and returns the full argument string.
     return "".join(
         (
             _checkpoint_args(args),
@@ -235,6 +290,9 @@ def _build_train_args(args: ScriptArgs) -> str:
 
 
 def _extra_env_vars(args: ScriptArgs) -> dict[str, str]:
+    # [FUNCTION DOC] HELPER: Returns the job runtime environment mapping: python path set to the
+    # Harbor example directory, agent server url, agent model name, and trial timeout (as text);
+    # plus the host ip variable only if configured.
     env = {
         "PYTHONPATH": str(_HARBOR_PIPELINE_DIR),
         "AGENT_SERVER_URL": args.agent_server_url,
@@ -247,6 +305,9 @@ def _extra_env_vars(args: ScriptArgs) -> dict[str, str]:
 
 
 def _prepare(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] HELPER: Converts the HF checkpoint to the Megatron distributed format under
+    # the model dir through the backend's convert-checkpoint command. Side effects: runs commands,
+    # uses GPUs.
     U = args.create_backend()
     U.convert_checkpoint(
         model_name=args.model_name,
@@ -259,6 +320,9 @@ def _prepare(args: ScriptArgs) -> None:
 
 
 def _execute(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] HELPER: Submits the training job through the backend's execute-train with the
+    # assembled argument string, GPUs per node, model type, megatron path and the runtime
+    # environment mapping. Side effects: starts Ray and the job.
     U = args.create_backend()
     U.execute_train(
         train_args=_build_train_args(args),
@@ -271,6 +335,8 @@ def _execute(args: ScriptArgs) -> None:
 
 @command_utils.dataclass_cli
 def main(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] Entry point (command line generated from the config dataclass): converts the
+    # checkpoint unless skip_prepare is set, then submits the job.
     if not args.skip_prepare:
         _prepare(args)
     _execute(args)

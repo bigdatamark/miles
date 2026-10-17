@@ -1,3 +1,9 @@
+# [MODULE DOC] Custom generate and reward functions that run a Strands agent on math problems
+# against the SGLang router, with a Python-execution tool. The agent talks to the router through
+# an SGLang model wrapper that records the generated tokens, loss mask and log probabilities
+# directly (no re-tokenization), the tool may be iterated at most 5 times (module constant), and
+# the reward uses the DAPO math scorer with a small adjustment depending on tool use. A shared
+# client per router address is cached in a module-level dict.
 import logging
 
 from camel.interpreters import SubprocessInterpreter
@@ -26,6 +32,9 @@ _client_cache: dict[str, SGLangClient] = {}
 
 
 def get_client(args) -> SGLangClient:
+    # [FUNCTION DOC] HELPER: Returns a cached SGLang client keyed by the router url built from the
+    # router ip and port in args; creates it from the Miles args on first use (so connections are
+    # pooled across samples). Mutates the module-level cache.
     """Get shared client for connection pooling (like MILES)."""
     base_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
     if base_url not in _client_cache:
@@ -35,6 +44,10 @@ def get_client(args) -> SGLangClient:
 
 @tool
 def execute_python_code(code: str) -> str:
+    # [FUNCTION DOC] Agent tool (registered through the Strands tool decorator). Runs the given
+    # Python source in a fresh subprocess interpreter without confirmation prompts and without
+    # printing its streams, with a 60 second execution timeout, logs the code and result at info
+    # level and returns the interpreter's output text. Side effect: executes arbitrary code.
     """Execute Python code and return the output."""
     interpreter = SubprocessInterpreter(
         require_confirm=False,
@@ -48,6 +61,21 @@ def execute_python_code(code: str) -> str:
 
 
 async def generate(args, sample: Sample, sampling_params) -> Sample:
+    # [FUNCTION DOC] Custom generate function: runs one agent episode and returns the sample filled
+    # in. Asserts partial rollout is off. Builds the model wrapper with the tokenizer from the
+    # generation state, the cached client, a model id equal to the last path segment of the HF
+    # checkpoint, and only the three sampling params max_new_tokens, temperature and top_p (a
+    # missing one raises a key error). Creates an agent with the Python tool, an iteration limiter
+    # (5), no callback handler and the system prompt. The user prompt is the sample prompt if text,
+    # else the content of its first message. Invokes the agent: success -> completed; any exception
+    # -> status truncated (never aborted, because aborted samples are mishandled in reward
+    # processing) and a warning log. Then reads the recorded trajectory from the model's token
+    # manager: the first segment (system plus user) is the prompt; sample tokens are all token ids,
+    # while loss mask and rollout log probs are the entries after the prompt; response length is
+    # total minus prompt length; response is the decoded text after the prompt keeping special
+    # tokens. Records the limiter's iteration count (parallel tool calls count as one iteration) and
+    # the number of tool-role messages in the formatted trajectory as the tool call count. Resets the
+    # model and cleans up the agent before returning.
     """Generate with TITO: tokens captured during generation, no retokenization."""
     assert not args.partial_rollout, "Partial rollout not supported."
 
@@ -98,6 +126,16 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
 
 async def reward_func(args, sample: Sample, **kwargs):
+    # [FUNCTION DOC] Custom reward hook for one sample; returns a float score. The ground truth is
+    # the sample label (empty text if none) and the iteration count defaults to zero if missing.
+    # Scores the response with the DAPO math scorer in non-strict boxed mode; if the prediction is
+    # marked invalid, scores again in strict boxed mode. For a negative score, adds
+    # (iterations - 2) / 2 times 0.1 (so more tool use reduces the penalty and little tool use
+    # increases it) and then takes the smaller of that and -0.6. Logs a summary line with score,
+    # status, tool iterations, tool calls, token count and response length. args and extra keyword
+    # arguments are unused.
+    # KNOWN ISSUE: the minimum with -0.6 only caps the adjusted score from above; because of it a
+    # failed sample can never be rewarded better than -0.6 even if tool use is high.
     """Reward function using math_dapo scoring."""
     ground_truth = sample.label or ""
     tool_iterations = getattr(sample, "tool_iterations", 0)

@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Command-line tool that turns a SWE-style dataset (a Hugging Face dataset id or a
+# local JSON-lines file) into the Miles prompt-data format used by the NeMo Gym example: one JSON
+# line per sample with a prompt (the problem statement) and a metadata object (the full original
+# instance plus the subset and split labels). Arguments: input (required), output (required),
+# split (default train; only used for Hugging Face datasets but always recorded in metadata),
+# limit (optional sample cap) and subset (default gym; "gym" selects SWE-Gym images, "verified"
+# the official SWE-bench images). Prints progress to standard output.
 """Download and process data to Miles format."""
 
 import argparse
@@ -11,6 +18,14 @@ from datasets import load_dataset
 def convert_to_miles_format(
     input_path: str, output_path: str, limit: int = None, split: str = "train", subset: str = "gym"
 ):
+    # [FUNCTION DOC] Streams the input JSON-lines file and writes the output JSON-lines file (created
+    # or overwritten), one output line per non-skipped input line, then prints a count message.
+    # Each output record has "prompt" (the instance's problem_statement, or an empty string when
+    # missing) and "metadata" (a shallow copy of the whole instance with "subset" and "split" keys
+    # set, overwriting any existing values). Stops once limit records are written. Returns nothing.
+    # Raises on unreadable input or malformed JSON lines (a blank line also fails to parse).
+    # KNOWN ISSUE: the limit check is a truthiness test, so a limit of zero means "no limit"; the
+    # annotation for limit says integer but the default is none (should be optional).
     """Convert JSONL to Miles format.
 
     Args:
@@ -46,6 +61,12 @@ def convert_to_miles_format(
 
 
 def main():
+    # [FUNCTION DOC] Script entry point. Parses the arguments. If the input path exists locally and
+    # ends with the jsonl suffix, converts it directly. Otherwise treats the input as a Hugging Face
+    # dataset id: loads the requested split (network download), optionally truncates it to the
+    # first limit rows, dumps it to a temporary JSON-lines file, converts that file to the output
+    # (passing the limit again, which is harmless), and always deletes the temporary file in a
+    # finally block. Prints "Done." at the end.
     parser = argparse.ArgumentParser(description="Download HuggingFace dataset and convert to Miles format")
     parser.add_argument("--input", type=str, required=True, help="HuggingFace dataset path or local JSONL file")
     parser.add_argument("--output", type=str, required=True, help="Output JSONL file path")

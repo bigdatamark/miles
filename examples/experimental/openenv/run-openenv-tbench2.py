@@ -1,3 +1,12 @@
+# [MODULE DOC] Self-executing launcher for GRPO training of GLM-4.7-Flash on Terminal-Bench-2
+# through the OpenEnv agent function. Flow in main: clean up stale processes, optionally convert
+# the HF checkpoint to the Megatron distributed format, then assemble the training argument string
+# from the shared launch helper fragments plus this model's own parallelism (tensor 4 with sequence
+# parallel, expert 2, CPU-offloaded precision-aware optimizer), SGLang (glm47 tool parser, glm45
+# reasoning parser, router port 31000) and colocated-actor settings, and submit via the command
+# utilities. Per-episode sandboxes are used when a task dir and a backend are configured, otherwise
+# a shared env server at the configured url. Most defaults come from environment variables read
+# at import time.
 """OpenEnv Terminal-Bench-2 (tbench2) learning launcher (GLM-4.7-Flash).
 
 Drives the OpenEnv tbench2 env through a per-episode sandbox agent function
@@ -56,6 +65,16 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC] Launcher configuration (extends the shared train config). Groups: mode (normal or
+    # rollout-only debug), run id (generated once at import), model identity (glm4.7-flash, 8 GPUs
+    # per node); paths (HF checkpoint id, ref load path, save dir, prompt data, base dir for
+    # checkpoint conversion, skip-prepare flag); training scale (max sequence length 16384, rollout
+    # batch 8, 8 samples per prompt, global batch 32); OpenEnv settings (shared env server url,
+    # agent model name, turn cap, per-episode time cap, task dir, sandbox backend, credential-file
+    # paths for Daytona, E2B and Modal, details dump dir, session server external host, host ip),
+    # all defaulting from environment variables read at import time; W&B settings; Prometheus
+    # settings (enabled, port 9090, run name).
+    # KNOWN ISSUE: the Prometheus run name and W&B run name are constants and not unique per run.
     mode: Literal["normal", "debug_rollout_only"] = "normal"
     run_id: str = command_utils.create_run_id()
     megatron_model_type: str = "glm4.7-flash"
@@ -130,6 +149,9 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
 
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Converts the HF checkpoint into the Megatron distributed format under base_dir
+    # through the backend's convert-checkpoint command (skipped by the utility if already done).
+    # Side effects: runs conversion commands, uses GPUs.
     """Convert HF checkpoint to torch_dist format if not already done."""
     U = args.create_backend()
     U.convert_checkpoint(
@@ -143,6 +165,21 @@ def prepare(args: ScriptArgs):
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Builds the training argument string from grouped blocks and submits the job.
+    # Checkpoint block: HF checkpoint, reference load, save path, save interval 100. Rollout, GRPO,
+    # optimizer, agent, W&B and Prometheus blocks come from the shared helpers (the agent block uses
+    # TITO model glm47 and the backend resolved from the config). Performance: tensor parallel 4
+    # with sequence parallel, expert parallel 2 (the single 8-GPU node leaves data parallel 2),
+    # full uniform recompute of 1 layer, dynamic batch size with 16384 tokens per GPU, CPU
+    # optimizer offload with overlap and the precision-aware optimizer. SGLang: one GPU per engine,
+    # memory fraction 0.7, glm47 tool parser, glm45 reasoning parser, router port 31000. Misc:
+    # dropouts off, fp32 gradient accumulation and softmax, flash attention, colocated, actor
+    # nodes/GPUs from the config and rollout GPUs equal to GPUs per node. Optional rollout-only
+    # debug flag and details-dump flag. The runtime environment comes from the base env helper plus
+    # the optional-variables helper (which may raise on a bad sandbox setup). Then calls
+    # execute-train. Side effects: Ray start and job submission.
+    # KNOWN ISSUE: the rollout GPU count is passed together with the colocate flag, although the
+    # argument parser ignores it when colocated.
     U = args.create_backend()
     ckpt_args = (
         f"--hf-checkpoint {args.hf_checkpoint} "
@@ -237,6 +274,8 @@ def execute(args: ScriptArgs):
 
 @command_utils.dataclass_cli
 def main(args: ScriptArgs):
+    # [FUNCTION DOC] Entry point (command line generated from the config dataclass): runs process
+    # cleanup, then prepare unless skip_prepare is set, then execute.
     C.cleanup()
     if not args.skip_prepare:
         prepare(args)

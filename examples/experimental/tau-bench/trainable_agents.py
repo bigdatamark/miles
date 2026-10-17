@@ -1,3 +1,10 @@
+# [MODULE DOC] Trainable tau-bench agent for Miles rollouts. Defines the interaction status enum
+# and result dataclass; a function turning a parsed tool call into a tau-bench action; the tool
+# instruction text that replaces the default multi-call sentence in the chat template output; a
+# mixin that runs a multi-turn conversation between the model (via the SGLang router's text
+# generate endpoint) and a tau-bench environment while tracking token ids and a loss mask (model
+# tokens trained on, environment tokens masked out); a tool-calling agent class combining the mixin
+# with the tau-bench tool-calling agent; and a factory choosing the agent from the run config.
 import json
 import logging
 from dataclasses import dataclass
@@ -18,6 +25,9 @@ logger = logging.getLogger(__name__)
 
 
 class Status(Enum):
+    # [CLASS DOC] Outcome of an interaction: completed (environment finished), truncated (step
+    # limit reached without finishing) or aborted (generation abort, unparsable output or
+    # environment failure). Values are the lowercase names.
     COMPLETED = "completed"
     TRUNCATED = "truncated"
     ABORTED = "aborted"
@@ -25,6 +35,13 @@ class Status(Enum):
 
 @dataclass
 class InteractionResult:
+    # [CLASS DOC] Result container for one interaction: initial prompt text, final reward, the
+    # message list, an info mapping, the concatenated assistant response text, the loss mask list
+    # (one entry per response token), the full token id list (prompt then response) and the status
+    # (default completed). A response_length attribute is added dynamically when the result is
+    # finalized.
+    # KNOWN ISSUE: the tokens field is annotated as an integer but holds a list of integers, and
+    # response_length is not a declared field.
     prompt: str
     reward: float
     messages: list[dict[str, Any]]
@@ -36,6 +53,13 @@ class InteractionResult:
 
 
 def call_to_action_sglang(calls: list[Any], text_response: str) -> Action:
+    # [FUNCTION DOC] Converts parsed tool calls into a tau-bench action. Default: the respond action
+    # with the text as content. If there are calls, only the first is used (extra calls logged at
+    # debug level): its parameters text is decoded as JSON and, if the result is a mapping, the
+    # action becomes that tool name with the mapping as keyword arguments; a non-mapping logs a
+    # warning and keeps the default. A missing key or invalid JSON raises (not caught here).
+    # KNOWN ISSUE: duplicates the adapter module's method of the same purpose, which additionally
+    # catches invalid JSON; here invalid JSON propagates and ends the interaction with an exception.
     """
     Convert sglang response message to Action, similar to original message_to_action
     but adapted for sglang response format.
@@ -65,6 +89,9 @@ TOOL_INSTRUCTION = (
 
 
 class TrainableAgentMixin:
+    # [CLASS DOC] Mixin adding the asynchronous training interaction to a tau-bench agent. The host
+    # class must provide the wiki text, the tool descriptions, an OpenAI adapter, and the agent
+    # temperature. Methods are small steps used by the main solve coroutine.
     """
     Mixin class that provides trainable agent functionality for tau-bench environments.
 
@@ -73,6 +100,10 @@ class TrainableAgentMixin:
     """
 
     def _reformulate_tool_call(self, text: str) -> str:
+        # [FUNCTION DOC] HELPER: Replaces the sentence "You may call one or more functions to assist
+        # with the user query." (the default tool template text) with the module's tool instruction
+        # (at most one call per turn, must execute tools to modify, never confirm without tool
+        # confirmation). Returns the new text; unchanged if the sentence is absent.
         """
         Reformulate tool call instruction for tau-bench environment.
 
@@ -88,6 +119,8 @@ class TrainableAgentMixin:
         return text.replace("You may call one or more functions to assist with the user query.", TOOL_INSTRUCTION)
 
     async def _call_llm(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
+        # [FUNCTION DOC] HELPER: Posts the payload to the url with the shared Miles HTTP helper and
+        # returns the decoded response mapping.
         """
         Make an LLM call tracking.
 
@@ -101,6 +134,8 @@ class TrainableAgentMixin:
         return await post(url, payload)
 
     def _parse_tool(self, response: str) -> dict[str, Any]:
+        # [FUNCTION DOC] HELPER: Delegates to the OpenAI adapter's response parser and returns its
+        # result mapping (success flag, parsed result, message or error).
         """
         Parse tool calls from LLM response string.
 
@@ -113,6 +148,8 @@ class TrainableAgentMixin:
         return self.openai_adapter.parse_response_to_openai_format(response)
 
     async def _execute_tool(self, env, action: Action):
+        # [FUNCTION DOC] HELPER: Steps the environment with the action (a blocking synchronous call
+        # inside a coroutine) and returns the step result (observation, reward, done, info).
         """
         Execute a tool/action in the environment.
 
@@ -126,6 +163,8 @@ class TrainableAgentMixin:
         return env.step(action)
 
     def _initialize_environment(self, env, task_index: int | None) -> tuple[str, dict[str, Any]]:
+        # [FUNCTION DOC] HELPER: Resets the environment (to the given task index if not none) and
+        # returns a pair of the first observation text and the reset info dumped to a mapping.
         """
         Initialize the environment and get initial observation.
 
@@ -143,6 +182,8 @@ class TrainableAgentMixin:
         return env_reset_res.observation, env_reset_res.info.model_dump()
 
     def _build_initial_messages(self, obs: str) -> list[dict[str, Any]]:
+        # [FUNCTION DOC] HELPER: Returns a two-message list: a system message with the agent's wiki
+        # text and a user message with the first observation.
         """
         Build initial conversation messages.
 
@@ -155,6 +196,10 @@ class TrainableAgentMixin:
         return [{"role": "system", "content": self.wiki}, {"role": "user", "content": obs}]
 
     def _prepare_prompt_tokens(self, state: GenerateState, messages: list[dict[str, Any]]) -> tuple[str, list[int]]:
+        # [FUNCTION DOC] HELPER: Renders the messages with the tokenizer's chat template as text
+        # (adding the generation prompt and passing the tool descriptions), applies the tool
+        # instruction rewrite, and tokenizes the text without special tokens. Returns the pair of
+        # prompt text and token ids.
         """
         Prepare prompt text and tokenize it.
 
@@ -181,6 +226,25 @@ class TrainableAgentMixin:
         task_index: int | None = None,
         max_num_steps: int = 30,
     ) -> InteractionResult:
+        # [FUNCTION DOC] Runs one full episode and returns the interaction result. Uses attribute
+        # access on rollout_args (router ip and port; a namespace object, not a mapping), builds the
+        # router generate url, resets the environment, and starts with system (wiki) and user
+        # (observation) messages and the initial prompt tokens. Loop for up to max_num_steps: render
+        # the whole conversation as text with the chat template (with tools, generation prompt, tool
+        # instruction rewrite) and post it with the sampling params. A finish reason of abort ends
+        # the episode as aborted. The response text loses a trailing end-of-turn marker if present.
+        # The response is parsed with the OpenAI adapter; a parse failure or exception ends the
+        # episode as aborted. Appends the assistant message (raw text) and its token delta with loss
+        # mask ones. Converts the parse to an action (first tool call, else a respond action with
+        # the plain text); steps the environment (an exception ends as aborted). Appends a tool
+        # message (named after the tool) for tool actions or a user message for respond actions with
+        # the observation, and its token delta with loss mask zeros. Reward becomes the latest
+        # environment reward (not a sum), info is merged with the step info, and a done flag ends
+        # the loop as completed. If the last step was not done, status is truncated. The final
+        # result is built by the helper (also used for aborts, with the data so far).
+        # KNOWN ISSUE: the declared type of rollout_args is a mapping though attribute access is
+        # used; if the loop body never runs (zero steps) the final check reads an undefined step
+        # result and raises a name error.
         """
         Execute async agent-environment interaction for training.
 
@@ -332,6 +396,16 @@ class TrainableAgentMixin:
         )
 
     def _get_token_delta(self, tokenizer: AutoTokenizer, messages: list[dict]) -> tuple[list[int], list[int]]:
+        # [FUNCTION DOC] HELPER: Computes the new tokens contributed by the LAST message. Renders the
+        # full conversation as text without a generation prompt. If the last message is from the
+        # assistant, the reference is the conversation without it rendered WITH a generation prompt
+        # and the new text is the remainder, tokenized without special tokens, with loss mask ones.
+        # Otherwise the reference is the previous messages rendered without a generation prompt and
+        # the remainder is tokenized with loss mask zeros. Returns the pair of token ids and mask.
+        # Assumes the reference text is an exact prefix of the full rendering (slicing by length).
+        # KNOWN ISSUE: the inline comments describe the mask semantics inversely ("mask only the new
+        # assistant tokens" / "don't mask environment tokens"); the code trains on assistant tokens
+        # (ones) and excludes environment tokens (zeros).
         """
         Calculate token delta for multi-turn conversations.
 
@@ -376,6 +450,10 @@ class TrainableAgentMixin:
         prompt_token_ids: list[int],
         response_token_ids: list[int],
     ) -> InteractionResult:
+        # [FUNCTION DOC] HELPER: Fills the result object in place and returns it: reward, info,
+        # messages, loss mask, tokens (prompt tokens followed by response tokens), response text (the
+        # content of all assistant messages concatenated with no separator; a missing content counts
+        # as empty), and response length equal to the loss mask length. Writes a debug log.
         """
         Build the final interaction result with all collected data.
 
@@ -410,6 +488,9 @@ class TrainableAgentMixin:
 
 
 class TrainableToolCallingAgent(ToolCallingAgent, TrainableAgentMixin):
+    # [CLASS DOC] Tool-calling agent that is also trainable: inherits tau-bench behavior and the
+    # asynchronous interaction mixin. Keeps default rollout args and sampling params and an OpenAI
+    # adapter built from the tool descriptions with the qwen25 parser.
     """
     A trainable version of ToolCallingAgent that uses sglang rollout for training.
 
@@ -428,6 +509,13 @@ class TrainableToolCallingAgent(ToolCallingAgent, TrainableAgentMixin):
         rollout_args: dict[str, Any] | None = None,
         sampling_params: dict[str, Any] | None = None,
     ):
+        # [FUNCTION DOC] Initializes the parent agent with tool info, wiki, model, provider and
+        # temperature (default 0.0). Stores rollout args, or if none given a default mapping (router
+        # at 127.0.0.1 port 30000, http2 off), and sampling params, or if none given a default
+        # (the agent temperature, 512 new tokens, top-p 0.9, top-k 50). Creates the OpenAI adapter
+        # with the tool descriptions and the qwen25 parser.
+        # KNOWN ISSUE: the default rollout args is a plain mapping, but the solve method reads the
+        # router address through attribute access, so the default would fail there.
         # Initialize the parent ToolCallingAgent
         super().__init__(
             tools_info=tools_info,
@@ -460,6 +548,12 @@ def agent_factory(
     rollout_args: dict[str, Any] | None = None,
     sampling_params: dict[str, Any] | None = None,
 ) -> Agent:
+    # [FUNCTION DOC] Factory: for the tool-calling strategy (read from the config's agent strategy
+    # attribute) returns a trainable tool-calling agent built from the tool info, wiki, the config's
+    # model, provider and temperature, and the given rollout args and sampling params. Any other
+    # strategy raises a not-implemented error.
+    # KNOWN ISSUE: the generate module's config sets a key named agent rather than agent strategy,
+    # so that key is not what this function reads.
     if config.agent_strategy == "tool-calling":
         return TrainableToolCallingAgent(
             tools_info=tools_info,

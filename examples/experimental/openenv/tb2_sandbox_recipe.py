@@ -1,3 +1,13 @@
+# [MODULE DOC] Provider-independent recipe for per-task Terminal-Bench-2 sandboxes, used by the
+# Daytona, E2B and Modal materialization modules. Contains: the env server start command template
+# and its builder; reading and flooring of task resource requirements from the task config file;
+# ownership labels; a daemon-thread keepalive helper; a run-with-deadline helper; shared
+# command-line options for the bake tools; deterministic embedding of the env package source as a
+# base64 tarball (size-capped at 45000 bytes); the build layer commands (OS dependencies, uv and a
+# managed Python 3.12 venv at /opt/envserver, the embedded env source installed with extra
+# packages and mcp pinned below 2, and the task directory downloaded from the pinned-commit GitHub
+# tarball with the solution directory excluded); and a server readiness poller. The per-command
+# execution timeout is read once at import from TB2_COMMAND_TIMEOUT_S (default 900 s).
 """Provider-agnostic image recipe for per-task Terminal-Bench-2 sandboxes.
 
 TB2 is a per-task-image benchmark: every task pins its official runtime image
@@ -98,6 +108,11 @@ SERVER_CMD = (
 
 
 def server_cmd(command_timeout_s: int = COMMAND_TIMEOUT_S, default_task_id: str = "") -> str:
+    # [FUNCTION DOC] Returns the shell command that starts the env server inside a sandbox, by
+    # filling the command template with the per-exec timeout and the default task id (quoted for
+    # the shell; an empty id becomes an empty quoted string). The command sets the task dir,
+    # default task id, command timeout, test withholding on, camel runtime on, and a maximum of one
+    # concurrent env, then runs the server app with the venv python on all interfaces, port 8000.
     # A per-task sandbox stages exactly one task, so make it the default:
     # a reset() with no task_id resolves to the staged task rather than the
     # env's built-in headless-terminal default (which isn't present here).
@@ -108,6 +123,8 @@ def server_cmd(command_timeout_s: int = COMMAND_TIMEOUT_S, default_task_id: str 
 
 
 def read_task_config(task_dir: Path) -> dict:
+    # [FUNCTION DOC] Parses and returns the task.toml file of the task directory as a nested
+    # mapping. Raises a file-not-found error if the file does not exist.
     toml_path = task_dir / "task.toml"
     if not toml_path.is_file():
         raise FileNotFoundError(f"{task_dir}: no task.toml")
@@ -115,6 +132,10 @@ def read_task_config(task_dir: Path) -> dict:
 
 
 def task_env_resources(task_dir: Path) -> tuple[int, int, int]:
+    # [FUNCTION DOC] Reads the environment section of the task config (empty if absent) and
+    # returns a triple of CPU count, memory in MB and storage in MB, each converted to an integer
+    # (default 1, 2048, 10240) and raised to the floors 1, 2048 and 10240. Raises if the config is
+    # missing or a value is not numeric.
     """``(cpus, memory_mb, storage_mb)`` from ``task.toml [environment]``, floored.
 
     The floors (1 CPU / 2048 MB memory / 10240 MB disk) are recipe policy —
@@ -132,6 +153,10 @@ def task_env_resources(task_dir: Path) -> tuple[int, int, int]:
 
 
 def sandbox_labels(task_dir: Path) -> dict[str, str]:
+    # [FUNCTION DOC] Returns a mapping of ownership labels: "openenv-tbench2-task" = task directory
+    # name; "openenv-launcher" = OPENENV_LAUNCHER if set and non-empty, else the local user name
+    # (the string "unknown" if it cannot be determined); and, only if OPENENV_RUN_ID is non-empty,
+    # "openenv-run-id" = that value. Environment read at call time.
     """Ownership labels/metadata for a per-task sandbox: what it runs, and who
     launched it. Provider-agnostic (Daytona labels, E2B metadata, Modal tags —
     same keys).
@@ -159,6 +184,10 @@ def sandbox_labels(task_dir: Path) -> dict[str, str]:
 
 
 def start_keepalive(beat, thread_name: str, *, interval_s: float, max_consecutive_failures: int) -> None:
+    # [FUNCTION DOC] Starts a daemon thread with the given name and returns immediately. The thread
+    # loops: sleep for the interval first, then call the beat function; a successful beat resets the
+    # failure counter, an exception increments it; the thread ends when the counter reaches the
+    # maximum of consecutive failures. It also ends with the process (daemon). No stop handle.
     """Run *beat* every *interval_s* for as long as THIS process lives.
 
     A daemon thread has exactly the right lifetime for a sandbox keepalive: it
@@ -169,6 +198,7 @@ def start_keepalive(beat, thread_name: str, *, interval_s: float, max_consecutiv
     """
 
     def _run() -> None:
+        # [FUNCTION DOC] HELPER: Heartbeat thread body; see the enclosing function for the loop.
         failures = 0
         while failures < max_consecutive_failures:
             time.sleep(interval_s)
@@ -182,6 +212,10 @@ def start_keepalive(beat, thread_name: str, *, interval_s: float, max_consecutiv
 
 
 def run_with_deadline(fn, timeout_s: float):
+    # [FUNCTION DOC] Runs the zero-argument function on a one-worker thread pool and waits up to
+    # the timeout for its result, which is returned; the function's own exception propagates; on
+    # timeout the standard timeout error is raised and the pool is shut down without waiting, so
+    # the worker keeps running in the background (its result is lost).
     """Run *fn* on a scoped worker thread; raise TimeoutError past *timeout_s*.
 
     For provider calls that block across many requests with no deadline of
@@ -200,6 +234,8 @@ def run_with_deadline(fn, timeout_s: float):
 
 
 def add_task_selection_args(ap) -> None:
+    # [FUNCTION DOC] Adds to the given argument parser: a required tasks-dir option and a required
+    # mutually exclusive group of a comma-separated tasks option or an all flag. Mutates the parser.
     """The bake CLIs' shared task selection: --tasks-dir + (--tasks | --all)."""
     ap.add_argument("--tasks-dir", required=True, help="local terminal-bench-2 checkout")
     group = ap.add_mutually_exclusive_group(required=True)
@@ -208,6 +244,10 @@ def add_task_selection_args(ap) -> None:
 
 
 def selected_task_ids(args) -> tuple[Path, list[str]]:
+    # [FUNCTION DOC] Resolves the tasks dir (home expanded, made absolute) and the task ids:
+    # with the all flag, the sorted names of the immediate subdirectories containing a task.toml
+    # file; otherwise the comma-separated list trimmed with empties dropped (not checked for
+    # existence). Returns the pair of directory and id list.
     tasks_dir = Path(args.tasks_dir).expanduser().resolve()
     if args.all:
         task_ids = sorted(p.name for p in tasks_dir.iterdir() if (p / "task.toml").is_file())
@@ -217,6 +257,10 @@ def selected_task_ids(args) -> tuple[Path, list[str]]:
 
 
 def _tar_filter(tarinfo: tarfile.TarInfo) -> tarfile.TarInfo | None:
+    # [FUNCTION DOC] HELPER: Tar entry filter. Drops (returns none) entries whose base name is a
+    # bytecode cache directory or the camel initial-env directory, or ends with a compiled-bytecode
+    # or egg-info suffix. Otherwise normalizes the entry for determinism: modification time zero,
+    # owner and group ids zero, owner and group names empty; returns the entry.
     name = Path(tarinfo.name).name
     if name in {"__pycache__", ".initial_env"} or name.endswith((".pyc", ".egg-info")):
         return None
@@ -229,6 +273,10 @@ def _tar_filter(tarinfo: tarfile.TarInfo) -> tarfile.TarInfo | None:
 
 
 def _dir_tar_b64(paths: list[Path], arcnames: list[str], max_bytes: int) -> str:
+    # [FUNCTION DOC] HELPER: Builds a gzip-compressed tar in memory of the given paths stored under
+    # the matching archive names (lists must have equal length, else a value error), applying the
+    # tar filter and a zero gzip timestamp so the bytes are identical for identical sources. Raises
+    # a value error if the compressed size exceeds max_bytes. Returns the base64 text (ASCII).
     # Must be byte-for-byte deterministic for identical source: the b64 is
     # embedded in a build command, so any drift — the gzip header's
     # compression timestamp (mtime=0 suppresses it), per-entry mtimes/owners
@@ -246,6 +294,15 @@ def _dir_tar_b64(paths: list[Path], arcnames: list[str], max_bytes: int) -> str:
 
 
 def _task_layer_command(task_dir: Path) -> str:
+    # [FUNCTION DOC] HELPER: Builds the shell command that stages one task directory. Runs git
+    # (subprocess, check on failure) in the parent directory of the task dir to get the current
+    # commit hash and the url of the origin remote; parses owner and repository name from a GitHub
+    # url (raises a value error if it is not a GitHub remote), forms the archive url of that commit,
+    # and returns a command that creates /opt/tb2-tasks, streams the archive through tar,
+    # stripping the top-level directory and extracting only this task's directory while excluding
+    # its solution subdirectory.
+    # KNOWN ISSUE: the repository-name pattern stops at the first dot, so a repository whose name
+    # contains a dot would be truncated and give a wrong archive url.
     """Build command that stages the task dir at /opt/tb2-tasks/<id>.
 
     One uniform path for every task: download the checkout's pinned-commit
@@ -288,6 +345,9 @@ def _task_layer_command(task_dir: Path) -> str:
 
 
 def _env_src_dir() -> Path:
+    # [FUNCTION DOC] HELPER: Imports the env package on demand and returns the directory holding
+    # it; raises a runtime error if that directory has no project file (not an editable/checkout
+    # install); import errors propagate if the package is missing.
     """Directory of the installed tbench2_env package source.
 
     The build embeds the package source into the image (_env_src_tar_b64),
@@ -312,6 +372,10 @@ def _env_src_dir() -> Path:
 
 
 def _env_src_tar_b64() -> str:
+    # [FUNCTION DOC] HELPER: Packs the existing items among the fixed list of env package files
+    # (project file, readme, yaml descriptor, init, client, models, server directory) from the env
+    # source directory under a "tbench2_env_src/" archive prefix, via the deterministic tar helper
+    # with the 45000-byte cap, and returns the base64 text. Missing items are skipped silently.
     src_dir = _env_src_dir()
     paths, arcnames = [], []
     for item in _ENV_SRC_ITEMS:
@@ -323,6 +387,9 @@ def _env_src_tar_b64() -> str:
 
 
 def resolve_docker_image(task_dir: Path, docker_image: str | None) -> str:
+    # [FUNCTION DOC] Returns the explicit image if truthy; otherwise the docker image named in the
+    # environment section of the task config. Raises a value error if the config names none (and a
+    # file-not-found error if the config is missing).
     if docker_image:
         return docker_image
     docker_image = read_task_config(task_dir).get("environment", {}).get("docker_image")
@@ -332,6 +399,13 @@ def resolve_docker_image(task_dir: Path, docker_image: str | None) -> str:
 
 
 def server_layer_commands(task_dir: Path) -> list[str]:
+    # [FUNCTION DOC] Returns the ordered list of six shell build commands: (1) update apt and
+    # install curl, certificates and bash without recommended packages, leaving apt lists in place;
+    # (2) install uv into /opt/uv without modifying PATH; (3) create a Python 3.12 venv at
+    # /opt/envserver; (4) unpack the embedded env package source (base64 tarball computed now) into
+    # /opt/src; (5) install that package plus uvicorn, gradio and mcp below version 2 into the venv;
+    # (6) the task staging command. Computing it may run git and read the installed env package,
+    # so it can raise the errors of those helpers.
     """The recipe itself: shell commands that turn the OFFICIAL task image
     into a combined task+env-server image. Nothing here is provider-specific —
     the same layers work for docker build, Daytona, Modal, ACA, etc.
@@ -373,6 +447,10 @@ def server_layer_commands(task_dir: Path) -> list[str]:
 
 
 def wait_server_ready(base_url: str, timeout_s: float = 300.0) -> None:
+    # [FUNCTION DOC] Polls the health endpoint under the base url (5 s per request, 2 s pause
+    # between attempts) until it returns status 200, then returns. Request errors are remembered
+    # and retried. After the timeout (default 300 s) raises a timeout error mentioning the url,
+    # the timeout and the last request error. Imports the requests library lazily.
     # In-function, deliberately: requests is not a hard dependency of this
     # module -- the offline tests import it with requests absent -- and only a
     # caller that actually waits on a live server needs it.

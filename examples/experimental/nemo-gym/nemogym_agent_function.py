@@ -1,3 +1,10 @@
+# [MODULE DOC] Agent function adapter that delegates one rollout to a NeMo Gym agent server. It
+# builds the run request (instance fields from sample metadata at top level, sampling params
+# translated to the Responses-style names, and the Miles session URL as the policy endpoint),
+# posts it with limited retry on transport errors, and returns the reward and evaluation report to
+# be merged into sample metadata. Reads the environment variables NEMO_GYM_URL and
+# NEMO_GYM_RUN_TIMEOUT at call time. Intentionally imports nothing heavy from Miles apart from the
+# session URL helper.
 """NeMo Gym <-> miles adapter (agent function).
 
 Targets upstream NVIDIA-NeMo/Gym's sandbox-backed ``mini_swe_agent_2`` agent,
@@ -48,6 +55,11 @@ _POST_BACKOFF_S = (1.0, 5.0)
 
 
 async def post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Posts the payload as JSON with no client timeout and returns the
+    # decoded JSON response. Makes up to three attempts (module constant); only transport-level
+    # errors (connection failures, not HTTP error statuses) are retried, sleeping a random time
+    # between 1 and 5 seconds before the next attempt; the final transport error is re-raised.
+    # HTTP error statuses raise immediately via the status check and are not retried.
     """POST JSON and return the JSON response, retrying transport errors.
 
     No HTTP timeout here: the caller bounds the whole episode with
@@ -66,6 +78,9 @@ async def post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_responses_create_params(request_kwargs: dict[str, Any]) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Builds the Responses-style parameter object. Starts with an empty
+    # input list; copies temperature and top_p when present and not none; copies max_tokens under
+    # the name max_output_tokens when present and not none. Pure; returns a new dict.
     """Map miles' chat-completions sampling kwargs onto NeMo Gym's Responses-API params.
 
     mini_swe_agent_2 reads sampling settings exclusively from
@@ -88,6 +103,15 @@ async def run(
     metadata: dict[str, Any] | None = None,
     **kwargs,
 ) -> dict[str, Any] | None:
+    # [FUNCTION DOC] Agent entry point for one sample. Missing metadata and request kwargs are
+    # treated as empty. Reads NEMO_GYM_URL (default http://localhost:12000) and NEMO_GYM_RUN_TIMEOUT
+    # (seconds, default 3600). Builds the request as the metadata fields spread at the top level,
+    # plus the sampling params and the policy base url set to the Miles session URL derived from
+    # base_url. Posts to the server's run endpoint bounded by the timeout. On timeout, cancellation
+    # or any other exception it logs and returns none (cancellation is swallowed, not re-raised).
+    # On success returns a dict with the reward (default 0.0) and the eval report taken from the
+    # response metadata (empty when missing or null). The prompt and extra keyword arguments are
+    # unused: the task text is carried by the metadata instance.
     """Run one task instance via the NeMo Gym mini_swe_agent_2 server.
 
     Returns the reward dict to merge into sample metadata, or None on a

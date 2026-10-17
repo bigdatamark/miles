@@ -1,3 +1,14 @@
+# [MODULE DOC] E2B-specific part of the sandbox recipe (works with E2B Cloud and any server
+# speaking the E2B API). Provides: a deterministic template alias derived from the task id and a
+# digest of the build inputs; build resources from the task config; connection options carrying
+# only the resolved api key; template building under a per-alias rollout lock with a wall-clock
+# deadline; the externally reachable env server url (scheme from OPENENV_E2B_URL_SCHEME, default
+# https, host from the sandbox for port 8000); a keepalive that re-arms the sandbox lifetime;
+# the per-episode create (warm start from the template, background server start as root, readiness
+# wait, keepalive start, kill on failure); a kill helper; api key resolution; and a bake command
+# line tool that pre-builds templates. Module settings read once at import: sandbox lifetime
+# OPENENV_E2B_SANDBOX_TTL_S (default 1800 s) and ready timeout OPENENV_E2B_READY_TIMEOUT_S
+# (default 300 s); the keepalive interval is one sixth of the lifetime.
 """E2B materialization of the per-task Terminal-Bench-2 sandbox recipe.
 
 The recipe itself — the shell layers that turn a task's official image into a
@@ -70,6 +81,12 @@ _BUILD_USER = "root"
 
 
 def template_alias(task_dir: Path) -> str:
+    # [FUNCTION DOC] Computes the template alias "tb2-<slug>-<digest>". The slug is the lowercased
+    # task directory name with every character outside lowercase letters, digits and hyphen replaced
+    # by a hyphen. The digest is the first 10 hex characters of a SHA-256 over the newline-joined
+    # list: base docker image, build user, every server layer command, and the textual form of the
+    # sorted build-resource items. Reads the task config and runs the recipe functions (which may
+    # call git, read the installed env package, and raise on missing config).
     """Deterministic template alias: ``tb2-<task-id>-<recipe digest>``.
 
     The digest covers the base image, the build user, every build command (which
@@ -89,6 +106,8 @@ def template_alias(task_dir: Path) -> str:
 
 
 def task_build_resources(task_dir: Path) -> dict[str, int]:
+    # [FUNCTION DOC] Returns a mapping with cpu_count and memory_mb taken from the recipe's floored
+    # task resources (storage is dropped because E2B does not take it).
     """Template build resources from ``task.toml [environment]``.
 
     E2B sizes sandboxes at template-build time (warm starts inherit the
@@ -99,6 +118,8 @@ def task_build_resources(task_dir: Path) -> dict[str, int]:
 
 
 def _connection_opts() -> dict:
+    # [FUNCTION DOC] HELPER: Returns a mapping with only the api key (resolved afresh on every
+    # call) to pass as keyword arguments to SDK calls.
     """Per-call connection kwargs. Only the key is passed explicitly (for the
     file indirection); endpoint overrides (E2B_API_URL, E2B_SANDBOX_URL,
     E2B_DOMAIN — e.g. a self-hosted AgentENV) are read from the environment
@@ -113,6 +134,15 @@ def ensure_task_template(
     build_timeout_s: float = 1800.0,
     on_logs=None,
 ) -> str:
+    # [FUNCTION DOC] Ensures a template exists for the task and returns its alias. Inputs: task
+    # dir, force (rebuild even if present and skip the build cache), build timeout (default 1800
+    # s) and an optional callback receiving build log entries. Steps under a rollout-wide lock
+    # named after the alias (so concurrent episodes of one task build once): unless forced, return
+    # immediately if the alias already exists on the provider; otherwise define the template from
+    # the base image, set the build user to root, add one run step per recipe layer command, and
+    # build it (with the task's cpu and memory) on a scoped thread bounded by the timeout; a
+    # timeout raises the standard timeout error while the provider-side build may continue.
+    # Imports the SDK lazily (import error if missing). Network side effects.
     """Build the per-task template if its alias doesn't exist yet; return the alias.
 
     *build_timeout_s* bounds the build's wall clock. ``Template.build`` blocks
@@ -144,6 +174,8 @@ def ensure_task_template(
             template = template.run_cmd(command)
 
         def _build() -> None:
+            # [FUNCTION DOC] HELPER: Calls the SDK template build with the alias, the build
+            # resources, the force flag as skip-cache, the log callback and connection options.
             Template.build(
                 template,
                 alias,
@@ -158,6 +190,8 @@ def ensure_task_template(
 
 
 def base_url(sandbox) -> str:
+    # [FUNCTION DOC] Returns the scheme (OPENENV_E2B_URL_SCHEME read at call time, default https),
+    # then "://", then the sandbox's per-port hostname for port 8000.
     """The env server's externally reachable URL on port 8000.
 
     ``get_host`` yields a per-port hostname routed by the provider's gateway
@@ -183,6 +217,9 @@ _KEEPALIVE_MAX_CONSECUTIVE_FAILURES = 3
 
 
 def _start_keepalive(sandbox, task_id: str) -> None:
+    # [FUNCTION DOC] HELPER: Captures the connection options once, then starts the recipe's
+    # background heartbeat that sets the sandbox lifetime back to the full time-to-live every
+    # interval (one sixth of it), named after the task, giving up after 3 consecutive failures.
     """Re-arm the sandbox TTL for as long as THIS process lives.
 
     A live episode of any length keeps its sandbox; a hard-killed caller
@@ -205,6 +242,13 @@ def create_task_sandbox(
     command_timeout_s: int = recipe.COMMAND_TIMEOUT_S,
     ready_timeout_s: float = _READY_TIMEOUT_S,
 ):
+    # [FUNCTION DOC] Blocking create of one episode sandbox; returns the sandbox and its base url.
+    # Ensures the template exists (building it on first use), then creates the sandbox from the
+    # template with the module lifetime and the recipe's ownership labels as metadata. In a
+    # protected block: starts the env server in the background as root through a shell with output
+    # to a log file, computes the base url, waits for the health check within the ready timeout and
+    # starts the keepalive. On any failure after creation tries to kill the sandbox (ignoring kill
+    # errors) and re-raises the original error. The caller must kill the sandbox afterwards.
     """Create ONE per-episode sandbox for *task_dir* from its template.
 
     Returns ``(sandbox, base_url)``. Caller must ``sandbox.kill()`` when the
@@ -253,6 +297,8 @@ def create_task_sandbox(
 
 
 def kill_sandbox(sandbox) -> None:
+    # [FUNCTION DOC] Kills the sandbox, supplying freshly resolved connection options. Errors from
+    # the SDK propagate.
     """Kill a sandbox created here.
 
     The handle does not carry the endpoint and key its create used, so they
@@ -266,6 +312,10 @@ _DEFAULT_API_KEY_FILE = "~/.config/e2b/api_key"
 
 
 def resolve_api_key() -> str:
+    # [FUNCTION DOC] HELPER: Returns the E2B api key via the shared credential resolver: the
+    # variable E2B_API_KEY if set, else the contents of the file named by E2B_API_KEY_FILE, else the
+    # default key file under the user's config directory. Failure behavior is defined by the
+    # resolver.
     """The E2B API key: E2B_API_KEY, else the key file (see
     recipe.resolve_provider_api_key for the file-indirection rationale). AgentENV does
     not enforce keys today, but recent SDKs validate the format client-side —
@@ -274,6 +324,9 @@ def resolve_api_key() -> str:
 
 
 def bake(tasks_dir: Path, task_id: str, force: bool) -> None:
+    # [FUNCTION DOC] Pre-builds the template for one task directory (tasks_dir joined with task_id).
+    # Prints the alias with the cpu and memory sizing, builds (or reuses, unless forced) the
+    # template streaming each build log entry to standard output, then prints a done line.
     """Pre-build the template for one task (optional warm cache)."""
     task_dir = tasks_dir / task_id
     alias = template_alias(task_dir)
@@ -288,6 +341,10 @@ def bake(tasks_dir: Path, task_id: str, force: bool) -> None:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Bake command-line entry point. Adds the shared task-selection options
+    # (tasks dir plus either an explicit task list or all tasks) and a force flag, resolves the
+    # selected task ids, and bakes each in order. Returns nothing (the script passes the result to
+    # the process exit, so exit code 0).
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     recipe.add_task_selection_args(ap)
     ap.add_argument("--force", action="store_true", help="rebuild even when the alias exists")

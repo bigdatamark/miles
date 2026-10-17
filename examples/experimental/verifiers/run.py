@@ -1,3 +1,10 @@
+# [MODULE DOC] Self-executing smoke-scale launcher that trains Qwen3-0.6B with GRPO on a Verifiers
+# taskset (default code-golf-v1) on two colocated GPUs. Miles loads no prompt data; instead the
+# rollout function (the adapter module in this directory, class based or legacy function based
+# depending on the environment variable MILES_USE_LEGACY_ROLLOUT_V1) pulls tasks from Verifiers
+# using a config file named by the VERIFIERS_CONFIG variable passed to the job. Steps in main:
+# optionally download and convert the checkpoint (prepare), then build the argument string and
+# submit (execute).
 """Verifiers launcher (Qwen3-0.6B on code-golf-v1): Miles <-> Verifiers V1.
 
 Defaults reproduce the two-GPU smoke configuration: 3 GRPO steps against the
@@ -28,6 +35,14 @@ LEGACY_ROLLOUT_ENV = "MILES_USE_LEGACY_ROLLOUT_V1"
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC] Launcher configuration (extends the shared train config). Fields: model type
+    # qwen3-0.6B, 2 GPUs per node, megatron path; skip-prepare flag; model name, local HF
+    # checkpoint path, a tokenizer id (kept as the registered hub id because the renderer registry
+    # resolves renderers from the model identity, which a local path lacks), reference load path
+    # and save dir; the Verifiers environment config file path and taskset id (the file is written
+    # with the taskset id if missing); smoke-scale training settings (response length 512, context
+    # length 2048, 3 rollouts, rollout batch 3, 4 samples per prompt, global batch 12); and
+    # evaluation (interval in rollouts, zero disables; 2 samples per eval prompt).
     megatron_model_type: str = "qwen3-0.6B"
     num_gpus_per_node: int = 2
     megatron_path: str = "/root/Megatron-LM"
@@ -61,6 +76,11 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
 
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Downloads the Qwen model of the configured model name from the hub into the HF
+    # checkpoint path (CPU command, network) and converts it to the Megatron distributed format in
+    # the checkpoint's parent directory. Side effects: downloads and conversion commands.
+    # KNOWN ISSUE: the download repository id is hard-coded to the Qwen organization, so a
+    # different model name from another organization would not resolve.
     U = args.create_backend()
     U.exec_command_cpu(f"hf download Qwen/{args.model_name} --local-dir {args.hf_checkpoint}")
     U.convert_checkpoint(
@@ -74,6 +94,24 @@ def prepare(args: ScriptArgs):
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Builds the argument string and submits the job. First ensures the Verifiers
+    # config file exists, writing a minimal one naming the taskset id if it does not (disk side
+    # effect). Runtime environment: python path of megatron, this directory and the repo base;
+    # the config path variable; the legacy rollout switch passed through if set in the launching
+    # environment; then resolved by the shared environment helper. Checkpoint flags: HF checkpoint,
+    # tokenizer path, reference load, save path, save interval 1000. Rollout flags: the rollout
+    # function path (legacy function if the switch's value parses to a nonzero integer, else the
+    # class), global dataset disabled, rollout counts and batch sizes, over-sampling batch size
+    # equal to the rollout batch size, response and context limits, temperature 0.8 fixed, one GPU
+    # per engine. Eval flags only when an interval is set (interval, samples per eval prompt, and
+    # a placeholder named eval dataset pointing at the config file, as a workaround for Miles
+    # requiring an eval dataset whenever an interval is set). GRPO flags (global batch size, data
+    # balancing, zero entropy coefficient, clip 0.2/0.28; no KL loss), Adam optimizer flags
+    # (1e-6 constant, weight decay 0.1, betas 0.9/0.98), performance flags (all parallel sizes 1,
+    # dynamic batch size with 4096 tokens per GPU, no gradient accumulation fusion), SGLang flags
+    # (memory fraction 0.6, metrics enabled) and misc flags (flash attention, colocated, one actor
+    # node with the configured GPUs). Submits through the backend's execute-train.
+    # KNOWN ISSUE: a non-integer value of the legacy switch raises a value error when parsed.
     U = args.create_backend()
     config_path = Path(args.verifiers_config)
     if not config_path.exists():
@@ -180,6 +218,8 @@ def execute(args: ScriptArgs):
 
 @command_utils.dataclass_cli
 def main(args: ScriptArgs):
+    # [FUNCTION DOC] Entry point (command line generated from the config dataclass): runs prepare
+    # unless skip_prepare is set, then execute.
     if not args.skip_prepare:
         prepare(args)
     execute(args)

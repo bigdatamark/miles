@@ -1,3 +1,9 @@
+# [MODULE DOC] E2B provider module for per-episode sandboxes (also serves E2B-compatible
+# self-hosted AgentENV). Supplies the E2B-specific pieces to the shared sandbox backend: throttle
+# classification (SDK rate-limit type, shared phrases, and extra phrases from the environment
+# variable OPENENV_E2B_THROTTLE_PATTERNS), a start hook that creates a sandbox for a task and a
+# close function that kills it, and the create knobs with the E2B prefix. Exposes the backend
+# object, the direct-drive episode function and the Miles run entry point.
 """E2B-sandbox variant of the OpenEnv tbench2 agent function.
 
 A drop-in alternative to ``openenv_agent_function.run`` for
@@ -61,6 +67,9 @@ logger = logging.getLogger(__name__)
 # shared backend caps in-flight creates per rollout and retries throttled ones
 # with jittered exponential backoff (knobs: OPENENV_E2B_CREATE_*).
 def _is_throttle_error(exc: BaseException) -> bool:
+    # [FUNCTION DOC] HELPER: True if the error is the E2B SDK's rate-limit exception type (imported
+    # lazily; a missing SDK is tolerated) or its message matches the shared throttle phrases or any
+    # comma-separated phrase listed in OPENENV_E2B_THROTTLE_PATTERNS (read at call time).
     """True when a sandbox create failed only because the provider throttled it.
 
     The SDK types HTTP 429 as RateLimitException; the text match covers
@@ -82,6 +91,9 @@ def _is_throttle_error(exc: BaseException) -> bool:
 
 
 def _start_sandbox(task_id: str, tasks_dir: str) -> tuple[Any, str]:
+    # [FUNCTION DOC] HELPER: Blocking start hook: creates the E2B sandbox for the task directory
+    # (tasks_dir joined with task_id) and returns a zero-argument function that kills it, plus the
+    # env server base url. Runs in a worker thread.
     sandbox, url = tb2_sandbox_e2b.create_task_sandbox(Path(tasks_dir) / task_id)
     return (lambda: tb2_sandbox_e2b.kill_sandbox(sandbox)), url
 

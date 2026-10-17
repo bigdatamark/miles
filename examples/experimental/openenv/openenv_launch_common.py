@@ -1,3 +1,8 @@
+# [MODULE DOC] HELPER module: model-agnostic building blocks for the OpenEnv tbench2 launchers.
+# Each function returns a fragment of the training argument string (rollout, GRPO, optimizer,
+# agent wiring, W&B, Prometheus) or environment-variable mapping for the ray runtime env, plus a
+# process cleanup routine and the sandbox backend resolver. A protocol class documents which
+# configuration fields the helpers read from a launcher's config object.
 """Shared launch helpers for the OpenEnv tbench2 learning launchers.
 
 ``run-openenv-tbench2.py`` (GLM-4.7-Flash) is the launcher in this example;
@@ -20,6 +25,12 @@ from miles.rollout.agentic.credentials import PROVIDER_CREDENTIALS, provision_pr
 
 
 class LaunchArgs(Protocol):
+    # [CLASS DOC] HELPER: Structural type listing the config attributes the helpers read: data and
+    # batch sizes (prompt data, rollout batch, samples per prompt, max sequence length, global
+    # batch), OpenEnv settings (env url, agent model name, turn cap, rollout time cap, task dir,
+    # sandbox backend, credential-file paths for Daytona, E2B and Modal, session server external
+    # host, host ip), W&B settings (key, project, team, run name) and Prometheus settings (enable
+    # flag, port, run name). No behavior.
     """The config fields the shared helpers read (satisfied by each launcher's ScriptArgs)."""
 
     prompt_data: str
@@ -51,6 +62,10 @@ class LaunchArgs(Protocol):
 
 
 def cleanup() -> None:
+    # [FUNCTION DOC] HELPER: Prints start and end messages and, for each of the patterns sglang,
+    # train.py and MegatronTrain, runs a shell pipeline that lists matching process ids, excludes
+    # this process and its parent, and kills the rest (errors ignored). Sleeps 5 seconds at the
+    # end. Side effects: terminates other processes on the host.
     """Kill old Ray jobs and stale processes to free GPU resources."""
     my_pid = os.getpid()
     ppid = os.getppid()
@@ -67,6 +82,11 @@ def cleanup() -> None:
 
 
 def rollout_args(args: LaunchArgs) -> str:
+    # [FUNCTION DOC] HELPER: Returns the rollout flags: prompt data from the config with input key
+    # prompt and metadata key metadata, shuffle, 40 rollouts, rollout batch and samples per prompt
+    # and max sequence length and global batch size from the config, temperature 0.8, response
+    # length limit 8192, data balancing. The rollout count, temperature and response limit are
+    # fixed, not configurable.
     return (
         f"--prompt-data {args.prompt_data} "
         "--input-key prompt "
@@ -84,6 +104,9 @@ def rollout_args(args: LaunchArgs) -> str:
 
 
 def grpo_args() -> str:
+    # [FUNCTION DOC] HELPER: Returns fixed GRPO flags: GRPO advantage estimator, KL loss with
+    # coefficient 0.01 and low-variance type, zero entropy coefficient, clip range 0.2 low and 0.28
+    # high.
     return (
         "--advantage-estimator grpo "
         "--use-kl-loss "
@@ -96,6 +119,8 @@ def grpo_args() -> str:
 
 
 def optimizer_args() -> str:
+    # [FUNCTION DOC] HELPER: Returns fixed optimizer flags: Adam, learning rate 1e-6 with constant
+    # schedule, weight decay 0.1, betas 0.9 and 0.98.
     return (
         "--optimizer adam "
         "--lr 1e-6 "
@@ -107,6 +132,12 @@ def optimizer_args() -> str:
 
 
 def resolve_sandbox_backend(args: LaunchArgs) -> str:
+    # [FUNCTION DOC] HELPER: Returns the canonical sandbox backend name, or an empty string when
+    # the shared env server mode is in effect. Reads the backend name (trimmed; missing attribute
+    # treated as empty) and the task directory from the config. Both empty -> empty result. Task
+    # directory missing but backend named -> value error; backend missing but task directory given
+    # -> value error; otherwise the name is normalized and validated by the common registry (which
+    # raises a value error for unknown names).
     """The per-episode sandbox backend in effect, or "" for the shared env server.
 
     Names and aliases resolve through openenv_sandbox_common, the canonical
@@ -137,6 +168,11 @@ def resolve_sandbox_backend(args: LaunchArgs) -> str:
 
 
 def agent_args(tito_model: str, sandbox_backend: str = "", session_server_external_host: str = "") -> str:
+    # [FUNCTION DOC] HELPER: Returns the agentic rollout flags: the agentic tool-call generator, the
+    # agent function path (the backend's run function from the registry, falling back to the shared
+    # server run function for an empty or unknown backend), the OpenEnv reward hook, the no-aborted
+    # dynamic sampling filter, the given TITO model, session server enabled on port 30000 with 32
+    # workers, and the external host flag only if a host is given.
     """Agentic-rollout wiring. The TITO surface differs across models; the
     agent function decides where episodes run — per-episode sandboxes on
     whichever backend the launcher resolves (see resolve_sandbox_backend), else
@@ -159,6 +195,9 @@ def agent_args(tito_model: str, sandbox_backend: str = "", session_server_extern
 
 
 def wandb_args(args: LaunchArgs) -> str:
+    # [FUNCTION DOC] HELPER: Returns W&B flags, or an empty string when no key is configured.
+    # Otherwise enables W&B with the configured project, the run name as group, the key (placed in
+    # the command line), and the team only if set.
     if not args.wandb_key:
         return ""
     out = (
@@ -173,6 +212,8 @@ def wandb_args(args: LaunchArgs) -> str:
 
 
 def prometheus_args(args: LaunchArgs) -> str:
+    # [FUNCTION DOC] HELPER: Returns Prometheus flags (enable, port, run name) or an empty string
+    # when disabled in the config.
     if not args.use_prometheus:
         return ""
     return (
@@ -183,6 +224,9 @@ def prometheus_args(args: LaunchArgs) -> str:
 
 
 def base_env_vars(args: LaunchArgs, script_dir: str, megatron_path: str, miles_root: str) -> dict[str, str]:
+    # [FUNCTION DOC] HELPER: Returns the base runtime environment mapping: python path joining
+    # megatron path, script dir and miles root with colons (in that order), plus the env server url,
+    # turn cap and rollout time cap (as text) and agent model name from the config.
     return {
         "PYTHONPATH": f"{megatron_path}:{script_dir}:{miles_root}",
         "OPENENV_ENV_URL": args.openenv_env_url,
@@ -193,6 +237,15 @@ def base_env_vars(args: LaunchArgs, script_dir: str, megatron_path: str, miles_r
 
 
 def apply_optional_env_vars(env: dict[str, str], args: LaunchArgs) -> None:
+    # [FUNCTION DOC] HELPER: Mutates the given environment mapping in place; returns nothing.
+    # Sets the host ip variable when configured. Resolves the sandbox backend; if one is in effect:
+    # looks up its credential spec in the provider table, provisions the provider credentials into
+    # the mapping (passing the configured credential-file path for that provider, or empty), then
+    # preflights the env package: imports it (a missing package raises a runtime error with install
+    # advice), reads the server environment source file next to it, and raises a runtime error
+    # unless that source mentions both the test-withholding setting and the canonical-verdict
+    # requirement (an older install would silently mis-score). Finally sets the task directory
+    # variable from the config. Side effects: imports a package and reads a source file.
     """Add the node-address and sandbox-provider env vars the args ask for."""
     if args.miles_host_ip:
         env["MILES_HOST_IP"] = args.miles_host_ip

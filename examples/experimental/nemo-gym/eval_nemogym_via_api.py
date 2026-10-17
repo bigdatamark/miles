@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Standalone validation scan for the NeMo Gym leg without a trainer. Reads instances
+# from a JSON-lines file, posts each one to the NeMo Gym agent server's run endpoint (with bounded
+# concurrency and a per-request wall-clock timeout), prints one status line per instance, an
+# aggregate summary, and optionally writes per-instance results as JSON lines. In golden mode no
+# policy endpoint is sent and every instance must score exactly 1.0; otherwise a policy base url
+# (and optional api key) is forwarded to the server. The process exit code is 1 only when a golden
+# scan has failures, else 0. Reuses the post helper and the sampling-parameter builder from the
+# agent function module (its directory is put on the import path).
 """Validate the NeMo Gym leg without a GPU trainer (golden / API-policy scan).
 
 Drives a running mini_swe_agent_2 server through the same ``/run`` contract
@@ -37,6 +45,10 @@ from nemogym_agent_function import build_responses_create_params, post_json  # n
 
 
 def _load_instances(path: str, limit: int | None) -> list[dict]:
+    # [FUNCTION DOC] HELPER: Reads up to limit rows (all if limit is none) from a JSON-lines file.
+    # Each row's instance is its metadata object when present, else the row itself (raw instance);
+    # the keys subset and split are defaulted to "gym" and "train" when absent. Returns the list of
+    # instance dicts (the parsed row objects are mutated in place by the defaulting).
     instances = []
     with open(path) as f:
         for line in f:
@@ -51,6 +63,15 @@ def _load_instances(path: str, limit: int | None) -> list[dict]:
 
 
 async def _run_one(args, instance: dict) -> dict:
+    # [FUNCTION DOC] HELPER: Runs one instance against the server and returns a result dict with
+    # instance_id, reward, error and eval_report. Builds the request body from the instance fields
+    # plus sampling params (temperature, top_p, max_tokens from args); unless golden mode, adds the
+    # policy base url and, if set, the policy api key. Posts to the server's run endpoint with the
+    # overall timeout from args. On success: reward is the response's reward (default 0.0 as a
+    # float), eval_report is the response metadata (or empty), error is the report's error entry.
+    # Any exception (including timeout) is captured: reward 0.0, empty report, error is the text of
+    # the exception. Prints a status line "OK" when there is no error and (not golden or reward is
+    # exactly 1.0), else "FAIL", with reward and elapsed seconds. Never raises.
     request = {
         **instance,
         "responses_create_params": build_responses_create_params(
@@ -79,12 +100,19 @@ async def _run_one(args, instance: dict) -> dict:
 
 
 async def _main(args) -> int:
+    # [FUNCTION DOC] HELPER: Loads the instances, runs them concurrently (at most args.concurrency
+    # at a time using a semaphore), preserves input order in the results, optionally writes the
+    # result dicts to args.output as JSON lines, and prints the mean reward (guarding division by
+    # zero) with the count of failures. A failure is a result with an error, or in golden mode a
+    # reward different from 1.0. Returns 1 if golden mode has failures (after printing a message),
+    # else 0.
     instances = _load_instances(args.input, args.limit)
     print(f"{'golden' if args.golden else 'api-policy'} scan: {len(instances)} instance(s) via {args.nemo_gym_url}")
 
     sem = asyncio.Semaphore(args.concurrency)
 
     async def bounded(instance):
+        # [FUNCTION DOC] HELPER: Runs a single instance while holding the concurrency semaphore.
         async with sem:
             return await _run_one(args, instance)
 
@@ -105,6 +133,12 @@ async def _main(args) -> int:
 
 
 def main():
+    # [FUNCTION DOC] Script entry point. Defines options: input (required), nemo-gym-url (default
+    # from environment variable NEMO_GYM_URL, else http://localhost:12000), golden flag, policy
+    # base url, policy api key (default from DEEPSEEK_API_KEY, else OPENAI_API_KEY), limit,
+    # concurrency (2), temperature (0.6), top-p (0.95), max-tokens (8192), timeout in seconds
+    # (default from NEMO_GYM_RUN_TIMEOUT, else 3600) and an output path. Exits with a usage error
+    # unless golden or a policy base url is given. Runs the async scan and exits with its code.
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--input", required=True, help="miles prompt data or raw SWE-bench jsonl")
     parser.add_argument("--nemo-gym-url", default=os.getenv("NEMO_GYM_URL", "http://localhost:12000"))

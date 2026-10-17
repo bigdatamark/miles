@@ -1,3 +1,11 @@
+# [MODULE DOC] Provider-independent orchestration of per-episode sandboxes for the OpenEnv
+# tbench2 agent functions. Contains: the backend registry (names mapped to the provider agent
+# modules and their run entry points, with the alias agentenv for e2b) and its lookup/validation
+# helpers; a cancellation-safe single sandbox create that reaps orphans; text-based throttle
+# detection; throttle knob reading (create concurrency and max retries from environment variables
+# with a provider prefix); and the backend dataclass that throttles creates with a per-rollout
+# semaphore, retries with jittered exponential backoff, provides an episode env context manager,
+# and exposes the direct-drive episode function and the Miles run entry point.
 """Shared per-episode sandbox orchestration for the backend agent functions.
 
 A backend module (``openenv_daytona_agent_function``,
@@ -58,11 +66,17 @@ _ALIASES = {"agentenv": "e2b"}
 
 
 def backend_names() -> str:
+    # [FUNCTION DOC] HELPER: Returns the registered backend names plus aliases, sorted
+    # alphabetically and joined with a comma and space, for help and error texts.
     """The accepted names, for help text that must not drift from the registry."""
     return ", ".join(sorted([*AGENT_FUNCTIONS, *_ALIASES]))
 
 
 def resolve_backend(name: str | None) -> str:
+    # [FUNCTION DOC] Normalizes a backend name: trims and lowercases it (none is treated as empty),
+    # raises a value error listing the allowed names if empty (there is intentionally no default),
+    # maps an alias to its target, and raises a value error if the result is not a registered
+    # backend (the message shows the original name). Returns the canonical backend name.
     """Normalize a backend name; reject unknown and missing ones alike.
 
     There is deliberately no default. Which provider runs decides whose quota
@@ -80,6 +94,9 @@ def resolve_backend(name: str | None) -> str:
 
 
 def load_backend(name: str | None) -> "SandboxBackend":
+    # [FUNCTION DOC] Resolves the name (may raise a value error) and imports the provider agent
+    # module registered for it on demand, returning that module's backend object. Side effect:
+    # imports the provider module and so its SDK-dependent code.
     """The SandboxBackend named by *name*, imported on demand.
 
     The sibling tools (scan_golden, eval_tbench2_via_api) drive one backend
@@ -91,11 +108,20 @@ def load_backend(name: str | None) -> "SandboxBackend":
 
 
 async def create_once(start_fn: StartFn, task_id: str, tasks_dir: str, *, logger: logging.Logger) -> tuple[Any, str]:
+    # [FUNCTION DOC] Runs the blocking start hook in a worker thread and returns its pair of close
+    # function and base url. The result is also recorded thread-side with a done event that is set
+    # whether the hook succeeds or fails. If the awaiting coroutine is cancelled (the worker thread
+    # cannot be cancelled), a non-daemon reaper thread named after the task is started that waits
+    # for the worker to finish and then closes every recorded sandbox, logging success or a warning
+    # on close failure; the cancellation is then re-raised. Errors from the hook propagate to the
+    # caller unchanged (nothing is recorded then).
     """One sandbox-create attempt, safe against cancellation mid-create."""
     result: list[tuple[Any, str]] = []
     done = threading.Event()
 
     def _start() -> tuple[Any, str]:
+        # [FUNCTION DOC] HELPER: Worker-thread body: calls the start hook, appends its result to the
+        # shared record, always sets the done event, and returns the recorded pair.
         try:
             result.append(start_fn(task_id, tasks_dir))
         finally:
@@ -107,6 +133,9 @@ async def create_once(start_fn: StartFn, task_id: str, tasks_dir: str, *, logger
     except asyncio.CancelledError:
 
         def _reap() -> None:
+            # [FUNCTION DOC] HELPER: Reaper thread body: waits for the create to finish, then
+            # closes any sandbox it produced, logging an info line on success or a warning when
+            # the close raises.
             done.wait()
             for close_fn, _url in result:
                 try:
@@ -121,6 +150,9 @@ async def create_once(start_fn: StartFn, task_id: str, tasks_dir: str, *, logger
 
 
 def _agent_function():
+    # [FUNCTION DOC] HELPER: Imports the agent function module on first use and returns the module
+    # object, so that callers needing only the registry do not require the agent loop's
+    # dependencies.
     """``openenv_agent_function``, imported on use rather than at module scope.
 
     The one lazy import in this module, and the reason is the module's other
@@ -141,6 +173,11 @@ _THROTTLE_TEXT = ("too many requests", "429", "rate limit")
 
 
 def throttle_text(exc: BaseException, *extra_patterns: str, patterns_env_var: str | None = None) -> bool:
+    # [FUNCTION DOC] Returns true if the lowercased message of the error contains any shared
+    # throttle phrase (too many requests, 429, rate limit) or any extra pattern (lowercased). If
+    # not and an environment variable name is given, reads that variable at call time, splits it on
+    # commas, trims and lowercases the chunks, ignores empty ones, and returns true if any chunk is
+    # contained in the message. Otherwise false. Matching is plain substring containment.
     """True when *exc*'s message reads like throttling or exhausted capacity.
 
     The typed-exception half of the decision stays in the backend (only it knows
@@ -174,6 +211,11 @@ _KNOB_DEFAULTS = {
 
 
 def backend_knobs(env_prefix: str) -> dict[str, Any]:
+    # [FUNCTION DOC] Reads the create-throttling settings for a provider prefix from the
+    # environment variables named OPENENV_<prefix>_CREATE_CONCURRENCY and
+    # OPENENV_<prefix>_CREATE_MAX_RETRIES (defaults 4 and 8; values converted to integers; an
+    # invalid number raises a value error). Returns a mapping from the backend field names
+    # (create concurrency, max retries) to those values, for use as constructor keywords.
     """The create-throttling knobs for a backend, read from OPENENV_<PREFIX>_*.
 
     Read once, at the importing module's import time: a rollout worker is a
@@ -188,6 +230,11 @@ def backend_knobs(env_prefix: str) -> dict[str, Any]:
 
 @dataclass
 class SandboxBackend:
+    # [CLASS DOC] Dataclass holding one provider's configuration and implementing the shared
+    # per-episode sandbox flow. Fields: provider display name (also used in the semaphore name and
+    # log text); start_sandbox hook; is_throttle classifier; logger; create_concurrency (default 4,
+    # max in-flight creates per rollout); max_retries (default 8, retries of throttled creates);
+    # backoff_base_s (2.0) and backoff_cap_s (30.0) shaping the retry delay.
     """The provider-blind half of a per-episode sandbox agent function.
 
     Every backend is the same rollout-facing object — throttled cancel-safe
@@ -213,6 +260,14 @@ class SandboxBackend:
     backoff_cap_s: float = BACKOFF_CAP_S
 
     async def start_task_sandbox(self, task_id: str) -> tuple[Any, str]:
+        # [FUNCTION DOC] Creates a sandbox for the task and returns the close function and base
+        # url. Reads the task directory from OPENENV_TB2_TASKS_DIR (trimmed, may be empty) at call
+        # time. Loop: acquire the per-rollout create semaphore (named by provider, limited by the
+        # create concurrency) only for the duration of one cancel-safe create attempt. On an
+        # exception: re-raise if it is not classified as throttling or the retry count is already
+        # at max_retries; else increment the attempt, compute a delay equal to the smaller of the
+        # cap and base times two to the (attempt - 1), multiplied by a random factor in [0.5, 1.5),
+        # log a warning, sleep (semaphore released meanwhile) and try again.
         """Create one sandbox for *task_id* with the env server running.
 
         Returns (close_fn, base_url); close_fn releases the sandbox. Creation
@@ -239,6 +294,12 @@ class SandboxBackend:
 
     @asynccontextmanager
     async def episode_env(self, env_cls: Any, metadata: dict[str, Any]):
+        # [FUNCTION DOC] Async context manager for one episode's lifetime. Takes the task id from
+        # metadata ("task_id", falling back to "task_name"); raises a value error if neither is
+        # set. Starts a sandbox, connects an env client to its url (with the message timeout from
+        # the agent function module) and yields the connected client. In all exits (including
+        # errors and cancellation) it closes the sandbox in a worker thread; a failing close is
+        # only logged as a warning.
         """Yield a connected env client on a fresh sandbox; release it after."""
         oaf = _agent_function()
         task_id = metadata.get("task_id") or metadata.get("task_name")
@@ -255,6 +316,8 @@ class SandboxBackend:
                 self.logger.warning(f"Failed to close sandbox for {task_id}: {e}")
 
     async def _run_body(self, env_cls: Any, metadata: dict[str, Any], body: Any) -> Any:
+        # [FUNCTION DOC] HELPER: The env-provisioning strategy passed to the shared agent loop: runs
+        # the body inside this instance's episode env context and returns its result.
         # self.episode_env, not the module function: an instance attribute
         # substituted by a test must win here.
         async with self.episode_env(env_cls, metadata) as env:
@@ -268,6 +331,10 @@ class SandboxBackend:
         request_kwargs: dict[str, Any],
         metadata: dict[str, Any],
     ) -> tuple[float | None, dict[str, Any]]:
+        # [FUNCTION DOC] Direct-drive entry: runs the shared multi-turn loop (loading the env
+        # classes from the agent function module) with this backend's per-episode sandbox strategy
+        # and no post-episode hook, using the caller's policy client. Returns the loop's reward
+        # (none for no verdict) and metrics; timeouts and errors are the caller's concern.
         """One episode in its own sandbox, with the caller's own policy.
         Direct-drive entry, same contract as openenv_agent_function's.
 
@@ -292,6 +359,10 @@ class SandboxBackend:
         metadata: dict[str, Any] | None = None,
         **kwargs,
     ) -> dict[str, Any] | None:
+        # [FUNCTION DOC] Miles agent entry point: delegates to the shared training wrapper (session
+        # url policy client, wall-clock cap, failure semantics) using this backend's episode
+        # function. Returns the result mapping or none to drop the sample. Extra keyword arguments
+        # are ignored.
         """Run one OpenEnv tbench2 episode in its own sandbox (training entry)."""
         oaf = _agent_function()
         return await oaf.run_for_training(base_url, prompt, request_kwargs, metadata, self.run_episode)

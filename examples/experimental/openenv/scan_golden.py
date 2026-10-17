@@ -1,3 +1,14 @@
+# [MODULE DOC] Command-line sweep that validates the sandbox environment and scoring per task by
+# replaying each task's official solution. For every requested task id it opens an episode sandbox
+# on the backend chosen by OPENENV_SANDBOX_BACKEND, resets the env, uploads the task's solution
+# directory (read from the local checkout in OPENENV_TB2_TASKS_DIR) as a chunked base64 tarball
+# through shell commands, runs the solve script with the official oracle conventions, then runs
+# the standard evaluate action and records the verdict. Options: tasks (required, comma
+# separated), concurrency (12), output path, and a flag to capture log tails for tasks not scoring 1.
+# The per-task cap comes from GOLDEN_TASK_CAP_S (default 1800 s). Prints one line per task and a
+# summary; writes JSON lines if requested.
+# Side effect at import time: the backend is resolved immediately and the process exits with an
+# error message if the backend variable is missing or unknown.
 """Golden-patch sweep: for each TB2 task, run the OFFICIAL solution/solve.sh in
 its own per-episode sandbox (OPENENV_SANDBOX_BACKEND selects the provider) and
 score with the standard evaluate action. Expected
@@ -46,6 +57,12 @@ _SOLUTION_CHUNK = 65536
 
 
 def _solution_push_commands(task_id: str) -> list[str]:
+    # [FUNCTION DOC] HELPER: Packs the local solution directory of the task (under
+    # OPENENV_TB2_TASKS_DIR; missing variable raises a key error, missing dir raises on archive) into
+    # a gzip tar with entries relative to the directory root, base64-encodes it and returns the list
+    # of shell commands to run in the sandbox: remove any old staging file, append each 65536-
+    # character chunk of the encoded text to a staging file via a printf, then create the solution
+    # directory, decode, extract into it and remove the staging file.
     """Stage the LOCAL checkout's solution/ into the sandbox at /solution.
 
     The task image withholds verifier assets (solution/ never enters it), so
@@ -65,12 +82,26 @@ def _solution_push_commands(task_id: str) -> list[str]:
 
 
 async def golden_one(task_id: str, capture_logs: bool = False) -> tuple[str, float | None, dict]:
+    # [FUNCTION DOC] Runs the golden replay for one task and never raises. Returns a triple of task
+    # id, reward (none when errored or no canonical verdict) and a metrics mapping. Steps inside
+    # the per-task time cap: open an episode sandbox, reset the env to the task, build the
+    # environment-assignment prefix (noninteractive frontend plus any variables from the solution
+    # section of the task's config file; config read errors are ignored), push the solution, run
+    # the solve script redirecting its output to a log and echoing its exit code, parse the last
+    # exit-code marker line (question mark if absent), then run evaluate. Metrics: solve exit code,
+    # solve seconds, eval seconds (rounded to 0.1), reward (none plus an error text if the reward
+    # is missing, an error was reported, or the harness marker is not the canonical test script),
+    # and total seconds. When log capture is on and the reward is below one or none, adds the last
+    # 800 characters of the evaluate output and the last 1200 bytes of the solve log. A timeout or
+    # exception yields reward none and an error text (exceptions truncated to 180 characters).
     classes = oaf.load_tbench2()
     action = classes["action"]
     t0 = time.monotonic()
     try:
 
         async def run() -> dict:
+            # [FUNCTION DOC] HELPER: The replay body executed under the time cap; returns the
+            # metrics mapping described for the enclosing function.
             async with _backend.episode_env(classes["env"], {"task_id": task_id}) as env:
                 await env.reset(task_id=task_id)
                 t = time.monotonic()
@@ -137,6 +168,12 @@ async def golden_one(task_id: str, capture_logs: bool = False) -> tuple[str, flo
 
 
 async def main() -> None:
+    # [FUNCTION DOC] Script entry point. Exits with a message unless OPENENV_TB2_TASKS_DIR is set
+    # and non-blank. Parses the task list (trimmed, empties dropped), prints a header, runs all
+    # tasks concurrently bounded by a semaphore, printing a line per task (reward or ERR, id,
+    # error text or solve exit code and timings) and, with the log flag, the last 900 characters of
+    # the solve log. Prints the golden pass count over scored tasks (reward at least 1.0) and the
+    # errored count; optionally writes JSON lines of task id, reward and metrics.
     ap = argparse.ArgumentParser()
     ap.add_argument("--tasks", required=True, help="comma-separated task_ids")
     ap.add_argument("--concurrency", type=int, default=12)
@@ -157,6 +194,8 @@ async def main() -> None:
     sem = asyncio.Semaphore(args.concurrency)
 
     async def run(t: str):
+        # [FUNCTION DOC] HELPER: Replays one task under the concurrency semaphore, prints its
+        # result lines and returns the triple of task id, reward and metrics.
         async with sem:
             tid, reward, m = await golden_one(t, capture_logs=args.logs)
             tag = "ERR" if reward is None else f"{reward:.0f}"

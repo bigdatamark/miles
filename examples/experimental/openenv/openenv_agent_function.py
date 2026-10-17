@@ -1,3 +1,14 @@
+# [MODULE DOC] Shared core of the OpenEnv Terminal-Bench-2 agent functions. Provides: the agent
+# system prompt constant (the contract: one shell command per turn in a bash fenced block, or the
+# completion marker to stop); the multi-turn loop (reset the env for a task, alternate policy
+# generation and shell command execution, then run the evaluate action for the verdict); the
+# connection helper for the shared env server with capacity-aware retry; a direct-drive episode
+# function for callers with their own policy client; and a training wrapper that adds the Miles
+# session-server policy client, a wall-clock cap and failure semantics. Sibling provider modules
+# reuse the loop and the wrapper and supply only their own episode function. Module-level
+# constants read the environment variables OPENENV_MESSAGE_TIMEOUT_S and
+# OPENENV_MAX_ROLLOUT_TIME_SECONDS once at import time; OPENENV_MAX_TURNS, OPENENV_ENV_URL and
+# AGENT_MODEL_NAME are read at call time.
 """OpenEnv Terminal-Bench-2 <-> miles adapter.
 
 miles selects the policy and calls ``run`` once per episode via
@@ -112,6 +123,10 @@ _MAX_ROLLOUT_TIME_S = float(os.getenv("OPENENV_MAX_ROLLOUT_TIME_SECONDS", "3600"
 
 
 def _is_retryable_env_error(e: BaseException) -> bool:
+    # [FUNCTION DOC] HELPER: Returns true if the error text contains the capacity-reached marker or
+    # the error's class name is one of the websocket connection-closed names (closed normally,
+    # closed with error, or the generic closed). Matching by class name avoids importing the
+    # websocket library. Otherwise false.
     """True when an env op failed only because no env slot was free (transient).
 
     The docker-mode tbench2 server caps concurrent envs; over that cap it either
@@ -125,6 +140,8 @@ def _is_retryable_env_error(e: BaseException) -> bool:
 
 
 def _extract_messages(prompt: Any) -> list[dict[str, str]]:
+    # [FUNCTION DOC] HELPER: Returns a shallow copy of the prompt when it is a list of messages;
+    # otherwise a one-message list with role user and the prompt converted to text.
     """Accept either a chat-message list or a raw string prompt."""
     if isinstance(prompt, list):
         return list(prompt)
@@ -132,6 +149,10 @@ def _extract_messages(prompt: Any) -> list[dict[str, str]]:
 
 
 def _strip_fence(text: str) -> str:
+    # [FUNCTION DOC] HELPER: Finds the first fenced code block in the text (opening fence with an
+    # optional language of python, py, bash or sh, case-insensitive, non-greedy body up to the next
+    # closing fence) and returns its body trimmed; if there is no complete block returns the whole
+    # text trimmed.
     """Return the contents of a single fenced block, else the stripped text."""
     match = _FENCE_RE.search(text)
     if match:
@@ -140,12 +161,17 @@ def _strip_fence(text: str) -> str:
 
 
 def _obs_field(result: Any, name: str) -> str:
+    # [FUNCTION DOC] HELPER: Reads a named attribute from the result's observation (or from the
+    # result itself when it has no observation), returning its text, or an empty string when the
+    # attribute is missing or falsy.
     """Read an Observation field off a StepResult, tolerating shape differences."""
     obs = getattr(result, "observation", result)
     return str(getattr(obs, name, "") or "")
 
 
 def _obs_info(result: Any) -> dict:
+    # [FUNCTION DOC] HELPER: Returns the info mapping of the result's observation (or of the result
+    # itself), or an empty mapping when absent or falsy.
     """Read the Observation's info dict off a StepResult (empty when absent)."""
     obs = getattr(result, "observation", result)
     return getattr(obs, "info", None) or {}
@@ -153,6 +179,9 @@ def _obs_info(result: Any) -> dict:
 
 # Lazy import so the file loads without the env client present at import time.
 def load_tbench2() -> dict[str, Any]:
+    # [FUNCTION DOC] Imports the tbench2 env client package on demand and returns a mapping with
+    # the env class under "env" and the action class under "action". Raises an import error when
+    # the package is not installed.
     from tbench2_env import Tbench2Action, Tbench2Env
 
     return {"env": Tbench2Env, "action": Tbench2Action}
@@ -181,12 +210,19 @@ _DEFAULT_ENV_URL = "http://localhost:8003"
 
 
 async def _shared_run_body(env_cls: Any, metadata: dict[str, Any], body: Callable[[Any], Any]) -> Any:
+    # [FUNCTION DOC] HELPER: The env-provisioning strategy for the shared server: reads the server
+    # url from OPENENV_ENV_URL (default localhost port 8003) and runs the body against a connection
+    # to it with capacity-aware retry. The metadata argument is unused here.
     """Run *body* against the one shared env server at OPENENV_ENV_URL."""
     env_url = os.getenv("OPENENV_ENV_URL", _DEFAULT_ENV_URL)
     return await _with_env(env_cls, env_url, body)
 
 
 async def _purge_trial_dirs(env: Any, action_cls: Any) -> None:
+    # [FUNCTION DOC] HELPER: Post-episode hook for the shared server. Sends one shell exec action
+    # that deletes every direct child of the server's trial output directory except the repo cache
+    # directory (errors in the shell command are suppressed). Any exception from the step is
+    # swallowed silently. Returns nothing.
     # Shared-server disk hygiene (a Daytona sandbox needs none of
     # this — it is deleted when its episode ends): the tbench2 env server
     # (TB2_OUTPUT_DIR=/tmp/tbench2_env_runs) leaves a per-episode trial dir
@@ -218,6 +254,12 @@ async def _purge_trial_dirs(env: Any, action_cls: Any) -> None:
 
 
 async def _with_env(env_cls: Any, env_url: str, body: Callable[[Any], Any]) -> Any:
+    # [FUNCTION DOC] HELPER: Opens an env client session as an async context (with the module
+    # message timeout) and returns the awaited result of the body. If any exception is retryable
+    # (capacity reached or connection closed) and the retry deadline (1800 s after the first
+    # attempt, measured on the event loop clock) has not passed, sleeps a random 1-5 seconds and
+    # starts over with a new session, so the whole body is re-run from scratch; other errors, or
+    # a retryable one after the deadline, propagate.
     """Open an env session and run ``body(env)``, retrying while a slot is busy."""
     deadline = asyncio.get_event_loop().time() + _CAPACITY_MAX_WAIT_S
     while True:
@@ -242,6 +284,26 @@ async def multi_turn(
     run_body: Callable[..., Any],
     post_episode: Callable[..., Any] | None = None,
 ) -> tuple[float | None, dict[str, Any]]:
+    # [FUNCTION DOC] Runs one episode and returns the reward (none when no canonical verdict) with
+    # an agent-metrics mapping. Inputs: classes (mapping with env and action classes), the async
+    # policy client and model name, the starting messages, extra request body entries for the
+    # policy, metadata (task id from "task_id", falling back to "task_name"), and keyword-only
+    # run_body (provisions an env and runs the inner body on it) and optional post_episode hook.
+    # The turn cap is read from OPENENV_MAX_TURNS (default 30) at call time. The inner body: resets
+    # the env (with the task id if any), appends the env's instruction as a user message when
+    # non-empty, then per turn: calls the policy, appends the assistant message dumped as a full
+    # mapping without null entries (so reasoning content and tool calls are echoed for session
+    # prefix matching); end reason "length" if the finish reason is length; the command is the
+    # fenced content when a fence marker is present else the trimmed reply; empty command ends with
+    # "no_command", a command starting with the completion marker (case-insensitive) ends with
+    # "task_complete"; otherwise executes the command, truncates its output to 4000 characters
+    # (placeholder text if empty) and feeds it back as a user message. Reaching the cap leaves
+    # "max_turns". Afterwards runs the evaluate action; the reward is none (with a warning) if the
+    # raw reward is missing, an error text is set, or the reported harness is not the canonical
+    # test script marker; else the reward as a float. Runs the post-episode hook if given.
+    # Returned metrics: turns, end reason, tool call count, per-turn generation and tool times,
+    # reset time, eval time, total generation time, and total tool time (exec + reset + eval).
+    # Exceptions from the policy or env propagate.
     """Agentic loop: reset(task) -> {policy -> exec -> feed output back} -> evaluate (tbench2).
 
     The policy emits one shell command per turn (a ```bash block or the bare
@@ -258,6 +320,9 @@ async def multi_turn(
     max_turns = int(os.getenv("OPENENV_MAX_TURNS", "30"))
 
     async def body(env: Any) -> tuple[float | None, int, str, list[float], list[float], float, float]:
+        # [FUNCTION DOC] HELPER: The episode body executed against a connected env; see the loop
+        # description above. Returns reward, turns, end reason, generation times, tool times,
+        # reset time and evaluate time (a seven-item tuple).
         # Per-turn wall-clock timings. gen_times[i] is turn i's policy generation
         # latency; tool_times[i] is turn i's env.step(exec) latency. reset_time and
         # eval_time bracket the one-off reset() and the final evaluate() env steps.
@@ -381,6 +446,9 @@ async def run_episode(
     request_kwargs: dict[str, Any],
     metadata: dict[str, Any],
 ) -> tuple[float | None, dict[str, Any]]:
+    # [FUNCTION DOC] Runs the multi-turn loop against the shared env server (provisioned by the
+    # shared strategy, with the trial directory purge as post-episode hook) with the caller's
+    # policy client. Returns the loop result unchanged; no timeout or error handling here.
     """One episode against the shared env server, with the caller's own policy.
 
     The direct-drive entry (see the module docstring): returns the loop's raw
@@ -406,6 +474,15 @@ async def run_for_training(
     metadata: dict[str, Any] | None,
     run_episode_fn: Callable[..., Any],
 ) -> dict[str, Any] | None:
+    # [FUNCTION DOC] Training wrapper used by every provider module. Missing request kwargs and
+    # metadata become empty. Builds an async client pointed at the Miles session url derived from
+    # base_url with a dummy api key, with the model name from AGENT_MODEL_NAME (falling back to
+    # SWE_AGENT_MODEL_NAME, then "model"), and the prompt normalized to a message list. Runs the
+    # provided episode function under the module wall-clock cap. Outcomes: timeout -> logs a
+    # warning and returns reward 0.0 with exit status "timeout", empty eval report and a
+    # timed-out metric; any other exception -> logs an error and returns none; no reward (none) ->
+    # logs and returns none (sample dropped); success -> a mapping with the reward, exit status
+    # "completed", an empty eval report and the agent metrics. The client is always closed.
     """miles-side wrapper around one episode: session-server policy wiring plus
     training failure semantics (timeout -> reward 0, no verdict -> drop sample).
 
@@ -473,5 +550,8 @@ async def run(
     metadata: dict[str, Any] | None = None,
     **kwargs,
 ) -> dict[str, Any] | None:
+    # [FUNCTION DOC] Agent entry point for Miles (selected by the custom agent function path flag):
+    # runs one episode against the shared env server through the training wrapper and returns its
+    # result mapping, or none if the sample should be dropped. Extra keyword arguments are ignored.
     """Run one OpenEnv tbench2 episode via the trained policy (shared env server)."""
     return await run_for_training(base_url, prompt, request_kwargs, metadata, run_episode)

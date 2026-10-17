@@ -1,3 +1,16 @@
+# [MODULE DOC] Rollout adapter that lets Miles train on Verifiers V1 environments. Verifiers runs
+# the grouped episodes and computes rewards; this module supplies (1) a transport that makes the
+# Verifiers/Renderers training client talk to Miles' SGLang router (token-id generate requests
+# with per-token log probabilities, Miles' prompt/response/context limits and stop settings),
+# (2) a train client subclass that turns unsupported request kinds into clear provider errors and
+# keeps local checkpoints usable by restoring a registered renderer identity, (3) conversion of
+# Verifiers traces/branches into Miles samples (tokens, loss mask from the sampled-token mask,
+# log probs, status, metadata), (4) the rollout function class used by the refactored rollout
+# manager (training batches with over-sampling, dynamic filtering and optional Miles reward
+# functions, and evaluation over the whole taskset), and (5) a legacy function entry point wrapping
+# a persistent instance of that class. Verifiers settings come from the TOML file named by the
+# environment variable VERIFIERS_CONFIG. Requires Python 3.11+ and supported verifiers (at least
+# 0.2.0, below 0.2.1) and renderers (at least 0.1.8, below 0.1.11) versions.
 """Verifiers V1 rollout adapter: Verifiers owns grouped episode execution and
 reward computation, Miles owns everything around it.
 
@@ -54,6 +67,11 @@ _CONFIG_ENV_VAR = "VERIFIERS_CONFIG"
 
 
 def _load_config_data(path: str) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Reads a Verifiers config file and returns its parsed contents as a
+    # mapping. Raises a value error if the file suffix (case-insensitive) is not toml; raises the
+    # optional-dependency runtime error on Python older than 3.11 (the TOML parser is imported
+    # lazily); raises a value error if the root is not a mapping (cannot happen with the parser).
+    # Reads the file from disk.
     config_path = Path(path)
     if config_path.suffix.lower() != ".toml":
         raise ValueError("--verifiers-config must point to a Verifiers TOML config.")
@@ -69,6 +87,8 @@ def _load_config_data(path: str) -> dict[str, Any]:
 
 
 def _optional_dependency_error() -> RuntimeError:
+    # [FUNCTION DOC] HELPER: Builds (does not raise) the runtime error telling the user that
+    # Verifiers rollouts need Python 3.11 or newer and the optional extra of the package.
     return RuntimeError(
         "Verifiers rollouts require Python 3.11+ and the optional dependencies. "
         "Install Miles with `pip install -e '.[verifiers]'`."
@@ -76,6 +96,8 @@ def _optional_dependency_error() -> RuntimeError:
 
 
 def _installed_version(package: str) -> str:
+    # [FUNCTION DOC] HELPER: Returns the installed version text of a distribution; if it is not
+    # installed raises the optional-dependency runtime error (chained to the lookup error).
     try:
         return importlib_metadata.version(package)
     except importlib_metadata.PackageNotFoundError as error:
@@ -90,6 +112,9 @@ def _check_version(
     *,
     maximum_reason: str | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Checks a version text against an inclusive minimum and an exclusive
+    # optional maximum. Raises a runtime error if it cannot be parsed, is below the minimum, or (when
+    # a maximum is given) is at or above it; the upper-bound message appends the optional reason.
     try:
         installed = Version(raw_version)
     except InvalidVersion as error:
@@ -104,6 +129,14 @@ def _check_version(
 
 
 def _import_verifiers():
+    # [FUNCTION DOC] HELPER: Verifies the environment and lazily imports the Verifiers V1 runtime.
+    # Raises the optional-dependency error on Python older than 3.11 or if an import fails; raises a
+    # runtime error if the verifiers version is outside [0.2.0, 0.2.1) (upper bound explained by an
+    # OpenAI dependency conflict with SGLang) or the renderers version is outside [0.1.8, 0.1.11)
+    # (upper bound explained by removed renderer pool APIs). Returns a simple namespace exposing the
+    # environment config class, environment class, decorated-function discovery helper, model
+    # context class, overlong-prompt error, provider error, sampling config class and train client
+    # class.
     if sys.version_info < (3, 11):
         raise _optional_dependency_error()
     _check_version(
@@ -140,6 +173,13 @@ def _import_verifiers():
 
 
 def _renderer_identity(checkpoint: str) -> str | None:
+    # [FUNCTION DOC] HELPER: Finds the registered renderer model id for a checkpoint name or path,
+    # or none. Returns the input itself if it is a key of the renderer registry. Otherwise collects
+    # candidates: for each path component that starts with "models--" (hub cache layout) the
+    # organization/name form obtained by dropping the prefix and turning double hyphens into
+    # slashes; plus every registered id whose last segment equals the path's final component.
+    # Keeps the candidates that are registered ids (sorted, deduplicated); none -> none; if all kept
+    # ids use the same renderer returns the first in sorted order, else none (ambiguous).
     from renderers.base import MODEL_RENDERER_MAP
 
     if checkpoint in MODEL_RENDERER_MAP:
@@ -166,6 +206,19 @@ def _train_client(
     *,
     router_args: Namespace | None = None,
 ):
+    # [FUNCTION DOC] HELPER: Builds the training client. Inputs: the lazily imported runtime
+    # namespace, rollout args, the model name or path, renderer pool size, and optionally the args
+    # object used for the router address (so a copied args object can follow the live one). The
+    # tokenizer source is the sglang tokenizer path option if set, else the model; the renderer
+    # identity is looked up for the model, else for the tokenizer source. Defines a subclass of the
+    # runtime train client that: converts not-implemented errors and tool-unsupported value errors
+    # raised during response generation into provider errors with status 400 and the adapter's
+    # unsupported prefix (other value errors re-raised); rejects streaming relay and auxiliary
+    # dialect relay with such provider errors; and, when an identity was found, creates the renderer
+    # pool lazily once (loading the tokenizer from the renderer model name or requested model,
+    # overriding its name with the registered identity, creating renderers with the client config and
+    # chat template kwargs of the FIRST request) and reuses it afterwards; without an identity it
+    # uses the parent behavior. Returns an instance wired to the Miles SGLang transport.
     tokenizer_source = getattr(args, "sglang_tokenizer_path", None) or model
     identity = _renderer_identity(model) or _renderer_identity(tokenizer_source)
 
@@ -173,14 +226,22 @@ def _train_client(
     # Miles checkpoints are commonly local snapshots, so keep local tokenizer
     # files while restoring the canonical identity used by Renderers' registry.
     class TrainClient(runtime.TrainClient):
+        # [CLASS DOC] HELPER: Local subclass of the runtime train client; see the enclosing
+        # function for the overridden behavior.
         @staticmethod
         def _unsupported_request(kind: str):
+            # [FUNCTION DOC] HELPER: Builds (does not raise) a provider error with status 400 whose
+            # message is the unsupported prefix plus the kind of request.
             return runtime.ProviderError(
                 f"{_UNSUPPORTED_ERROR_PREFIX} {kind}.",
                 status_code=400,
             )
 
         async def get_response(self, *args, **kwargs):
+            # [FUNCTION DOC] Calls the parent method and returns its response. A not-implemented
+            # error becomes a provider error (status 400, unsupported prefix and the original
+            # text); a value error whose text contains "does not support tools" becomes a provider
+            # error advising a renderer-registered model identity; other value errors propagate.
             try:
                 return await super().get_response(*args, **kwargs)
             except NotImplementedError as error:
@@ -199,12 +260,18 @@ def _train_client(
                 ) from error
 
         async def relay(self, *args, **kwargs):
+            # [FUNCTION DOC] Always raises the provider error for unsupported streaming requests.
             raise self._unsupported_request("streaming requests")
 
         async def relay_aux(self, *args, **kwargs):
+            # [FUNCTION DOC] Always raises the provider error for unsupported auxiliary dialect
+            # routes.
             raise self._unsupported_request("auxiliary dialect routes")
 
         def _renderer_pool(self, requested_model, *, chat_template_kwargs=None):
+            # [FUNCTION DOC] HELPER: Returns the renderer pool. With no registered identity,
+            # delegates to the parent. Otherwise creates the pool on first use (see the enclosing
+            # function) and returns the cached pool afterwards, ignoring later template kwargs.
             if identity is None:
                 return super()._renderer_pool(
                     requested_model,
@@ -217,6 +284,9 @@ def _train_client(
                 source = self.renderer_model_name or requested_model
 
                 def factory():
+                    # [FUNCTION DOC] HELPER: Pool factory: loads the tokenizer from the source,
+                    # sets its name to the registered identity, and creates a renderer from it with
+                    # the client config and chat template kwargs; returns the renderer.
                     tokenizer = load_tokenizer(source)
                     tokenizer.name_or_path = identity
                     return create_renderer(
@@ -236,6 +306,9 @@ def _train_client(
 
 
 def _generate_url(args: Namespace, endpoint: str = "/generate") -> str:
+    # [FUNCTION DOC] HELPER: Builds the router url "http://<ip>:<port><endpoint>". The address is the
+    # "default" entry of the model-routers mapping (a pair of ip and port) when that mapping exists
+    # and has that entry; otherwise the single router ip and port attributes.
     routers = getattr(args, "sglang_model_routers", None)
     if routers and "default" in routers:
         ip, port = routers["default"]
@@ -245,6 +318,10 @@ def _generate_url(args: Namespace, endpoint: str = "/generate") -> str:
 
 
 async def _sglang_worker_urls(args: Namespace) -> list[str]:
+    # [FUNCTION DOC] HELPER: Lists the SGLang worker urls behind the router. Unless the Miles router
+    # is in use, first asks the router's workers endpoint and returns the "url" of each listed worker;
+    # any failure there is logged at debug level and the Miles router's list-workers endpoint is used
+    # instead, returning its "urls" list. Network side effects; errors from the fallback propagate.
     from miles.utils.http_utils import get
 
     router_url = _generate_url(args).removesuffix("/generate")
@@ -259,6 +336,9 @@ async def _sglang_worker_urls(args: Namespace) -> list[str]:
 
 
 def _finish_reason(output: dict[str, Any]) -> str:
+    # [FUNCTION DOC] HELPER: Extracts the finish reason from an engine output's meta info (a mapping
+    # with a type entry, or a plain text). Raises a runtime error for "abort". Returns "stop",
+    # "length" or "content_filter" unchanged and maps anything else (including missing) to "stop".
     finish_reason = (output.get("meta_info") or {}).get("finish_reason")
     if isinstance(finish_reason, dict):
         finish_reason = finish_reason.get("type")
@@ -268,9 +348,16 @@ def _finish_reason(output: dict[str, Any]) -> str:
 
 
 class MilesSGLangTransport:
+    # [CLASS DOC] HTTP-client-shaped transport used by the Renderers/Verifiers train client. It
+    # accepts requests in the token-id generate format, applies Miles' limits and settings, sends
+    # them to the SGLang router's generate endpoint and returns responses in the format the client
+    # expects (completion token ids with log probabilities and a finish reason). Keeps a bounded
+    # least-recently-used record of session ids to check the initial prompt length once per session.
     """Translate Renderers' /inference/v1/generate wire format to Miles' SGLang endpoint."""
 
     def __init__(self, args: Namespace, *, router_args: Namespace | None = None):
+        # [FUNCTION DOC] Stores the rollout args and the args used to find the router (defaults to
+        # the same object), an empty ordered record of seen session ids and its size cap of 10000.
         self.args = args
         self.router_args = router_args or args
         self._seen_sessions: OrderedDict[str, None] = OrderedDict()
@@ -278,17 +365,31 @@ class MilesSGLangTransport:
 
     @property
     def base_url(self) -> str:
+        # [FUNCTION DOC] Property: the router base url ending in "/v1", computed on every access
+        # from the router args (the address is only known after SGLang starts).
         # The refactored RolloutManager constructs rollout functions before it
         # starts SGLang and fills in the router address.
         return f"{_generate_url(self.router_args, '').rstrip('/')}/v1"
 
     async def get(self, _path: str, **_kwargs) -> dict[str, list[Any]]:
+        # [FUNCTION DOC] Answers every GET probe with an empty model list (so no engine context cap
+        # is reported); Miles' own limits are enforced when a request is posted.
         # Renderers probes this endpoint for an engine context cap (max_model_len).
         # Miles owns separate prompt and response limits, so the transport
         # enforces them at POST time.
         return {"data": []}
 
     def _sampling_params(self, raw: dict[str, Any], prompt_len: int) -> dict[str, Any]:
+        # [FUNCTION DOC] HELPER: Converts the client's sampling mapping to SGLang's. Copies it, drops
+        # the log-probs entry, renames max tokens to max new tokens, min tokens to min new tokens and
+        # seed to sampling seed. Miles settings win over the request: the default stop strings from
+        # args are added only if the request has none; the stop token ids become the request's
+        # (if any) followed by the args' ones, deduplicated keeping order; special-token skipping
+        # comes from args; stop trimming is disabled, spaces between special tokens are off and the
+        # sample count is 1. Token budget: the requested max new tokens (default the response
+        # limit) is cut to the context limit minus the prompt length when a context limit is set,
+        # then to the response limit. If the budget is not positive, raises the overlong-prompt error
+        # (imported lazily). Returns the new mapping.
         values = dict(raw)
         values.pop("logprobs", None)
         for source, target in (
@@ -323,6 +424,21 @@ class MilesSGLangTransport:
         return values
 
     async def post(self, endpoint: str, *, body: dict[str, Any], options=None, **_kwargs) -> httpx.Response:
+        # [FUNCTION DOC] Handles one generate request and returns a successful HTTP response object
+        # whose JSON body has a request id (the engine's, else "vf-" plus a random hex), and one
+        # choice with the completion token ids, a log-prob content list (one item per token with the
+        # text "token_id:<id>" and the log prob) and a finish reason. Steps: raises a not-implemented
+        # error if the body has multimodal features. Reads prompt token ids from the body and the
+        # session id from the "X-Session-ID" request header (options). For a session id: if already
+        # seen, marks it recently used; otherwise, if a maximum prompt length is configured and the
+        # prompt is longer, raises the overlong-prompt error; records it and evicts the oldest ids
+        # beyond the cap. Builds the engine payload: input ids, converted sampling params, log probs
+        # enabled, the LoRA adapter name when LoRA is enabled, and priority and cache salt (as extra
+        # key) when present. With the consistent-hashing or manual router policy and a session id,
+        # sends the routing key header equal to the session id. Posts to the router generate url.
+        # Collects token ids and log probs from the output's per-token log-prob list; raises a runtime
+        # error if the count differs from the reported completion token count (default: the list
+        # length). Raises a runtime error on an abort finish reason.
         if body.get("features") is not None:
             raise NotImplementedError("Miles Verifiers rollouts do not yet support multimodal renderer features.")
 
@@ -392,10 +508,13 @@ class MilesSGLangTransport:
         return httpx.Response(200, json=response_body, request=request)
 
     async def close(self) -> None:
+        # [FUNCTION DOC] No-op; there is nothing to release.
         return None
 
 
 def _sample_status(trace) -> Sample.Status:
+    # [FUNCTION DOC] HELPER: Maps a trace to a sample status: failed if the trace has an error, else
+    # truncated if it was truncated, else completed.
     if trace.has_error:
         return Sample.Status.FAILED
     if trace.is_truncated:
@@ -404,6 +523,10 @@ def _sample_status(trace) -> Sample.Status:
 
 
 def _serialize_prompt(prompt):
+    # [FUNCTION DOC] HELPER: Makes a task prompt storable. A list of messages becomes a list in
+    # which message objects with a dump method are converted to JSON-compatible mappings without
+    # null entries and other items are kept; anything else is returned as is, or an empty string if
+    # falsy.
     if isinstance(prompt, list):
         return [
             message.model_dump(mode="json", exclude_none=True) if hasattr(message, "model_dump") else message
@@ -413,6 +536,11 @@ def _serialize_prompt(prompt):
 
 
 def _validate_group_reward_sample_counts(args: Namespace, tasks, discover_decorated) -> None:
+    # [FUNCTION DOC] HELPER: Does nothing unless some task defines group-level reward functions
+    # (found by the discovery helper). Otherwise raises a value error if training is enabled (the
+    # rollout count is not zero or missing) and samples per prompt is below 2, or if an eval
+    # interval is set (not none) and samples per eval prompt is below 2, since group rewards need
+    # at least two rollouts to rank.
     if not any(discover_decorated(task, "group_reward") for task in tasks):
         return
     if getattr(args, "num_rollout", None) != 0 and args.n_samples_per_prompt < 2:
@@ -422,12 +550,26 @@ def _validate_group_reward_sample_counts(args: Namespace, tasks, discover_decora
 
 
 def _raise_for_unsupported_trace_errors(traces) -> None:
+    # [FUNCTION DOC] HELPER: Raises a runtime error with the message of the first trace whose error
+    # message starts with the adapter's unsupported-feature prefix (so unsupported requests fail the
+    # run instead of being silently dropped). Returns nothing otherwise.
     for trace in traces:
         if trace.error is not None and trace.error.message.startswith(_UNSUPPORTED_ERROR_PREFIX):
             raise RuntimeError(trace.error.message)
 
 
 def _branch_to_sample(args: Namespace, trace, branch, *, group_index: int, index: int) -> Sample:
+    # [FUNCTION DOC] HELPER: Builds one validated Miles sample from a trace branch. Reads token ids,
+    # the sampled-token mask and log probs of the branch (raises a value error if lengths differ).
+    # The response starts at the first sampled token (or at the end if none): response length is
+    # tokens minus that position; the loss mask is the sampled mask from there as integers (so
+    # environment tokens inside the response get zero) and rollout log probs are sliced the same way;
+    # everything before is the prompt. Reward: the trace reward, or, when a reward key is configured,
+    # a mapping of all named rewards plus "reward". Label: the task data's label, else its answer.
+    # Metadata: a "verifiers" mapping with branch index, task index, named rewards, metrics, stop
+    # condition and, if present, the serialized error. Other fields: group and sample indexes, the
+    # serialized task prompt, the trace's last reply as response, status from the helper, and the
+    # trace id as routing key. Calls the sample's own validation before returning.
     tokens = list(branch.token_ids)
     sampled_mask = list(branch.sampled_mask)
     logprobs = list(branch.logprobs)
@@ -476,6 +618,10 @@ def _branch_to_sample(args: Namespace, trace, branch, *, group_index: int, index
 
 
 def trace_to_samples(args: Namespace, trace, *, group_index: int, index_start: int) -> list[Sample]:
+    # [FUNCTION DOC] Converts a trace to a list of samples. A trace without branches is skipped with
+    # a warning (including its error) and gives an empty list. More than one branch raises a
+    # not-implemented error (trace groups cannot be preserved yet). Otherwise returns a one-item list
+    # holding the sample for the single branch, using index_start as its sample index.
     if not trace.branches:
         error = trace.error.model_dump(mode="json", exclude_none=True) if trace.error is not None else None
         logger.warning(
@@ -501,6 +647,8 @@ def trace_to_samples(args: Namespace, trace, *, group_index: int, index_start: i
 
 
 def trace_to_sample(args: Namespace, trace, *, group_index: int, index: int) -> Sample:
+    # [FUNCTION DOC] Converts a trace to exactly one sample (via the list version); raises a value
+    # error if the number of samples is not one (for example a trace without branches).
     samples = trace_to_samples(args, trace, group_index=group_index, index_start=index)
     if len(samples) != 1:
         raise ValueError(f"Verifiers trace {trace.id} produced {len(samples)} branches, expected one.")
@@ -508,6 +656,9 @@ def trace_to_sample(args: Namespace, trace, *, group_index: int, index: int) -> 
 
 
 def _trace_metrics(traces) -> dict[str, float]:
+    # [FUNCTION DOC] HELPER: Returns the means over the traces of: reward, error indicator, truncated
+    # indicator and turn count, under the keys "verifiers/reward_mean", "verifiers/error_rate",
+    # "verifiers/truncated_rate" and "verifiers/num_turns_mean". Empty input gives an empty mapping.
     if not traces:
         return {}
     return {
@@ -519,6 +670,9 @@ def _trace_metrics(traces) -> dict[str, float]:
 
 
 def _trace_eval_reward(trace, reward_key: str | None):
+    # [FUNCTION DOC] HELPER: Evaluation reward of a trace. No reward key: the trace reward. With a
+    # key: looks it up in the named rewards plus "reward"; for an errored trace a missing key gives
+    # none, otherwise a missing key raises a key error.
     if reward_key is None:
         return trace.reward
     rewards = {**trace.rewards, "reward": trace.reward}
@@ -528,6 +682,8 @@ def _trace_eval_reward(trace, reward_key: str | None):
 
 
 def _flatten_samples(values: Iterable[Any]) -> list[Sample]:
+    # [FUNCTION DOC] HELPER: Recursively flattens arbitrarily nested lists of samples into one flat
+    # list, preserving order.
     flattened = []
     for value in values:
         if isinstance(value, list):
@@ -538,6 +694,12 @@ def _flatten_samples(values: Iterable[Any]) -> list[Sample]:
 
 
 def _make_eval_args(args: Namespace) -> Namespace:
+    # [FUNCTION DOC] HELPER: Returns a copy of the args with evaluation overrides applied. For each
+    # of temperature, top-p, top-k, max response length and max context length: if the eval setting
+    # is set (not none) it replaces the rollout setting in the copy. Unconditionally (even when
+    # none) the rollout max prompt length becomes the eval max prompt length and the rollout min new
+    # tokens becomes the eval min new tokens; the reward key becomes the eval reward key if set,
+    # else the rollout reward key. The original args are not modified.
     eval_args = Namespace(**vars(args))
     for eval_name, rollout_name in (
         ("eval_temperature", "rollout_temperature"),
@@ -555,6 +717,8 @@ def _make_eval_args(args: Namespace) -> Namespace:
 
 
 def _config_path() -> str:
+    # [FUNCTION DOC] HELPER: Returns the value of the VERIFIERS_CONFIG environment variable; raises a
+    # value error explaining how to set it if it is unset or empty.
     path = os.environ.get(_CONFIG_ENV_VAR)
     if not path:
         raise ValueError(
@@ -566,6 +730,12 @@ def _config_path() -> str:
 
 
 def _validate_args(args: Namespace) -> None:
+    # [FUNCTION DOC] HELPER: Raises a value error for each unsupported option combination, checked
+    # in this order: the global prompt dataset still enabled (must be disabled because Verifiers
+    # supplies the tasks); partial rollout; multimodal keys; a custom chat template path (renderers
+    # cannot take one); and any of on-policy-distillation, rollout routing replay or rollout indexer
+    # replay (the transport does not carry the extra token metadata; the error lists all enabled
+    # flags). Returns nothing when all are fine.
     """Reject the Miles options this adapter cannot honor.
 
     run.py never builds these combinations; this catches a hand-rolled command
@@ -608,7 +778,25 @@ def _validate_args(args: Namespace) -> None:
 
 
 class VerifiersRolloutFn(BaseRolloutFn):
+    # [CLASS DOC] Miles rollout function backed by a Verifiers V1 environment. One instance holds the
+    # environment, the training and evaluation model contexts and clients, the loaded and optionally
+    # shuffled task list, the dynamic sampling filter, and running counters for the next training
+    # task index (set from the first rollout id), group index and sample index. Calling it with an
+    # input produces either a training batch or an evaluation result.
     def __init__(self, input: RolloutFnConstructorInput):
+        # [FUNCTION DOC] Builds the adapter from the constructor input (args and data source).
+        # Steps: lazily import the Verifiers runtime; validate the args; load and validate the
+        # environment config from the file named by the config environment variable (a legacy-style
+        # config or the codex harness raises a value error); create the environment; the model is
+        # the HF checkpoint; build sampling configs for training and for evaluation (from a copy of
+        # the args with eval overrides); engines = rollout GPUs divided by GPUs per engine and the
+        # maximum concurrency = per-server concurrency times engines; renderer pool size = that
+        # concurrency clamped to between 1 and 16; create the training client and an evaluation
+        # client whose router address is read from the live training args; build the two model
+        # contexts; load the dynamic sampling filter function; load the tasks from the taskset,
+        # shuffled with the rollout seed if rollout shuffle is on (zero tasks raises a value error);
+        # validate group-reward sample counts; initialize the counters (next training task index
+        # unset).
         super().__init__(input)
         runtime = _import_verifiers()
         self.args = input.args
@@ -657,6 +845,10 @@ class VerifiersRolloutFn(BaseRolloutFn):
 
     @staticmethod
     def _sampling_config(SamplingConfig, args: Namespace):
+        # [FUNCTION DOC] HELPER: Builds a validated Verifiers sampling config from args: temperature,
+        # top-p and max tokens (the rollout response length); top-k if not none; min tokens if the
+        # min-new-tokens setting exists and is not none; and, if chat template kwargs are given, an
+        # extra body entry carrying them. Returns the validated config object.
         data: dict[str, Any] = {
             "temperature": args.rollout_temperature,
             "top_p": args.rollout_top_p,
@@ -671,12 +863,21 @@ class VerifiersRolloutFn(BaseRolloutFn):
         return SamplingConfig.model_validate(data)
 
     def _task(self, index: int):
+        # [FUNCTION DOC] HELPER: Returns the task at the position modulo the task count (the task
+        # list is cycled endlessly).
         return self._tasks[index % len(self._tasks)]
 
     async def __call__(self, input: RolloutFnInput) -> RolloutFnOutput:
+        # [FUNCTION DOC] Rollout entry point: runs evaluation if the input says so, else produces a
+        # training batch; returns the corresponding output object.
         return await (self._call_eval(input) if input.evaluation else self._call_train(input))
 
     async def _run_task_group(self, task, n: int, semaphore: asyncio.Semaphore, seed_base: int, ctx=None):
+        # [FUNCTION DOC] HELPER: Runs n rollouts of one task as an episode group and returns the list
+        # of traces. Uses the given model context (default the training one). If deterministic
+        # inference is enabled in args, each rollout gets its own context copy whose sampling seed is
+        # seed_base plus the rollout's offset. The episode is run under the shared concurrency
+        # semaphore.
         runtime = _import_verifiers()
         ctx = ctx or self.ctx
         episode = self.env.episode(task, ctx, n=n)
@@ -687,6 +888,11 @@ class VerifiersRolloutFn(BaseRolloutFn):
         return await episode.run(semaphore)
 
     def _convert_group(self, traces, *, group_index: int, preserve_empty: bool = False):
+        # [FUNCTION DOC] HELPER: Converts a group of traces into a list of samples, one per trace,
+        # assigning consecutive global sample indexes (the counter advances by the number of samples
+        # produced, even if the group is later discarded). A trace that yields no sample marks the
+        # group incomplete; with preserve_empty a none placeholder keeps its position. Returns the
+        # list when complete or when preserve_empty is set; otherwise an empty list.
         group = []
         complete = True
         for trace in traces:
@@ -706,6 +912,11 @@ class VerifiersRolloutFn(BaseRolloutFn):
         return group if complete or preserve_empty else []
 
     async def _apply_miles_rewards(self, group) -> None:
+        # [FUNCTION DOC] HELPER: Optionally replaces the Verifiers rewards with Miles reward model
+        # rewards, in place on the samples. Flattens the group; with group-level reward modeling
+        # computes all rewards in one batched call; else if a custom reward path or a reward type is
+        # configured computes one reward per sample concurrently; else leaves the Verifiers rewards.
+        # Raises a value error if the number of rewards does not match the number of samples.
         from miles.rollout.rm_hub import async_rm, batched_async_rm
 
         samples = _flatten_samples(group)
@@ -721,6 +932,13 @@ class VerifiersRolloutFn(BaseRolloutFn):
             sample.reward = reward
 
     async def _postprocess_train_samples(self, data, all_data) -> None:
+        # [FUNCTION DOC] HELPER: Post-processes a finished training batch in place. data is the kept
+        # groups, all_data every converted group. If configured, calls the sample filter function
+        # with the args and kept groups, and the all-samples process function with the args, all
+        # groups and the data source. Then recomputes the rollout log probabilities of the kept
+        # (flattened) samples with a prefill pass against the router generate endpoint, using the
+        # rollout temperature, top-p, top-k and response length as sampling params (network side
+        # effect; the sampled values from the transport are replaced).
         from miles.utils.function_registry import load_function
 
         if function := load_function(self.args.rollout_sample_filter_path):
@@ -740,6 +958,10 @@ class VerifiersRolloutFn(BaseRolloutFn):
         )
 
     async def _cancel_pending(self, futures: Iterable[asyncio.Task]) -> None:
+        # [FUNCTION DOC] HELPER: Cancels every unfinished task. If any were unfinished, asks every
+        # SGLang worker to abort ALL of its in-flight requests (the failure to look up or post is
+        # logged, not raised; individual post errors are ignored). Finally waits for all given tasks,
+        # swallowing their exceptions.
         pending = [future for future in futures if not future.done()]
         for future in pending:
             future.cancel()
@@ -757,6 +979,24 @@ class VerifiersRolloutFn(BaseRolloutFn):
         await asyncio.gather(*futures, return_exceptions=True)
 
     async def _call_train(self, input: RolloutFnTrainInput) -> RolloutFnTrainOutput:
+        # [FUNCTION DOC] Produces one training batch of rollout_batch_size groups. Configures the
+        # SGLang dumper first. On the first call sets the next task index to rollout id times the
+        # batch size (later calls continue from where the counter stopped). Within the environment's
+        # serving context, loops until enough groups are kept: while kept groups plus pending tasks
+        # are below the target, starts over-sampling-batch-size new group tasks (task index counter
+        # advances; seed = rollout seed + task index times samples per prompt); waits for the first
+        # task to finish; for each finished task: an exception is logged and counted as a dropped
+        # "episode_error"; otherwise the traces are added to the metric pool, unsupported-feature
+        # errors raise, any trace error drops the group as "trace_error"; the group is converted (the
+        # group counter advances even if dropped), a group with the wrong number of samples is
+        # dropped as "empty_trace"; Miles rewards are applied; the group is recorded among all
+        # groups and in the pre-filter metrics; the dynamic filter decides keep or drop (with the
+        # filter's reason); a kept group is added while below the target. Always cancels leftover
+        # pending tasks afterwards. Then sorts kept and all groups by the index of their first
+        # sample, post-processes the batch, and returns the kept groups with filter metrics merged
+        # with the trace metrics over all traces.
+        # KNOWN ISSUE: each top-up starts a whole over-sampling batch even when fewer groups are
+        # missing, so more groups than needed may be started (extra ones are cancelled at the end).
         from miles.utils import dumper_utils
 
         await dumper_utils.configure_sglang(self.args)
@@ -831,6 +1071,18 @@ class VerifiersRolloutFn(BaseRolloutFn):
         return RolloutFnTrainOutput(samples=groups, metrics=output_metrics)
 
     async def _call_eval(self, input: RolloutFnEvalInput) -> RolloutFnEvalOutput:
+        # [FUNCTION DOC] Evaluates on the whole taskset. Asserts group-level reward modeling is off.
+        # Configures the SGLang dumper, then within the environment's serving context runs one group
+        # per task (samples-per-eval-prompt rollouts, seed base = rollout seed + task position times
+        # that count, evaluation context) concurrently and gathers all; always cancels leftovers.
+        # Then per group: collects traces, raises on unsupported-feature errors, converts the group
+        # keeping empty placeholders, applies Miles rewards to the converted samples, and collects
+        # the samples. Per trace the evaluation reward is: when Miles rewards are in use and the
+        # sample exists, the mean of its reward values under the eval args; when Miles rewards are in
+        # use but the sample is missing, the trace reward; otherwise the Verifiers evaluation reward
+        # for the configured eval (or rollout) reward key. Also records each trace's truncated flag.
+        # Returns an output whose data maps the environment id (or the name "verifiers") to rewards,
+        # truncated flags and samples, with the trace metrics.
         assert not self.args.group_rm, "Group RM is not supported for eval rollout"
 
         from miles.utils import dumper_utils
@@ -898,6 +1150,10 @@ def generate_rollout(
     data_source: Any,
     evaluation: bool = False,
 ) -> RolloutFnTrainOutput | RolloutFnEvalOutput:
+    # [FUNCTION DOC] Legacy function-style rollout entry point. Keeps one adapter instance per
+    # combination of args object identity, data source identity and evaluation flag in a module-level
+    # cache (created on first use), builds the matching train or eval input from the rollout id, runs
+    # the adapter's coroutine to completion with the shared async runner and returns its output.
     """Legacy Miles entrypoint backed by one persistent rollout adapter."""
     from miles.utils.async_utils import run
 

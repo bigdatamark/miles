@@ -1,3 +1,10 @@
+# [MODULE DOC] Command-line generator of the prompt-data JSON-lines file for Terminal-Bench-2
+# training and eval. Each output row has a prompt of one system message (the agent contract prompt
+# imported from the agent function module) and metadata with the task id. Options: tasks_dir
+# (TB2 checkout; default /workspace/terminal-bench-2), output (default /root/tbench2_train.jsonl),
+# n (first n discovered tasks; zero means all) and an explicit comma-separated task id list which
+# takes precedence over discovery and over n. Every selected task must have a task.toml file in its
+# directory, otherwise the program exits with an error listing the missing ones before writing.
 """Generate a prompt dataset for the OpenEnv Terminal-Bench-2 (tbench2) run.
 
 The *tasks* are not hand-written: they are the
@@ -31,6 +38,8 @@ from tap import Tap
 
 
 class Args(Tap):
+    # [CLASS DOC] Command-line options: tasks_dir (path of the TB2 checkout), output (file path to
+    # write), n (limit on discovered tasks, zero for all), tasks (optional comma-separated ids).
     tasks_dir: str = "/workspace/terminal-bench-2"  # TB2 repo checkout
     output: str = "/root/tbench2_train.jsonl"
     n: int = 0  # 0 = all discovered tasks
@@ -38,10 +47,16 @@ class Args(Tap):
 
 
 def _discover_task_ids(tasks_dir: Path) -> list[str]:
+    # [FUNCTION DOC] HELPER: Lists the names of the immediate children of the directory that contain
+    # a regular file named task.toml, sorted alphabetically. Raises if the directory is missing.
     return sorted(p.name for p in tasks_dir.iterdir() if (p / "task.toml").is_file())
 
 
 def main() -> None:
+    # [FUNCTION DOC] Script entry point: resolves the tasks dir (user home expanded), picks task ids
+    # (explicit list trimmed with empties dropped, else discovered ids truncated to the first n when
+    # n is positive), exits with an error if any lacks task.toml, writes one JSON line per task to
+    # the output file (overwriting it), and prints how many tasks were written.
     args = Args().parse_args()
     tasks_dir = Path(args.tasks_dir).expanduser().resolve()
 

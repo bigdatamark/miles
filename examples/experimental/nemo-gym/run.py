@@ -1,3 +1,9 @@
+# [MODULE DOC] Self-executing launcher that trains Qwen3-4B-Instruct-2507 with GRPO against a
+# running NeMo Gym agent server (SWE-bench style tasks). Steps in main: clean up stale processes,
+# optionally convert the HF checkpoint to the Megatron distributed format (prepare), then build the
+# training argument string in grouped blocks and submit the job through the shared command
+# utilities (execute). The agent function, reward hook and session server flags are wired here;
+# the NeMo Gym server itself must already be running and reachable at the configured url.
 """NeMo Gym launcher (Qwen3-4B-Instruct-2507): Miles <-> mini_swe_agent_2 orchestration.
 
 Defaults are the exact configuration of the validated smoke run (4x H200,
@@ -27,6 +33,16 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC] Command-line configuration (extends the shared train config). Fields: mode
+    # (normal, or debug_rollout_only which runs only rollouts); model type, GPUs per node (4) and
+    # Megatron path; skip_prepare; base_dir, model_name, HF checkpoint id, ref-load checkpoint
+    # path, save dir and prompt data path (all defaulting under /root); training scale (max
+    # sequence length 16384, max response length 4096, 3 rollouts, rollout batch 2, 4 samples per
+    # prompt, global batch 8, save interval 1000); the NeMo Gym server url (default from the
+    # environment variable NEMO_GYM_URL at import time, else http://localhost:12000); and an
+    # optional trainer host name that the NeMo Gym host should dial back, forwarded as the session
+    # server external host (empty means unset).
+    # KNOWN ISSUE: the NeMo Gym url default is evaluated once at import, not at call time.
     mode: Literal["normal", "debug_rollout_only"] = "normal"
     megatron_model_type: str = "qwen3-4B-Instruct-2507"
     num_gpus_per_node: int = 4
@@ -59,6 +75,10 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
 
 def cleanup():
+    # [FUNCTION DOC] HELPER: Kills leftover processes whose command line matches sglang, train.py
+    # or MegatronTrain, using a shell pipeline of process listing, filtering out this process id
+    # and its parent id, then kill; failures are ignored. Then sleeps 5 seconds to let GPUs free.
+    # Side effects: runs shell subprocesses and terminates other processes on the machine.
     """Kill old Ray jobs and stale processes to free GPU resources."""
     my_pid = os.getpid()
     ppid = os.getppid()
@@ -72,6 +92,9 @@ def cleanup():
 
 
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Converts the HF checkpoint into the Megatron distributed format under base_dir
+    # through the backend's convert-checkpoint command (skipped by the utility if already done).
+    # Side effects: runs conversion commands, uses GPUs.
     """Convert the HF checkpoint to torch_dist format if not already done."""
     U = args.create_backend()
     U.convert_checkpoint(
@@ -85,6 +108,21 @@ def prepare(args: ScriptArgs):
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Builds the training argument string and submits the job. Blocks: checkpoint
+    # (HF checkpoint, reference load, save path and interval); rollout (prompt data with input key
+    # prompt and metadata key metadata, shuffle, rollout counts, temperature 0.8, response and
+    # sequence limits, global batch size, data balancing); GRPO with KL loss (coefficient 0.01, low
+    # variance type), zero entropy coefficient and asymmetric clipping 0.2/0.28; Adam optimizer
+    # (learning rate 1e-6 constant, weight decay 0.1, betas 0.9/0.98); performance (tensor
+    # parallel 2, other parallel sizes 1, full uniform recompute of 1 layer, dynamic batch size
+    # with max tokens per GPU equal to max sequence length); SGLang (1 GPU per engine, static
+    # memory fraction 0.7); agent (the agentic tool-call generate function, this directory's agent
+    # function and reward hook, the no-aborted dynamic sampling filter, session server on 0.0.0.0
+    # port 30000 with 32 workers, optional external host, qwen3 TITO model); misc (dropouts off,
+    # fp32 grad accumulation and softmax, flash attention backend, colocated actor on one node);
+    # plus the rollout-only debug flag in debug mode. The runtime environment gets a python path of
+    # Megatron, this directory and the repo base, and the NeMo Gym url. Submits via the backend's
+    # execute-train; side effects are starting Ray and the training job.
     U = args.create_backend()
     ckpt_args = (
         f"--hf-checkpoint {args.hf_checkpoint} "
@@ -203,6 +241,8 @@ def execute(args: ScriptArgs):
 
 @command_utils.dataclass_cli
 def main(args: ScriptArgs):
+    # [FUNCTION DOC] Entry point (command line wired from the config dataclass): runs cleanup,
+    # runs prepare unless skip_prepare is set, then runs execute.
     cleanup()
     if not args.skip_prepare:
         prepare(args)

@@ -1,3 +1,7 @@
+# [MODULE DOC] Client for the local retrieval server of the Search-R1 example, exposing one
+# coroutine, local_search, with the same result shape as the Google backend so the generate module
+# can use either. It posts a single query to the retrieval endpoint and returns a list of
+# {"document": {"contents": text}} mappings.
 """
 Local Search Server for Search-R1
 
@@ -29,6 +33,18 @@ async def local_search(
     timeout: int = 60,
     proxy: str | None = None,
 ) -> list[dict]:
+    # [FUNCTION DOC] Sends one query to the retrieval server and returns formatted results. Request
+    # body: a one-item query list, the top-k count and scores disabled. Posts with the given total
+    # timeout (seconds) and optional proxy; an HTTP error status raises inside a protected block. Any
+    # exception while calling is caught, printed to standard output with the url, and an empty list
+    # is returned (failures are silent to the caller). Takes the first query's result list from the
+    # "result" entry (an empty list if absent) and, for each dictionary item, uses its "contents"
+    # text directly as the document contents, or the placeholder '"No title."' line plus "No
+    # snippet available." when the contents are empty; non-dictionary items are skipped.
+    # KNOWN ISSUE: the docstring lists a snippet-only parameter that does not exist, the in-code
+    # comments claim the document mapping is accessed first although items are read directly, and
+    # the module usage text shows an outdated configuration layout; the proxy argument is honored
+    # despite the note that it is unused.
     """
     Call local search engine server and format results to match google_search_server.py output.
 

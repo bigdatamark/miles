@@ -1,3 +1,7 @@
+# [MODULE DOC] Adapter that converts the output of the local SGLang tool-call parser into
+# OpenAI-style assistant messages and tool definitions, and into tau-bench Action objects. Two
+# small dataclasses model the OpenAI tool call and assistant message; the adapter class holds the
+# tool descriptions and the parser name; a factory function builds an adapter.
 import json
 import logging
 from dataclasses import dataclass
@@ -13,6 +17,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class OpenAIToolCall:
+    # [CLASS DOC] Data holder for one tool call: id, type (default "function") and a function
+    # mapping with the tool name and its arguments text (default none).
     """OpenAI format tool call structure"""
 
     id: str
@@ -22,6 +28,8 @@ class OpenAIToolCall:
 
 @dataclass
 class OpenAIAssistantMessage:
+    # [CLASS DOC] Data holder for an assistant message: role (default assistant), optional text
+    # content and optional list of tool calls (both default none).
     """OpenAI format assistant message structure"""
 
     role: str = "assistant"
@@ -30,6 +38,9 @@ class OpenAIAssistantMessage:
 
 
 class OpenAICompatibleToolCallAdapter:
+    # [CLASS DOC] Holds the list of tool descriptions (each with a type and a function entry having
+    # name, description and parameters) and the SGLang parser name (default qwen25) and offers
+    # conversions of model output text into OpenAI-style messages and tau-bench actions.
     """
     Adapter class that converts sglang tool call parsing results to OpenAI compatible format
 
@@ -38,6 +49,7 @@ class OpenAICompatibleToolCallAdapter:
     """
 
     def __init__(self, tools_info: list[dict[str, Any]], parser_type: str = "qwen25"):
+        # [FUNCTION DOC] Stores the tool descriptions and parser name; no other work.
         """
         Initialize adapter
 
@@ -49,6 +61,13 @@ class OpenAICompatibleToolCallAdapter:
         self.parser_type = parser_type
 
     def parse_response_to_openai_format(self, response: str) -> dict[str, Any]:
+        # [FUNCTION DOC] Parses raw model text with the SGLang tool parser and returns a mapping.
+        # Success: "openai_message" (assistant message), "parsed_result" (the parser's mapping with
+        # normal text and call dictionaries) and "success" true. Any exception is caught, logged as
+        # a warning, and the result is "openai_message" none, "parsed_result" none, "success" false
+        # and "error" with the message text. Never raises.
+        # KNOWN ISSUE: the docstring says exceptions are thrown on parse failure, but they are
+        # swallowed and reported in the result.
         """
         Parse sglang response to OpenAI compatible format
 
@@ -79,6 +98,12 @@ class OpenAICompatibleToolCallAdapter:
             return {"openai_message": None, "parsed_result": None, "success": False, "error": str(e)}
 
     def _convert_to_openai_message(self, normal_text: str, calls: list[dict[str, Any]]) -> OpenAIAssistantMessage:
+        # [FUNCTION DOC] HELPER: Builds the assistant message. No calls: content is the normal text
+        # and no tool calls. Otherwise one tool call per parsed call, in order, with id
+        # "call_<index>_<name>" (name "unknown" if missing), type function, and a function mapping
+        # of the name (empty if missing) and the arguments text from the call's parameters entry
+        # (the text "{}" if missing); the message content is the normal text, or none if that is
+        # blank.
         """
         Convert parsing results to OpenAI format assistant message
 
@@ -109,6 +134,13 @@ class OpenAICompatibleToolCallAdapter:
         return result
 
     def _call_to_action_sglang(self, calls: list[Any], text_response: str) -> Action:
+        # [FUNCTION DOC] HELPER: Converts parsed calls to one tau-bench action. Default action is the
+        # respond action with the text response as content. If there are calls, only the first is
+        # used (a debug log notes extras); its parameters text is decoded as JSON; if the result is a
+        # mapping the action becomes that tool name with the mapping as keyword arguments; a
+        # non-mapping logs a warning and a decoding failure logs a warning, both keeping the default
+        # respond action. A missing name or parameters key raises a key error.
+        # KNOWN ISSUE: not called anywhere in this module.
         """
         Convert sglang tool calls to Action object
 
@@ -137,6 +169,9 @@ class OpenAICompatibleToolCallAdapter:
         return action
 
     def get_openai_tools_format(self) -> list[dict[str, Any]]:
+        # [FUNCTION DOC] Returns the tool list in OpenAI format: for each stored tool a mapping of
+        # type "function" and a function mapping with only the name, description and parameters
+        # copied from the tool's function entry (missing keys raise a key error; other keys dropped).
         """
         Get OpenAI format tool definitions
 
@@ -162,6 +197,7 @@ class OpenAICompatibleToolCallAdapter:
 def create_openai_adapter(
     tools_info: list[dict[str, Any]], parser_type: str = "qwen25"
 ) -> OpenAICompatibleToolCallAdapter:
+    # [FUNCTION DOC] Factory: returns a new adapter for the given tool descriptions and parser name.
     """
     Factory function to create OpenAI compatible tool call adapter
 

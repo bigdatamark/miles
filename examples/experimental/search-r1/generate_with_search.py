@@ -1,3 +1,13 @@
+# [MODULE DOC] Custom generate and reward functions for the Search-R1 example: multi-turn
+# question answering in which the model emits search queries between search tags, the module runs
+# the query against a backend (a local retrieval server or the Google search service, chosen by a
+# module-level configuration mapping), and appends the retrieved passages between information tags
+# as masked-out observation tokens before the model continues. Configuration mapping keys:
+# maximum turns (2), top-k passages (3), search concurrency (256, a module-level semaphore),
+# backend (local by default), per-backend settings (url or api key, snippet-only flag, proxy), a
+# flag to collect rollout log probabilities (true) and a format score (0.2). The generate function
+# talks directly to the SGLang router over HTTP using text prompts; the reward function scores
+# with the exact-match scorer from the sibling format module.
 # Adapted from https://github.com/PeterGriffinJin/Search-R1/blob/ceee7b89655ed52f205b9beb98e1190c3eedcfb0/search_r1/llm_agent/generation.py
 # This is a unified version supporting both local search and Google search, with optional log probability collection
 
@@ -42,6 +52,11 @@ SEMAPHORE = asyncio.Semaphore(SEARCH_R1_CONFIGS["search_concurrency"])
 
 
 def _passages2string(retrieval_result):
+    # [FUNCTION DOC] HELPER: Formats retrieved documents into one reference text. Each item is a
+    # mapping with a "document" mapping holding "contents"; the first line of the contents is the
+    # title and the remaining lines are the body. Output has one line per document in the form
+    # "Doc <1-based index>(Title: <title>) <body>" followed by a newline. Returns an empty string for
+    # no results; a missing key raises a key error.
     """
     Convert retrieval results to a formatted string.
     This function works with both google_search and local_search results.
@@ -57,6 +72,12 @@ def _passages2string(retrieval_result):
 
 
 async def search(query: str) -> str:
+    # [FUNCTION DOC] Runs one search and returns the formatted reference text. Reads the backend
+    # name from the configuration mapping at call time. Local: lazily imports the local search
+    # helper and calls it with the configured url, the query, top-k and proxy. Google: lazily
+    # imports the Google helper and calls it with the api key, query, top-k, snippet-only flag and
+    # proxy. Any other backend raises a value error. The retrieved documents are then converted by
+    # the passage formatter. Network side effects.
     """
     Perform search using either local search engine or Google search.
     The search backend is determined by SEARCH_R1_CONFIGS["search_backend"].
@@ -97,6 +118,10 @@ async def search(query: str) -> str:
 #    leading to misalignment between tokens and their log probabilities
 # Therefore, postprocess_responses is only used when return_logprob=False.
 def postprocess_responses(resp: str) -> str:
+    # [FUNCTION DOC] HELPER: Truncates a model response right after the first closing search tag if
+    # present; otherwise right after the first closing answer tag if present; otherwise returns it
+    # unchanged. Only valid when log probabilities are not collected (the text would no longer
+    # match the generated tokens).
     """
     Post-process response to ensure tag completeness.
     Only used when SEARCH_R1_CONFIGS["return_logprob"] is False.
@@ -109,6 +134,9 @@ def postprocess_responses(resp: str) -> str:
 
 
 def postprocess_predictions(prediction: str):
+    # [FUNCTION DOC] HELPER: Finds the first search-or-answer tagged span in the text (multi-line,
+    # shortest match, same tag name closing it). Returns a pair of action name ("search" or
+    # "answer") and the trimmed inner text; (none, empty string) if no span is found.
     pattern = r"<(search|answer)>(.*?)</\1>"
     match = re.search(pattern, prediction, re.DOTALL)
     if match:
@@ -122,6 +150,12 @@ def postprocess_predictions(prediction: str):
 
 
 async def execute_predictions(prediction: str) -> str:
+    # [FUNCTION DOC] HELPER: Interprets one model turn and returns a pair of next observation text
+    # and a done flag. Search action: runs the search for the query while holding the module
+    # concurrency semaphore and returns the trimmed results wrapped in information tags with blank
+    # lines around, not done. Answer action: empty observation, done. No valid action: a fixed
+    # reminder message explaining the tag formats, not done.
+    # KNOWN ISSUE: the return annotation says a string but the function returns a pair.
     action, content = postprocess_predictions(prediction)
 
     if action == "search":
@@ -143,6 +177,27 @@ If I want to give the final answer, I should put the answer between <answer> and
 
 
 async def generate(args, sample: Sample, sampling_params) -> Sample:
+    # [FUNCTION DOC] Custom generate function: runs the multi-turn search loop for one sample and
+    # returns the same sample object filled in. Asserts partial rollout is off. Builds the router
+    # generate url from args, tokenizes the prompt text (no special tokens) and starts with empty
+    # response, token ids, loss mask and (if collecting) log prob lists. For up to max-turns turns:
+    # post the prompt plus the response so far as text with the given sampling params (and the
+    # log-prob request flag when collecting); if the finish reason is abort, mark the sample
+    # aborted and return immediately. When collecting log probs, raises a runtime error if the
+    # engine omitted per-token log probs, and takes token ids and log probs directly from them (so
+    # they stay aligned); otherwise truncates the text with the response post-processor and
+    # re-tokenizes it. Appends the turn text, tokens, loss mask ones, and log probs. Stops if the
+    # finish reason is length. Otherwise executes the turn: done ends the loop; else (asserting a
+    # non-empty observation) tokenizes the observation, appends it to the response and tokens with
+    # loss mask zeros and zero placeholder log probs, and asserts token and log-prob lengths match.
+    # After the loop sets tokens (prompt + response), response length, response text, loss mask and
+    # prompt, sets rollout log probs when collecting (none if the list is empty), and sets the status
+    # from the last finish reason: length -> truncated, abort -> aborted, stop -> completed (any
+    # other value leaves the status unchanged).
+    # KNOWN ISSUE: a comment mentions handling partial rollout continuation although partial
+    # rollout is rejected; on the last allowed turn a search is still executed and its observation
+    # appended although no further generation follows; a sample that exhausts the turn limit gets
+    # whatever status the last engine finish reason maps to (normally completed).
     assert not args.partial_rollout, "Partial rollout is not supported for this function at the moment."
 
     state = GenerateState(args)
@@ -248,6 +303,13 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
 
 async def reward_func(args, sample, **kwargs):
+    # [FUNCTION DOC] Custom reward hook for one sample. Raises a type error if the argument is not a
+    # sample object. Returns the exact-match score of the full text (prompt plus response) against
+    # the ground truth stored in the sample label under "ground_truth", passing the configured
+    # format score.
+    # KNOWN ISSUE: the scorer ignores its format-score argument (only its structure/final/retrieval
+    # scores, all zero by default, are used), so the configured value has no effect and the reward
+    # is effectively 1.0 for a correct well-formed answer and 0 otherwise.
     """The reward function for retrieval-based question answering.
 
     Args:

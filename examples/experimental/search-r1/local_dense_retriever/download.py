@@ -15,6 +15,12 @@
 # limitations under the License.
 # Adapted from https://github.com/PeterGriffinJin/Search-R1/blob/main/scripts/download.py
 
+# [MODULE DOC] HELPER script (runs on import, no functions): downloads the Wikipedia-2018 e5 index
+# parts and the corpus archive from Hugging Face dataset repositories into a local directory given
+# by the required save path option. Downloads two index part files from the index repository and
+# one gzip corpus file from the corpus repository (network and disk side effects).
+# KNOWN ISSUE: the repo id option is parsed but ignored, because the index repository id is
+# overwritten by a hard-coded value before use.
 
 import argparse
 

@@ -1,3 +1,9 @@
+# [MODULE DOC] Modal provider module for per-episode sandboxes. Supplies the Modal-specific
+# pieces to the shared sandbox backend: throttle classification (SDK resource-exhausted error
+# type, shared phrases, and the phrase "resource exhausted"), a start hook that creates a sandbox
+# for a task with a close function bound to it, and the create knobs with the MODAL prefix. No
+# credentials are handled here; the SDK reads them itself. Exposes the backend object, the
+# direct-drive episode function and the Miles run entry point.
 """Modal-sandbox variant of the OpenEnv tbench2 agent function.
 
 A drop-in alternative to ``openenv_agent_function.run`` for
@@ -64,6 +70,9 @@ logger = logging.getLogger(__name__)
 # creates per rollout and retries throttled ones with jittered exponential
 # backoff (knobs: OPENENV_MODAL_CREATE_*).
 def _is_throttle_error(exc: BaseException) -> bool:
+    # [FUNCTION DOC] HELPER: True if the error is the Modal SDK's resource-exhausted exception type
+    # (imported lazily; a missing SDK is tolerated) or its message matches the shared throttle
+    # phrases or "resource exhausted".
     """True when a sandbox create failed only because Modal was out of room.
 
     Modal types a hit ceiling (the plan's container concurrency, or a workspace
@@ -84,6 +93,10 @@ def _is_throttle_error(exc: BaseException) -> bool:
 
 
 def _start_sandbox(task_id: str, tasks_dir: str) -> tuple[Any, str]:
+    # [FUNCTION DOC] HELPER: Blocking start hook: creates the Modal sandbox for the task directory
+    # (tasks_dir joined with task_id) and returns a close function bound to that sandbox (a partial
+    # application of the module's close helper) plus the env server base url. Runs in a worker
+    # thread.
     sandbox, url = tb2_sandbox_modal.create_task_sandbox(Path(tasks_dir) / task_id)
     return partial(tb2_sandbox_modal.close_sandbox, sandbox), url
 

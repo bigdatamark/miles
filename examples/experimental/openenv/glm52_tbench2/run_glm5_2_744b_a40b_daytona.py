@@ -1,3 +1,12 @@
+# [MODULE DOC] Launcher for fully-asynchronous RL training of GLM-5.2 (744B total, 40B active
+# parameters) on Terminal-Bench-2 tasks, each episode in its own Daytona sandbox. It exposes a
+# typer app with a single subcommand "train" whose options are the fields of the config
+# dataclass. The training function builds the argument string in grouped blocks (checkpoint,
+# rollout, eval, agent, performance, GRPO, optimizer, SGLang, dashboard, misc), a ray runtime
+# environment (NCCL trace, SGLang, cache dirs, python path including this example's parent
+# directory, and OpenEnv/Daytona settings) and submits it with the async train script. Layout: the
+# first 8 nodes are training actors; all remaining nodes are rollout engines. Requires Daytona
+# credentials in the environment and the openenv packages installed in the container.
 """GLM-5.2 744B-A40B x OpenEnv terminal-bench-2 on per-task Daytona sandboxes.
 
 Fully-async RL on 16 GB300 nodes (4 GPUs each): 8 training nodes (TP2/CP4/PP4,
@@ -36,6 +45,22 @@ REPO_ROOT = SCRIPT_DIR.parents[3]
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC] Configuration for the GLM-5.2 launcher (extends the shared train config; each
+    # field becomes a command-line option). Groups: model identity (name GLM-5.2, megatron model
+    # type, 4 GPUs per node, fp8 rollout weights on, mtp speculative decoding on, deepep flags off);
+    # run (run id generated once when the module is imported, rollout count 100, free-form extra
+    # argument string, data/model/megatron paths); scale (rollout batch 8, 8 samples per prompt,
+    # global batch 64, response limit 8192, whole-session limit 65536, max concurrent generating
+    # samples 128, node-local optimizer-state streaming dir, save interval); OpenEnv/Daytona
+    # settings (prompt data default derived from data_dir, agent model name, turn cap, rollout
+    # time cap, task dir, sandbox creation concurrency and retries, launcher and run labels, all
+    # defaulting from environment variables read at import time); eval (interval 10, prompt data
+    # default derived, samples per eval prompt 2); daytona api key from the environment;
+    # load-from checkpoint override; debug replay data path; and the SGLang recipe choice
+    # between balanced and low-latency.
+    # The post-init hook validates the cluster shape and fills derived defaults.
+    # KNOWN ISSUE: model_dir is declared but only model_local_dir is used to build checkpoint paths;
+    # the mode field only allows one value and is not read in this file.
     mode: Literal["normal"] = "normal"
     run_id: str = command_utils.create_run_id()
     model_name: str = "GLM-5.2"
@@ -101,6 +126,11 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     sglang_config: Literal["balanced", "low-latency"] = "balanced"
 
     def __post_init__(self):
+        # [FUNCTION DOC] Validates and fills defaults. Requires at least 10 nodes (8 when replaying
+        # debug rollout data, which needs no engines) and exactly 4 GPUs per node, and a non-empty
+        # Daytona api key; each failure is an assertion error. When prompt data is empty it
+        # becomes the train file under the data dir; when eval is enabled (interval non-zero) and
+        # eval prompt data is empty it becomes the eval file under the data dir.
         min_nodes = 8 if self.debug_replay_data else 10
         assert (
             self.num_nodes >= min_nodes and self.num_gpus_per_node == 4
@@ -113,6 +143,9 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
 
 def _assert_openenv_deps():
+    # [FUNCTION DOC] HELPER: Checks that the four required packages (openenv, tbench2_env, daytona,
+    # fastmcp) can be located in the current environment without importing them; raises an
+    # assertion error naming the first missing one.
     """Fail at launch, not 20 minutes later inside a Ray actor."""
     for mod in ("openenv", "tbench2_env", "daytona", "fastmcp"):
         assert (
@@ -121,6 +154,33 @@ def _assert_openenv_deps():
 
 
 def _execute_train(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Builds all training arguments and submits the job. Checks dependencies
+    # first. Checkpoints: HF weights from the fp8 variant directory when fp8 rollout is on, the
+    # reference model from the torch-dist directory, load from the load-from override or this run's
+    # own checkpoint directory under the output dir, save to the run's checkpoint directory.
+    # Rollout: fully async with in-place generation pause, per-sample submission granularity,
+    # prompt data with chat template applied, shuffle, counts and lengths from the config,
+    # temperature 0.8 fixed, data balancing. Eval (only when interval non-zero): tbench2 dataset,
+    # fixed temperature 0.8. Agent: agentic tool-call generator with the Daytona agent function,
+    # the OpenEnv reward hook, the no-aborted filter, glm47 TITO and a session server on port 30000
+    # with 32 workers. Training parallelism: tensor 2 with sequence parallel, pipeline 4 (18 layers
+    # first stage, 20 last), context 4, expert 8, expert tensor 1, full uniform recompute, dynamic
+    # batch size with 8192 tokens per GPU. GRPO with zero KL/entropy coefficients, asymmetric clip
+    # and truncated importance sampling (clip 0 to 2). SGLang: engine size 4 (balanced) or 8,
+    # memory fraction 0.85, fp8 KV cache, NSA attention, per-recipe request limits and prefill chunk
+    # size; balanced adds dp-attention (size 4) and deepep all-to-all; mtp adds EAGLE speculative
+    # decoding (1 step/2 draft tokens balanced, 5/6 low-latency); fp8 rollout without balanced adds
+    # a flashinfer MoE backend. Dashboard and details dump under the run directory. Misc: 8 actor
+    # nodes, optimizer-state disk streaming when a dir is set, rollout GPU count = (nodes - 8) x
+    # GPUs per node, which must be a positive multiple of 8 unless replaying debug data (then at
+    # least 8 is passed), and the replay data path when given. Builds the ray runtime environment
+    # (NCCL tracing, SGLang/DeepEP knobs, node-local compile caches defaulting under /tmp, python
+    # path of megatron + OpenEnv dir + existing path, and the OpenEnv and Daytona settings including
+    # the api key) and calls execute-train with the async train script.
+    # Raises assertion errors for bad node counts. Side effects: ray/job submission.
+    # KNOWN ISSUE: a comment inside the environment dict about the fully-async rollout class has
+    # no following entry and reads as a leftover; the kl-loss-coef is 0 while the KL loss flag is
+    # not passed, so the KL settings have no effect.
     U = args.create_backend()
     _assert_openenv_deps()
 
@@ -345,6 +405,8 @@ def _execute_train(args: ScriptArgs):
 
 @app.callback()
 def _cli():
+    # [FUNCTION DOC] HELPER: Typer app callback with no behavior; its presence makes the app
+    # require an explicit subcommand name instead of treating the only command as the default.
     # Force subcommand mode: a single-command Typer app would otherwise
     # swallow the command name and reject `... daytona.py train`.
     pass
@@ -353,6 +415,8 @@ def _cli():
 @app.command()
 @command_utils.dataclass_cli
 def train(args: ScriptArgs):
+    # [FUNCTION DOC] The "train" subcommand: command-line options are generated from the config
+    # dataclass; runs the training submission function with the parsed config.
     _execute_train(args)
 
 

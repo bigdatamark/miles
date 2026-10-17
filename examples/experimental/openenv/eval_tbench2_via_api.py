@@ -1,3 +1,16 @@
+# [MODULE DOC] Command-line driver for evaluating an external OpenAI-compatible policy API on
+# Terminal-Bench-2 tasks, without Miles training. Rows come from either a JSON-lines data file
+# (the output of the data generator in this directory) or a comma-separated list of task ids
+# (each given the agent system prompt as its only prompt message). Each row is run through an
+# episode function chosen at start: if the environment variable OPENENV_TB2_TASKS_DIR is set, the
+# per-episode sandbox backend resolved from OPENENV_SANDBOX_BACKEND supplies it (via the common
+# sandbox module); otherwise the shared-env-server episode function from the agent function module
+# is used (server url from OPENENV_ENV_URL or its default). Episodes run with bounded concurrency
+# under a per-episode wall-clock cap (OPENENV_MAX_ROLLOUT_TIME_SECONDS, default 3600) and failures
+# are recorded as errored rather than scored zero. Prints per-task lines and a pass summary, and
+# can write per-task results as JSON lines. Policy settings come from the environment variables
+# DEEPSEEK_API_KEY or POLICY_API_KEY (required), POLICY_BASE_URL (default the DeepSeek api root)
+# and POLICY_MODEL (default deepseek-v4-flash); only the sampling temperature is forwarded.
 """Standalone Terminal-Bench-2 eval: an OpenAI-compatible *API* as the policy,
 per-episode sandboxes as the env. No GPU, no miles training pipeline.
 
@@ -54,6 +67,10 @@ import openenv_sandbox_common as sandbox_common  # noqa: E402
 
 
 def _load_rows(args: argparse.Namespace) -> list[dict]:
+    # [FUNCTION DOC] HELPER: Builds the list of work rows. With a tasks string: splits on commas,
+    # trims, drops empties, and creates one row per id holding a single system-role prompt message
+    # (the shared agent system prompt) and metadata with the task id. Otherwise reads the data file
+    # as JSON lines, skipping blank lines, and returns the parsed rows unchanged.
     """--tasks builds rows with the adapter's own agent-contract prompt, so it
     reproduces exactly what make_tbench2_data.py emits for training."""
     if args.tasks:
@@ -69,6 +86,13 @@ def _load_rows(args: argparse.Namespace) -> list[dict]:
 async def _eval_one(
     run_episode, policy: AsyncOpenAI, model: str, row: dict, request_kwargs: dict
 ) -> tuple[str, float | None, dict]:
+    # [FUNCTION DOC] HELPER: Runs one row's episode and never raises. Returns a triple of task id
+    # (question mark when missing), reward (none when errored, timed out or without a verdict) and
+    # a metrics dict. The episode function is called with the policy client, model name, the row's
+    # prompt messages (default empty), the request kwargs and the row's metadata, under a timeout
+    # read from OPENENV_MAX_ROLLOUT_TIME_SECONDS (default 3600 seconds). On timeout the metrics hold
+    # an error string naming the limit; on any other exception, an error string with the exception
+    # class name and message.
     task_id = row.get("metadata", {}).get("task_id", "?")
     cap = float(os.getenv("OPENENV_MAX_ROLLOUT_TIME_SECONDS", "3600"))
     try:
@@ -95,6 +119,16 @@ async def _eval_one(
 
 
 async def main() -> None:
+    # [FUNCTION DOC] Script entry point. Options: exactly one of data file or tasks list
+    # (required), concurrency (default 4), sampling temperature (default 0.8) and an optional
+    # output path. Exits with a message if no api key is set. Chooses the episode function (sandbox
+    # backend when the tasks-dir variable is non-empty, else the shared server; an invalid backend
+    # name exits with the error text), prints a header line, creates the policy client (3600 s
+    # timeout, no automatic retries), and runs all rows concurrently limited by a semaphore,
+    # printing one line per finished task (reward or ERR, task id, error text or turn count).
+    # Then prints the solved count over scored tasks (reward at least 1.0) with the errored count,
+    # the sorted solved ids, and if requested writes one JSON line per task with task id, reward
+    # and metrics in input order. The policy client is never explicitly closed.
     ap = argparse.ArgumentParser()
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--data", help="jsonl from make_tbench2_data.py (one row per task)")
@@ -128,6 +162,8 @@ async def main() -> None:
     sem = asyncio.Semaphore(args.concurrency)
 
     async def _run(row: dict) -> tuple[str, float | None, dict]:
+        # [FUNCTION DOC] HELPER: Evaluates one row while holding the concurrency semaphore, prints
+        # its result line, and returns the triple of task id, reward and metrics.
         async with sem:
             tid, reward, metrics = await _eval_one(run_episode, policy, model, row, request_kwargs)
             tag = "ERR" if reward is None else f"{reward:.0f}"

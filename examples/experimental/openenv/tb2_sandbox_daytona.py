@@ -1,3 +1,11 @@
+# [MODULE DOC] Daytona-specific part of the sandbox recipe: turns the provider-independent recipe
+# into a running Daytona sandbox. Provides the declarative image definition (base image plus the
+# recipe's server layer commands and a sleep-forever entrypoint), resource sizing in whole GB, a
+# keepalive heartbeat that refreshes the sandbox activity timer, the per-episode create function
+# (auto-stop 30 min, auto-delete 120 min backstops, labels, server start and readiness wait, signed
+# preview url valid for a day), API key resolution, and a process-wide shared client. The ready
+# timeout is read from OPENENV_DAYTONA_READY_TIMEOUT_S (default 300 s) once at import; the api url
+# from DAYTONA_API_URL (default the public Daytona API) when the client is first built.
 """Daytona materialization of the per-task Terminal-Bench-2 sandbox recipe.
 
 The recipe itself — the shell layers that turn a task's official image into a
@@ -47,6 +55,10 @@ _READY_TIMEOUT_S = float(os.getenv("OPENENV_DAYTONA_READY_TIMEOUT_S", "300"))
 
 
 def build_task_image(task_dir: Path, docker_image: str | None = None):
+    # [FUNCTION DOC] Builds the Daytona image definition: resolves the base docker image for the
+    # task (explicit override or the task's own), then adds the recipe's server layer commands as run
+    # steps and sets the entrypoint to sleep forever (Daytona does not run the image command).
+    # Imports the Daytona SDK lazily. Returns the image definition object; no build happens here.
     """Daytona-declarative expression of the recipe (same layers as a
     Dockerfile expression would use, so the Daytona build cache is shared)."""
     from daytona import Image
@@ -62,6 +74,9 @@ def build_task_image(task_dir: Path, docker_image: str | None = None):
 
 
 def task_resources(task_dir: Path):
+    # [FUNCTION DOC] Returns a Daytona resources object sized from the recipe's per-task values
+    # (cpu count, memory and storage in MB): cpu as is, memory and disk converted to whole GB by
+    # integer division by 1024 (the recipe's minimum floors keep them above zero).
     from daytona import Resources
 
     # Daytona sizes in whole GB; the recipe's floors (2048 MB / 10240 MB)
@@ -78,6 +93,10 @@ _KEEPALIVE_MAX_CONSECUTIVE_FAILURES = 3
 
 
 def _start_keepalive(sandbox, task_id: str) -> None:
+    # [FUNCTION DOC] HELPER: Starts the recipe's background heartbeat that calls the sandbox's
+    # refresh-activity method every 300 seconds, named after the task, giving up after 3
+    # consecutive failures. Returns nothing; the thread lives as long as the process (see the recipe
+    # for its exact lifetime).
     """Refresh the sandbox's activity timer for as long as THIS process lives.
 
     Daytona's auto-stop clock counts only SDK interactions — preview-proxy
@@ -107,6 +126,17 @@ def create_task_sandbox(
     auto_stop_minutes: int = 30,
     auto_delete_minutes: int = 120,
 ):
+    # [FUNCTION DOC] Blocking create of one sandbox for the task directory; returns the sandbox
+    # object and the signed preview base url of the env server. Defaults: command timeout from the
+    # recipe, create timeout 1800 s, ready timeout from the module setting, auto-stop 30 minutes,
+    # auto-delete 120 minutes. Steps: build create params (declarative image, resources, auto
+    # intervals, ownership labels from the recipe), create the sandbox; then in a protected block:
+    # compute the server start command (default task id is the directory name), run it in the
+    # background with nohup (output to a log file, process id to a pid file; 10 s exec timeout),
+    # create a signed preview url for port 8000 valid for 86400 seconds, wait for the server health
+    # check to pass within the ready timeout, start the keepalive heartbeat. If any step after
+    # creation fails, tries to delete the sandbox (ignoring deletion errors) and re-raises the
+    # original error. The caller must delete the sandbox when the episode ends.
     """Create ONE per-episode sandbox for *task_dir*, declaratively (no named snapshot).
 
     Returns ``(sandbox, base_url)``. Caller must ``daytona.delete(sandbox)``
@@ -154,6 +184,10 @@ _DEFAULT_API_KEY_FILE = "~/.config/daytona/api_key"
 
 
 def resolve_api_key() -> str:
+    # [FUNCTION DOC] HELPER: Returns the Daytona api key via the shared credential resolver: the
+    # value of DAYTONA_API_KEY if set, else the contents of the file named by DAYTONA_API_KEY_FILE,
+    # else the default key file under the user's config directory. Failure behavior is defined by
+    # the resolver.
     """The Daytona API key: DAYTONA_API_KEY, else the key file (see
     recipe.resolve_provider_api_key for the file-indirection rationale)."""
     return resolve_provider_api_key("DAYTONA_API_KEY", "DAYTONA_API_KEY_FILE", _DEFAULT_API_KEY_FILE)
@@ -164,6 +198,10 @@ _client = None
 
 
 def make_daytona():
+    # [FUNCTION DOC] Returns the process-wide Daytona client, creating it on first use under a lock
+    # (so concurrent threads share one client and one connection pool). The client uses the key from
+    # the key resolver and the api url from DAYTONA_API_URL (default the public Daytona api
+    # address). The client is never closed. Imports the SDK lazily.
     """The process's Daytona client: key from resolve_api_key(), endpoint from
     optional DAYTONA_API_URL. Public: callers driving create_task_sandbox() need
     a client configured this way.

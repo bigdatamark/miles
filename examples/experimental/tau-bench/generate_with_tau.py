@@ -1,3 +1,11 @@
+# [MODULE DOC] Custom generate function for training on tau-bench (retail by default). The task
+# index is carried in the sample prompt; the function builds the tau-bench environment with an
+# LLM-driven user simulator, creates a trainable agent, runs one full interaction and converts the
+# result to a Miles sample. Import-time side effects: reads the environment variables
+# TAU_USER_MODEL_PROVIDER (default gemini) and TAU_USER_MODEL (default gemini-2.5-flash-lite),
+# raises a runtime error if the provider's api key variable (GEMINI_API_KEY, DEEPSEEK_API_KEY, or
+# <PROVIDER>_API_KEY for others) is unset, and builds the module-level run configuration (env
+# retail, tool-calling agent, train split, llm user strategy; model fields are placeholders).
 """
 Tau-Bench Integration for miles Training
 
@@ -54,6 +62,14 @@ tau_config = RunConfig(**TAU_CONFIGS)
 
 
 def res_to_sample(res: InteractionResult, task_index: int) -> Sample:
+    # [FUNCTION DOC] HELPER: Builds a Miles sample from an interaction result. Status mapped from
+    # the result status to the lowercase strings completed, truncated or aborted (none for any
+    # other value). The sample takes index (the task index), prompt, tokens, response, reward, loss
+    # mask and the result's info mapping as metadata. Response length: the result's own attribute if
+    # present; else the loss mask length if non-empty; else the token count if tokens exist; else 0.
+    # Debug logs are written. Returns the sample.
+    # KNOWN ISSUE: the comment says the loss mask covers only the response part, which the fallback
+    # relies on; the final fallback uses total token count which would include the prompt.
     """
     Convert InteractionResult to Sample format for miles training.
 
@@ -115,6 +131,16 @@ def res_to_sample(res: InteractionResult, task_index: int) -> Sample:
 
 
 async def generate(args: dict[str, Any], sample: Sample, sampling_params: dict) -> Sample:
+    # [FUNCTION DOC] Custom generate function; returns a NEW sample (the input sample is not
+    # modified). Asserts partial rollout is off. Takes the task index as the integer value of the
+    # sample prompt text. Builds the tau-bench environment from the module config (environment
+    # name, user strategy, user model and provider, task split, that task index), creates the
+    # agent through the agent factory with the env's tools info and wiki, the config, the rollout
+    # args and sampling params, runs the agent's async solve on the environment with the agent's
+    # own stored rollout args and sampling params and the task index, converts the result to a
+    # sample and returns it. Logs start and finish.
+    # KNOWN ISSUE: the args annotation says mapping but the code uses attribute access on a
+    # namespace object.
     """
     Generate a complete agent-environment interaction trajectory for tau-bench.
 
