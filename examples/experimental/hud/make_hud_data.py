@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Command line tool that converts a HUD environment package's task list into a Miles training
+# prompt file in JSON lines format. It loads the package's tasks module by file path (temporarily
+# adding the package directory to the module search path), optionally keeps only tasks whose slugs
+# are listed, optionally merges a JSON object of argument overrides over every selected task's
+# arguments, and writes the whole selection repeated the requested number of times (the repeat loop
+# is outermost, so tasks interleave). Each output record has a one-message user prompt holding the
+# task slug, an empty label and a metadata mapping with the task row (environment name, task id,
+# arguments, slug) under the HUD task key. Exits with a message if nothing is selected. Prints the
+# selected slugs and the number of rows written.
 """Build a Miles prompt jsonl from a HUD v6 taskset.
 
 A v6 task is a data row -- an env name, a template id, bound args -- minted by
@@ -27,6 +37,11 @@ from pathlib import Path
 
 
 def load_tasks(env_dir: str | Path):
+    # [FUNCTION DOC] Imports the tasks module (tasks file inside the expanded, resolved directory)
+    # under a fixed module name with the directory temporarily first on the module search path
+    # (removed afterwards even on error), executing its code, and returns a copy of its public
+    # tasks list. Raises if the file is missing or lacks the list. Executes arbitrary code from the
+    # package.
     """The env package's minted task rows (its public ``tasks`` list)."""
     env_dir = Path(env_dir).expanduser().resolve()
     sys.path.insert(0, str(env_dir))
@@ -40,11 +55,18 @@ def load_tasks(env_dir: str | Path):
 
 
 def task_row(task) -> dict:
+    # [FUNCTION DOC] Returns a plain mapping with the task's environment name, id, a copy of its
+    # arguments (empty if none) and slug: the part needed to re-create the task at rollout time.
     """The part of a Task that travels to the rollout: enough to re-mint it."""
     return {"env": task.env, "id": task.id, "args": dict(task.args or {}), "slug": task.slug}
 
 
 def main() -> None:
+    # [FUNCTION DOC] Command line entry point. Options: required environment package directory;
+    # optional list of task slugs (default all); optional JSON text of argument overrides; repeat
+    # count (default 1); output path (default hud_train.jsonl under the root directory). Overrides
+    # are merged shallowly over each task's arguments (override wins). Opens the output for writing
+    # (truncating) and writes one JSON line per task per repeat, without ASCII escaping.
     ap = argparse.ArgumentParser()
     ap.add_argument("--env-dir", required=True, help="HUD env package (has tasks.py + Dockerfile.hud)")
     ap.add_argument("--task-ids", nargs="*", default=None, help="slugs to include; default all")

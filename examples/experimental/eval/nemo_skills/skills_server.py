@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# Standalone Flask HTTP server that executes NeMo Skills evaluations on behalf of Miles. One
+# endpoint accepts an evaluation request (rollout id, inference router URL, optional default
+# generation parameters, and a list of benchmark dataset records), runs the NeMo Skills "ns eval"
+# command once per benchmark (sequentially, serialised by a lock so only one evaluation runs at a
+# time) against the router's OpenAI-compatible endpoint, and returns the aggregated metrics and
+# artifact locations; a second endpoint reports health. Generation parameters map onto Hydra
+# override arguments of the Skills tool. Each run writes into a timestamped directory under the
+# configured output root, with one sub-directory and one log file per benchmark. At startup it
+# adds the repository root to the import path so the shared configuration module resolves, and
+# configures root logging. Command line options: host, port, output root, cluster profile, config
+# directory, model name reported to the endpoint and maximum concurrent requests.
 """
 Simple HTTP server that proxies Miles evaluation requests to the `ns eval`
 command shipped with NeMo Skills.
@@ -55,6 +67,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 @dataclass
 class EvalRequestPayload:
+    # [CLASS DOC]
+    # Structured schema of the evaluation request body, validated through OmegaConf: rollout id,
+    # router URL, a defaults mapping for generation parameters (empty by default) and a list of
+    # skills dataset records (empty by default).
     rollout_id: int
     router_url: str
     defaults: dict[str, Any] = field(default_factory=dict)
@@ -75,6 +91,8 @@ HYDRA_OVERRIDE_MAP = {
 
 
 def _openai_api_base(router_url: str) -> str:
+    # [FUNCTION DOC] HELPER: Returns the router URL without trailing slashes plus the OpenAI
+    # compatible v1 path suffix.
     return router_url.rstrip("/") + "/v1"
 
 
@@ -85,6 +103,12 @@ def _hydra_overrides_from_benchmark(
     openai_model_name: str,
     max_concurrent_requests: int,
 ) -> list[str]:
+    # [FUNCTION DOC] HELPER: Builds the list of Hydra override arguments for one benchmark. For each
+    # generation parameter in the mapping table (temperature, top-p, top-k, maximum response
+    # length), the benchmark record's value is used, falling back to the request defaults, and an
+    # override with a double plus prefix and the mapped Hydra key is added only if a value exists.
+    # Then fixed overrides are appended: server type openai, base URL (router URL plus v1), model
+    # name, a placeholder API key and the maximum concurrent request count.
     overrides: list[str] = []
     for key, hydra_key in HYDRA_OVERRIDE_MAP.items():
         value = getattr(benchmark_cfg, key, None)
@@ -108,6 +132,10 @@ def _hydra_overrides_from_benchmark(
 
 @dataclass
 class ServerConfig:
+    # [CLASS DOC]
+    # Immutable-by-convention server settings: output root directory, optional cluster profile,
+    # optional config directory, optional model name (default applied later) and maximum
+    # concurrent requests (default 512).
     output_root: Path
     cluster: str | None
     config_dir: str | None
@@ -116,6 +144,8 @@ class ServerConfig:
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> ServerConfig:
+        # [FUNCTION DOC] Class method creating the settings from parsed command line options; the
+        # output root is user-expanded and resolved to an absolute path.
         return cls(
             output_root=Path(args.output_root).expanduser().resolve(),
             cluster=args.cluster,
@@ -126,12 +156,26 @@ class ServerConfig:
 
 
 class SkillsEvaluator:
+    # [CLASS DOC]
+    # Runs NeMo Skills evaluations as subprocesses. Holds the server settings and a lock that makes
+    # evaluation requests mutually exclusive.
     def __init__(self, config: ServerConfig):
+        # [FUNCTION DOC] Stores the settings, creates the lock and creates the output root
+        # directory (with parents) if missing.
         self._config = config
         self._lock = threading.Lock()
         self._config.output_root.mkdir(parents=True, exist_ok=True)
 
     def evaluate(self, payload: EvalRequestPayload) -> dict[str, Any]:
+        # [FUNCTION DOC] Executes a whole evaluation request and returns a JSON-ready mapping. With
+        # no benchmarks, logs a warning and returns a mapping with a fresh random job id, null
+        # command, output directory and log path, the warning text and empty raw metrics. Otherwise:
+        # creates a run directory named by the current integer epoch seconds and "rollout-<id>"
+        # under the output root; under the lock, runs each benchmark in order, collecting per-run
+        # info and merging metric mappings (later benchmarks overwrite equal keys). Returns the job
+        # id, the commands of all runs joined by newlines, the run directory, the last run's log
+        # path, the merged raw metrics and the list of per-run info mappings. A failure of any
+        # benchmark raises and aborts the rest.
         if not payload.benchmarks:
             warning_msg = "No benchmarks specified in delegate config; skipping NeMo Skills evaluation."
             logger.warning(warning_msg)
@@ -184,6 +228,12 @@ class SkillsEvaluator:
         router_url: str,
         run_dir: Path,
     ) -> dict[str, Any]:
+        # [FUNCTION DOC] HELPER: Runs one benchmark. Creates a sub-directory named after the
+        # benchmark inside the run directory, with a log file there; builds the evaluation command
+        # (experiment name is the rollout experiment name plus the benchmark name, benchmark id is
+        # the runtime name including sample count), logs it, runs it with the process environment
+        # and collects metrics. Returns a mapping with run info (benchmark name, shell-quoted
+        # command, output directory, log path) and the metrics mapping.
         name = benchmark.name
         benchmark_run_dir = run_dir / name
         benchmark_run_dir.mkdir(parents=True, exist_ok=True)
@@ -222,6 +272,11 @@ class SkillsEvaluator:
         defaults: Mapping[str, Any],
         benchmark_cfg: SkillsEvalEnvDatasetConfig,
     ) -> list[str]:
+        # [FUNCTION DOC] HELPER: Assembles the argument list for the Skills evaluation tool: the
+        # tool and its eval subcommand, output directory, benchmark id, server type openai, server
+        # address (router URL plus v1) and experiment name; then the cluster profile and config
+        # directory options if configured; then the Hydra overrides for the benchmark (model name
+        # defaults to a fixed placeholder when not configured). Returns the list.
         base_cmd = [
             "ns",
             "eval",
@@ -252,11 +307,17 @@ class SkillsEvaluator:
         return base_cmd + hydra_overrides
 
     def _build_env(self) -> dict[str, str]:
+        # [FUNCTION DOC] HELPER: Returns a copy of the current process environment for the
+        # subprocess, unmodified.
         env = os.environ.copy()
         return env
 
     @staticmethod
     def _run_command(cmd: list[str], *, env: dict[str, str], log_path: Path):
+        # [FUNCTION DOC] HELPER: Static method. Runs the command as a subprocess with standard
+        # output and error both written to the log file (overwritten) and waits with no timeout. On
+        # a non-zero exit status raises a runtime error containing the status, the log path and the
+        # last 200 lines of the log. Returns nothing on success.
         with open(log_path, "w", encoding="utf-8") as log_file:
             process = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, env=env)
             retcode = process.wait()
@@ -267,6 +328,11 @@ class SkillsEvaluator:
 
     @staticmethod
     def _collect_metrics(run_dir: Path, benchmark: str) -> dict[str, Any]:
+        # [FUNCTION DOC] HELPER: Static method. Takes the benchmark id without any sample-count
+        # suffix after a colon and reads the metrics JSON file at eval-results/<name>/metrics.json
+        # under the run directory. A missing or unparseable file logs a warning and gives an empty
+        # mapping. Otherwise returns a one-entry mapping from the benchmark name to the value stored
+        # under that same name in the file, or to the whole file content if that key is absent.
         benchmark_name = benchmark.split(":")[0]
         metrics_path = run_dir / "eval-results" / benchmark_name / "metrics.json"
         if not metrics_path.exists():
@@ -287,14 +353,23 @@ class SkillsEvaluator:
 
 
 def build_app(evaluator: SkillsEvaluator) -> Flask:
+    # [FUNCTION DOC] Creates the Flask application with two routes bound to the given evaluator
+    # and returns it.
     app = Flask(__name__)
 
     @app.get("/health")
     def health_check():
+        # [FUNCTION DOC] Health route handler: returns a JSON object with status ok.
         return jsonify({"status": "ok"})
 
     @app.post("/evaluate")
     def evaluate_endpoint():
+        # [FUNCTION DOC] Evaluation route handler. Reads the request body as JSON (forced, errors
+        # not silenced), merges it onto the structured request schema (an empty body counts as an
+        # empty mapping), converts to a payload object and runs the evaluator, returning its result
+        # as JSON. Configuration validation errors from OmegaConf give HTTP 400 with an error
+        # message; any other exception gives HTTP 500 with the message. Both are logged with
+        # tracebacks. The request blocks until the whole evaluation finishes.
         try:
             raw_payload = request.get_json(force=True, silent=False)
             cfg = OmegaConf.merge(
@@ -320,6 +395,10 @@ def build_app(evaluator: SkillsEvaluator) -> Flask:
 
 
 def parse_args() -> argparse.Namespace:
+    # [FUNCTION DOC] Parses the command line: host (default all interfaces), port (default 9050),
+    # output root (default ./skills-eval-output), optional cluster profile, optional config
+    # directory, optional OpenAI model name and maximum concurrent requests (default 512).
+    # Returns the namespace.
     parser = argparse.ArgumentParser(description="Run the NeMo Skills evaluation HTTP server.")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=9050)
@@ -357,6 +436,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def main():
+    # [FUNCTION DOC] Entry point: parses options, builds settings, evaluator and Flask app, logs
+    # the listening address and runs the built-in Flask development server (blocking) on the host
+    # and port.
     args = parse_args()
     config = ServerConfig.from_args(args)
     evaluator = SkillsEvaluator(config)

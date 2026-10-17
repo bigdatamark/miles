@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Launcher script for GRPO training of a Qwen3 vision-language model on the HUD 2048 computer-use
+# task with the FSDP backend on a single node (run as a script). Settings come from environment
+# variables read at import time: model name, GPU count, number of rollouts, mode and output
+# directory (see the existing documentation below). Mode smoke uses batch size 1 with 2 samples per
+# prompt and one rollout in rollout-only debug mode; otherwise 4 prompts with 8 samples each. Mode
+# debug rollout only skips training; any other value behaves like normal. The training command
+# uses the HUD rollout and reward functions and a YAML custom config, GRPO without KL loss, Adam at
+# 1e-6, gradient checkpointing, flash attention 3, one GPU per inference engine, a dashboard and
+# per-turn logging, colocation, checkpoint saving every 5 steps and trace dumps under the output
+# directory. Needs a prepared training data file and a local model directory.
 """HUD v6 2048 computer-use GRPO launcher (Qwen3-VL-4B-Instruct, FSDP, single node).
 
 Based on the CI-verified qwen3_vl FSDP recipe (tests/e2e/fsdp/
@@ -44,6 +55,14 @@ BATCH_SIZE, SAMPLES_PER_PROMPT = (1, 2) if SMOKE else (4, 8)
 
 
 def preflight() -> dict[str, str]:
+    # [FUNCTION DOC] Launch-time validation before any GPU is claimed. Exits (system exit with a
+    # message) if the hud or daytona SDK is not importable. The Daytona credential key file
+    # defaults under the user's config directory or comes from the key-file environment variable. If
+    # the file is readable and non-blank, prints a notice and returns a mapping with the key-file
+    # variable set to the path (the workers read the file; the secret itself is not forwarded). Else,
+    # if the key environment variable is non-blank, prints a notice and returns an empty mapping.
+    # Otherwise exits with instructions for provisioning the file. Returns the extra environment
+    # mapping to forward.
     """Check what every episode needs, before any GPU is claimed.
 
     Both failures this catches -- a missing SDK, a missing Daytona credential --
@@ -80,6 +99,15 @@ def preflight() -> dict[str, str]:
 
 
 def execute():
+    # [FUNCTION DOC] Assembles all training arguments and submits the job. Argument groups:
+    # checkpoint (local model directory), rollout (prompt data file of task slugs, label and metadata
+    # keys, chat template, shuffle, rollout count, batch geometry, response cap 12288, context cap
+    # 16384, temperature 1.0), custom generate/reward/config paths, FSDP options with a long
+    # distributed timeout, GRPO and optimiser settings, W&B arguments from the command utilities,
+    # inference engine options (tool call parser required, flash attention 3), telemetry, the debug
+    # flag in smoke or debug-only modes, and miscellaneous (single actor node, colocation, save
+    # directory, dump directory). Extra environment: single CUDA connection, the preflight mapping,
+    # and the W&B and HUD API keys if present. Submits with no Megatron model type (FSDP).
     U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME} "
 

@@ -1,3 +1,20 @@
+# [MODULE DOC]
+# Custom rollout generate function and reward function for multi-turn, vision-language computer-use
+# training on HUD environments hosted in cloud sandboxes. For each sample: mint the HUD task from
+# the task row in the sample metadata, build the chat agent against the training run's inference
+# router (using token-id-returning client), run the episode in a shared sandbox runtime under a
+# process-wide concurrency cap and an episode timeout, then convert the graded trace into one
+# training sample: concatenate the per-turn prompt and output token ids into one sequence with a
+# loss mask (1 on model-emitted tokens, 0 elsewhere) and per-token rollout log probabilities,
+# verifying that each later turn's prompt starts with the sequence so far (tolerating whitespace-only
+# differences by re-synchronising), and rebuild the image tensors from the screenshots the policy
+# saw, checked against the number of image placeholder tokens. Any failure (episode error, no
+# usable turns, broken stitch, image count mismatch, no screenshot) yields a "written off" sample
+# with status failed, removal flag set, zero response length and a one-image dummy so vision
+# collectives stay aligned across ranks. Optional launch args read with defaults: Daytona key file,
+# environment directory and snapshot name (required), sandbox cap (32), step budget (24),
+# system prompt override, screenshot width (640), tokens per turn (512) and episode timeout seconds
+# (1800). Module-level globals hold the shared runtime, its lock and the concurrency semaphore.
 """Multi-turn computer-use rollout on HUD v6 environments.
 
 The division of labour, and why this file is small:
@@ -54,6 +71,11 @@ _gate: asyncio.Semaphore | None = None
 
 
 def _load_daytona_key(args: Any) -> None:
+    # [FUNCTION DOC] HELPER: Ensures the Daytona API key variable is set in this process. Returns
+    # at once if already set. Otherwise the key file path is the launch arg for the key file, or the
+    # key file environment variable, or a default under the user's config directory (home expanded);
+    # a missing file raises a value error telling where to put the key; otherwise the stripped file
+    # content is stored in the environment. Side effect: mutates the environment.
     """Put the Daytona key in this process's environment, from a file if need be.
 
     Reading it here rather than exporting it before launch keeps it out of Ray's
@@ -71,6 +93,11 @@ def _load_daytona_key(args: Any) -> None:
 
 
 def _shared_runtime(args: Any):
+    # [FUNCTION DOC] HELPER: Returns the process-wide Daytona runtime, creating it under a thread
+    # lock on first use: loads the key, lazily imports the sandbox SDK and HUD runtime class, and
+    # builds the runtime named by the snapshot-name launch arg, with an image built from the
+    # Dockerfile.hud in the environment directory launch arg if that file exists (otherwise no
+    # image). Sharing avoids races on resolving or rebuilding the environment snapshot.
     """One DaytonaRuntime for the whole process.
 
     Sharing matters: the runtime resolves (and, when stale, rebuilds) the env
@@ -92,6 +119,9 @@ def _shared_runtime(args: Any):
 
 
 def _sandbox_gate(args: Any) -> asyncio.Semaphore:
+    # [FUNCTION DOC] HELPER: Returns the process-wide semaphore limiting concurrent sandboxes,
+    # created lazily with the maximum-sandboxes launch arg (default 32) on first call; later changes
+    # to the arg are ignored. Not thread safe (assumes a single event loop).
     """Cap concurrent sandboxes process-wide, independent of batch geometry."""
     global _gate
     if _gate is None:
@@ -100,6 +130,16 @@ def _sandbox_gate(args: Any) -> asyncio.Semaphore:
 
 
 def _build_agent(args: Any, sampling_params: dict):
+    # [FUNCTION DOC] HELPER: Creates the computer-use agent for one episode (imports lazily).
+    # Reads the step budget (default 24), system prompt template (launch arg or the module default),
+    # and screenshot width (default 640). The model client points at the rollout router's
+    # OpenAI-compatible base URL built from the router ip and port, with the token-id compatibility
+    # transport; the model name is the Hugging Face checkpoint path. The system prompt template is
+    # formatted with the step budget. Completion settings: max tokens per turn (default 512),
+    # temperature and top-p taken from the sampling parameters (default 1.0 each), and a request
+    # flag asking the server to return token ids. Other sampling parameters are ignored.
+    # KNOWN ISSUE: formatting the system prompt template with the step budget fails for a custom
+    # template that contains other brace characters.
     from examples.experimental.hud.agent import SYSTEM_PROMPT, ComputerChatAgent  # noqa: PLC0415
     from examples.experimental.hud.sglang_compat import sglang_client  # noqa: PLC0415
     from hud.agents.types import OpenAIChatConfig  # noqa: PLC0415
@@ -124,12 +164,16 @@ def _build_agent(args: Any, sampling_params: dict):
 
 
 def _mint_task(meta: dict):
+    # [FUNCTION DOC] HELPER: Creates a HUD task object from the metadata row's environment name,
+    # task id and arguments (empty if missing or none). Missing env or id raises a key error.
     from hud import Task  # noqa: PLC0415
 
     return Task(env=meta["env"], id=meta["id"], args=meta.get("args") or {})
 
 
 def _collect_turns(run) -> list:
+    # [FUNCTION DOC] HELPER: Walks the run's trace collecting the token sample attached to each
+    # agent step, keeping, in order, only those that exist and have non-empty output token ids.
     """The turns that produced tokens, in order."""
     from hud.agents.types import AgentStep  # noqa: PLC0415
 
@@ -138,6 +182,9 @@ def _collect_turns(run) -> list:
 
 
 def _collect_images(run) -> list[PILImage.Image]:
+    # [FUNCTION DOC] HELPER: Returns, in step order, one RGB image per tool step that has a result
+    # containing at least one image block: the last image block of that result, base64-decoded.
+    # Tool steps without a result or without images contribute nothing.
     """Every screenshot the policy was shown, in message order.
 
     The computer tool returns exactly one image per successful call, and the
@@ -168,6 +215,17 @@ def _resync_whitespace(
     response_start: int,
     tokenizer,
 ) -> tuple[list[int], list[int], list[float]] | None:
+    # [FUNCTION DOC] HELPER: Tries to repair the accumulated sequence when a later turn's prompt
+    # differs from it only by whitespace. Inputs: accumulated token ids, loss mask and log
+    # probabilities (the latter two cover only the response region starting at the given start
+    # index), the new prompt token ids, the response start index and the tokenizer. Walks both
+    # sequences in step. Equal tokens are copied (carrying mask and log probability for positions
+    # in the response region). On a mismatch inside the fixed first prompt returns none. Otherwise
+    # searches the smallest pair of windows (each up to four tokens, either may be empty) whose
+    # decoded texts are equal after removing all whitespace and after which the sequences agree again
+    # (or the accumulated one ends); none found returns none. The re-rendered prompt tokens of the
+    # window are adopted with mask zero and log probability zero. Returns a triple of new tokens,
+    # mask and log probabilities; the returned tokens are a prefix of the new prompt.
     """Realign an accumulated sequence with a re-rendered prompt that differs
     only in whitespace, or return None.
 
@@ -230,6 +288,18 @@ def _resync_whitespace(
 
 
 def _stitch(turns, tokenizer=None) -> tuple[list[int], list[int], list[float], int] | None:
+    # [FUNCTION DOC] Concatenates per-turn token samples (objects with prompt token ids, output
+    # token ids and output log probabilities) into one sequence; the tokenizer is optional and only
+    # enables whitespace re-synchronisation and richer divergence logging. First turn: the sequence is
+    # its prompt and the response start index is the prompt length. Each later turn: if its prompt
+    # does not begin with the sequence so far, try re-synchronising (needs the tokenizer); if that
+    # fails, log a warning with the divergence position (and decoded context when a tokenizer is
+    # available) and stop, keeping earlier turns. Otherwise the prompt's extra tokens beyond the
+    # sequence are appended with mask zero and log probability zero. Then the turn's output tokens
+    # are appended with mask one and their log probabilities (replaced by zeros if the count
+    # does not match the output length). Returns none when no output was gathered, else a four-tuple
+    # of tokens, loss mask and log probabilities (both covering the region after the response
+    # start) and the response start index.
     """Per-turn (prompt_ids, output_ids) -> one training sequence.
 
     Returns (tokens, loss_mask, rollout_log_probs, response_start), where the
@@ -298,6 +368,15 @@ def _stitch(turns, tokenizer=None) -> tuple[list[int], list[int], list[float], i
 
 
 def _vision_inputs(state: Any, images: list[PILImage.Image], tokens: list[int]) -> dict | None:
+    # [FUNCTION DOC] HELPER: Builds the image tensors for the stitched sequence. Returns none if
+    # there are no images or the sequence contains no image placeholder tokens. Otherwise runs the
+    # processor's image processor on all screenshots, computes tokens per image (grid product
+    # divided by the square of the merge size, default 2), and keeps the longest prefix of images
+    # whose cumulative token count equals the placeholder count in the sequence (the trace usually
+    # has one extra trailing screenshot never shown to the model). If no prefix matches exactly
+    # raises a value error describing the mismatch. Returns a mapping with pixel values and image
+    # grid; when the prefix is shorter than the image list the processor is run again on just the
+    # kept images.
     """pixel_values/image_grid_thw for the stitched sequence, verified against it.
 
     The trace usually holds one more screenshot than the ids: the final tool
@@ -338,6 +417,13 @@ def _vision_inputs(state: Any, images: list[PILImage.Image], tokens: list[int]) 
 
 
 def _failed(sample: Sample, reason: str, state: Any) -> Sample:
+    # [FUNCTION DOC] HELPER: Turns the sample into a consistent write-off and returns it. Logs the
+    # reason as a warning. Builds a 64 by 64 blank image, processes it, and computes its number of
+    # image tokens. Sets status failed, the remove flag, tokens made of a vision start token, that
+    # many image placeholder tokens and a vision end token, the image tensors, zero response length,
+    # empty response, empty loss mask and empty rollout log probabilities, and a default reward of
+    # zero in metadata if none exists. The dummy image keeps every rank calling the vision tower the
+    # same number of times (needed under fully sharded data parallelism).
     """A structurally valid write-off that trains on nothing.
 
     Downstream expects every field list-shaped and consistent even for
@@ -381,6 +467,17 @@ def _failed(sample: Sample, reason: str, state: Any) -> Sample:
 
 
 async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
+    # [FUNCTION DOC] Custom generate function for one sample (plugged in by path). Asserts partial
+    # rollout is off. Creates the generation state lazily imported inside (tokenizer, processor);
+    # requires the HUD task row under the sample metadata (value error otherwise). Builds the task,
+    # agent and shared runtime, and runs the episode inside the sandbox semaphore with the
+    # configured timeout (default 1800 seconds); any exception is logged and returns a write-off.
+    # Takes the first run of the job (none gives a write-off), stores its reward (zero if none) and
+    # trace status text in metadata, collects turns and stitches them (none gives a write-off), then
+    # builds vision inputs (a value error or no vision gives a write-off). On success fills the
+    # sample: multimodal inputs, tokens, response length (tokens after the first prompt), loss mask,
+    # rollout log probs, decoded response text including special tokens, status completed; logs a
+    # summary line. Returns the sample.
     assert not args.partial_rollout, "Partial rollout is not supported for HUD rollouts."
 
     # In-function on purpose: sglang_rollout pulls in sglang_router, which only
@@ -455,6 +552,9 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
 
 
 async def reward_func(args, samples: Sample | list[Sample], **kwargs) -> float | list[float]:
+    # [FUNCTION DOC] Reward hook: returns the reward stored in each sample's metadata by the
+    # generate function (zero if absent): a list of floats for a list of samples, a single float for
+    # one sample. Launch args and extra keyword arguments are ignored.
     """Pass through the reward HUD's task template computed inside the env."""
     if isinstance(samples, list):
         return [s.metadata.get("reward", 0.0) for s in samples]

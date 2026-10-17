@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Function-calling computer tool for self-hosted policies. Subclasses HUD's remote-framebuffer tool
+# to expose one function (named computer) whose argument schema offers the actions screenshot,
+# click, double click, type, press, scroll and wait. Every successful action waits 300 milliseconds
+# and returns a screenshot, downscaled to a configurable width (default 640) with the aspect ratio
+# kept; coordinates the model gives in the downscaled frame are scaled up to the real screen.
+# Key presses are normalised to X11 key symbols through an alias table; each element of the keys
+# list is a separate keystroke and a plus inside an element joins a chord. The first typed input of
+# an episode is preceded by one click at the screen centre to establish keyboard focus. Errors of
+# individual actions are returned as tool error results and never raised, so one bad action does
+# not end the episode.
 """A chat-completions computer tool over HUD's rfb capability.
 
 HUD ships the screen primitives (``hud.agents.tools.rfb.RFBTool``: VNC
@@ -47,12 +58,24 @@ _EXTRA_ALIASES = {"left": "Left", "right": "Right", "up": "Up", "down": "Down"}
 
 
 def to_keysym(key: str) -> str:
+    # [FUNCTION DOC] Maps a model-written key name to the X11 key symbol the VNC library expects.
+    # Trims whitespace; looks up the lowercased name first in HUD's OpenAI alias table, then in the
+    # extra table of bare direction words (left, right, up, down mapped to capitalised symbols);
+    # if neither knows it, returns the trimmed original unchanged.
     """Model-friendly key names to the X11 keysyms asyncvnc wants."""
     k = key.strip()
     return OPENAI_KEY_ALIASES.get(k.lower()) or _EXTRA_ALIASES.get(k.lower(), k)
 
 
 class ChatComputerTool(RFBTool):
+    # [CLASS DOC]
+    # The computer tool. Class attributes: the tool name (computer), the model-visible screenshot
+    # width (default 640; per-run values are set on a subclass, see the factory function), a
+    # description and an object schema of parameters: action (required, one of the seven actions),
+    # integer x and y in screenshot coordinates, button (left, middle, right; default left), text,
+    # keys (list of strings), scroll_y (clicks, positive down) and ms (wait milliseconds). Instance
+    # state: whether the pointer has established focus yet (starts false), used so that the focus
+    # click happens once per tool instance; the tool is assumed to live for one episode.
     """Drive the environment's screen via OpenAI-style function calling."""
 
     name = "computer"
@@ -101,10 +124,14 @@ class ChatComputerTool(RFBTool):
 
     @classmethod
     def default_spec(cls, model: str) -> AgentToolSpec:
+        # [FUNCTION DOC] Class method: returns the agent tool specification declaring a plain
+        # function tool with this tool's name; the model argument is deleted and ignored.
         del model
         return AgentToolSpec(api_type="function", api_name=cls.name)
 
     def to_params(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Returns the chat-completions function tool definition: type function with
+        # the tool name, description and parameter schema.
         return {
             "type": "function",
             "function": {
@@ -121,15 +148,25 @@ class ChatComputerTool(RFBTool):
 
     @property
     def _scale(self) -> float:
+        # [FUNCTION DOC] HELPER: Property giving the factor from the downscaled frame to the real
+        # screen: display width divided by the shot width when the shot width is set and smaller than
+        # the display width; otherwise 1.0 (no scaling).
         """Downscaled-frame -> real-screen factor."""
         if self.shot_width and self.display_width > self.shot_width:
             return self.display_width / self.shot_width
         return 1.0
 
     def _to_screen(self, v: Any) -> int:
+        # [FUNCTION DOC] HELPER: Converts a coordinate in the downscaled frame (anything convertible
+        # to an integer) to a real-screen integer coordinate by multiplying by the scale and rounding.
         return round(int(v) * self._scale)
 
     async def _observation(self) -> MCPToolResult:
+        # [FUNCTION DOC] HELPER: Takes a screenshot and returns it as a tool result. With scale 1.0
+        # the result is returned untouched. Otherwise every image block is decoded from base64,
+        # resized with a high-quality filter to the shot width keeping the aspect ratio (height
+        # rounded), re-encoded as PNG and re-wrapped; non-image blocks are kept as they are. The
+        # imaging library is imported lazily.
         """A screenshot at the width the model is trained to look at."""
         result = await self.screenshot()
         if self._scale == 1.0:
@@ -153,6 +190,10 @@ class ChatComputerTool(RFBTool):
         return MCPToolResult(content=content)
 
     async def _ensure_focus(self) -> None:
+        # [FUNCTION DOC] HELPER: Before the first typed input, if no pointer action has happened
+        # yet, marks the pointer as used, clicks the centre of the real display and waits 200
+        # milliseconds. Does nothing on later calls. Note it is set before the click, so a failed
+        # click is not retried.
         """Give the screen keyboard focus before the first typed input.
 
         A desktop routes key events to whatever it has focused, and a freshly
@@ -170,6 +211,20 @@ class ChatComputerTool(RFBTool):
     # ---- dispatch ----
 
     async def execute(self, arguments: dict[str, Any]) -> MCPToolResult:
+        # [FUNCTION DOC] Runs one action from the model's argument mapping and returns a
+        # screenshot result or an error result. Logs the action and its other arguments at info
+        # level. Actions: screenshot does nothing before observing; click and double click require
+        # both coordinates (else an error result), scale them to the real screen and click with the
+        # given button (default left; count two for double click) and mark the pointer as used; type
+        # ensures focus then types the text (empty if missing); press ensures focus, accepts a list
+        # or a single string, requires at least one key (else an error result), and for each element
+        # splits on plus signs, maps each part to a key symbol (blank parts dropped) and presses that
+        # chord, skipping empty chords; scroll scales optional coordinates and scrolls by the integer
+        # amount (default zero); wait pauses for the given milliseconds (default 500, capped at 5000);
+        # an unknown action returns an error result. After any successful action it waits 300
+        # milliseconds and returns the observation. Any exception inside is caught and returned as an
+        # error result naming the action. Note scroll, missing coordinates reaching the conversion
+        # for only one of the two are handled as none for that axis.
         action = str(arguments.get("action", ""))
         # One line per action, at INFO, because the alternative is finding out
         # what the policy did only after the batch lands: a run whose reward
@@ -220,6 +275,10 @@ class ChatComputerTool(RFBTool):
 
 
 def computer_tool_class(shot_width: int) -> type[ChatComputerTool]:
+    # [FUNCTION DOC] Returns the tool class for a screenshot width: the base class itself when the
+    # width equals its default, otherwise a new subclass of the same name with the shot width
+    # overridden (the harness constructs tools with a fixed signature, so configuration travels on
+    # the class).
     """The tool with a specific screenshot width baked in.
 
     The harness constructs tools with a fixed ``(spec, client, encoding)``

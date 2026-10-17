@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Launcher for asynchronous GRPO training of a Nemotron model on the Workplace Assistant tool-use
+# tasks across two eight-GPU nodes (one for training actors, the rest of the cluster for rollout
+# inference), run as a script with a JSON configuration file. The configuration keys fill the
+# script argument record, which validates the topology and batch arithmetic. The launcher builds
+# the training argument string from helper functions that render ordered mappings to command line
+# flags, grouped as checkpoint, rollout, learning (parallelism, algorithm, optimiser), serving
+# (inference engine, routing replay, session server with token-in-token-out handling) and
+# miscellaneous (dropout, precision, tracing, metrics, a training pre-step hook). Environment
+# forwarded to the job: the verifier resource URL, Hugging Face cache locations, and a module
+# search path entry for this example directory. Submitted with the asynchronous training script.
 """Nemotron 3.5 Lightning Workplace Assistant GRPO with separate rollout and training nodes.
 
 Requires two joined eight-GPU Ray nodes, matching model and dataset paths on both,
@@ -25,6 +36,13 @@ import miles.utils.external_utils.command_utils as U
 
 @dataclass
 class ScriptArgs(U.ExecuteTrainConfig):
+    # [CLASS DOC]
+    # Validated launcher configuration (extends the shared execute-train configuration). Fields and
+    # defaults: run id (generated per instance), nodes 2, GPUs per node 8, model and data
+    # directories, model name, data file name, Megatron path, verifier URL (local port 8211), Hugging
+    # Face cache directory, learning rate 3e-7, rollout batch 8 prompts, group size 16, global batch
+    # 128, 1000 rollouts, save interval 100, response length 65536, context length 81920, maximum
+    # tokens per GPU 16384, and pause generation mode (only retract is accepted).
     run_id: str = field(default_factory=U.create_run_id)
     num_nodes: int = 2
     num_gpus_per_node: int = 8
@@ -47,6 +65,11 @@ class ScriptArgs(U.ExecuteTrainConfig):
     pause_generation_mode: str = "retract"
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] Validation after construction; raises a value error unless: the node and GPU
+        # counts are exactly two and eight; global batch size equals rollout batch size times group
+        # size; response length is positive and strictly below context length; the batch sizes, group
+        # size, rollout count, save interval and token budget are all positive; and the pause
+        # generation mode is retract (needed by routing replay).
         if (self.num_nodes, self.num_gpus_per_node) != (2, 8):
             raise ValueError("This example requires two nodes with eight GPUs each")
         if self.global_batch_size != self.rollout_batch_size * self.group_size:
@@ -70,10 +93,16 @@ class ScriptArgs(U.ExecuteTrainConfig):
 
     @property
     def run_name(self) -> str:
+        # [FUNCTION DOC] Property: descriptive run name joining the run id, a fixed model/topology
+        # label, the global batch size, group size and pause mode; used as the logging run id.
         return f"{self.run_id}-nemotron35-lightning-workplace-async-2n-bs{self.global_batch_size}-g{self.group_size}-{self.pause_generation_mode}"
 
 
 def _flags(values: dict[str, object]) -> str:
+    # [FUNCTION DOC] HELPER: Renders a mapping to a shell-quoted command line string in mapping
+    # order. Entries whose value is false or none are skipped. Each other key becomes a flag with a
+    # double dash prefix and underscores replaced by hyphens; the value follows as text unless the
+    # value is exactly true (a bare switch). Zero and empty text are emitted as values.
     tokens = []
     for key, value in values.items():
         if value is False or value is None:
@@ -85,6 +114,15 @@ def _flags(values: dict[str, object]) -> str:
 
 
 def _learning_args(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: Learning-related flags in three groups joined by spaces. Performance:
+    # tensor parallel 2 with sequence parallel, pipeline parallel 2, context parallel 1, expert
+    # parallel 2, expert tensor parallel 1, full uniform recompute of one layer, dynamic batch size
+    # with the token budget per GPU, log-prob chunk size 128, sequence length equal to the context
+    # length, and CPU optimiser offload with overlapped transfers and precision-aware optimiser.
+    # Algorithm: GRPO with KL loss enabled at zero coefficient (low-variance type), zero entropy
+    # coefficient, clip range 0.2 below and 0.28 above, use of rollout log probabilities, and the
+    # pause generation mode. Optimiser: Adam, configured learning rate, constant schedule, weight decay
+    # 0.1, betas 0.9 and 0.98.
     performance_args = _flags(
         {
             "tensor_model_parallel_size": 2,
@@ -132,6 +170,11 @@ def _learning_args(args: ScriptArgs) -> str:
 
 
 def _checkpoint_args(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: Checkpoint flags. The Hugging Face checkpoint and reference load both
+    # point to the model directory joined with the model name (training starts from the original
+    # weights); save directory is a checkpoints sub-directory of the configured output directory,
+    # with the configured interval; weights are converted through the bridge mode; optimiser and
+    # random-state loading are disabled and fine-tune mode is on.
     checkpoint = str(Path(args.model_dir) / args.model_name)
     return _flags(
         {
@@ -148,6 +191,13 @@ def _checkpoint_args(args: ScriptArgs) -> str:
 
 
 def _rollout_args(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: Rollout flags. Prompt data is the data directory joined with the data
+    # file; input, metadata and label keys are prompt, metadata and label; the chat template is not
+    # applied (the flag value false is omitted); custom generate, agent and reward function paths
+    # point at modules in this example directory; maximum sequence length equals the context length;
+    # the dynamic sampling filter removes aborted samples; shuffle on; reward type deepscaler (with
+    # the custom reward path configured as well); the rollout count, rollout batch size, group size
+    # (samples per prompt), global batch size, response length cap, temperature 1 and data balancing.
     return _flags(
         {
             "prompt_data": str(Path(args.data_dir) / args.data_file),
@@ -174,6 +224,11 @@ def _rollout_args(args: ScriptArgs) -> str:
 
 
 def _serving_args(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: Inference serving flags: one GPU per engine, static memory fraction
+    # 0.7, engine context length equal to the configured context length, routing replay on, round
+    # robin router policy, engine metrics on, the version-one session server with 8 workers listening
+    # on all interfaces at port 31000 and pinned to the head node's rollout manager, the nemotron3
+    # token handling model, the nemotron_3 reasoning parser and the qwen3_coder tool call parser.
     return _flags(
         {
             "rollout_num_gpus_per_engine": 1,
@@ -195,6 +250,12 @@ def _serving_args(args: ScriptArgs) -> str:
 
 
 def _miscellaneous_args(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: Remaining flags: zero dropouts; fp32 gradient accumulation and
+    # attention softmax; automatic attention backend; one actor node and the GPU counts per node
+    # (rollout GPU count equal to GPUs per node, no colocation); zero multi-token-prediction loss
+    # scale; a pre-train-step hook from this example's training checks module; detail dumps into a
+    # traces directory under the output directory; dashboard, training and rollout entropy
+    # observation; and Prometheus metrics on port 9090 forwarded to the dashboard.
     return _flags(
         {
             "attention_dropout": 0,
@@ -220,6 +281,13 @@ def _miscellaneous_args(args: ScriptArgs) -> str:
 
 
 def execute(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] Submits the training job. Concatenates the checkpoint, rollout, learning,
+    # serving and miscellaneous flag strings and the default logging arguments (run name as run
+    # id) with spaces, and submits through the configuration's backend using the asynchronous
+    # training script, the configured GPUs per node, the nemotron-3 nano 30B model type and the
+    # Megatron path. Extra environment: an empty value for the keep-MTP switch, the verifier
+    # resource URL, Hugging Face home and hub cache locations, and a module search path of this
+    # example directory under the repository base.
     args.create_backend().execute_train(
         train_args=" ".join(
             [
@@ -247,10 +315,15 @@ def execute(args: ScriptArgs) -> None:
 
 
 class _CLI(Tap):
+    # [CLASS DOC] HELPER: Command line schema with one required option, the path of the JSON
+    # configuration file.
     config: Path
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point: parses the command line, reads the JSON configuration file,
+    # builds the validated script arguments from its keys (unknown keys raise a type error,
+    # invalid values a value error) and runs the launcher.
     cli = _CLI().parse_args()
     execute(ScriptArgs(**json.loads(cli.config.read_text())))
 

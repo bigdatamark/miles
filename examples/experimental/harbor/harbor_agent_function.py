@@ -1,3 +1,17 @@
+# [MODULE DOC]
+# Agent function plug-in (loaded through the custom agent function path option of the agentic tool
+# call generator) that runs one Harbor trial inside the rollout worker process for each sample.
+# Flow of the async entry point: resolve the provider API key file into the environment, build a
+# Harbor trial configuration from the sample metadata, environment variables and the session URL
+# of the training-side inference session server, create and run the trial under a wall-clock
+# timeout, then convert Harbor's trial result into a metadata mapping with reward, exit status,
+# verifier report and agent metrics. Per-harness settings (which keyword arguments and
+# environment variables carry the endpoint, key and model name) live in a table of bindings
+# keyed by agent name, with a default for any other OpenAI-chat-completions-speaking agent.
+# Configuration errors raise (they would fail every sample); trial-level failures map to a
+# zero reward with a named exit status. Harbor itself is imported lazily inside functions so the
+# module imports without it. All settings are read from environment variables (listed in the
+# existing documentation below), never from arguments.
 """In-process Harbor agent function for ``agentic_tool_call.generate``.
 
 Runs one Harbor trial inside the rollout worker: build a ``TrialConfig`` from
@@ -87,20 +101,30 @@ _OUTPUT_LIMIT_EXCEPTIONS = {"MaxSeqLenExceededError", "SingleTurnMaxSeqLenExceed
 
 
 def _trial_timeout_s() -> int:
+    # [FUNCTION DOC] HELPER: Returns the wall-clock cap in whole seconds for one trial, read from
+    # the trial timeout environment variable (default 7200). A non-integer value raises a value
+    # error.
     """The wall-clock cap run() puts on one trial; the longest a trial can live."""
     return int(os.environ.get("AGENT_TRIAL_TIMEOUT", _DEFAULT_AGENT_TRIAL_TIMEOUT_S))
 
 
 def _env_flag(var: str) -> bool:
+    # [FUNCTION DOC] HELPER: Reads a boolean environment variable: true when its value
+    # (default "false"), lowercased, is one of 1, true or t; every other value, including yes, is
+    # false.
     return os.getenv(var, "false").lower() in ("1", "true", "t")
 
 
 def _env_int(var: str) -> int | None:
+    # [FUNCTION DOC] HELPER: Reads an integer environment variable; returns none when unset or
+    # empty, otherwise the parsed integer (a non-integer value raises a value error).
     raw = os.getenv(var)
     return int(raw) if raw else None
 
 
 def _allowed_hosts(var: str) -> list[str]:
+    # [FUNCTION DOC] HELPER: Splits the environment variable on commas and whitespace and returns
+    # the non-empty host names in order (empty list if unset).
     return [host for host in re.split(r"[,\s]+", os.getenv(var, "")) if host]
 
 
@@ -121,6 +145,12 @@ def _allowed_hosts(var: str) -> list[str]:
 
 @dataclass(frozen=True)
 class HarnessBinding:
+    # [CLASS DOC]
+    # Immutable per-harness adapter with three members: a function building the agent keyword
+    # arguments from the session URL, API key, sampling parameters mapping, model name and optional
+    # maximum sequence length; a function building the agent environment variable mapping from the
+    # session URL and API key; and a function mapping the model name to the name Harbor passes to the
+    # harness (identity by default).
     # (session_url, api_key, sampling_params, model, max_seq_len) -> AgentConfig.kwargs
     kwargs: Callable[[str, str, dict[str, Any], str, int | None], dict[str, Any]]
     # (session_url, api_key) -> AgentConfig.env
@@ -132,6 +162,15 @@ class HarnessBinding:
 def _terminus_kwargs(
     session_url: str, api_key: str, sampling_params: dict[str, Any], model: str, max_seq_len: int | None
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Agent keyword arguments for the terminus family. Fixed: XML parser,
+    # interleaved thinking, abort when a response exceeds the length limit, the sampling parameters
+    # as LLM call keyword arguments, the session URL as API base, the API key inside the LLM keyword
+    # arguments (the agent has no top-level key parameter), summarisation and linear history flags
+    # from environment booleans, and the response-length policy from its environment variable
+    # (default abort, because recovering would replay a fabricated assistant turn and desync the
+    # token-level session server). If the maximum-iterations environment integer is set and non-zero
+    # it adds a turn cap and suppresses the cap warning. The model and maximum sequence length
+    # parameters are unused here.
     kwargs: dict[str, Any] = {
         "parser_name": "xml",
         "interleaved_thinking": True,
@@ -156,12 +195,18 @@ def _terminus_kwargs(
 
 
 def _openai_env(session_url: str, api_key: str) -> dict[str, str]:
+    # [FUNCTION DOC] HELPER: Environment for harnesses speaking OpenAI chat completions: the API
+    # key and API base variables set to the key and session URL.
     return {"OPENAI_API_KEY": api_key, "OPENAI_API_BASE": session_url}
 
 
 def _claude_code_kwargs(
     session_url: str, api_key: str, sampling_params: dict[str, Any], model: str, max_seq_len: int | None
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Agent keyword arguments for the Claude Code harness: disables the web
+    # search and web fetch tools (Anthropic server-side tools the session server cannot translate)
+    # and, if the maximum-iterations environment integer is set and non-zero, adds a turn cap.
+    # All other parameters are unused.
     # WebSearch / WebFetch are Anthropic server-side tools; the session server
     # translates client-side tools onto an OpenAI-compatible backend only.
     kwargs: dict[str, Any] = {"disallowed_tools": "WebSearch,WebFetch"}
@@ -171,6 +216,11 @@ def _claude_code_kwargs(
 
 
 def _claude_code_env(session_url: str, api_key: str) -> dict[str, str]:
+    # [FUNCTION DOC] HELPER: Environment for Claude Code: Anthropic API key set to the key;
+    # Anthropic base URL set to the session URL with a trailing version path segment removed (the
+    # SDK appends its own messages path and the session server's Anthropic route hangs off the
+    # session root); server-side tool search disabled; and, if the max output tokens environment
+    # variable is non-empty, the Claude Code output token limit set to the same value.
     env = {
         "ANTHROPIC_API_KEY": api_key,
         # The Anthropic SDK appends /v1/messages itself, and the session
@@ -186,12 +236,16 @@ def _claude_code_env(session_url: str, api_key: str) -> dict[str, str]:
 
 
 def _mini_swe_agent_env(session_url: str, api_key: str) -> dict[str, str]:
+    # [FUNCTION DOC] HELPER: The OpenAI-style environment plus a setting that makes the mini
+    # software-engineering agent ignore cost-tracking errors.
     return {**_openai_env(session_url, api_key), "MSWEA_COST_TRACKING": "ignore_errors"}
 
 
 def _no_kwargs(
     session_url: str, api_key: str, sampling_params: dict[str, Any], model: str, max_seq_len: int | None
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Keyword-argument builder for harnesses that need none; ignores all
+    # parameters and returns an empty mapping.
     return {}
 
 
@@ -203,6 +257,11 @@ _OPENCODE_COMPAT_PROVIDER = "openai-compatible"
 
 
 def _opencode_provider_model(model: str) -> tuple[str, str]:
+    # [FUNCTION DOC] HELPER: Splits a model name of the form provider slash model id into a pair.
+    # A name without a slash gets the compatible provider id and the whole name as model id; a
+    # provider equal to openai is renamed to the compatible provider id (the real openai id would
+    # make the harness use the Responses API, which the backend rejects), keeping the model id;
+    # other providers are kept. Splits at the first slash only.
     provider, sep, model_id = model.partition("/")
     if not sep:
         return _OPENCODE_COMPAT_PROVIDER, model
@@ -212,6 +271,10 @@ def _opencode_provider_model(model: str) -> tuple[str, str]:
 
 
 def _opencode_model_entry(sampling_params: dict[str, Any], max_seq_len: int | None) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Builds the OpenCode model entry. A limit mapping gets a context key
+    # when a maximum sequence length is given and an output key from the sampling parameters' max
+    # tokens, falling back to the max output tokens environment integer, when either is non-zero.
+    # Returns a mapping with only the limit key if the limit is non-empty, else an empty mapping.
     """The OpenCode model entry, including its context/output limits.
 
     OpenCode only auto-compacts a session when it knows the model's context
@@ -230,6 +293,10 @@ def _opencode_model_entry(sampling_params: dict[str, Any], max_seq_len: int | No
 def _opencode_kwargs(
     session_url: str, api_key: str, sampling_params: dict[str, Any], model: str, max_seq_len: int | None
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Agent keyword arguments for OpenCode: a configuration mapping
+    # defining one provider (id from the model name) using the OpenAI-compatible package, with the
+    # session URL as base URL, the API key, and the model entry with limits. No turn cap is set
+    # because the agent has no such flag.
     provider, model_id = _opencode_provider_model(model)
     # Deliberately no max_turns: the OpenCode agent exposes no turn-cap flag,
     # so honouring HARBOR_AGENT_MAX_ITERATIONS would be a silent no-op.
@@ -247,6 +314,8 @@ def _opencode_kwargs(
 
 
 def _opencode_env(session_url: str, api_key: str) -> dict[str, str]:
+    # [FUNCTION DOC] HELPER: Environment for OpenCode: both the base URL and API base variables set
+    # to the session URL (the harness reads the former) and the API key variable.
     # OpenCode reads OPENAI_BASE_URL when deciding whether to write
     # provider.options.baseURL; the generic OPENAI_API_BASE is not consulted.
     # Export both so either lookup resolves.
@@ -273,6 +342,11 @@ _DEFAULT_BINDING = HarnessBinding(kwargs=_no_kwargs, env=_openai_env)
 
 
 def _task_path(tasks_dir: Path, instance_id: str) -> Path:
+    # [FUNCTION DOC] HELPER: Resolves the task directory for an instance id under the tasks
+    # directory. The id must be non-empty and match a conservative pattern (alphanumeric first
+    # character, then alphanumerics, dots, underscores, hyphens) else a value error; the resolved
+    # path must be inside the tasks directory (else a value error, guarding symbolic link escapes)
+    # and must be an existing directory (else a file-not-found error). Returns the resolved path.
     if not instance_id or not _SAFE_INSTANCE_ID.match(instance_id):
         raise ValueError(f"invalid instance_id {instance_id!r}")
     path = (tasks_dir / instance_id).resolve()
@@ -284,6 +358,11 @@ def _task_path(tasks_dir: Path, instance_id: str) -> Path:
 
 
 def _ensure_provider_key() -> None:
+    # [FUNCTION DOC] HELPER: Looks up the credential spec for the (trimmed, lowercased) sandbox
+    # backend type; does nothing if the backend has no spec or has more than one key variable. If
+    # the single key variable is unset or blank in the environment, resolves the key (from the
+    # variable, the key file named by the spec's file variable, or its default path; raising if none
+    # works) and stores it in the process environment. Side effect: mutates the environment.
     """Resolve the key file the launcher forwarded (by PATH) into the env var the
     provider's SDK reads. Modal needs nothing here: its SDK reads the config file
     MODAL_CONFIG_PATH names."""
@@ -296,6 +375,16 @@ def _ensure_provider_key() -> None:
 
 
 def _environment_config():
+    # [FUNCTION DOC] HELPER: Builds Harbor's environment configuration object (imports Harbor
+    # lazily). The backend type comes from the environment variable (trimmed, lowercased); empty
+    # raises a value error, an unknown one raises through Harbor's enumeration. Backend keyword
+    # arguments come from a JSON object in another variable (default empty object). For the Daytona
+    # backend, defaults are filled in: auto-stop interval equals trial timeout in whole minutes
+    # (rounded up) plus thirty, auto-delete interval 1440 minutes; an explicit auto-stop interval
+    # not exceeding the trial minutes raises a value error. CPU, memory and storage overrides come
+    # from integer environment variables (non-positive values raise a value error; unset gives
+    # none); CPU and memory enforcement policies come from their variables when non-empty. The
+    # configuration always requests sandbox deletion when done.
     """``HARBOR_ENV_TYPE`` straight through to Harbor's ``EnvironmentType``: adding a
     backend is Harbor's job, not a branch here. Backend-specific settings ride in
     ``HARBOR_ENV_KWARGS`` (a JSON object) as ``EnvironmentConfig.kwargs``."""
@@ -339,6 +428,21 @@ def _environment_config():
 
 
 def build_trial_config(metadata: dict[str, Any], session_url: str, request_kwargs: dict[str, Any]):
+    # [FUNCTION DOC] Builds Harbor's trial configuration (imports Harbor lazily). Inputs: the
+    # sample metadata mapping (agent name, default mini software-engineering agent; instance id;
+    # optional maximum sequence length), the session URL and the sampling parameters mapping.
+    # The tasks directory comes from its required environment variable (key error if unset). The
+    # model name is "openai/" plus the model name environment value (default "model") and the API
+    # key is a fixed dummy value. The harness binding is looked up by agent name with the default
+    # binding as fallback. Maximum sequence length is the metadata value or the environment
+    # integer, if any. Agent keyword arguments from the binding are extended with model info
+    # (maximum input tokens default 32768, maximum output tokens default 8192, zero costs) and the
+    # sequence length when known. Optional verifier timeout and environment build timeout
+    # multiplier come from environment floats. The agent config uses the binding's model name,
+    # the agent timeout from its environment float (none if unset), the binding environment, the
+    # keyword arguments and extra allowed hosts. Also sets the task path (validated), the environment
+    # configuration, the trials directory (default under the system temp directory) and the timeout
+    # multiplier (default 2.0). Returns the configuration object.
     from harbor.models.trial.config import AgentConfig, TaskConfig, TrialConfig, VerifierConfig
 
     tasks_dir = Path(os.environ["HARBOR_TASKS_DIR"])
@@ -387,12 +491,26 @@ def build_trial_config(metadata: dict[str, Any], session_url: str, request_kwarg
 
 
 def _timing_duration_sec(timing) -> float | None:
+    # [FUNCTION DOC] HELPER: Returns finish minus start in seconds from an object's start and
+    # finish timestamp attributes, or none if either is missing.
     started = getattr(timing, "started_at", None)
     finished = getattr(timing, "finished_at", None)
     return (finished - started).total_seconds() if started and finished else None
 
 
 def trial_result_to_metadata(result) -> dict[str, Any]:
+    # [FUNCTION DOC] Converts Harbor's trial result into a mapping with reward, exit status,
+    # eval report and agent metrics. Exit status: if the result has exception info, it is time
+    # limit exceeded for the agent, verifier or environment-start timeout exception types, sequence
+    # length limit exceeded for the two max-sequence-length exception types, otherwise agent error;
+    # without exception info it is submitted when a verifier result exists, else agent error.
+    # Rewards: the verifier's reward mapping (copied) is the eval report; the reward is its
+    # "reward" entry, or its first value if that key is missing, or 0.0 when the mapping is empty
+    # or there is no verifier result. Metrics: input tokens, output tokens and cost when not none;
+    # the step count under the name turns; any agent metadata mapping merged in (overriding on
+    # equal keys); and durations in seconds for total, environment setup, agent setup, agent run
+    # and evaluation phases when their timestamps exist. All attribute accesses are tolerant of
+    # missing attributes.
     """Harbor ``TrialResult`` -> the dict merged into sample metadata."""
     exc = getattr(result, "exception_info", None)
     if exc is not None:
@@ -436,6 +554,8 @@ def trial_result_to_metadata(result) -> dict[str, Any]:
 
 
 def _failed(exit_status: str) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Result mapping for an episode without a verdict: reward 0.0, the
+    # given exit status, and empty eval report and agent metrics.
     return {"reward": 0.0, "exit_status": exit_status, "eval_report": {}, "agent_metrics": {}}
 
 
@@ -449,6 +569,17 @@ async def run(
     metadata: dict[str, Any] | None = None,
     **kwargs,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] Async entry point called per sample (extra keyword arguments accepted and
+    # ignored). Inputs: the inference base URL (converted to the OpenAI-style session URL), the
+    # prompt, sampling request keyword arguments (default empty) and the sample metadata (default
+    # empty). Resolves the provider key and builds the trial configuration first, outside any
+    # error handling, so configuration errors propagate and stop the run. Then creates the trial
+    # and runs it under the wall-clock timeout; a timeout is logged and returns the failed result
+    # with exit status time limit exceeded; any other exception is logged with traceback and
+    # returns the failed result with agent error. On success returns the converted result mapping
+    # plus the trial directory path as text, logging exit status and reward.
+    # KNOWN ISSUE: the prompt parameter is unused; the instruction comes from the Harbor task
+    # directory selected by the instance id in the metadata.
     """Run one Harbor trial for the sample; return its verdict as metadata."""
     from harbor.trial.trial import Trial
 

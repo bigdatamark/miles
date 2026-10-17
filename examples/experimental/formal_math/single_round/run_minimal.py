@@ -1,3 +1,17 @@
+# [MODULE DOC]
+# Minimal demonstration script (all work happens at import time, no functions) that launches
+# single-round formal-math GRPO training of Qwen3-8B on one node with eight GPUs by submitting a
+# job to a Ray cluster already listening at the local dashboard address (port 8265). It builds the
+# training argument string in groups (checkpoint paths under the root directory, rollout with the
+# custom Lean reward function and the minimal demo dataset, evaluation on miniF2F every 20 steps,
+# performance, GRPO, optimiser, inference engine, miscellaneous with colocation), adds wandb
+# options only if the WANDB_API_KEY environment variable is set, composes the model architecture
+# arguments from the model definition helper, and runs a shell that exports unbuffered output and
+# submits the job with a runtime environment (Megatron path, single CUDA connection, NCCL NVLS
+# enabled) running the training entry script. The assembled command is printed before it runs.
+# Requires the converted reference checkpoint and the prepared minimal demo dataset to exist.
+# KNOWN ISSUE: the printed command contains the wandb API key in clear text when it is set, and the
+# exit status of the submission is ignored. The computed repository base directory is unused.
 """
 Example to demonstrate how to launch training.
 You can also do the same using a .sh or others, and we use Python here just for simplicity.

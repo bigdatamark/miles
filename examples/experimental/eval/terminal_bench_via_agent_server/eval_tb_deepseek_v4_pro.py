@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Standalone asynchronous client script that evaluates an LLM on the Terminal-Bench 2.0 task set
+# through an already running agent server. Reads the list of task names for a named dataset from a
+# registry JSON file, then sends one run request per (task, trial) pair with bounded concurrency
+# (a semaphore), each carrying the LLM endpoint, model, API key, agent name, sampling parameters
+# and sequence length cap. The API key is read from the environment variable named by an option
+# (default for the DeepSeek key) and never stored. Each finished trial is appended as one JSON line
+# to a results file (truncated at start) and printed as a progress line; at the end all rows
+# (without the nested agent metrics and eval report) are written as a parquet table and a summary of
+# completed and passing (reward exactly 1.0) trials is printed. No GPU, training or Ray is used.
 """Evaluate DeepSeek-V4-Pro on Terminal-Bench 2.0 via a running ``miles_agent_server``.
 
 This is a pure client: no training, no Ray, no Megatron. It just POSTs
@@ -40,6 +50,13 @@ import polars as pl
 
 
 def parse_args() -> argparse.Namespace:
+    # [FUNCTION DOC] HELPER: Defines and parses the command line. Options and defaults: server URL
+    # (localhost port 8080), registry path (registry.json), dataset name (terminal-bench), trials
+    # per task (4), max concurrent requests (16), streamed JSONL path, parquet path, model
+    # identifier (openai/deepseek-v4-pro), LLM base URL (DeepSeek API v1), name of the API key
+    # environment variable (DEEPSEEK_API_KEY), agent name (mini-swe-agent), max sequence length
+    # (65536), temperature (0.7), max output tokens (8192) and per-request client timeout seconds
+    # (3600). Help output shows defaults. Returns the namespace.
     parser = argparse.ArgumentParser(
         description="Evaluate DeepSeek-V4-Pro on Terminal-Bench 2.0 via miles_agent_server.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -138,6 +155,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_task_names(registry_path: Path, dataset_name: str) -> list[str]:
+    # [FUNCTION DOC] Reads the registry file (a JSON list of dataset objects) and returns the names
+    # of the tasks of the first dataset whose name equals the requested one; only task entries that
+    # are objects with a name are kept, in file order. Raises a value error listing the available
+    # (sorted) dataset names if none matches. File and JSON errors propagate.
     """Pull the list of task names for ``dataset_name`` from ``registry_path``."""
     data: list[dict[str, Any]] = json.loads(registry_path.read_text())
     for dataset in data:
@@ -154,6 +175,17 @@ async def run_one_trial(
     instance_id: str,
     trial_idx: int,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] Sends one run request and returns a flat result row; never raises for request
+    # failures. The body carries the LLM base URL, model, API key, task instance id, agent name,
+    # sampling parameters (temperature and max tokens) and max sequence length, posted as JSON to
+    # the run path of the server URL with the per-request timeout (connect timeout thirty seconds).
+    # A response body that is not JSON, or not a JSON object, is replaced by a mapping holding its
+    # first 4000 characters of text. Success row: instance id, trial index, HTTP status code,
+    # elapsed seconds (monotonic clock), reward, exit status, agent metrics and eval report (the
+    # latter two default to empty mappings). Any exception while posting yields a row with status
+    # code -1, elapsed time, no reward, exit status "ClientError" and an error string of the
+    # exception type and message. Note the HTTP status is not checked, so an error status still
+    # produces a normal row whose reward is absent.
     """Submit one /run request and shape the response into a flat record."""
     body: dict[str, Any] = {
         "base_url": args.base_url,
@@ -202,6 +234,15 @@ async def run_one_trial(
 
 
 async def main(args: argparse.Namespace) -> None:
+    # [FUNCTION DOC] Orchestrates the evaluation. Exits with a message if the API key environment
+    # variable is unset or empty, or if there are zero trials. Prints a plan line, creates output
+    # parent directories and deletes any existing JSONL file. Creates one task per (task name,
+    # trial index) pair (all at once, gated by a semaphore of the concurrency cap) and, as each
+    # finishes, appends its row as a JSON line (non-serialisable values stringified) and prints a
+    # progress line with counts, truncated instance id, trial, status code, elapsed seconds, reward
+    # and exit status. Afterwards writes the parquet file from the rows minus nested metrics and
+    # report columns, and prints counts of rows, trials with a reward and trials with reward exactly
+    # one (pass rate over the scored trials, using at least one as denominator).
     api_key = os.environ.get(args.api_key_env)
     if not api_key:
         raise SystemExit(
@@ -229,6 +270,8 @@ async def main(args: argparse.Namespace) -> None:
     sem = asyncio.Semaphore(args.max_concurrent)
 
     async def bounded(client: httpx.AsyncClient, iid: str, idx: int) -> dict[str, Any]:
+        # [FUNCTION DOC] HELPER: Runs one trial while holding the concurrency semaphore and returns
+        # its result row.
         async with sem:
             return await run_one_trial(client, args, api_key, iid, idx)
 

@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Shared helpers for the Harbor example launchers. Provides the directories to add to the
+# workers' module search path (this example's directory and the sibling agent-server example, whose
+# reward hook and rollout class are reused), the fixed block of training command line flags that
+# wire up the agentic tool-call generation with the Harbor agent function and the inference session
+# server, and a preflighted mapping of Harbor-related environment variables to forward to rollout
+# workers. Kept free of heavy training dependencies; it needs only the credential helper module.
 """The Harbor-side launcher wiring, shared by this example's launchers.
 
 Separate from run.py so it imports without the trainer's heavy dependencies:
@@ -16,6 +23,10 @@ HARBOR_DOCKER_EXAMPLE_DIR = HARBOR_EXAMPLE_DIR.parents[1] / "swe-agent-harbor-do
 
 
 def agentic_pythonpath_dirs() -> list[str]:
+    # [FUNCTION DOC] Returns the two absolute directory paths (as text) to put on the workers'
+    # module search path: this example directory, then the swe-agent-harbor-docker example
+    # directory (two levels up from here, under the top-level examples directory). Existence is
+    # not checked.
     """Directories every Harbor launcher puts on the workers' PYTHONPATH: the
     agent function here, and the reward hook it reuses from the agent-server
     example."""
@@ -29,6 +40,15 @@ def agentic_train_args(
     session_server_port: int = 30000,
     session_server_external_host: str = "",
 ) -> str:
+    # [FUNCTION DOC] Builds the flag string (keyword-only inputs: token-in-token-out model name,
+    # session server worker count, session server port default 30000, optional external host
+    # default empty). The flags: custom generate function path set to the agentic tool call
+    # generator; custom agent function path set to the Harbor agent function's run; custom reward
+    # path and rollout function path set to the reward function and rollout class of the reused
+    # example's generate module; the dynamic sampling filter that drops aborted samples; the model
+    # name for token handling; use of the session server with its port and worker count; and, only
+    # when an external host is given, the external host flag. Returns one string with each flag
+    # followed by a space.
     """The agentic wiring every Harbor launcher passes to train.py.
 
     One copy, shared by the recipes and the GPU e2e, so the flags the test
@@ -53,6 +73,19 @@ def agentic_train_args(
 
 
 def harbor_env_vars(args) -> dict[str, str]:
+    # [FUNCTION DOC] Validates the launcher arguments and builds the environment mapping for
+    # rollout workers. The sandbox backend type is trimmed and lowercased; empty raises a value
+    # error asking to set it, and docker raises a value error (docker needs a daemon next to the
+    # trial, use the agent-server example). Harbor must be importable in the launching process, else
+    # a runtime error. The mapping holds backend type, tasks directory, trials directory, agent
+    # model name and agent timeout (as text), plus the backend keyword JSON when non-empty. For a
+    # backend with a known credential spec, the credential is provisioned by file path (using the
+    # launcher argument named in the spec, empty if absent); for other backends a notice is printed
+    # that the worker environment must carry the credentials. Finally forwards, when non-blank in
+    # the launcher's environment (trimmed), a fixed list of tuning variables (token limits, trial
+    # timeout, sequence length, iteration cap, response length policy, terminus options, resource
+    # overrides and policies, timeout multipliers, verifier timeout, build timeout multiplier,
+    # allowed hosts).
     """The Harbor-side environment for rollout workers, preflighted on the launcher.
 
     HARBOR_ENV_TYPE is passed through untouched (Harbor validates it). The

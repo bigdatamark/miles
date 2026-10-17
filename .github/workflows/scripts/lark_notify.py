@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# Command line tool that turns finished GitHub Actions runs into Lark (Feishu) interactive cards
+# and posts them to an incoming webhook, or prints the card JSON in dry-run mode. Subcommands:
+# ci-status (summarise a finished scheduled PR test run, with automatic one-time rerun of failed
+# nightly jobs and optional AI failure analysis from the sibling analysis module), and
+# docker-build-failure / wheels-build-failure (list failed jobs and steps of a build run).
+# Layers in this file, top to bottom: a small GitHub REST client using only the standard library
+# (with retries, pagination, safe log tail download); card building helpers for Lark schema 2.0;
+# formatting helpers; the per-command render and command functions; and main. The GitHub token
+# comes from the token option or GITHUB_TOKEN, the webhook from the webhook option or LARK_WEBHOOK,
+# and an optional separate token CI_FAILURE_ANALYSIS_GITHUB_TOKEN is used for evidence gathering.
+# Exit status: zero success, two for missing credentials; GitHub or webhook failures raise.
 """
 Post Miles CI health cards to a Lark group via an incoming webhook.
 
@@ -49,13 +61,26 @@ MAX_LOG_STREAM_BYTES = 64 * 1024 * 1024
 
 
 class GitHub:
+    # [CLASS DOC]
+    # Small synchronous GitHub REST API client bound to one repository, using only the standard
+    # library. Holds the token, repository name (owner/name), request timeout in seconds (default
+    # sixty) and the default retry attempt count (default five). All methods perform network I/O
+    # and raise a runtime error on failure; transient failures are retried with exponential
+    # backoff in the lower-level helpers.
     def __init__(self, token: str, repo: str, *, timeout: int = 60, retries: int = 5):
+        # [FUNCTION DOC] Stores the token, repository, timeout and retry count. No validation.
         self.token = token
         self.repo = repo
         self.timeout = timeout
         self.retries = retries
 
     def get(self, path: str, params: dict | None = None, retries: int | None = None) -> Any:
+        # [FUNCTION DOC] GET a path under the API root with optional query parameters and returns
+        # the decoded JSON body. Attempts up to the retry count (default the instance value) with a
+        # sleep of two to the power of the attempt index seconds between attempts. HTTP errors are
+        # retried only for status 429, 502, 503, 504 or a 403 whose body mentions a rate limit;
+        # connection-level errors are retried too. Other or final failures raise a runtime error
+        # including the URL and (for HTTP) status and the first 300 characters of the body.
         retries = self.retries if retries is None else retries
         url = f"{GITHUB_API}/{path}"
         if params:
@@ -80,6 +105,9 @@ class GitHub:
         raise RuntimeError("unreachable")
 
     def paginate(self, path: str, key: str, params: dict | None = None, max_pages: int = 30) -> list:
+        # [FUNCTION DOC] Fetches pages (default one hundred per page, at most thirty pages) of an
+        # endpoint whose response is an object, collecting the list found under the given key from
+        # each page. Stops at the first page shorter than the page size. Returns the combined list.
         params = dict(params or {})
         params.setdefault("per_page", 100)
         items: list = []
@@ -93,9 +121,12 @@ class GitHub:
         return items
 
     def run(self, run_id: int) -> dict:
+        # [FUNCTION DOC] Returns the workflow run object for the id.
         return self.get(f"repos/{self.repo}/actions/runs/{run_id}")
 
     def run_jobs(self, run_id: int) -> list:
+        # [FUNCTION DOC] Returns all jobs of the run, using the latest attempt of each job (jobs not
+        # rerun keep their earlier result).
         return self.paginate(
             f"repos/{self.repo}/actions/runs/{run_id}/jobs",
             "jobs",
@@ -104,9 +135,13 @@ class GitHub:
         )
 
     def run_attempt_jobs(self, run_id: int, attempt: int) -> list:
+        # [FUNCTION DOC] Returns all jobs belonging to one specific attempt number of the run.
         return self.paginate(f"repos/{self.repo}/actions/runs/{run_id}/attempts/{attempt}/jobs", "jobs")
 
     def rerun_failed_jobs(self, run_id: int) -> None:
+        # [FUNCTION DOC] Asks GitHub to rerun the failed jobs of a run via an empty-body post. No
+        # retries. Raises a runtime error on HTTP or connection failure, or if the status is not
+        # 201. Side effect: starts CI jobs.
         url = f"{GITHUB_API}/repos/{self.repo}/actions/runs/{run_id}/rerun-failed-jobs"
         req = urllib.request.Request(url, data=b"", method="POST")
         req.add_header("Authorization", f"Bearer {self.token}")
@@ -124,6 +159,9 @@ class GitHub:
             raise RuntimeError(f"POST {url} -> {status}")
 
     def paginate_list(self, path: str, params: dict | None = None, max_pages: int = 10) -> list:
+        # [FUNCTION DOC] Like the object paginator but for endpoints whose response is itself a
+        # list (default hundred per page, up to ten pages). Raises a runtime error if a page is not
+        # a list. Stops at the first short page; returns the combined list.
         params = dict(params or {})
         params.setdefault("per_page", 100)
         items: list = []
@@ -138,6 +176,14 @@ class GitHub:
         return items
 
     def _download_tail(self, path: str, max_bytes: int, retries: int | None = None) -> bytes:
+        # [FUNCTION DOC] HELPER: Downloads the last max_bytes bytes of a (possibly huge) API
+        # response such as a job log, returning bytes; returns empty bytes immediately if max_bytes
+        # is not positive. Sends an authorised request with redirects disabled. When the API answers
+        # with a redirect (301, 302, 303, 307, 308), the location must be present, https and on a
+        # host with an allowed suffix (GitHub, AWS or Azure blob storage); then the tail is fetched
+        # from that location without the token. Retries (with exponential backoff) on connection
+        # errors, redirected-download errors and statuses 429, 502, 503, 504; other statuses raise
+        # a runtime error, as does the final failure. Error messages contain no response content.
         retries = self.retries if retries is None else retries
         if max_bytes <= 0:
             return b""
@@ -178,6 +224,11 @@ class GitHub:
         raise RuntimeError("unreachable")
 
     def _download_tail_from(self, location: str, max_bytes: int) -> bytes:
+        # [FUNCTION DOC] HELPER: Fetches the last max_bytes of a resource at an absolute URL.
+        # Opens it once to read the declared content length; if that is unknown (treated as zero)
+        # or not larger than max_bytes, reads the tail of that same response. Otherwise issues a
+        # second request with an explicit byte range for the final max_bytes bytes (the log storage
+        # backend ignores suffix ranges) and returns the tail of that response.
         # The log storage backend ignores suffix ranges, so the tail needs an explicit offset.
         with urllib.request.urlopen(location, timeout=self.timeout) as response:
             length = response.headers.get("Content-Length")
@@ -189,6 +240,9 @@ class GitHub:
             return _read_tail(response, max_bytes)
 
     def job_log(self, job_id: int, max_bytes: int) -> str:
+        # [FUNCTION DOC] Returns the last max_bytes bytes of a job's log decoded as UTF-8 with
+        # invalid bytes replaced. Raises a value error if the job id is not a positive integer
+        # (booleans rejected).
         if isinstance(job_id, bool) or not isinstance(job_id, int) or job_id <= 0:
             raise ValueError("job_id must be a positive integer")
         return self._download_tail(f"repos/{self.repo}/actions/jobs/{job_id}/logs", max_bytes).decode(
@@ -196,21 +250,31 @@ class GitHub:
         )
 
     def pulls_for_commit(self, sha: str) -> list:
+        # [FUNCTION DOC] Returns the pull requests associated with a commit; raises a runtime error
+        # if the response is not a list.
         pulls = self.get(f"repos/{self.repo}/commits/{sha}/pulls")
         if not isinstance(pulls, list):
             raise RuntimeError("GitHub API returned an unexpected pull response")
         return pulls
 
     def pull_files(self, pull_number: int) -> list:
+        # [FUNCTION DOC] Returns the changed file entries of a pull request (up to three pages of
+        # one hundred).
         return self.paginate_list(f"repos/{self.repo}/pulls/{pull_number}/files", max_pages=3)
 
     def commits_for_path(self, path: str, sha: str, limit: int) -> list:
+        # [FUNCTION DOC] Returns up to limit commits (newest first) that touched the path,
+        # starting from the given sha; raises a runtime error if the response is not a list.
         commits = self.get(f"repos/{self.repo}/commits", {"path": path, "sha": sha, "per_page": limit})
         if not isinstance(commits, list):
             raise RuntimeError("GitHub API returned an unexpected commit response")
         return commits
 
     def file_content(self, path: str, sha: str, max_bytes: int) -> str:
+        # [FUNCTION DOC] Fetches a file's content at a given commit through the contents endpoint
+        # and returns at most max_bytes of it decoded as UTF-8 (invalid bytes replaced). Raises a
+        # runtime error if the payload is not base64-encoded content, has invalid base64, or the
+        # decoded (truncated) bytes contain a NUL byte (binary file).
         payload = self.get(f"repos/{self.repo}/contents/{urllib.parse.quote(path)}", {"ref": sha})
         if payload.get("encoding") != "base64" or not isinstance(payload.get("content"), str):
             raise RuntimeError("GitHub content response is not a base64 file")
@@ -225,11 +289,18 @@ class GitHub:
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    # [CLASS DOC] HELPER: Redirect handler that never follows redirects, so the API token is not
+    # forwarded to the redirect target and the redirect surfaces as an HTTP error.
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # [FUNCTION DOC] HELPER: Always returns none, declining to follow the redirect.
         return None
 
 
 def _read_tail(response: Any, max_bytes: int) -> bytes:
+    # [FUNCTION DOC] HELPER: Reads a file-like response in chunks of up to 65536 bytes and keeps
+    # only the last max_bytes bytes, dropping whole leading chunks once enough later data is
+    # held. Stops after a hard cap of 64 MiB streamed in total (for backends that report no length
+    # and ignore ranges). Returns the final bytes.
     """Keep the last max_bytes of the body; failures are reported at the end of a job log."""
     chunks: deque[bytes] = deque()
     held = 0
@@ -252,14 +323,19 @@ def _read_tail(response: Any, max_bytes: int) -> bytes:
 
 
 def md(text: str) -> dict:
+    # [FUNCTION DOC] HELPER: Returns a Lark markdown element mapping holding the text.
     return {"tag": "markdown", "content": text}
 
 
 def grey(text: str) -> str:
+    # [FUNCTION DOC] HELPER: Wraps text in a grey font tag for Lark markdown; returns the string.
     return f"<font color='grey'>{text}</font>"
 
 
 def kv_columns(pairs: list) -> dict:
+    # [FUNCTION DOC] HELPER: Builds a Lark flowing column set from (label, value) pairs: one equal
+    # weight column per pair, each a markdown element with the label in grey and, on the next line,
+    # the value in bold. Returns the element mapping.
     return {
         "tag": "column_set",
         "flex_mode": "flow",
@@ -277,6 +353,8 @@ def kv_columns(pairs: list) -> dict:
 
 
 def button(text: str, url: str) -> dict:
+    # [FUNCTION DOC] HELPER: Builds a default-style Lark button element with the label text that
+    # opens the URL when clicked.
     return {
         "tag": "button",
         "text": {"tag": "plain_text", "content": text},
@@ -289,6 +367,10 @@ HR = {"tag": "hr"}
 
 
 def build_card(title: str, color: str, elements: list, buttons: list) -> dict:
+    # [FUNCTION DOC] Builds the full webhook message: an interactive message with a schema 2.0
+    # card, wide-screen mode, a header with the plain-text title and the header template color
+    # (red, orange, green, blue or grey), and a body consisting of the given elements followed by
+    # one button per (label, url) pair. Returns the message mapping.
     return {
         "msg_type": "interactive",
         "card": {
@@ -304,6 +386,10 @@ def build_card(title: str, color: str, elements: list, buttons: list) -> dict:
 
 
 def post_card(card: dict, webhook: str, dry_run: bool) -> None:
+    # [FUNCTION DOC] Delivers a card. In dry-run mode prints the indented JSON and returns without
+    # network access. Otherwise posts the JSON to the webhook URL with a thirty second timeout,
+    # parses the JSON reply and raises a runtime error if its code (or status code) field is
+    # present and non-zero; on success prints a line with the card title. Network errors propagate.
     if dry_run:
         print(json.dumps(card, indent=2))
         return
@@ -325,18 +411,26 @@ def post_card(card: dict, webhook: str, dry_run: bool) -> None:
 
 
 def parse_time(s: str | None) -> datetime | None:
+    # [FUNCTION DOC] HELPER: Parses a GitHub timestamp in year-month-day T hour:minute:second Z
+    # form into a UTC-aware datetime; returns none for none or an empty string. Other formats
+    # raise a value error.
     if not s:
         return None
     return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
 
 
 def fmt_local(dt: datetime | None) -> str:
+    # [FUNCTION DOC] HELPER: Formats a datetime in the Los Angeles time zone as year-month-day,
+    # twelve-hour clock with AM/PM and the zone abbreviation; returns a dash for none.
     if dt is None:
         return "-"
     return dt.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %I:%M %p %Z")
 
 
 def ci_display_name(run: dict) -> str:
+    # [FUNCTION DOC] HELPER: Returns the title prefix for a run. Non-scheduled runs use the
+    # workflow name. Scheduled runs are labelled "Weekly Test" if the run's creation day (UTC) is a
+    # Saturday, otherwise "Nightly Test".
     if run["event"] != "schedule":
         return run["name"]
     scheduled_at = parse_time(run["created_at"])
@@ -346,10 +440,15 @@ def ci_display_name(run: dict) -> str:
 
 
 def plural(n: int, word: str) -> str:
+    # [FUNCTION DOC] HELPER: Returns the count and word, appending "s" to the word unless the
+    # count is exactly one (zero gets the plural).
     return f"{n} {word}" if n == 1 else f"{n} {word}s"
 
 
 def fmt_duration(seconds: float | None) -> str:
+    # [FUNCTION DOC] HELPER: Formats seconds (truncated to integer) compactly: under a minute as
+    # seconds; under an hour as minutes and two-digit seconds; otherwise hours and two-digit
+    # minutes (seconds dropped). Returns a dash for none.
     if seconds is None:
         return "-"
     seconds = int(seconds)
@@ -361,6 +460,11 @@ def fmt_duration(seconds: float | None) -> str:
 
 
 def analysis_md(analysis: Any, repo: str) -> list[str]:
+    # [FUNCTION DOC] Renders one job analysis (object with tags, test name, reason and related
+    # pull request) as indented markdown lines, each beginning with an arrow: an optional headline
+    # line with the tags in square brackets followed by the test name in code formatting (omitted
+    # when both are empty), the reason line, and an optional line linking the related pull request
+    # to its page in the given repository. Returns the list of lines.
     tags = "".join(f"[{tag}]" for tag in analysis.tags)
     headline = " ".join(part for part in (tags, f"`{analysis.test_name}`" if analysis.test_name else "") if part)
     lines = [f"  ↳ {headline}"] if headline else []
@@ -372,6 +476,10 @@ def analysis_md(analysis: Any, repo: str) -> list[str]:
 
 
 def group_identical_failures(jobs: list, reasons: dict | None) -> list[tuple[tuple, list]]:
+    # [FUNCTION DOC] Groups jobs, preserving first-appearance order, so that jobs whose analyses
+    # (looked up by job id in the reasons mapping, which may be none) are the same non-empty tuple
+    # share one group. Jobs with no analysis always form their own group. Returns a list of pairs
+    # (analyses tuple, list of member jobs).
     """One defect can fail every shard the same way, and repeating it per job buries the rest.
 
     Jobs group only on an identical, non-empty analysis: without one there is nothing to
@@ -394,6 +502,10 @@ def group_identical_failures(jobs: list, reasons: dict | None) -> list[tuple[tup
 def list_jobs_md(
     jobs: list, limit: int = MAX_LISTED_JOBS, reasons: dict | None = None, repo: str = DEFAULT_REPO
 ) -> str:
+    # [FUNCTION DOC] Renders failed jobs as a markdown bullet list. Only the first limit jobs
+    # (default fifteen) are listed; they are grouped by identical analysis, each group giving one
+    # bullet of comma-separated job links followed by its analysis lines. If more jobs exist, a
+    # final bullet states how many more. Returns the newline-joined text.
     lines = []
     for analyses, members in group_identical_failures(jobs[:limit], reasons):
         lines.append("- " + ", ".join(f"[{job['name']}]({job['html_url']})" for job in members))
@@ -410,6 +522,8 @@ def list_jobs_md(
 
 
 def is_reportable_job(job: dict) -> bool:
+    # [FUNCTION DOC] HELPER: True if the job has finished with a conclusion other than skipped and
+    # is not one of the aggregator jobs (which merely mirror other failures).
     return job.get("conclusion") not in (
         None,
         "skipped",
@@ -417,10 +531,15 @@ def is_reportable_job(job: dict) -> bool:
 
 
 def failed_job_names(jobs: list) -> dict:
+    # [FUNCTION DOC] HELPER: Returns a mapping from job name to job for reportable jobs whose
+    # conclusion is a failure kind (failure, timed out, startup failure, action required).
     return {j["name"]: j for j in jobs if is_reportable_job(j) and j.get("conclusion") in FAILED_CONCLUSIONS}
 
 
 def diff_attempts(current: dict, previous: dict) -> dict:
+    # [FUNCTION DOC] HELPER: Compares failed-job mappings (name to job) of two attempts. Returns a
+    # mapping with three job lists: fixed (failed before, not failing now, i.e. flaky), still
+    # (failing in both; job objects taken from the current attempt) and new (failing now only).
     return {
         "fixed": [j for n, j in previous.items() if n not in current],
         "still": [j for n, j in current.items() if n in previous],
@@ -435,6 +554,18 @@ def render_ci_status(
     analysis: AnalysisOutcome | None = None,
     repo: str = DEFAULT_REPO,
 ) -> dict:
+    # [FUNCTION DOC] Builds the card for a finished PR test run. Inputs: the run, its jobs, the
+    # previous attempt's failed-job mapping (none on the first attempt), an optional analysis
+    # outcome and the repository. Title: cancelled (grey) if the run was cancelled; failed (red)
+    # with failed count of reportable jobs and a flaky count if any failed job; else passed (green).
+    # Flaky means failed in the previous attempt but not now. Body: commit link with first message
+    # line (label says tested main commit for scheduled runs), columns for start, finish, duration
+    # (run start to last update) and a job summary (totals, failed, flaky, cancelled). Then a
+    # divider and sections: on the first attempt a failed jobs list; on later attempts lists for
+    # flaky (passed on rerun), still failing and new failures, where analyses are attached only to
+    # still failing and new, and the combined listing of those two shares the fifteen-job limit.
+    # Notes are added when the analysis is unavailable or when extra jobs were omitted. Buttons:
+    # view run, plus view of the previous attempt if the attempt number is above one.
     name = ci_display_name(run)
     attempt = run.get("run_attempt", 1)
     conclusion = run.get("conclusion") or "unknown"
@@ -515,6 +646,18 @@ def render_ci_status(
 
 
 def cmd_ci_status(args: argparse.Namespace, gh: GitHub) -> None:
+    # [FUNCTION DOC] Implements the ci-status subcommand for the run id in args. Skips with a
+    # printed message if the run is not a scheduled run (unless the any-event flag is set) or is
+    # not completed. Loads the latest jobs. For a first-attempt scheduled, non-cancelled run with
+    # failed jobs: in dry-run mode prints what would be rerun and returns; otherwise requests a
+    # rerun of failed jobs and returns without posting (the card follows attempt two); if the rerun
+    # request fails, remembers the error, posts the attempt-one card anyway and re-raises after.
+    # For later attempts loads the previous attempt's failures. The jobs to analyse are the failed
+    # ones (still failing plus new when comparing attempts), capped at fifteen; if any, builds a
+    # separate GitHub client from the analysis token variable (short timeout, two retries) when
+    # that variable is set, runs failure analysis (printing audit lines to standard error) and
+    # converts any unexpected exception into an unavailable outcome, printing only the exception
+    # class name. Finally renders and posts the card.
     run = gh.run(args.run_id)
     if run["event"] != "schedule" and not args.any_event:
         print(f"run {args.run_id} event={run['event']} is not a scheduled run; skipping")
@@ -574,10 +717,17 @@ def cmd_ci_status(args: argparse.Namespace, gh: GitHub) -> None:
 
 
 def failed_steps(job: dict) -> list[str]:
+    # [FUNCTION DOC] HELPER: Returns the names of a job's steps whose conclusion is a failure
+    # kind, in order; empty if the job has no steps.
     return [step["name"] for step in job.get("steps") or [] if step.get("conclusion") in FAILED_CONCLUSIONS]
 
 
 def render_build_failure(run: dict, failed: list) -> dict:
+    # [FUNCTION DOC] Builds the red card for a failed build run. Elements: commit link with first
+    # message line; columns for the trigger (scheduled rebuild, or event name to branch) and the
+    # local start time; a divider; and a failed-jobs list with up to fifteen bullets (job link and
+    # the names of its failed steps if any) plus a "more" bullet for the rest. Title is the
+    # workflow name plus failed; single button to view the run.
     repo_url = run["html_url"].split("/actions/")[0]
     sha = run["head_sha"]
     subject = ((run.get("head_commit") or {}).get("message") or "").splitlines()
@@ -599,6 +749,10 @@ def render_build_failure(run: dict, failed: list) -> dict:
 
 
 def cmd_build_failure(args: argparse.Namespace, gh: GitHub) -> None:
+    # [FUNCTION DOC] Implements the docker-build-failure and wheels-build-failure subcommands (the
+    # same code). Fetches the run (still in progress, since this runs inside the build's own
+    # workflow run) and its latest jobs; if none failed, prints a skip message and returns;
+    # otherwise posts the build failure card.
     # Runs as a job of the build's own workflow run, so the run is still in progress.
     run = gh.run(args.run_id)
     failed = [job for job in gh.run_jobs(run["id"]) if job.get("conclusion") in FAILED_CONCLUSIONS]
@@ -614,6 +768,13 @@ def cmd_build_failure(args: argparse.Namespace, gh: GitHub) -> None:
 
 
 def main() -> int:
+    # [FUNCTION DOC] Command line entry point; returns the exit status. Options: repository
+    # (default the miles repo), token (default from the token environment variable), webhook
+    # (default from the webhook environment variable) and a dry-run flag; required subcommand with
+    # a required run id (and for ci-status an any-event flag). Returns two with a message on
+    # standard error if the token is missing, or if the webhook is missing outside dry-run mode.
+    # Otherwise creates the GitHub client and dispatches the subcommand; the docker and wheels
+    # failure subcommands share one implementation. Returns zero.
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--repo", default=DEFAULT_REPO)
     parser.add_argument("--token", default=os.environ.get("GITHUB_TOKEN"))

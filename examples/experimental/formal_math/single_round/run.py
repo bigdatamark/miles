@@ -1,3 +1,17 @@
+# [MODULE DOC]
+# Launcher for single-round formal-math reinforcement learning (GRPO) on a Qwen3 model, intended to
+# be run as a script. Module-level configuration is read from environment variables at import:
+# dynamic sampling switch, reference and actor checkpoint paths, evaluation response length cap,
+# dataset transform id (the name of a prepared dataset directory), and a mode (train, pass-at-k
+# evaluation, or evaluation on a chunk of the training corpus; any other value fails an assertion).
+# The model is fixed in the file (Qwen3-8B on eight GPUs). Two entry points: prepare downloads the
+# Hugging Face checkpoint and, unless a reference checkpoint path was given, converts it to the
+# Megatron distributed format; execute assembles the training argument string and submits the
+# training job through the command utilities. Argument groups: checkpoint, rollout (custom reward
+# function, 32 prompts times 8 samples, 8192 response tokens), evaluation (miniF2F and held-out
+# corpus data), performance (tensor parallel 2, full recompute, dynamic batch size), GRPO, Adam
+# optimiser with a constant 1e-6 learning rate, inference engine, and miscellaneous (colocated
+# actor and rollout, rollout debug dumps under a run-id directory, pass-rate logging).
 import os
 from pathlib import Path
 
@@ -22,6 +36,11 @@ NUM_GPUS = 8
 
 
 def prepare():
+    # [FUNCTION DOC] One-time preparation on the CPU side: creates the models and datasets
+    # directories, downloads the model from the hub into the models directory, and, only if no
+    # reference checkpoint path environment variable was set, converts the model to the Megatron
+    # distributed checkpoint format with eight GPUs per node into the shared models directory.
+    # Side effects: shell commands, network, disk.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -36,6 +55,22 @@ def prepare():
 
 
 def execute():
+    # [FUNCTION DOC] Builds all training arguments and launches the job. A new run id is created
+    # and used for the checkpoint directory (named by model, this script's name and run id), the
+    # logging setup and the rollout debug dump path (which contains a rollout id placeholder filled
+    # in later). Checkpoint load defaults: reference model from the converted checkpoint unless
+    # overridden by environment; actor load from the override or the new save directory.
+    # Mode handling: training uses 3000 rollouts; both evaluation modes use zero rollouts. Dynamic
+    # sampling, if enabled, adds over-sampling of 64 prompts and a filter that keeps only groups
+    # whose rewards have non-zero spread. Evaluation: every 20 steps, one sample per prompt, top-p
+    # of one, response cap from the environment or 16384. In the chunk evaluation mode it evaluates
+    # the training corpus slice named by an environment variable with 32 samples per prompt;
+    # otherwise it evaluates miniF2F and the held-out corpus file, with 32 samples in pass-at-k
+    # mode. All dataset paths contain the dataset transform id.
+    # Finally runs the training with eight GPUs per node and the model type.
+    # KNOWN ISSUE: the dataset transform id is not validated, so when its environment variable is
+    # unset the dataset paths silently contain the text none. Also the one-engine-per-node setting
+    # is a temporary workaround (see the inline comment) for an attention-library error.
     U = command_utils.default_config().create_backend()
     run_id: str = command_utils.create_run_id()
 

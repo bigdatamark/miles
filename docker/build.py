@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
-# doc-dev: docs/developer/ci/02-docker-build.md
+# [MODULE DOC]
+# Command line driver (typer based) that assembles and runs a docker buildx build for a Miles
+# image. A table of variants maps a variant name to the target image repository, optional
+# platform list, tag postfix and prefix, optional dockerfile override and variant build
+# arguments (CUDA 13 multi- and single-architecture images, a Rubin arm64 image, and several ROCm
+# images for different GPU generations). Tag modes: latest, dev (a moving tag plus a UTC
+# timestamped tag) and custom (a user supplied tag). The build stamps the image with a label
+# holding the content hash of the build inputs (from the image inputs module) so CI can skip
+# unchanged rebuilds. Proxy settings from the environment are passed as build arguments. With the
+# dry-run flag the commands are only printed. Needs the docker CLI with buildx and the typer
+# package; sibling module image_inputs is imported by plain name so the script must run from its
+# own directory context (run as a script).
 """Build and push Miles Docker images.
 
 Usage:
@@ -93,6 +104,9 @@ VARIANTS = {
 
 
 def run(cmd: list[str], dry_run: bool) -> None:
+    # [FUNCTION DOC] HELPER: Prints the command (space-joined, prefixed by a plus) and, unless
+    # dry-run is set, executes it as a subprocess, raising a called-process error on a non-zero
+    # exit status.
     print(f"+ {' '.join(cmd)}", flush=True)
     if dry_run:
         return
@@ -110,6 +124,20 @@ def build_and_push(
     context: Path = REPO_ROOT,
     output: str = "",
 ) -> None:
+    # [FUNCTION DOC] Builds the docker buildx command for a variant and runs it. Inputs: variant
+    # name (key into the variant table; unknown raises a key error), tag mode, dry-run flag, default
+    # dockerfile path (overridden by the variant's own dockerfile), push flag, custom tag, extra
+    # KEY=VALUE build arguments, build context directory (default repository root) and an optional
+    # buildx exporter specification. Tags: latest gives the image with the latest tag plus the
+    # variant postfix; dev gives the prefix (default dev) with postfix and a second tag with a UTC
+    # minute-resolution timestamp; custom requires a custom tag (else a typer bad-parameter error)
+    # and gives that tag plus postfix; anything else is a bad-parameter error. Command layout:
+    # buildx build, dockerfile path joined onto the context, platforms if the variant lists them,
+    # push flag if set, output exporter if given, HTTP and HTTPS proxy build arguments if present in
+    # the environment (lowercase name checked first), a no-proxy argument for localhost, variant
+    # build arguments, caller build arguments last so they win (each must contain an equals sign,
+    # asserted), the inputs-hash label computed from the context, one tag option per tag, and the
+    # context path. Prints a banner and runs the command.
     extra_build_args = extra_build_args or []
     config = VARIANTS[variant]
     # A variant may pin its own Dockerfile (e.g. ROCm); otherwise use the CLI default.
@@ -179,6 +207,9 @@ def build_and_push(
 
 
 class Variant(str, Enum):
+    # [CLASS DOC]
+    # Enumeration of selectable build variants for the command line; each member's value is the key
+    # of the variant table. The member list must be kept in sync with that table by hand.
     cu13 = "cu13"
     cu13_x86 = "cu13-x86"
     cu13_aarch64 = "cu13-aarch64"
@@ -189,6 +220,8 @@ class Variant(str, Enum):
 
 
 class ImageTag(str, Enum):
+    # [CLASS DOC]
+    # Enumeration of tag modes accepted on the command line: latest, dev and custom.
     latest = "latest"
     dev = "dev"
     custom = "custom"
@@ -205,6 +238,11 @@ def main(
     context: Path = typer.Option(REPO_ROOT, help="Repository build context, separate from this driver."),  # noqa: B008
     output: str = typer.Option("", help="Buildx exporter, e.g. type=oci,dest=/tmp/image,tar=false."),  # noqa: B008
 ) -> None:
+    # [FUNCTION DOC] Typer command. Options: required variant and tag mode; dockerfile path
+    # (default docker/Dockerfile, ignored when the variant pins its own); dry-run; push; custom tag;
+    # repeatable extra build arguments; build context directory (default repository root; resolved
+    # to an absolute path); and a buildx exporter specification. Passes everything to the builder
+    # function using the enumeration values.
     build_and_push(
         variant.value,
         image_tag.value,

@@ -1,3 +1,15 @@
+# [MODULE DOC]
+# Command line launcher (typer) for GRPO training of GLM-4.7-Flash on Harbor agentic tasks where
+# the Harbor trial runs inside each rollout worker against a cloud sandbox backend. Flow of the
+# entry point: kill stale training processes, optionally convert the Hugging Face checkpoint to the
+# Megatron distributed format, then assemble the training arguments in groups (checkpoint, rollout
+# with 4 prompts times 8 samples, performance with tensor parallel 4 and expert parallel 8 and CPU
+# optimiser offload, GRPO with a small KL loss, Adam, inference engine with one GPU per engine and
+# GLM tool and reasoning parsers, the shared agentic wiring, colocated miscellaneous options,
+# optional debug and trace and W&B options) and submit the job with a module search path that
+# includes Megatron, this example, the reused agent-server example and the repository, plus
+# the Harbor environment variables forwarded to workers. Defaults of the script argument record
+# are read from environment variables at import time.
 """Launcher: GLM-4.7-Flash GRPO on Harbor tasks, with Harbor run in-process on a
 cloud sandbox backend (no agent server).
 
@@ -23,6 +35,16 @@ from miles.utils.external_utils import command_utils
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC]
+    # Command line argument record (extends the shared execute-train configuration). Groups: mode
+    # (normal, or debug rollout only which skips training), run id (generated once at import time),
+    # model type and node/GPU counts, Megatron path; paths and model names; training sizes (max
+    # sequence length 65536, 3000 rollouts, 4 prompts per rollout, 8 samples per prompt, global batch
+    # 32, save interval 100, optional trace dump directory); Harbor settings (backend type, backend
+    # keyword JSON, tasks and trials directories, agent model name, agent timeout default 5400
+    # seconds) and provider credential file paths (all defaulting from same-named environment
+    # variables evaluated at import time); the externally visible session server host and the host
+    # IP; and Weights & Biases settings (key from either of two environment variables).
     mode: Literal["normal", "debug_rollout_only"] = "normal"
     run_id: str = command_utils.create_run_id()
     megatron_model_type: str = "glm4.7-flash"
@@ -72,6 +94,11 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
 
 def cleanup():
+    # [FUNCTION DOC] HELPER: Frees GPU resources from earlier runs. For each of the patterns
+    # sglang, train.py and MegatronTrain, lists matching processes with the pattern-grep tool,
+    # excludes this process and its parent, and sends the default terminate signal to the rest (errors
+    # ignored); then sleeps five seconds. Side effect: kills any matching process on the machine,
+    # including unrelated ones.
     """Kill old Ray jobs and stale processes to free GPU resources."""
     my_pid = os.getpid()
     ppid = os.getppid()
@@ -82,6 +109,9 @@ def cleanup():
 
 
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Converts the Hugging Face checkpoint named in the arguments into the Megatron
+    # distributed format under the base directory, using the configured GPUs per node and Megatron
+    # path. Delegates to the backend's checkpoint converter.
     U = args.create_backend()
     U.convert_checkpoint(
         model_name=args.model_name,
@@ -94,6 +124,15 @@ def prepare(args: ScriptArgs):
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Builds the training argument string and submits the job. Groups as described
+    # in the module overview. Details: rollout sampling temperature 0.8 with a response length cap of
+    # 8192 and the configured maximum sequence length; the actor uses the configured node and GPU
+    # counts, and the rollout GPU count equals GPUs per node (colocated); W&B flags are added only if a
+    # key is set (with an optional team); the debug flag is added only in debug-rollout-only mode;
+    # trace dumping only if a directory is set. Extra environment for the job: module search path
+    # (Megatron, agentic directories, repository base), the Harbor variables from the shared
+    # preflight (which can raise), and the host IP when set. Submits through the backend with the
+    # script arguments as configuration.
     U = args.create_backend()
     ckpt_args = (
         f"--hf-checkpoint {args.hf_checkpoint} "
@@ -203,6 +242,8 @@ def execute(args: ScriptArgs):
 
 @command_utils.dataclass_cli
 def main(args: ScriptArgs):
+    # [FUNCTION DOC] Entry point (command line parsed into the argument record by the decorator).
+    # Cleans up stale processes, runs checkpoint preparation unless skipped, then executes training.
     cleanup()
     if not args.skip_prepare:
         prepare(args)

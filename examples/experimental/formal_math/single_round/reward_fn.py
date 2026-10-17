@@ -1,3 +1,15 @@
+# [MODULE DOC]
+# Custom reward function for the single-round formal-math examples. It verifies a model's Lean 4
+# proof by assembling a complete Lean program and checking it on a Kimina Lean server cluster
+# (see the wrapper module): the theorem statement comes from the last fenced code block of the
+# prompt (text up to its definition marker) and the proof comes from the last fenced code block
+# of the response (from its definition marker onwards, or, if the response has no marker, the whole
+# block prefixed by a by-tactic definition marker, as the Leanabell prover style emits only the
+# proof). The reward is 1.0 when the server reports the snippet valid, otherwise 0.0, with a
+# category label. A module-level lazily created singleton holds the verifier so that the cluster
+# is started once per process. Running the file as a script performs a self-test with one known
+# theorem and proof pair; it needs a Ray cluster, docker and the Kimina image, and asserts a
+# reward of 1.0.
 import asyncio
 import logging
 import re
@@ -16,10 +28,23 @@ _TIMEOUT = 60
 
 
 class RewardFn:
+    # [CLASS DOC]
+    # Callable reward object owning a Kimina server and client cluster created at construction.
     def __init__(self):
+        # [FUNCTION DOC] Starts the verifier cluster (blocking; creates Ray actors and docker
+        # containers on all nodes).
         self._verifier = kimina_wrapper.KiminaServerAndClientCluster()
 
     async def __call__(self, args, sample, **kwargs):
+        # [FUNCTION DOC] Scores one sample (the launch args and extra keyword arguments are
+        # ignored). Assembles the Lean code from the sample's prompt and response; if the response
+        # has no code block returns reward 0.0 with category no_code. Otherwise checks the snippet
+        # on the cluster with a sixty second timeout and no progress display, requires exactly one
+        # result, analyses it and treats status valid as success. Success returns reward 1.0,
+        # category success, the full result dump and the assembled code; failure returns reward 0.0
+        # with a category made of the lean prefix and the status name, plus the same extra fields.
+        # Any exception (including a prompt without a definition marker or a server error) is
+        # logged as a warning and returns reward 0.0, category python_error and the error text.
         try:
             code, code_error_cat = _assemble_code(prompt=sample.prompt, response=sample.response)
             if code is None:
@@ -42,11 +67,17 @@ class RewardFn:
 
 
 def _single(arr):
+    # [FUNCTION DOC] HELPER: Asserts the sequence has exactly one element and returns it.
     assert len(arr) == 1, f"{arr=}"
     return arr[0]
 
 
 def _assemble_code(prompt: str, response: str) -> tuple[str | None, str | None]:
+    # [FUNCTION DOC] HELPER: Builds the full Lean program. Extracts the last fenced block of the
+    # prompt (assertion error if none) and the response; a response without a block returns a pair
+    # of none and the category no_code. Otherwise the statement part is the prompt block's text up
+    # to its first definition marker (a value error if the marker is missing) and the proof part is
+    # derived from the response block; returns their concatenation and none for the category.
     prompt_code_block = _extract_last_full_code_block(prompt)
     assert prompt_code_block is not None
 
@@ -61,6 +92,9 @@ def _assemble_code(prompt: str, response: str) -> tuple[str | None, str | None]:
 
 
 def _extract_answer_code_from_response_code_block(response_code_block: str):
+    # [FUNCTION DOC] HELPER: Returns the part of the response block starting at its first
+    # definition marker; if there is none, assumes the block is only proof tactics and returns a
+    # definition marker, the by keyword and a newline followed by the whole block.
     haystack = ":="
     if haystack in response_code_block:
         return response_code_block[response_code_block.index(haystack) :]
@@ -70,6 +104,9 @@ def _extract_answer_code_from_response_code_block(response_code_block: str):
 
 
 def _extract_last_full_code_block(text):
+    # [FUNCTION DOC] HELPER: Finds all complete triple-backtick fenced blocks (optional language
+    # tag word, newline, minimal body, closing fence) and returns the body of the last one, or none
+    # if there is none. An unterminated final fence is not counted.
     pattern = r"```(?:\w+)?\n(.*?)```"
     matches = re.findall(pattern, text, flags=re.DOTALL)
     return matches[-1] if matches else None
@@ -79,6 +116,9 @@ _REWARD_FN: RewardFn | None = None
 
 
 async def reward_fn(*args, **kwargs):
+    # [FUNCTION DOC] Entry point used as the custom reward path. Lazily creates the process-wide
+    # reward object on first call (blocking, starting the verifier cluster; not guarded against
+    # concurrent first calls) and awaits it with the given arguments, returning its reward mapping.
     global _REWARD_FN
     if _REWARD_FN is None:
         _REWARD_FN = RewardFn()

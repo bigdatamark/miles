@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Prompt templates for the multi-agent pipeline. A constant template for the solver stage that is
+# just the problem statement placeholder. Two builders return templates, as text, for a given number
+# of candidate solutions: the rewriter template (revise your solution using the numbered previous
+# solutions) and the selector template (analyse the numbered candidate solutions and end with a
+# line stating the index of the best one). The returned templates still contain unfilled
+# placeholders for the problem statement and one placeholder per numbered solution, to be filled by
+# the caller with the string formatting facility; the solution texts themselves are inserted
+# afterwards, so braces inside them are harmless.
 ## 定义了一些 prompts 的模板，用于生成不同的 prompts
 
 
@@ -5,6 +14,11 @@ SOLVER_PROMPT_TEMPLATE = """{problem_statement}"""
 
 
 def generate_rewriter_template(num_solutions: int) -> str:
+    # [FUNCTION DOC] Builds the rewriter prompt template for the given number of previous
+    # solutions. Creates one section per solution (heading with its one-based number, a placeholder
+    # named solution plus the number, and a separator line), joined by newlines; embeds the count
+    # in the instruction text and the problem placeholder and the sections in the body. Returns the
+    # template text with placeholders left unfilled.
     """Dynamically generate rewrite templates based on the number of solutions."""
     solution_sections = []
     for i in range(num_solutions):
@@ -34,6 +48,11 @@ Refer to the following {num_solutions} solutions and solve the problem.
 
 
 def generate_select_template(num_solutions: int) -> str:
+    # [FUNCTION DOC] Builds the selector prompt template for the given number of candidates, with
+    # the same per-solution sections as the rewriter template. The text instructs a staged
+    # evaluation (screening, analysis, comparison), the expected content of the answer, and
+    # requires ending with a line "Judgment:" followed by the one-based index of the best solution,
+    # which the caller later parses. Returns the template with placeholders left unfilled.
     """Dynamically generate select templates based on the number of solutions."""
     solution_sections = []
     for i in range(num_solutions):

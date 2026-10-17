@@ -1,4 +1,22 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# Command handler for CI slash commands posted as pull request comments on the radixark/miles
+# repository (run as a GitHub Actions job triggered by the issue comment created event). Supported
+# comment commands (the whole trimmed comment must be exactly one command): a label command
+# ("/run-ci-*", "/run-on-*" or "/bypass-fastfail") adds that label to the pull request;
+# "/clear-labels" removes all CI control labels; "/rerun-failed-ci" reruns the failed jobs of the
+# latest failed runs of the pre-commit, PR test and ROCm PR test workflows for the head commit;
+# "/rerun-test <test file>" dispatches the run-ci-file workflow for one registered test file.
+# Comments containing a command marker but not parsing as exactly one command are errors; comments
+# with no marker are ignored. A JSON policy file (strict, version 4) maps each command to a group
+# of allowed repository permissions, user ids and author associations, and lists the label names
+# the add-label command may add. Authorization is checked against the live GitHub API, never the
+# comment payload alone. The script runs in one of several modes selected by environment variables
+# (file-run announce/report status, acknowledge with a reaction, preflight authorization that
+# writes routing outputs, or the default full processing). Every successful mode prints one compact
+# JSON audit mapping to stdout; errors print a workflow error annotation and exit with status one.
+# Environment: GITHUB_EVENT_PATH, GITHUB_OUTPUT, CI_COMMAND_API_TOKEN, CI_COMMAND_POLICY_PATH,
+# CI_COMMAND_ACKNOWLEDGE, CI_COMMAND_PREFLIGHT, CI_COMMAND_FILE_RUN_STATUS and FILE_RUN_* values.
 
 import datetime
 import json
@@ -93,26 +111,49 @@ AUTHOR_ASSOCIATIONS = frozenset(
 
 
 class CommentCommandError(Exception):
+    # [CLASS DOC]
+    # The single exception type for every expected failure (bad input, policy violation, API
+    # error, authorization denial). The main function catches it and turns its message into a
+    # workflow error annotation, so messages must never contain secrets.
     pass
 
 
 class AddLabel(NamedTuple):
+    # [CLASS DOC]
+    # Parsed request to add one CI label; holds the label name.
     label: str
 
 
 class ClearLabels(NamedTuple):
+    # [CLASS DOC]
+    # Parsed request to remove all CI control labels; carries no data.
     pass
 
 
 class RerunFailedCI(NamedTuple):
+    # [CLASS DOC]
+    # Parsed request to rerun failed CI jobs for the pull request head; carries no data.
     pass
 
 
 class RunTestFile(NamedTuple):
+    # [CLASS DOC]
+    # Parsed request to run one test file through the dispatch workflow; holds the repository
+    # relative test file path, already matched against the allowed test path pattern.
     test_file: str
 
 
 class CommandSpec(NamedTuple):
+    # [CLASS DOC]
+    # Static registration of one command type in the command registry. Fields: policy_key (the name
+    # of the command in the policy file); capability (token capability needed: issues or actions,
+    # routed to later workflow steps); handler (function taking a context and request and returning
+    # an audit mapping); resource_key (policy field holding a resource allowlist, or none);
+    # resource_loader (validator for that policy field, or none); resource_getter (extracts the
+    # resource from a request, or none); allows_user_ids (whether the policy group may grant access
+    # by explicit user id); audit_key and audit_value (name of the audit field and a function
+    # producing its value from a request); success_reaction (comment reaction to add after
+    # success, or the word none).
     policy_key: str
     capability: str
     handler: object
@@ -126,6 +167,12 @@ class CommandSpec(NamedTuple):
 
 
 class CommandContext(NamedTuple):
+    # [CLASS DOC]
+    # Everything a command handler needs, assembled by the event processor: the API client; pull
+    # request number; comment author id, login and author association; the policy-derived allowed
+    # repository permissions, allowed user ids and allowed author associations; the pull request's
+    # current label names (frozen set); head commit sha; head repository id, owner login and branch
+    # name; and the pull request body text.
     api: object
     pull_number: int
     actor_id: int
@@ -143,6 +190,8 @@ class CommandContext(NamedTuple):
 
 
 def _strict_object(pairs):
+    # [FUNCTION DOC] HELPER: JSON object-pairs hook. Builds a dictionary and raises a command error
+    # naming the key if any key appears twice.
     result = {}
     for key, value in pairs:
         if key in result:
@@ -152,10 +201,15 @@ def _strict_object(pairs):
 
 
 def _reject_json_constant(value):
+    # [FUNCTION DOC] HELPER: JSON constant hook; always raises a command error naming the
+    # non-standard number literal (NaN or infinity) so it is rejected.
     raise CommentCommandError(f"non-standard JSON number: {value}")
 
 
 def load_json(path):
+    # [FUNCTION DOC] Reads a UTF-8 file and parses it as strict JSON (duplicate keys and
+    # non-standard number constants rejected). Returns the parsed value. Raises a command error
+    # including the path and cause if the file is unreadable, not valid UTF-8 or not valid JSON.
     try:
         text = Path(path).read_text(encoding="utf-8")
         return json.loads(
@@ -168,6 +222,9 @@ def load_json(path):
 
 
 def _validate_permissions(name, values):
+    # [FUNCTION DOC] HELPER: Validates a policy list of repository permission names. It must be a
+    # non-empty list of exact strings drawn only from write and admin, with no duplicates; the name
+    # is used in error messages. Returns a frozen set.
     if not isinstance(values, list) or not values:
         raise CommentCommandError(f"{name} must be a non-empty array")
     if any(type(value) is not str or value not in POLICY_PERMISSIONS for value in values):
@@ -178,6 +235,9 @@ def _validate_permissions(name, values):
 
 
 def _validate_author_associations(name, values):
+    # [FUNCTION DOC] HELPER: Same as the permissions validator but for GitHub author association
+    # names: non-empty list of exact strings from the known association set, no duplicates.
+    # Returns a frozen set.
     if not isinstance(values, list) or not values:
         raise CommentCommandError(f"{name} must be a non-empty array")
     if any(type(value) is not str or value not in AUTHOR_ASSOCIATIONS for value in values):
@@ -188,6 +248,9 @@ def _validate_author_associations(name, values):
 
 
 def _validate_labels(name, values):
+    # [FUNCTION DOC] HELPER: Validates the policy allowlist of exact label names for the add-label
+    # command: a non-empty list, every entry a string fully matching the CI label shape (run-ci-* or
+    # run-on-* names, or the bypass fast-fail label), no duplicates. Returns a frozen set.
     if not isinstance(values, list) or not values:
         raise CommentCommandError(f"{name} must be a non-empty array")
     for label in values:
@@ -199,6 +262,18 @@ def _validate_labels(name, values):
 
 
 def load_policy(path):
+    # [FUNCTION DOC] Loads and validates the policy file. Returns a mapping with groups and
+    # commands. The top level must have exactly version, groups and commands; version must be the
+    # integer four. Groups must be exactly add_label_access, repo_write_access and
+    # prior_contributor_access; each has repository_permissions, the first and third also users
+    # (a list of objects with an id), and the third also author_associations. Result per group:
+    # permissions set, user id set (empty if no users) and author association set (empty if none).
+    # Commands must match exactly the policy keys in the command registry; each has a group name
+    # naming a defined group plus, for commands with a resource key, that resource loaded through the
+    # registered validator. A command whose registration forbids user-id grants may not use a
+    # group with any user ids. Raises a command error on any violation.
+    # KNOWN ISSUE: user entries are read by indexing their id without checking they are objects or
+    # that the ids are positive integers; malformed entries raise raw errors or are accepted.
     raw = load_json(path)
     if not isinstance(raw, dict) or set(raw) != {"version", "groups", "commands"}:
         raise CommentCommandError("policy must contain only version, groups, and commands")
@@ -268,6 +343,12 @@ def load_policy(path):
 
 
 def parse_command(body):
+    # [FUNCTION DOC] Parses a comment body (must be a string, else command error). After trimming
+    # whitespace the entire text must equal one of: the clear-labels command, the rerun-failed-ci
+    # command, a label command (returns an add-label request with the label name), or the rerun-test
+    # command followed by spaces and an allowed test file path (returns a run-test-file request).
+    # If it matches none but contains any command marker substring anywhere, raises a command error
+    # saying exactly one command is required. If no marker is present returns none (ignored).
     if not isinstance(body, str):
         raise CommentCommandError("comment body must be a string")
     command = body.strip()
@@ -290,18 +371,31 @@ def parse_command(body):
 
 
 def _positive_int(value, name):
+    # [FUNCTION DOC] HELPER: Returns the value if it is exactly an integer type (booleans rejected)
+    # greater than zero; otherwise raises a command error saying the named item must be a positive
+    # integer.
     if type(value) is not int or value <= 0:
         raise CommentCommandError(f"{name} must be a positive integer")
     return value
 
 
 def _validate_workflow_run_url(value):
+    # [FUNCTION DOC] HELPER: Returns the value if it is a string fully matching the repository's
+    # GitHub Actions run page URL shape (positive numeric run id); else raises a command error.
     if not isinstance(value, str) or WORKFLOW_RUN_URL_PATTERN.fullmatch(value) is None:
         raise CommentCommandError("workflow run URL is invalid")
     return value
 
 
 def parse_event(event):
+    # [FUNCTION DOC] Validates the issue comment event payload and extracts the request. Requires:
+    # action is created; the repository id and full name match the expected repository; the issue
+    # is attached to a pull request and has a positive number; the comment has a user of type
+    # user (not a bot) with positive id and non-empty login; the comment's author association is in
+    # the known set; the sender id equals the comment author id. Returns a five-tuple of pull
+    # number, author id, author login, author association and the parsed command request (none if
+    # the comment is not a command). Raises a command error for any violation, including those from
+    # command parsing.
     if not isinstance(event, dict) or event.get("action") != "created":
         raise CommentCommandError("event must be issue_comment.created")
 
@@ -339,12 +433,25 @@ def parse_event(event):
 
 
 class GitHubAPI:
+    # [CLASS DOC]
+    # Minimal GitHub REST client for the single target repository using the standard library.
+    # Every method performs network I/O with a fifteen second timeout and converts failures into
+    # command errors; the token is only sent as a bearer header and never appears in messages.
     def __init__(self, token):
+        # [FUNCTION DOC] Stores the API token; raises a command error if the token is empty or none.
         if not token:
             raise CommentCommandError("GitHub API token is missing")
         self.token = token
 
     def _request(self, path, *, method="GET", payload=None, expected_statuses=None, expect_json=True):
+        # [FUNCTION DOC] HELPER: Performs one API call against the API root with the given path,
+        # method (default get) and optional JSON payload (compact encoding), sending the standard
+        # accept, authorization, content type and API version headers. If expected statuses are
+        # given, the response status must be one of them, else a command error. When JSON is
+        # expected (default) returns the decoded body; when not, the body must be blank and none is
+        # returned. HTTP errors become a command error naming method, path and status, plus the
+        # accepted-permissions header if present; URL errors and timeouts and invalid UTF-8/JSON
+        # become command errors with generic messages.
         data = None
         if payload is not None:
             data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -387,13 +494,18 @@ class GitHubAPI:
             raise CommentCommandError("GitHub API returned invalid JSON") from error
 
     def get_pull(self, pull_number):
+        # [FUNCTION DOC] Fetches and returns the pull request object for the number.
         return self._request(f"/repos/{REPOSITORY}/pulls/{pull_number}")
 
     def get_permission(self, actor_login):
+        # [FUNCTION DOC] Fetches and returns the collaborator permission object for the login
+        # (percent-encoded into the path), containing the permission level and the user.
         encoded_login = urllib.parse.quote(actor_login, safe="")
         return self._request(f"/repos/{REPOSITORY}/collaborators/{encoded_login}/permission")
 
     def add_label(self, pull_number, label):
+        # [FUNCTION DOC] Adds one label to the issue/pull request via a post; returns the resulting
+        # full label list from the API. Mutates GitHub state.
         return self._request(
             f"/repos/{REPOSITORY}/issues/{pull_number}/labels",
             method="POST",
@@ -401,6 +513,8 @@ class GitHubAPI:
         )
 
     def remove_label(self, pull_number, label):
+        # [FUNCTION DOC] Removes one label (percent-encoded in the path) via a delete; returns the
+        # remaining label list from the API. Mutates GitHub state.
         encoded_label = urllib.parse.quote(label, safe="")
         return self._request(
             f"/repos/{REPOSITORY}/issues/{pull_number}/labels/{encoded_label}",
@@ -408,6 +522,12 @@ class GitHubAPI:
         )
 
     def list_workflow_runs(self, workflow_file, head_sha):
+        # [FUNCTION DOC] Lists all pull-request-event runs of a workflow file for a head sha, paging
+        # up to ten pages of one hundred. Validates every page: the response is an object, the total
+        # count is an integer between zero and one thousand and constant across pages, runs is a
+        # list. Returns the accumulated runs once their count reaches the total (raising if it
+        # exceeds it). Raises a command error for an empty page before reaching the total, or if
+        # the pages are exhausted (the thousand-run API limit).
         encoded_workflow = urllib.parse.quote(workflow_file, safe="")
         runs = []
         total_count = None
@@ -443,6 +563,9 @@ class GitHubAPI:
         raise CommentCommandError("workflow-run listing exceeded the 1000-run API limit")
 
     def list_pulls_for_head(self, owner_login, head_ref):
+        # [FUNCTION DOC] Lists pull requests of any state whose head is owner:branch, paging one
+        # hundred at a time up to ten pages; returns the list, stopping at the first short page.
+        # Raises a command error if a page is not a list or all ten pages are full.
         pulls = []
         for page in range(1, 11):
             query = urllib.parse.urlencode(
@@ -462,6 +585,8 @@ class GitHubAPI:
         raise CommentCommandError("head pull-request listing exceeded the 1000-result limit")
 
     def rerun_failed_jobs(self, run_id):
+        # [FUNCTION DOC] Requests a rerun of the failed jobs of a workflow run via a post; the API
+        # must answer status 201 with an empty body. Returns nothing. Starts CI jobs.
         self._request(
             f"/repos/{REPOSITORY}/actions/runs/{run_id}/rerun-failed-jobs",
             method="POST",
@@ -470,6 +595,10 @@ class GitHubAPI:
         )
 
     def create_workflow_dispatch(self, workflow_file, ref, inputs):
+        # [FUNCTION DOC] Dispatches a workflow file on a ref with the given input mapping, asking
+        # for run details in the response (must be status 200). Validates that the answer is an
+        # object with a positive workflow run id, a run page URL of the expected shape, and
+        # consistent API and page URLs for that run id. Returns the run page URL. Starts a run.
         encoded_workflow = urllib.parse.quote(workflow_file, safe="")
         result = self._request(
             f"/repos/{REPOSITORY}/actions/workflows/{encoded_workflow}/dispatches",
@@ -489,6 +618,9 @@ class GitHubAPI:
         return html_url
 
     def add_comment_reaction(self, comment_id, content):
+        # [FUNCTION DOC] Adds a reaction (for example thumbs up) to an issue comment; status must be
+        # 200 or 201 and the response must echo the same reaction content, else a command error.
+        # Returns nothing.
         result = self._request(
             f"/repos/{REPOSITORY}/issues/comments/{comment_id}/reactions",
             method="POST",
@@ -499,6 +631,8 @@ class GitHubAPI:
             raise CommentCommandError("GitHub API did not confirm the comment reaction")
 
     def create_issue_comment(self, pull_number, body):
+        # [FUNCTION DOC] Posts a new comment on the pull request (status must be 201) and checks the
+        # returned body equals the sent body. Returns the new comment's positive integer id.
         result = self._request(
             f"/repos/{REPOSITORY}/issues/{pull_number}/comments",
             method="POST",
@@ -510,6 +644,8 @@ class GitHubAPI:
         return _positive_int(result.get("id"), "comment ID")
 
     def update_issue_comment(self, comment_id, body):
+        # [FUNCTION DOC] Replaces a comment's body via a patch (status must be 200) and checks the
+        # returned body equals the sent body, else a command error. Returns nothing.
         result = self._request(
             f"/repos/{REPOSITORY}/issues/comments/{comment_id}",
             method="PATCH",
@@ -520,10 +656,17 @@ class GitHubAPI:
             raise CommentCommandError("GitHub API did not confirm the status update")
 
     def get_workflow_run(self, run_id):
+        # [FUNCTION DOC] Fetches and returns the workflow run object for the id.
         return self._request(f"/repos/{REPOSITORY}/actions/runs/{run_id}")
 
 
 def _validate_live_pull(pull, pull_number):
+    # [FUNCTION DOC] HELPER: Validates a pull request object fetched live. Requires the matching
+    # number, open state, a base repository matching the target repository id and name, a head
+    # repository with positive id and an owner with non-empty login, a non-empty head branch name,
+    # a list of label objects each with a string name, and a head sha of forty lowercase hex
+    # characters. Raises a command error naming the missing or invalid part. Returns a five-tuple:
+    # frozen set of label names, head sha, head repository id, head owner login, head branch.
     if not isinstance(pull, dict) or pull.get("number") != pull_number:
         raise CommentCommandError("GitHub API returned the wrong pull request")
     if pull.get("state") != "open":
@@ -567,6 +710,8 @@ def _validate_live_pull(pull, pull_number):
 
 
 def _pull_body(pull):
+    # [FUNCTION DOC] HELPER: Returns the pull request body text, or an empty string if the body is
+    # null; raises a command error if it is present but not a string.
     body = pull.get("body")
     if body is None:
         return ""
@@ -576,6 +721,9 @@ def _pull_body(pull):
 
 
 def _command_spec(request):
+    # [FUNCTION DOC] HELPER: Looks up the registry entry for a parsed request by its exact type.
+    # Raises a command error if the request is none (no recognised command) or its type is not
+    # registered. Returns the CommandSpec.
     if request is None:
         raise CommentCommandError("comment does not contain a recognized command")
     spec = COMMAND_REGISTRY.get(type(request))
@@ -585,6 +733,12 @@ def _command_spec(request):
 
 
 def resolve_policy(event, policy):
+    # [FUNCTION DOC] Parses the event, finds the command's registry entry, and applies the loaded
+    # policy. Returns a nine-tuple: pull number, author id, author login, author association,
+    # request, spec, allowed repository permissions, allowed user ids (empty when the command may
+    # not grant by user id) and allowed author associations. For commands with a resource
+    # allowlist (add-label), the requested resource must be in the policy list, else a command
+    # error saying the label is not exposed. A policy missing the needed keys gives a command error.
     pull_number, actor_id, actor_login, author_association, request = parse_event(event)
     spec = _command_spec(request)
     try:
@@ -613,6 +767,10 @@ def resolve_policy(event, policy):
 
 
 def require_permission(api, actor_id, actor_login, allowed_permissions):
+    # [FUNCTION DOC] Verifies, via a live API lookup by login, that the actor holds an allowed
+    # repository permission. Checks the response is an object, its user id is a positive integer
+    # equal to the actor id (guards against login reuse), the permission is a string and is in the
+    # allowed set. Raises a command error otherwise (including the not-authorized denial).
     permission_result = api.get_permission(actor_login)
     if not isinstance(permission_result, dict):
         raise CommentCommandError("GitHub API returned an invalid repository permission")
@@ -638,6 +796,10 @@ def require_access(
     allowed_user_ids,
     allowed_author_associations,
 ):
+    # [FUNCTION DOC] Authorization gate; returns nothing on success and raises a command error on
+    # denial. Access is granted, in order, if the actor id is in the allowed user ids, or the
+    # comment's author association is in the allowed associations (no live lookup), or the live
+    # repository permission check passes.
     if actor_id in allowed_user_ids:
         return
     # The association GitHub stamped on the comment admits prior contributors
@@ -648,6 +810,10 @@ def require_access(
 
 
 def _is_ci_control_label(label):
+    # [FUNCTION DOC] HELPER: True if the label name begins with the run-ci prefix or the run-on
+    # dash prefix, or is exactly one of the clearable names (nightly, bypass fast-fail).
+    # KNOWN ISSUE: the run-ci prefix test has no trailing dash, so it also matches names such as
+    # run-ciXYZ that the label allowlist shape would not accept.
     return label.startswith(("run-ci", "run-on-")) or label in CLEAR_EXACT_LABELS
 
 
@@ -660,6 +826,14 @@ def _latest_failed_run(
     head_ref,
     allow_empty_pull_requests,
 ):
+    # [FUNCTION DOC] HELPER: Given the list of runs of one workflow for a head sha, returns the id
+    # of the newest run if it is a completed failure, else none. Each run is validated strictly
+    # (object, positive unique id and run number, expected workflow path, pull request event, same
+    # head sha, same head branch, head repository id equal to the given one, list of pull request
+    # objects with positive numbers); any mismatch raises a command error. A run counts as
+    # associated with the pull request if its pull request list contains the number, or, only when
+    # allow_empty_pull_requests is true (fork pull requests), if that list is empty. The newest is
+    # chosen by highest run number, ties broken by id.
     associated = []
     seen_ids = set()
     for run in runs:
@@ -706,6 +880,11 @@ def _require_unique_head_pull(
     head_owner_login,
     head_ref,
 ):
+    # [FUNCTION DOC] HELPER: For fork pull requests, confirms that the fork branch (owner and
+    # branch) identifies exactly one pull request in the target repository and that it is the
+    # current one: same number, open, base repository matches the target, head repository id,
+    # owner login, branch and sha all equal the expected values. Raises a command error otherwise;
+    # returns nothing.
     pulls = api.list_pulls_for_head(head_owner_login, head_ref)
     if len(pulls) != 1:
         raise CommentCommandError("fork head does not identify exactly one pull request")
@@ -732,6 +911,17 @@ def _require_unique_head_pull(
 
 
 def _handle_rerun_failed_ci(context, request):
+    # [FUNCTION DOC] HELPER: Handler for the rerun-failed-ci command. Raises a command error if the
+    # request is not exactly the rerun type. For fork pull requests first verifies the unique head
+    # pull request. For each of the three rerun workflows finds the latest failed run for the head
+    # sha; the candidates are sorted by run id. If there are no candidates, still requires the
+    # actor's access (so denial is not masked) and reports that no failed runs exist. For each
+    # candidate re-fetches and revalidates the live pull request (head sha, repository, owner and
+    # branch must be unchanged), re-verifies the fork identity, re-lists runs and checks the
+    # latest failed run is still the same, requires access, then requests the rerun of failed
+    # jobs (errors are wrapped with the run id). Returns an audit mapping: actor id, decision
+    # (rerun requested or no failed runs), head sha, pull number and the list of rerun run ids.
+    # Side effect: restarts CI jobs.
     if type(request) is not RerunFailedCI:
         raise CommentCommandError("rerun handler received the wrong request type")
     (
@@ -846,6 +1036,10 @@ def _handle_rerun_failed_ci(context, request):
 
 
 def _handle_add_label(context, request):
+    # [FUNCTION DOC] HELPER: Handler for the add-label command. Checks the request type and the
+    # actor's access. If the pull request already has the label, no change is made; otherwise adds
+    # it and verifies the returned label list contains it (else command error). Returns an audit
+    # mapping: actor id, decision (already present or added), label and pull number.
     if type(request) is not AddLabel:
         raise CommentCommandError("add-label handler received the wrong request type")
     require_access(
@@ -876,6 +1070,12 @@ def _handle_add_label(context, request):
 
 
 def _handle_clear_labels(context, request):
+    # [FUNCTION DOC] HELPER: Handler for the clear-labels command. Checks request type and access,
+    # then removes, in sorted order, every current label that is a CI control label. After each
+    # removal the API's returned list must be a list of named objects not containing the removed
+    # label (else command error naming it); the returned list becomes the remaining labels. At the
+    # end no CI control label may remain. Returns an audit mapping: actor id, decision (cleared or
+    # already clear), the removed labels list and pull number. Mutates GitHub labels.
     if type(request) is not ClearLabels:
         raise CommentCommandError("clear-labels handler received the wrong request type")
     require_access(
@@ -912,6 +1112,11 @@ def _handle_clear_labels(context, request):
 
 
 def _pr_body_pins(body):
+    # [FUNCTION DOC] HELPER: Extracts dependency pins from the pull request body. For each of the
+    # four known pins (CI image tag, Megatron PR, Megatron Bridge PR, SGLang PR) searches for a
+    # line starting with the pin's key and colon followed by one non-space token. The token must
+    # fully match that pin's allowed value shape, else a command error naming the pin. Returns a
+    # mapping from dispatch input name to value, containing only pins present.
     pins = {}
     for input_name, body_pattern, value_pattern in PR_BODY_PINS:
         match = body_pattern.search(body)
@@ -927,6 +1132,12 @@ def _pr_body_pins(body):
 
 
 def _handle_run_test_file(context, request):
+    # [FUNCTION DOC] HELPER: Handler for the rerun-test command. Checks request type. If the head
+    # repository is a fork, requires the unique open head pull request identity (the policy tier is
+    # otherwise the only gate; the dispatched workflow withholds secrets from fork heads). Requires
+    # access. Dispatches the run-ci-file workflow on the main ref with inputs: pull number as text,
+    # head sha, test file, plus any pins from the pull request body. Returns an audit mapping:
+    # actor id, decision (file run dispatched), head sha, pull number, test file and the new run URL.
     if type(request) is not RunTestFile:
         raise CommentCommandError("rerun-test handler received the wrong request type")
     if context.head_repository_id != REPOSITORY_ID:
@@ -974,24 +1185,32 @@ def _handle_run_test_file(context, request):
 
 
 def _add_label_resource(request):
+    # [FUNCTION DOC] HELPER: Resource getter and audit value producer for add-label: verifies the
+    # request is an add-label request (else command error) and returns its label name.
     if type(request) is not AddLabel:
         raise CommentCommandError("add-label resource received the wrong request type")
     return request.label
 
 
 def _clear_command_value(request):
+    # [FUNCTION DOC] HELPER: Audit value producer for clear-labels: verifies the request type (else
+    # command error) and returns the slash-prefixed clear-labels command text.
     if type(request) is not ClearLabels:
         raise CommentCommandError("clear-labels audit received the wrong request type")
     return f"/{CLEAR_COMMAND}"
 
 
 def _rerun_command_value(request):
+    # [FUNCTION DOC] HELPER: Audit value producer for rerun-failed-ci: verifies the request type
+    # (else command error) and returns the slash-prefixed rerun-failed-ci command text.
     if type(request) is not RerunFailedCI:
         raise CommentCommandError("rerun audit received the wrong request type")
     return f"/{RERUN_COMMAND}"
 
 
 def _run_file_value(request):
+    # [FUNCTION DOC] HELPER: Audit value producer for rerun-test: verifies the request type (else
+    # command error) and returns the test file path.
     if type(request) is not RunTestFile:
         raise CommentCommandError("rerun-test audit received the wrong request type")
     return request.test_file
@@ -1050,6 +1269,10 @@ COMMAND_REGISTRY = {
 
 
 def process_event(event, policy, api):
+    # [FUNCTION DOC] Full processing of a comment event: resolves the policy for the event, fetches
+    # and validates the live pull request, builds the command context (including the pull request
+    # body) and invokes the command's registered handler. Returns the handler's audit mapping.
+    # Raises a command error from any stage.
     (
         pull_number,
         actor_id,
@@ -1089,6 +1312,9 @@ def process_event(event, policy, api):
 
 
 def authorize_policy(event, policy, api):
+    # [FUNCTION DOC] Preflight authorization: resolves the policy for the event and runs the access
+    # gate without touching the pull request. Returns a four-tuple of pull number, author id,
+    # request and spec. Raises a command error on denial or invalid input.
     (
         pull_number,
         actor_id,
@@ -1113,6 +1339,11 @@ def authorize_policy(event, policy, api):
 
 
 def acknowledge_event(event, api):
+    # [FUNCTION DOC] Adds the command's success reaction to the triggering comment. Parses the
+    # event; raises a command error if the command defines no success reaction (reaction value
+    # none) or the comment id is not a positive integer. Returns an audit mapping: actor id,
+    # decision (success reaction confirmed), pull number and reaction. Side effect: posts a
+    # reaction.
     pull_number, actor_id, _, _, request = parse_event(event)
     spec = _command_spec(request)
     if spec.success_reaction == "none":
@@ -1128,12 +1359,17 @@ def acknowledge_event(event, api):
 
 
 def _file_run_marker(run_id):
+    # [FUNCTION DOC] HELPER: Returns an HTML comment string embedding the workflow run id, appended
+    # to status comments so the owning run is visible in the comment source.
     # Keep the owning workflow run visible in the comment source; the exact
     # comment ID passed between jobs prevents concurrent runs from colliding.
     return f"<!-- rerun-test-run:{run_id} -->"
 
 
 def _format_duration(seconds):
+    # [FUNCTION DOC] HELPER: Formats a duration in seconds (truncated to an integer) as compact
+    # text: seconds only below a minute; minutes and two-digit seconds below an hour; otherwise
+    # hours, two-digit minutes and two-digit seconds. Negative input raises a command error.
     seconds = int(seconds)
     if seconds < 0:
         raise CommentCommandError("workflow run duration is negative")
@@ -1147,6 +1383,9 @@ def _format_duration(seconds):
 
 
 def _parse_run_timestamp(value, name):
+    # [FUNCTION DOC] HELPER: Parses an ISO-8601 timestamp string from a workflow run (a trailing Z
+    # is treated as UTC). Returns a timezone-aware datetime. Raises a command error naming the
+    # field if the value is missing or not a non-empty string, unparseable, or lacks a time zone.
     if not isinstance(value, str) or not value:
         raise CommentCommandError(f"workflow run {name} is missing")
     try:
@@ -1159,6 +1398,9 @@ def _parse_run_timestamp(value, name):
 
 
 def _run_elapsed(api, run_id, now):
+    # [FUNCTION DOC] HELPER: Fetches the workflow run and returns the seconds (float) from its
+    # start time to the given current time. Raises a command error for a non-object response or an
+    # invalid start time.
     run = api.get_workflow_run(run_id)
     if not isinstance(run, dict):
         raise CommentCommandError("GitHub API returned an invalid workflow run")
@@ -1173,6 +1415,10 @@ FILE_RUN_STATUS_MODES = frozenset({"announce", "report"})
 
 
 class FileRunStatus(NamedTuple):
+    # [CLASS DOC]
+    # Validated inputs for reporting on a dispatched file run: pull request number, test file path,
+    # workflow run id, suite name (may be empty), the result of the resolve job and the result of
+    # whichever hardware job executed the file (empty if none ran).
     pull_number: int
     test_file: str
     run_id: int
@@ -1182,6 +1428,14 @@ class FileRunStatus(NamedTuple):
 
 
 def _file_run_status_inputs(environ):
+    # [FUNCTION DOC] HELPER: Validates the environment mapping for the file-run status modes and
+    # returns a triple: mode, a FileRunStatus and a comment id (none unless the mode is report).
+    # Requires: the status mode variable is announce or report; positive integer pull number and run
+    # id; a test file fully matching the allowed test path shape; the suite empty or lowercase
+    # hyphenated alphanumeric; the resolve, CUDA and CPU results each in the known result set. Of
+    # the CUDA and CPU results, those that are neither skipped nor empty are executed; more than one
+    # raises a command error; the single one (or empty) is the execute result. In report mode the
+    # comment id must be a positive integer. All violations raise a command error.
     mode = environ.get("CI_COMMAND_FILE_RUN_STATUS", "")
     if mode not in FILE_RUN_STATUS_MODES:
         raise CommentCommandError("file run status mode must be announce or report")
@@ -1224,12 +1478,20 @@ def _file_run_status_inputs(environ):
 
 
 def _parse_positive_int(value, name):
+    # [FUNCTION DOC] HELPER: Parses a text value consisting only of digits into a positive integer
+    # via the positive-integer check; raises a command error naming the item if it is not a digit
+    # string or is zero.
     if not isinstance(value, str) or not value.isdigit():
         raise CommentCommandError(f"{name} must be a positive integer")
     return _positive_int(int(value), name)
 
 
 def _file_run_outcome(status):
+    # [FUNCTION DOC] HELPER: Maps a file run status to a pair of outcome word and explanation text.
+    # Cancelled if either the resolve or execute result is cancelled; failed with a "never started"
+    # explanation if resolve did not succeed; passed with empty explanation if execute succeeded;
+    # failed with a pointer to the workflow run if execute failed; otherwise failed with a message
+    # that no execution job ran.
     """Describe the run for a reviewer: headline, and why when it is not a pass."""
     if status.resolve_result == "cancelled" or status.execute_result == "cancelled":
         return "cancelled", "The run was cancelled."
@@ -1243,6 +1505,10 @@ def _file_run_outcome(status):
 
 
 def announce_file_run(api, status):
+    # [FUNCTION DOC] Posts a "running" comment on the pull request containing the test file, a link
+    # to the workflow run, the UTC start time and the run marker. Returns an audit mapping: new
+    # comment id, decision (file run announced), pull number, run id and test file. Side effect:
+    # creates a comment.
     run_url = f"https://github.com/{REPOSITORY}/actions/runs/{status.run_id}"
     body = (
         f"⏳ `{status.test_file}` is **running** — [workflow run]({run_url})\n\n"
@@ -1261,6 +1527,13 @@ def announce_file_run(api, status):
 
 
 def report_file_run(api, status, comment_id):
+    # [FUNCTION DOC] Rewrites the previously announced comment with the final result. Computes the
+    # outcome and explanation, picks an icon (check, cross or white circle for passed, failed,
+    # cancelled), computes elapsed time from the run's start to now, and builds a headline with the
+    # test file, outcome, optional suite, duration and workflow run link, then the explanation
+    # (if any) and the run marker, separated by blank lines. Updates the comment. Returns an audit
+    # mapping: comment id, decision (upper-case outcome with a file-run prefix), duration text,
+    # pull number, run id and test file.
     outcome, explanation = _file_run_outcome(status)
     icon = {"passed": "✅", "failed": "❌", "cancelled": "⚪"}[outcome]
     run_url = f"https://github.com/{REPOSITORY}/actions/runs/{status.run_id}"
@@ -1283,10 +1556,16 @@ def report_file_run(api, status, comment_id):
 
 
 def _utc_now():
+    # [FUNCTION DOC] HELPER: Returns the current time as a timezone-aware UTC datetime.
     return datetime.datetime.now(datetime.timezone.utc)
 
 
 def _write_routing(capability, success_reaction):
+    # [FUNCTION DOC] HELPER: Validates that the capability is one of none, issues or actions and
+    # the success reaction is none or the thumbs-up name (else command error). If the GitHub output
+    # file environment variable is set, appends two lines giving the capability and the success
+    # reaction for later workflow steps; if unset does nothing. A write failure raises a command
+    # error. Side effect: file append.
     if capability not in {"none", "issues", "actions"}:
         raise CommentCommandError("command registry selected an unknown capability")
     if success_reaction not in {"none", "+1"}:
@@ -1303,6 +1582,9 @@ def _write_routing(capability, success_reaction):
 
 
 def _write_file_run_comment_id(comment_id):
+    # [FUNCTION DOC] HELPER: Validates the comment id as a positive integer and, if the GitHub
+    # output file variable is set, appends a line giving the comment id for later steps; does
+    # nothing when unset. Write failures raise a command error.
     comment_id = _positive_int(comment_id, "comment ID")
     output_path = os.environ.get("GITHUB_OUTPUT")
     if not output_path:
@@ -1315,6 +1597,17 @@ def _write_file_run_comment_id(comment_id):
 
 
 def main():
+    # [FUNCTION DOC] Entry point; returns the process exit status (zero success, one for a command
+    # error). Mode selection by environment: (1) if the file-run status variable is set, validate
+    # its inputs, announce (and write the new comment id to the output file) or report, and print the
+    # JSON audit; no event file is read. (2) Otherwise load the event JSON from the event path
+    # variable. If the acknowledge variable is the word true, add the success reaction. Else if the
+    # preflight variable is true: parse the event; an unrecognised comment writes routing none and
+    # prints an ignore decision, returning zero; otherwise load the policy, authorize, write routing
+    # outputs and print an authorization mapping (actor, pull number and the command's audit field).
+    # Else full processing: load the policy and run the event handler. Results are printed as
+    # compact sorted-key JSON. A command error prints a workflow error annotation and returns one.
+    # Missing required environment variables raise key errors.
     try:
         # The file-run status modes report on a dispatched workflow run, not on
         # a comment event, so they are the one path that reads no event payload.

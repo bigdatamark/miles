@@ -1,4 +1,20 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# Trusted-side orchestration for building a CI Docker image for a pull request that comes from a
+# fork. It runs from the default branch (with a trusted checkout of this repository as the root
+# for imports) in several modes selected by a positional argument: resolve (wait for the PR test
+# run to upload a fork image request artifact, validate it, and write the request, pull number
+# and merge sha to the GitHub output file), wait-build (wait for the separate publisher workflow
+# run that matches the source run to finish successfully), check-source (validate the untrusted
+# merge checkout), build (validate, then run the repository docker build script with the OCI
+# output destination from the environment), check-current (validate only) and finish (verify the
+# published multi-platform image carries the expected inputs hash and, if a forced rebuild was
+# requested, remove the rebuild label from the pull request). All GitHub access is through the gh
+# command line tool via subprocess. Every validation failure raises a value error; subprocess
+# failures propagate. Environment: GITHUB_REPOSITORY, GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT,
+# GITHUB_EVENT_PATH, GITHUB_OUTPUT, REQUEST_JSON (a JSON request) and OCI_OUTPUT.
+# The request is a small JSON document (inside a zip artifact) with the pull number, merge sha,
+# inputs hash, source run id and attempt, a force rebuild flag and the PR label names.
 # doc-dev: docs/developer/ci/02-docker-build.md
 """Validate a fork image request for default-branch build orchestration."""
 
@@ -30,11 +46,18 @@ REQUEST_KEYS = {"pr", "merge_sha", "inputs_hash", "run_id", "run_attempt", "forc
 
 
 def require(condition, message):
+    # [FUNCTION DOC] HELPER: Assertion helper; raises a value error with the given message when the
+    # condition is false, else does nothing.
     if not condition:
         raise ValueError(message)
 
 
 def api(path, *, method="GET", collection=None):
+    # [FUNCTION DOC] HELPER: Calls the GitHub REST API through the gh command line tool with the
+    # given path and HTTP method (default get). Returns the parsed JSON, or none when the output is
+    # blank. If a collection key name is given, requests all pages merged into a list of pages and
+    # returns the flat list of items found under that key in every page. A failing command raises
+    # a subprocess error. Side effect: runs a subprocess and network access.
     command = ["gh", "api", "-X", method, path]
     if collection:
         command += ["--paginate", "--slurp"]
@@ -46,6 +69,13 @@ def api(path, *, method="GET", collection=None):
 
 
 def parse_request(data):
+    # [FUNCTION DOC] Parses and validates the request artifact bytes. The archive must be at most
+    # 65536 bytes, a zip containing exactly one entry named request.json of at most 4096 bytes
+    # uncompressed, which must decode to a JSON object with exactly the expected keys (pr, merge
+    # sha, inputs hash, run id, run attempt, force rebuild, labels). The pr, run id and attempt must
+    # be positive integers, force rebuild a boolean, labels a list of strings, merge sha forty and
+    # inputs hash sixty-four lowercase hex characters. Returns the request mapping; raises a value
+    # error on violations (a bad zip or JSON raises the library's error).
     require(len(data) <= 65536, "Request archive is too large")
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
         require(archive.namelist() == ["request.json"], "Expected only request.json")
@@ -68,6 +98,16 @@ def parse_request(data):
 
 
 def validate_identity(request, run, pr, repository, workflow_id):
+    # [FUNCTION DOC] Checks that the request, the live workflow run, the live pull request and the
+    # repository agree; raises a value error naming the first failure, returns nothing. Requires:
+    # run id and attempt equal the request's; the run is a pull request event and in progress; the
+    # run's repository is the given one; the run's workflow id equals the PR test workflow id and
+    # its path (ignoring the ref suffix) is the PR test workflow file; the pull request number
+    # matches and is open; its base repository is the given one; the head repository exists, differs
+    # from the base (a fork), and equals the run's head repository; the PR head sha and branch equal
+    # the run's. Finally the run must list, among its referenced workflows, the image build
+    # workflow pinned at the request's merge sha with the pull request merge ref and the same sha
+    # (reruns keep the original merge sha).
     require(run["id"] == request["run_id"] and run["run_attempt"] == request["run_attempt"], "Stale run attempt")
     require(run["event"] == "pull_request" and run["status"] == "in_progress", "Expected an active PR run")
     require(run["repository"]["full_name"] == repository, "Wrong run repository")
@@ -95,6 +135,15 @@ def validate_identity(request, run, pr, repository, workflow_id):
 
 
 def current_request(request, repository):
+    # [FUNCTION DOC] Re-validates a request against live GitHub state and returns a pair of the
+    # live pull request object and the CI run policy. Fetches the source run, pull request and PR
+    # test workflow, validates identity, then lists PR test runs for the head sha filtered to the
+    # same head repository and branch, requiring that the request's run is the newest (highest id)
+    # so a newer run supersedes the request. Recomputes the run policy from the PR event labels
+    # saved in the request (so reruns and later label removal do not change it). Unless the policy
+    # bypasses fast-fail, requires that the four CPU stage-A jobs all exist and concluded with
+    # success, taking for each job name the latest attempt not newer than the request's attempt
+    # (partial reruns retain earlier successes). Raises a value error on any failure.
     run = api(f"repos/{repository}/actions/runs/{request['run_id']}")
     pr = api(f"repos/{repository}/pulls/{request['pr']}")
     workflow = api(f"repos/{repository}/actions/workflows/pr-test.yml")
@@ -128,6 +177,12 @@ def current_request(request, repository):
 
 
 def resolve_request(event, repository):
+    # [FUNCTION DOC] Looks for the fork image request artifact of the workflow run in the event.
+    # Lists the run's artifacts, picks those named with the run id and attempt that are not
+    # expired; returns none if there are none. Requires exactly one match of at most 65536 bytes,
+    # downloads its zip, parses it, requires that its run id and attempt equal the event's run, and
+    # revalidates it against live state. Returns the request mapping; raises a value error on
+    # violations. Side effect: gh subprocess calls.
     run = event["workflow_run"]
     artifacts = api(f"repos/{repository}/actions/runs/{run['id']}/artifacts?per_page=100", collection="artifacts")
     name = f"fork-ci-image-{run['id']}-{run['run_attempt']}"
@@ -146,6 +201,11 @@ def resolve_request(event, repository):
 
 
 def wait_request(event, repository):
+    # [FUNCTION DOC] Polls every thirty seconds until the source run uploads a valid request.
+    # Each iteration: refetch the run; return none if its attempt changed or it completed; try to
+    # resolve a request and return it if found; return none if the run's docker build job (either
+    # naming form) of this attempt has already completed (so no request will come); else sleep.
+    # Blocks, with no overall timeout.
     source = event["workflow_run"]
     while True:
         run = api(f"repos/{repository}/actions/runs/{source['id']}")
@@ -168,6 +228,9 @@ def wait_request(event, repository):
 
 
 def require_active_source(request, repository):
+    # [FUNCTION DOC] Fetches the request's source run and requires it still be in progress at the
+    # same attempt (else a value error saying the source CI attempt is no longer active). Returns
+    # the run mapping.
     run = api(f"repos/{repository}/actions/runs/{request['run_id']}")
     require(
         run["run_attempt"] == request["run_attempt"] and run["status"] == "in_progress",
@@ -177,6 +240,14 @@ def require_active_source(request, repository):
 
 
 def wait_build(request, repository):
+    # [FUNCTION DOC] Waits for the publisher workflow run that builds this request's image. The
+    # request only needs the source run id and attempt here. Loops with thirty-second sleeps while
+    # the source run stays active: until found, lists publisher workflow runs (workflow_run event,
+    # created at or after the source run's creation) whose display title is the fork image title
+    # built from run id and attempt and picks the newest, printing its URL; once found, refetches
+    # it each loop. When the publisher has completed, requires a success conclusion and that its
+    # latest jobs include a successful job named build (value error otherwise). Returns nothing.
+    # Blocks; no overall timeout other than the source run ending.
     source = require_active_source(request, repository)
     workflow = api(f"repos/{repository}/actions/workflows/build-fork-ci-image.yml")
     query = urlencode({"event": "workflow_run", "created": f">={source['created_at']}", "per_page": 100})
@@ -217,6 +288,14 @@ def wait_build(request, repository):
 
 
 def build_image(request, repository, source):
+    # [FUNCTION DOC] Builds the image from the validated source checkout by running the repository
+    # docker build script in its own session/process group with the cu13 variant, the custom image
+    # tag mode with a custom tag naming the pull request, the source as build context, and an OCI
+    # output at the destination given by the OCI output environment variable (a missing variable
+    # raises a key error). Beforehand and every thirty seconds while it runs, requires the source CI
+    # attempt to be still active (this raises a value error and aborts the build). A non-zero exit
+    # raises a subprocess error. On any exit path, if the child is still running its process group
+    # receives a terminate signal, then after ten seconds a kill signal, and the child is reaped.
     require_active_source(request, repository)
     command = [
         sys.executable,
@@ -260,7 +339,19 @@ def build_image(request, repository, source):
 
 
 def validate_source(request, pr, policy, source):
+    # [FUNCTION DOC] Validates the untrusted merge checkout directory against the request; raises
+    # a value error on failure and returns nothing. Requires: HEAD equals the requested merge sha;
+    # HEAD is a two-parent merge whose second parent is the PR head sha; none of the build input
+    # paths (computed at HEAD, plus the Dockerfile and the two dockerignore files) nor any of their
+    # parent directories is a symbolic link; the inputs hash computed at HEAD equals the request's;
+    # differs from the hash at the first parent (the base); and equals the hash computed from the
+    # working tree. Finally derives the run policy from the policy's cadence and raw labels, finds
+    # which GPU stages would be skipped using the checkout's registered tests, and requires at
+    # least one CUDA stage remains selected.
+    # KNOWN ISSUE: relies on a private function of the image inputs module for path listing.
     def git(*args):
+        # [FUNCTION DOC] HELPER: Runs a git command in the source directory and returns its
+        # whitespace-stripped text output; a failing command raises a subprocess error.
         return subprocess.check_output(["git", *args], cwd=source, text=True).strip()
 
     require(git("rev-parse", "HEAD") == request["merge_sha"], "Checkout is not the requested merge")
@@ -293,6 +384,12 @@ def validate_source(request, pr, policy, source):
 
 
 def verify_published(request):
+    # [FUNCTION DOC] Inspects the published pull request image tag in the docker hub repository via
+    # docker buildx imagetools (JSON image format). For each of the linux amd64 and arm64
+    # platforms (matching entries named exactly the platform or starting with it plus a slash, such
+    # as variant suffixes), requires at least one config and that every config's inputs label equals
+    # the request's inputs hash; otherwise a value error naming the platform. Side effect: runs a
+    # subprocess with network access.
     manifest = json.loads(
         subprocess.check_output(
             [
@@ -317,6 +414,17 @@ def verify_published(request):
 
 
 def main():
+    # [FUNCTION DOC] Command line entry point. Takes a mode argument (resolve, wait-build,
+    # check-source, build, check-current, finish) and an optional source directory path; reads the
+    # repository name from the environment. wait-build: waits on the publisher using only the run id
+    # and attempt from the environment. resolve: loads the workflow run event JSON from the event
+    # path, waits for a request and, if found, appends request JSON, pull number and merge sha lines
+    # to the GitHub output file. Other modes: load the request JSON from the request environment
+    # variable, revalidate it live, validate the source directory (resolved to an absolute path;
+    # note the source argument is required in practice though declared optional), then for build
+    # run the image build, and for finish verify the published image and, if a forced rebuild was
+    # requested, delete the rebuild label from the pull request, only warning if that fails.
+    # check-source and check-current perform only the common validation. Returns nothing.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=["resolve", "wait-build", "check-source", "build", "check-current", "finish"])
     parser.add_argument("--source", type=Path)

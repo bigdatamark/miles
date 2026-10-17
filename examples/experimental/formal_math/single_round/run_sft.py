@@ -1,3 +1,16 @@
+# [MODULE DOC]
+# Launcher for supervised fine-tuning of Qwen3-8B-Base on the prepared Leanabell formal-math
+# conversation dataset (parquet file of message lists), intended to be run as a script. The
+# dataset transform id environment variable (name of the prepared dataset directory) is required
+# at import time (a key error otherwise). Two entry points: prepare downloads the checkpoint and
+# converts it to the Megatron distributed format; execute assembles training arguments and submits
+# the job with the asynchronous training script and expandable CUDA memory segments. Training uses
+# the SFT rollout function, a single epoch, batch size 128, per-token SFT loss, no advantage
+# computation, training-only debug mode, tensor parallel size from an environment variable
+# (default 2), dynamic batching with 9216 tokens per GPU, Adam with cosine decay (peak learning
+# rate from an environment variable, default 2e-4, minimum 1e-6, 10 percent warmup), and an
+# optional CPU-offloaded optimiser switched by an environment variable. Checkpoints are saved
+# every 1000 steps into a directory named by model, script name and run id.
 import os
 from pathlib import Path
 
@@ -12,6 +25,9 @@ NUM_GPUS = 8
 
 
 def prepare():
+    # [FUNCTION DOC] Creates the models and datasets directories, downloads the base model from the
+    # hub and converts it to the Megatron distributed checkpoint format using eight GPUs per node
+    # (default destination of the converter). Side effects: shell commands, network, disk.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -19,6 +35,15 @@ def prepare():
 
 
 def execute():
+    # [FUNCTION DOC] Builds the SFT training argument string and submits the job. Creates a run id;
+    # the same new directory is used to load and save checkpoints, with the reference model taken
+    # from the converted checkpoint. Argument groups: checkpoint, SFT data (leanabell parquet from
+    # the dataset transform directory, messages column, shuffle), performance (tensor parallel size
+    # from the environment, full recompute), optimiser (plus CPU offload options if the CPU Adam
+    # environment flag is a non-zero integer), logging setup from the command utilities, and
+    # miscellaneous (zero dropout, fp32 gradient reduction and softmax, flash attention). Submits
+    # with eight GPUs per node, the asynchronous training script and the CUDA allocator setting for
+    # expandable segments.
     U = command_utils.default_config().create_backend()
     run_id: str = command_utils.create_run_id()
 
