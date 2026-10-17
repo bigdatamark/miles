@@ -1,3 +1,7 @@
+# [MODULE DOC] Helpers for the rollout sampling mask (the set of vocabulary ids the sampler was
+# allowed to pick at each response position, stored compactly as concatenated ids plus offsets): one
+# function rebuilds per-sample mask objects from a training batch, another expands a sample's mask
+# into a dense boolean mask over the local tensor-parallel vocabulary shard of response logits.
 from collections.abc import Mapping, Sequence
 
 import torch
@@ -6,6 +10,10 @@ from miles.utils.sampling_mask import RolloutSamplingMask
 
 
 def get_rollout_sampling_masks(batch: Mapping[str, object]) -> list[RolloutSamplingMask]:
+    # [FUNCTION DOC] Builds one mask object per sample from the batch's mask ids and mask offsets
+    # entries (each a sequence with one item per sample). Raises a value error if either entry is
+    # missing or none, or if their lengths differ; raises a type error if either is not a sequence.
+    # Each item is converted to a tensor (no copy for tensors). Returns the list in sample order.
     """Reconstruct the per-sample masks carried by the training-data wire."""
     ids_batch = batch.get("rollout_sampling_mask_ids")
     offsets_batch = batch.get("rollout_sampling_mask_offsets")
@@ -28,6 +36,16 @@ def build_local_sampling_mask(
     *,
     tp_rank: int,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Returns a boolean tensor shaped like the logits (rows by local vocabulary size)
+    # that is true at the ids inside the sampling support of each row's response position, restricted
+    # to this tensor-parallel rank's vocabulary range [rank*local size, (rank+1)*local size).
+    # Validation (value errors): response indices, if a tensor, must be one-dimensional and of an
+    # integer type (not boolean, floating or complex); their count must equal the number of logit
+    # rows. Zero rows give an all-false mask. Otherwise the sample's mask selects the ids for the
+    # given response positions (a private selection method returning concatenated ids and per-row
+    # counts), ids are moved to the logits' device, row numbers are repeated per id, ids outside the
+    # local shard are dropped, and the remaining (row, local id) pairs are set to true in a flat
+    # mask that is reshaped to the logits' shape.
     """Build the dense local-vocabulary mask consumed by the log-prob primitive.
 
     Args:

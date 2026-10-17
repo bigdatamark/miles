@@ -1,3 +1,9 @@
+# [MODULE DOC] Advantage and return computation for RL training. compute_advantages dispatches on
+# the configured estimator (GRPO/GSPO, PPO with GAE, REINFORCE++ and its baseline variant) over
+# per-sample lists of tensors, and normalize_advantages whitens advantages across the data-parallel
+# group using the loss masks as weights, accounting for context-parallel slicing of masks. All
+# per-sample tensors are response-aligned: with context parallelism only this rank's part of each
+# response is present.
 from argparse import Namespace
 
 import torch
@@ -24,6 +30,20 @@ def compute_advantages(
     values: list[torch.Tensor] | None = None,
     max_seq_lens: list[int] | None = None,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    # [FUNCTION DOC] Returns (advantages, returns), two lists of per-sample tensors. Branch by the
+    # estimator name in arguments: grpo or gspo: rewards become a float32 tensor on the device of
+    # the first kl tensor; returns come from the GRPO returns helper (rewards combined with kl);
+    # advantages are a new list holding the same tensors as returns. ppo: each kl tensor is
+    # multiplied in place by minus the kl coefficient to form token-level rewards; the GAE helper
+    # computes advantages and returns from values, token rewards, terminal rewards, lengths, qkv
+    # format, max sequence lengths, loss masks, gamma and lambda. reinforce_plus_plus: rewards to a
+    # float32 tensor; returns from the REINFORCE++ helper (using kl, masks, lengths, kl coefficient
+    # and gamma); advantages are a new list of the same tensors. reinforce_plus_plus_baseline:
+    # advantages from the baseline helper (rewards, kl, masks, kl coefficient) and returns is the
+    # very same list object. Any other estimator raises a not-implemented error.
+    # KNOWN ISSUE: the log-probs parameter is never used; the ppo branch mutates the caller's kl
+    # tensors in place; the first kl tensor is indexed for its device, so an empty batch fails on
+    # the grpo and reinforce branches.
     """Dispatch to the configured advantage estimator.
 
     Shape symbols:
@@ -113,6 +133,17 @@ def normalize_advantages(
     response_lengths: list[int],
     max_seq_lens: list[int] | None = None,
 ) -> list[torch.Tensor]:
+    # [FUNCTION DOC] Returns the list of whitened advantages (new tensors, same per-sample shapes),
+    # or the input list unchanged when this rank has no masked tokens. Asserts that all per-sample
+    # lists have the same length. Concatenates all advantages; builds the matching concatenated
+    # mask: without CP simply the concatenated masks; with CP, for each sample converts the token
+    # offsets of this rank's two chunks to response-relative ranges (clamped at zero), slices the
+    # full mask by the non-empty ranges and joins them (empty float-typed placeholder if none). If
+    # the mask has any elements, asserts its size equals the advantages' size, whitens over the
+    # effective data-parallel group with masked weighting and mean shifting (mean subtracted), and
+    # splits the result back to the original per-sample lengths.
+    # KNOWN ISSUE: the whitening is a collective over the data-parallel group, but it is skipped
+    # when only this rank's mask is empty, so ranks could disagree about calling it.
     """Whiten advantages across the DP group using `loss_masks` for weighting.
 
     Under CP > 1 the mask is sliced to this rank's tokens; when the local

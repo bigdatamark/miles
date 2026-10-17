@@ -1,3 +1,11 @@
+# [MODULE DOC] Megatron-side model lifecycle for training: building the DDP-wrapped model chunks,
+# the optimizer and the learning-rate scheduler, loading checkpoints, running forward-only
+# inference (log-probs and the like), running one or many training steps over a rollout, and
+# saving checkpoints.
+# Several names are re-exported or imported only for side-effect-free compatibility (the LoRA
+# bridge helpers are imported with a lint suppression), so callers may import them from here.
+# Most functions read process-global Megatron state (parallel groups, global args) and require
+# an initialized distributed environment and GPUs.
 from __future__ import annotations
 
 import dataclasses
@@ -65,6 +73,10 @@ logger = logging.getLogger(__name__)
 
 
 def _has_loadable_ckpt(load_dir: str | None) -> bool:
+    # [FUNCTION DOC] HELPER: Returns true only if the given load directory path is set (not empty or
+    # missing), exists as a directory, and contains at least one entry. Pure filesystem read, no
+    # side effects. Used to decide whether to load a checkpoint or start from freshly initialized
+    # weights.
     """Whether ``--load`` holds anything; ``load_checkpoint`` dispatches dist vs HF itself."""
     return bool(load_dir) and Path(load_dir).is_dir() and any(Path(load_dir).iterdir())
 
@@ -74,6 +86,22 @@ from .lora.bridge import _ensure_model_list, _setup_lora_model_via_bridge  # noq
 
 
 def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer) -> OptimizerParamScheduler | None:
+    # [FUNCTION DOC] Builds Megatron's optimizer parameter scheduler (learning rate and weight decay
+    # schedules) for the given optimizer. The scheduler works in units of samples, so every
+    # iteration count is multiplied by the global batch size.
+    # Side effect: mutates the arguments object. It sets the total training iterations to
+    # (number of rollouts * rollout batch size * samples per prompt) integer-divided by the global
+    # batch size, and, if the learning-rate decay iterations is unset, sets it to the total
+    # training iterations.
+    # Steps: decay steps = decay iterations * global batch size; weight-decay increment steps =
+    # total training iterations * global batch size; the optional warmup-stable-decay steps =
+    # its iterations * global batch size when given, else none. Warmup steps = warmup fraction *
+    # decay steps when a warmup fraction is set (this can be a non-integer), otherwise warmup
+    # iterations * global batch size. All other schedule knobs (initial/max/min learning rate,
+    # decay style, start/end weight decay and its increment style, the checkpoint-scheduler
+    # use/override flags, and the warmup-stable-decay style) are passed straight through from
+    # the arguments. Returns the new scheduler; it never returns none despite the optional
+    # return annotation.
     """Create and configure the optimizer learning-rate/weight-decay scheduler.
 
     This configures iteration-based schedules derived from the global batch size
@@ -127,6 +155,8 @@ def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer)
 
 
 def _is_muon_optimizer(optimizer: str | None) -> bool:
+    # [FUNCTION DOC] HELPER: True when the optimizer name is set and contains the word "muon"
+    # (case-insensitive), which also matches variants such as distributed or adaptive Muon.
     return optimizer is not None and "muon" in optimizer.lower()
 
 
@@ -134,6 +164,30 @@ def setup_model_and_optimizer(
     args: Namespace,
     role: str = "actor",
 ) -> tuple[list[DDP], MegatronOptimizer | None, OptimizerParamScheduler | None]:
+    # [FUNCTION DOC] Builds the model chunks, then the optimizer and scheduler. Raises assertion
+    # errors if MoE upcycling is on, or if neither a load path nor a pretrained checkpoint is set.
+    # Model construction has three paths: (1) multi-LoRA, or single LoRA for the actor role in
+    # bridge conversion mode, goes through the LoRA bridge helper and then forces the dtypes of
+    # parameters marked for it; (2) otherwise a model provider function is obtained for the role;
+    # for the actor with LoRA enabled the provider is wrapped by a model-specific native LoRA
+    # injector (Inkling when the custom provider path mentions it, Kimi K3 when the model name
+    # mentions it, which also patches the parameter/grad buffer when train offload is on), and any
+    # other model raises an assertion error telling the user to use bridge mode; Inkling also
+    # requires the plain LoRA type; (3) the Megatron get-model helper then builds the DDP model
+    # chunks from the provider.
+    # If the debug flag to disable the optimizer is set, logs a warning (first replica main rank
+    # only) and returns the model with no optimizer and no scheduler.
+    # Optimizer config is built from the optimizer-config dataclass fields that also exist on the
+    # arguments; timers are cleared; when streaming optimizer state to disk is on and the
+    # optimizer is not Muon, deferred main-parameter initialization is switched on.
+    # Muon branch: optionally sets up on-disk Muon state; for Inkling it forces off the split of
+    # fused q/k/v (with an info log) so whole matrices are orthogonalized; builds the Muon
+    # optimizer, with the layer-wise distributed mode on when the optimizer name contains "dist".
+    # Multi-LoRA branch (checked after Muon): validates optimizer args and returns the model with
+    # no optimizer and no scheduler (per-tenant optimizers are created later when a slot loads).
+    # Default branch: builds the standard Megatron optimizer. Afterwards, for non-Muon with disk
+    # streaming enabled, attaches optimizer state streaming. Finally builds the scheduler.
+    # Returns (model chunks, optimizer or none, scheduler or none).
     """Build model(s), wrap with DDP, and construct optimizer and scheduler.
 
     Args:
@@ -246,6 +300,8 @@ def setup_model_and_optimizer(
 
 
 def enable_forward_pre_hook(model_chunks: Sequence[DDP]) -> None:
+    # [FUNCTION DOC] Calls enable-forward-pre-hook on every chunk. Asserts each chunk is a
+    # Megatron DDP wrapper (assertion error otherwise). Mutates the chunks; returns nothing.
     """Enable forward pre-hooks for provided DDP-wrapped model chunks.
 
     Args:
@@ -257,6 +313,9 @@ def enable_forward_pre_hook(model_chunks: Sequence[DDP]) -> None:
 
 
 def disable_forward_pre_hook(model_chunks: Sequence[DDP], param_sync: bool = True) -> None:
+    # [FUNCTION DOC] Calls disable-forward-pre-hook on every chunk, passing the param-sync flag
+    # (when true, outstanding parameter all-gathers are completed during disabling). Asserts each
+    # chunk is a Megatron DDP wrapper. Mutates the chunks; returns nothing.
     """Disable forward pre-hooks for provided DDP-wrapped model chunks.
 
     Args:
@@ -269,6 +328,9 @@ def disable_forward_pre_hook(model_chunks: Sequence[DDP], param_sync: bool = Tru
 
 
 def should_disable_forward_pre_hook(args: Namespace) -> bool:
+    # [FUNCTION DOC] True exactly when both the distributed optimizer and overlapped parameter
+    # gather are enabled in the arguments; in that case the forward pre-hook must be turned off
+    # around the first step and around saving.
     """Block forward pre-hook for certain configurations."""
     return args.use_distributed_optimizer and args.overlap_param_gather
 
@@ -290,6 +352,22 @@ def forward_only(
     fp32_output: bool = True,
     use_rollout_sampling_mask: bool = False,
 ) -> dict[str, list[torch.Tensor]]:
+    # [FUNCTION DOC] Runs inference-only pipeline passes over every step of a rollout and returns
+    # the callback outputs (for example per-token log-probs) aggregated on the last pipeline stage.
+    # Runs with gradients disabled (decorator). Inputs: the post-forward callback, arguments, model
+    # chunks, one data iterator per chunk, a list with the microbatch count of each step, the
+    # rollout id (used only for dump naming), an output key prefix, whether Megatron should upcast
+    # the full output to fp32 (default true), and whether to score over the rollout's captured
+    # sampling support (default false).
+    # Steps: create a forward-only dumper helper; reset every data iterator; fetch the model
+    # config; put all chunks in eval mode (disables dropout); if a custom before-log-prob hook path
+    # is configured, load it and call it with the arguments, model and prefix; for each step run
+    # the Megatron forward-backward function in forward-only mode with non-loss data collection,
+    # appending its results to a list; restore train mode on all chunks; finalize the dumper.
+    # Model timers in the config are cleared. On the last pipeline stage only, the collected
+    # results are aggregated using the first data iterator and each key is stored under the
+    # prefix plus key; other stages return an empty mapping. Returns that mapping from key to a
+    # list of tensors.
     """Run forward passes only and collect non-loss outputs (e.g., logprobs).
 
     The model is put into evaluation mode, a forward-only pipeline pass is
@@ -325,6 +403,18 @@ def forward_only(
     def forward_step(
         data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False
     ) -> tuple[torch.Tensor, Callable[[torch.Tensor], dict[str, list[torch.Tensor]]]]:
+        # [FUNCTION DOC] HELPER: Forward step handed to Megatron's pipeline schedule (wrapped by the
+        # dumper). Fetches a batch with the fixed forward-only keys (tokens, loss masks, multimodal
+        # inputs, total and response lengths, max sequence lengths, witness ids, plus the sampling
+        # mask ids and offsets when sampling-support scoring is on), using the configured padding
+        # multiplier, query/key/value format and context-parallel allgather flag. Builds packed
+        # sequence params; when the batch carries per-adapter token counts, sets the tokens per
+        # adapter slot on the model (multi-LoRA). Runs the model with no labels or attention mask,
+        # the input loss mask, optional witness ids (when witness is enabled), optional multimodal
+        # inputs and the fp32 output flag. Returns the output tensor and a partially applied
+        # callback that, given the output, computes the collected values using the unconcatenated
+        # tokens, lengths, entropy flag, max sequence lengths and (optionally) the sampling mask.
+        # The return_schedule_plan argument is accepted but unused.
         """Return the model output and its batch-bound loss callback."""
 
         forward_only_keys = [
@@ -426,6 +516,8 @@ def forward_only(
 
 
 def _zero_grads(model: Sequence[DDP], optimizer: MegatronOptimizer | None, disable_optimizer: bool) -> None:
+    # [FUNCTION DOC] HELPER: Zeroes the gradient buffer of every DDP chunk, and, unless the
+    # optimizer is disabled, also zeroes the optimizer's gradients. Mutates in place.
     for model_chunk in model:
         model_chunk.zero_grad_buffer()
     if not disable_optimizer:
@@ -435,6 +527,14 @@ def _zero_grads(model: Sequence[DDP], optimizer: MegatronOptimizer | None, disab
 def run_forward_backward_pass(
     args, dumper_phase_util, data_iterator, model, num_microbatches, num_rollouts, forward_only=False
 ):
+    # [FUNCTION DOC] Runs Megatron's forward-backward schedule once over the microbatches and
+    # returns its per-microbatch loss outputs; it does not touch the optimizer. Inputs: arguments,
+    # dumper helper, data iterators, model chunks, microbatch count, rollout count (for loss
+    # scaling) and a forward-only flag (default false) that runs under no-grad and skips backward.
+    # The sampling mask keys (mask ids and offsets) are requested only when sampling-support replay
+    # is on and the loss type is policy loss or score centering.
+    # KNOWN ISSUE: the parameter named forward-only shadows the module-level forward-only function;
+    # the type annotations are absent.
     """One pipeline forward/backward pass over the microbatches; no optimizer interaction."""
 
     sampling_mask_keys = (
@@ -448,6 +548,22 @@ def run_forward_backward_pass(
         torch.Tensor,
         Callable[[torch.Tensor], tuple[torch.Tensor, int, dict]],
     ]:
+        # [FUNCTION DOC] HELPER: Training forward step (wrapped by the dumper). Fetches a batch
+        # with a fixed key list: tokens, multimodal inputs, packed sequence params, lengths, loss
+        # masks, log-probs, reference log-probs, values, advantages, returns, rollout log-probs,
+        # rollout top-k ids/lengths/log-probs, max sequence lengths, witness ids, on-policy
+        # distillation reverse KL, rollout mask sums, loss weights, target tokens, sample indices
+        # and the optional sampling mask keys. Sets per-adapter token counts for multi-LoRA when
+        # present. Temporarily sets the stage of every registered replay manager to the replay
+        # forward stage and restores each previous stage after the model call (not restored if the
+        # model raises).
+        # Two model paths: when a schedule plan is requested (combined 1F1B), asserts that MTP
+        # training and witness are off and builds a schedule plan from the tokens, with no
+        # labels/attention mask and the input loss mask; otherwise calls the model with the same
+        # inputs plus optional witness ids and multimodal inputs, upcasting output to fp32 unless
+        # the loss type is policy loss, SFT loss or score centering.
+        # Returns the output (tensor or plan) and the loss function partially applied with
+        # arguments, batch, microbatch count, Megatron loss scaling on and the rollout count.
         """Forward step used by Megatron's pipeline engine during training.
 
         Args:
@@ -576,6 +692,28 @@ def train_one_step(
     attempt: int,
     ft_test_action_executor: FTTestActionActorExecutor | None = None,
 ) -> tuple[dict[str, float], float, TrainStepOutcome]:
+    # [FUNCTION DOC] Executes one optimizer step of a rollout. Returns (reduced loss mapping, grad
+    # norm, outcome). The incoming arguments object is overwritten by the global Megatron
+    # arguments, and the optimizer may be absent or disabled (then no stepping happens).
+    # Steps: zero grads; run the optional custom before-train-step hook; run forward/backward.
+    # If independent data parallelism has more than one replica (only step 0 is supported):
+    # optionally trigger a fault-tolerance test crash, then all-reduce grads and losses across
+    # replicas (loss scaled by rollouts unless per-token loss); a failed reduce marks the outcome
+    # as discarded-should-retry and the step invalid.
+    # If NaN/Inf checking in loss and grads is off (default on), prepares grads on the optimizer
+    # and marks the step invalid when an overflow flag is found or the grad norm is NaN/Inf.
+    # In CI with MTP training and short responses, checks that only MTP params have gradients.
+    # When the outcome is normal, finalizes the dumper while grads are still attached. If the
+    # step is valid and the optimizer is enabled: step the optimizer (asserting success), take the
+    # new grad norm, and advance the scheduler by the rollout count. Then zero grads again, emit a
+    # structured log line, and, for a normal outcome, dump local weight checksums and (with witness)
+    # dump and clear stale witness data.
+    # Loss is returned only on the last pipeline stage (virtual stages ignored) with a normal
+    # outcome: the independent-DP reduced loss if used, else the aggregated train losses. All other
+    # cases return an empty mapping.
+    # KNOWN ISSUE: when the step is invalid because of NaN/Inf with a normal outcome the optimizer
+    # step is skipped silently but the outcome is still normal; the optimizer-scheduler parameter
+    # is otherwise used only for the scheduler step.
     """Run pipeline forward/backward, then step the optimizer and scheduler when gradients are valid."""
     args = get_args()
     parallel_state = get_parallel_state()
@@ -672,6 +810,11 @@ def train_one_step(
 
 
 def finalize_model_grads_with_empty_cache(*args, **kwargs):
+    # [FUNCTION DOC] Replacement for Megatron's finalize-model-grads hook. Checks free versus
+    # total memory of the current GPU and, if less than ten percent is free, clears memory caches.
+    # Then reduces the marked LoRA grads of the model chunks (first positional argument) and
+    # delegates to Megatron's finalize-model-grads with all given arguments, returning its result.
+    # Side effects: GPU memory query and cache clearing, in-place gradient reduction.
     # TODO: this is an ad-hoc method and we should figure out why the oom happens in the first place.
     device = torch.cuda.current_device()
     free, total = torch.cuda.mem_get_info(device)
@@ -684,6 +827,13 @@ def finalize_model_grads_with_empty_cache(*args, **kwargs):
 
 
 def setup_train_iteration_config(args, model, optimizer, disable_optimizer):
+    # [FUNCTION DOC] Configures the shared Megatron model config for training and returns it. Gets
+    # the config from the first chunk; sets the gradient scaling function to none when the
+    # optimizer is disabled, else the optimizer's loss scaler; clears timers. If the first chunk is
+    # a DDP wrapper and overlapped grad reduce is on, sets the no-sync function (one function if
+    # one chunk, else a list), and if grad-reduce alignment is on, the start-grad-sync function(s).
+    # If overlapped param gather and its alignment are on, sets the start-param-sync function(s).
+    # Finally installs the memory-aware finalize-grads function. Mutates the config.
     """Set the DDP gradient and parameter sync hooks for this training iteration."""
     config = get_model_config(model[0])
     config.grad_scale_func = None if disable_optimizer else optimizer.scale_loss
@@ -713,6 +863,28 @@ def train(
     attempt: int,
     ft_test_action_executor: FTTestActionActorExecutor | None = None,
 ) -> TrainStepOutcome:
+    # [FUNCTION DOC] Trains on one rollout: one optimizer step per entry of the microbatch list.
+    # Reads the global Megatron arguments (not passed in). Asserts the microbatch and rollout
+    # count lists have equal length, and for independent data parallelism that there is only one
+    # step. Returns the outcome of the last step.
+    # Setup: reset data iterators, set train mode, configure the shared model config, optionally
+    # reset optimizer states (logged on first replica main rank), and, with manual garbage
+    # collection, disable automatic GC and collect once (asserting a non-negative interval).
+    # If the forward pre-hook must be blocked (distributed optimizer with overlapped param
+    # gather), disables the hook without param sync and temporarily clears the param sync function
+    # so the first step makes no param all-gather; both are restored after step 0.
+    # Per step: call the single-step trainer. After step 0 restore the pre-hook and param sync
+    # function. With MTP training, read the MTP loss from Megatron's logging tracker (single MTP
+    # layer assumed, scaled by 1 or by the inverse of the step's microbatch count), clear the
+    # tracker, and in CI check the loss bounds. On a normal outcome, on the first replica main
+    # rank only: build extra metrics (MTP loss and per-param-group learning rates from the
+    # scheduler), log the train step, in CI run the KL check (unless disabled) and the grad norm
+    # check, and log a line prefixed by the role (the model's role attribute, default actor;
+    # prefix omitted for actor). After all steps, disable the pre-hook if it was enabled.
+    # KNOWN ISSUE: the docstring omits the witness info, attempt and fault-tolerance executor
+    # parameters, and the return value. The variable that remembers whether the pre-hook is
+    # enabled is set to false in the blocking branch redundantly. With zero steps the returned
+    # outcome would be unbound.
     """Run training over a rollout consisting of multiple steps.
 
     The model is switched to train mode, training hooks are configured, and
@@ -882,6 +1054,15 @@ def save(
     *,
     snapshot_publisher: SnapshotPublisher | None = None,
 ) -> None:
+    # [FUNCTION DOC] Saves a checkpoint for the given iteration. Reads global Megatron arguments.
+    # In CI with model-hash saving on, first computes per-layer model hashes. If the forward
+    # pre-hook must be blocked, disables it (with param sync) before saving and re-enables it
+    # afterwards. LoRA models are saved through the LoRA saver, which also takes the optional
+    # snapshot publisher (keyword-only); other models use Megatron's saver with zero floating
+    # point operations, no data iterator, no common-state preprocessing, the checkpointing context
+    # and the non-persistent flag. Afterwards writes the model hashes if computed.
+    # KNOWN ISSUE: the checkpointing context and non-persistent flag are ignored for LoRA models,
+    # and the hooks are not restored if saving raises.
     """Persist a training checkpoint safely with forward hooks disabled.
 
     Args:
@@ -926,6 +1107,8 @@ def initialize_model_and_optimizer(
     role: str = "actor",
     checkpointing_context=None,
 ) -> tuple[list[DDP], MegatronOptimizer | None, OptimizerParamScheduler | None, LoadCheckpointOutput]:
+    # [FUNCTION DOC] Convenience composition: builds the model and optimizer for the role, then
+    # loads checkpoint state into them. Returns (model chunks, optimizer, scheduler, load output).
     """Initialize model(s), optimizer, scheduler, and load from checkpoint.
 
     Args:
@@ -953,6 +1136,9 @@ def initialize_model_and_optimizer(
 def build_model_and_optimizer(
     args: Namespace, *, role: str
 ) -> tuple[list[DDP], MegatronOptimizer | None, OptimizerParamScheduler | None]:
+    # [FUNCTION DOC] Builds the model, optimizer and scheduler through the setup function, tags the
+    # first model chunk with the role (read later for log prefixes), clears GPU/host memory caches,
+    # and returns the three objects.
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(args, role)
     model[0].role = role
     clear_memory()
@@ -961,6 +1147,9 @@ def build_model_and_optimizer(
 
 @dataclasses.dataclass(frozen=True)
 class LoadCheckpointOutput:
+    # [CLASS DOC] Immutable result of loading model state: the rollout id (iteration) found in
+    # the loaded checkpoint (zero when nothing was loaded) and the rollout id training should
+    # start from.
     loaded_rollout_id: int
     start_rollout_id: int
 
@@ -974,6 +1163,21 @@ def load_model_state(
     role: str,
     checkpointing_context: dict | None,
 ) -> LoadCheckpointOutput:
+    # [FUNCTION DOC] Loads checkpoint state into the model (and optimizer/scheduler) and works out
+    # where training resumes. Keyword-only except the arguments.
+    # With multi-LoRA, adapter parameters are hidden during the load so the bridge's conversion
+    # walk does not see them. The load happens when the load path is unset (the pretrained
+    # checkpoint then covers it) or the directory is non-empty; otherwise a warning is logged on
+    # the first replica main rank and the iteration is zero.
+    # Native Inkling LoRA (LoRA on, actor role, non-bridge mode, adapter path set, custom provider
+    # mentions Inkling): if the adapter safetensors file exists and the native optimizer state was
+    # not restored from the checkpoint, loads the adapter into the model and refreshes the
+    # optimizer's fp32 master params so the first step does not overwrite the adapter.
+    # Then checks peak GPU memory (CI), clears memory, and checks model hashes (CI). Steps the
+    # scheduler by iteration times global batch size, unless the scheduler state came from the
+    # checkpoint and iteration is positive (avoids double counting).
+    # Start rollout: with finetune and no LoRA, asserts the loaded iteration is zero and starts at
+    # zero; otherwise starts at iteration plus one. Returns the loaded and start ids.
     if is_multi_lora_enabled(args):
         # Hide adapter params so the bridge's conversion-task walk doesn't see them
         # while loading the base checkpoint.

@@ -1,3 +1,11 @@
+# [MODULE DOC] Builds the shell command line that launches one SGLang inference engine process (one
+# node of an engine) and computes the server-argument dictionary behind it. Argument precedence,
+# lowest to highest: SGLang defaults, then the user's "--sglang-" options (applied last, and only
+# for names not already set), then values miles derives from its own arguments (model path,
+# parallel sizes, memory saver, routing replay, LoRA, disaggregation mode, and so on), then the
+# per-group overrides which win over everything. Keys unknown to the installed SGLang are dropped
+# with a log message. Also contains small URL helpers. Reads one environment variable that switches
+# weight loading to dummy.
 import functools
 import ipaddress
 import logging
@@ -20,6 +28,9 @@ logger = logging.getLogger(__name__)
 
 
 def format_v6_uri(addr: str | None) -> str | None:
+    # [FUNCTION DOC] Wraps an IPv6 literal address in square brackets for use inside a URL. None,
+    # empty strings, already-bracketed text, IPv4 addresses and non-address text (host names) are
+    # returned unchanged.
     if not addr or addr.startswith("["):
         return addr
     try:
@@ -31,6 +42,7 @@ def format_v6_uri(addr: str | None) -> str | None:
 
 
 def build_server_url(host: str, port: int) -> str:
+    # [FUNCTION DOC] Returns the plain-HTTP base URL for a host (IPv6 literals bracketed) and port.
     return f"http://{format_v6_uri(host)}:{port}"
 
 
@@ -52,6 +64,16 @@ def compute_engine_launch_cmd(
     gated_launch_port: int,
     random_seed: int,
 ) -> str:
+    # [FUNCTION DOC] Returns the shell-quoted command that starts one engine node. All inputs after
+    # the parsed arguments are keyword-only: the interpreter command prefix (list of tokens), node
+    # rank, worker type (regular, prefill or decode), first GPU id, per-group overrides, GPUs per
+    # engine, distributed init address, NCCL port, host, port, the disaggregation bootstrap port
+    # (required for prefill workers), the engine-info bootstrap port, the gated launch port and the
+    # random seed. First asserts the installed SGLang supports the gated launch option. Builds the
+    # server-argument dictionary, removes square brackets from the host (IPv6 literals are given
+    # bare on the command line), renders the dictionary to arguments with the round-trip-checked
+    # renderer, and joins the prefix, the module-run flag with the launch-server module, and those
+    # arguments with proper shell quoting.
     _assert_launch_gate_served()
 
     server_args_dict = _compute_server_args(
@@ -92,6 +114,36 @@ def _compute_server_args(
     gated_launch_port: int,
     random_seed: int,
 ):
+    # [FUNCTION DOC] HELPER: Builds the server-argument dictionary for one engine node (parameters
+    # as described for the command builder; worker type defaults to regular; overrides and GPUs per
+    # engine may be none). Steps: GPUs per engine falls back to the rollout GPUs-per-engine
+    # argument; node count is GPUs per engine divided by GPUs per node, at least one. Base entries:
+    # checkpoint path, trust remote code, seed, memory saver iff rollout offload is on, host, port,
+    # NCCL port, node count and rank, init address, GPU id step one and base id, gated launch port,
+    # tensor-parallel size = GPUs per engine, data/pipeline/expert parallel sizes from the user
+    # options, skip warmup always, draft-weights CPU backup always, metrics always. An environment
+    # variable equal to "1" selects dummy weight loading. Prefill workers: disaggregation mode
+    # prefill, round-robin load balancing, and the bootstrap port (assertion error if none).
+    # Decode workers: mode decode and prefill round-robin balancing. Routing replay and indexer
+    # replay arguments turn on returning routed experts / indexer top-k; fp16 sets the dtype;
+    # engine-info bootstrap port is added if given.
+    # LoRA: multi-LoRA enables LoRA with batch size = number of adapters, rank = max(configured
+    # rank or zero, 1), and targets (a single "all" entry for the all-linear setting, else the
+    # configured list). Single-adapter rollout LoRA does the same with batch size one, plus: if the
+    # engine loads the adapter from disk, a startup path entry pairing the adapter name with the
+    # path; if a path exists but is pushed by the trainer, logs that startup loading is skipped;
+    # else logs random initial weights; and when the base CPU backup is enabled, turns on weights
+    # CPU backup (the trainer then skips base weight sync).
+    # Then applies the group overrides (they win over everything above). Then fills in the user's
+    # SGLang options: for each field name of the installed server arguments (decode workers skip the
+    # hierarchical cache option) a user option with that name is copied only if the key is not
+    # already set. Keys in the dictionary that are not server-argument fields are logged and
+    # removed (compatibility with older SGLang). With multi-LoRA: asserts dummy loading is off and
+    # defaults the maximum loaded adapters to twice the batch size. Finally defaults the device to
+    # "cuda". Returns the dictionary.
+    # KNOWN ISSUE: the unknown-key message is logged at info level but is worded as a warning; and
+    # a decode worker's hierarchical cache key is never marked as used, so an override of it would
+    # be removed as unsupported.
     _gpus_per_engine = num_gpus_per_engine or args.rollout_num_gpus_per_engine
     nnodes = max(1, _gpus_per_engine // args.num_gpus_per_node)
     kwargs = {
@@ -213,6 +265,9 @@ def _compute_server_args(
 
 @functools.cache
 def _assert_launch_gate_served() -> None:
+    # [FUNCTION DOC] HELPER: Cached (checked once per process) assertion that the installed SGLang
+    # server arguments include the gated launch port field; raises an assertion error telling the
+    # user to upgrade SGLang otherwise. Returns nothing.
     assert "gated_launch_port" in _record_field_names(ServerArgs), (
         "this sglang has no --gated-launch-port, and miles launches every inference engine through "
         "that gate; upgrade sglang to one that serves it"

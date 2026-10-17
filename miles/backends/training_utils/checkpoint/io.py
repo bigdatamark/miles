@@ -1,3 +1,8 @@
+# [MODULE DOC] Writes a checkpoint directory in a distributed-safe way. Rank zero prepares an empty
+# directory (optionally replacing an existing one), all ranks write their shards, failures on any
+# rank are collected by an all-gather over the CPU (gloo) group, and on success rank zero writes
+# optional metadata and an optional empty completion marker file; on any failure rank zero deletes
+# the whole directory so no half-written checkpoint remains. Works without distributed too.
 """Checkpoint directory writes with completion metadata and failure cleanup."""
 
 # TODO: isolate checkpoint IO failures in Tinker; they still terminate the trainer cell.
@@ -23,6 +28,22 @@ def write_checkpoint_dir(
     overwrite: bool = True,
     completion_marker: str | None = None,
 ) -> None:
+    # [FUNCTION DOC] Inputs: target directory path; a callback that receives the directory path and
+    # writes this rank's shards; optional metadata dictionary; keyword-only overwrite flag (default
+    # true) and optional completion marker file name. Returns nothing; raises on any failure.
+    # Steps: (1) rank zero (or the only process) checks the directory: if it exists and overwrite is
+    # off, records a file-exists error; otherwise removes it recursively; then creates it with
+    # parents; any exception is captured. The captured error is broadcast to all ranks over the gloo
+    # group and every rank re-raises it, so nobody proceeds into the write phase. (2) Every rank runs
+    # the write callback and captures any exception (not raising yet, so collectives inside the
+    # callback finish on all ranks). (3) When distributed, all ranks all-gather a text description of
+    # their write error (type name and message) or none; this also acts as a barrier. (4) A rank with
+    # its own write error re-raises it; otherwise if any rank reported an error, raises a runtime
+    # error listing "rank N: error" entries; otherwise rank zero writes the metadata as indented JSON
+    # to META.json (if metadata is given) and creates the empty completion marker (if named).
+    # (5) On any failure in step 4, rank zero removes the directory (logging, not raising, if the
+    # cleanup itself fails with an operating-system error) and the original error propagates.
+    # Callers must make sure no readers use the directory concurrently.
     """Replace a checkpoint; callers must exclude concurrent readers.
 
     All ranks must call and finish weight collectives before raising local write errors.

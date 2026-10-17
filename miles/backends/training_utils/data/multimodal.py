@@ -1,3 +1,11 @@
+# [MODULE DOC] Expands media placeholders in rollout token sequences so that the language model has
+# one position per media unit, mutating the rollout batch dictionary in place. Two families: Kimi
+# VL / Kimi K2.5 (one in-vocabulary placeholder per media item, expanded to a run whose length is
+# derived from the item's (time, height, width) grid after 2x2 spatial merging; loss mask extended
+# with zeros for placeholders inside the response) and Inkling (negative out-of-vocabulary sentinel
+# ids for images and audio, replaced by runs of in-vocabulary placeholder ids whose lengths come from
+# per-item counts; positions of the runs are recorded back into the multimodal input dictionary).
+# Public entry point: expand_multimodal_rollout_data_in_place. Constants hold token ids.
 """Multimodal-specific preprocessing for rollout data.
 
 The rollout side emits one media placeholder/sentinel per media item; training
@@ -29,6 +37,10 @@ _KIMI_VL_MERGE_W = 2
 def _num_image_tokens_from_grid(
     grid_thw: torch.Tensor, merge_h: int = _KIMI_VL_MERGE_H, merge_w: int = _KIMI_VL_MERGE_W
 ) -> int:
+    # [FUNCTION DOC] HELPER: Number of tokens one image occupies given its (time, height, width) grid
+    # tensor: floor(height / merge height) times floor(width / merge width), merge sizes defaulting
+    # to 2. Time is ignored because temporal pooling averages it away. Raises a value error if the
+    # grid does not have exactly three entries.
     _, h, w = grid_thw.tolist()
     # tpool_patch_merger averages over the temporal dimension T, so the
     # actual number of tokens per image depends only on the spatial grid.
@@ -41,6 +53,22 @@ def _expand_image_tokens_for_sample(
     grid_thws: torch.Tensor,
     media_token_id: int = KIMI_VL_MEDIA_TOKEN_ID,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Expands each media placeholder of one sample into a run of identical
+    # placeholders. Inputs: the full token tensor (prompt plus response), the response loss mask,
+    # the per-image grid tensors, and the placeholder id (default Kimi VL media id). Returns
+    # (tokens, loss mask), unchanged when there are no grids or no placeholders, or when the number
+    # of placeholders already equals the total expected image tokens (already expanded, which keeps
+    # the function idempotent). If the placeholder count differs from the grid count, logs a
+    # warning. Otherwise works on clones and processes placeholders from last to first: the i-th
+    # from last is paired with grid number (placeholder count - 1 - i), skipped when that index is
+    # not below the grid count; the placeholder is replaced by as many copies as the image's token
+    # count; if the placeholder lies in the response (position at or after the prompt length), the
+    # loss mask entry at the corresponding response position is replaced by that many zeros.
+    # Prompt length is the token count minus the mask length.
+    # KNOWN ISSUE: grids are paired by index with placeholders, so with more placeholders than
+    # grids the trailing placeholders stay unexpanded while the leading ones take the grids in
+    # order; the code's own note says expansion shifts token indices so recorded weight-version span
+    # positions are not remapped.
     # TODO: expansion shifts token indices, so Sample.weight_versions span positions are not remapped and misalign here.
     if grid_thws is None or len(grid_thws) == 0:
         return tokens, loss_mask
@@ -96,6 +124,9 @@ def _expand_image_tokens_for_sample(
 def _collect_multimodal_grid_inputs(
     multimodal_train_inputs: Sequence[dict[str, torch.Tensor] | None] | None,
 ) -> list[dict[str, torch.Tensor] | None]:
+    # [FUNCTION DOC] HELPER: Returns a list aligned with the input in which each entry is the
+    # sample's multimodal dictionary if it is present and contains the grid key, else none. A none
+    # input gives an empty list.
     if multimodal_train_inputs is None:
         return []
 
@@ -112,6 +143,8 @@ def _batch_has_media_placeholders(
     tokens: Sequence[torch.Tensor],
     media_token_id: int = KIMI_VL_MEDIA_TOKEN_ID,
 ) -> bool:
+    # [FUNCTION DOC] HELPER: True if any token tensor in the sequence contains the media placeholder
+    # id (default Kimi VL media id).
     return any((token_tensor == media_token_id).any().item() for token_tensor in tokens)
 
 
@@ -122,6 +155,20 @@ INKLING_MM_AUDIO_PLACEHOLDER_TOKEN_ID = 200025
 
 
 def _expand_inkling_sample(token_tensor, loss_mask, mm, sample_idx: int):
+    # [FUNCTION DOC] HELPER: Replaces Inkling media sentinels in one sample's tokens by placeholder
+    # runs. Two media kinds are handled: image sentinel (negative 101) expanded into runs of the
+    # image placeholder id with lengths from the per-item vision patch counts, and audio sentinel
+    # (negative 102) expanded into the audio placeholder id with lengths from the audio token
+    # counts; the counts and position keys are entries of the multimodal dictionary. For each kind
+    # with sentinels present, asserts the multimodal dictionary has counts and one count per
+    # sentinel. With no sentinels returns the tokens unchanged (idempotent). Asserts all sentinels
+    # lie in the prompt (position below token count minus mask length). Sentinels of both kinds are
+    # sorted by position and spliced in one pass: each is replaced by its run, and the resulting
+    # positions of the run in the new token tensor (sample-local, accounting for earlier shifts)
+    # are collected per kind and written into the multimodal dictionary as a long tensor on the
+    # tokens' device (mutating it). Returns the new concatenated token tensor.
+    # The loss mask is read only for its length and is not changed.
+    # KNOWN ISSUE: the sample index argument is used only in assertion messages.
     """Replace media sentinels with placeholder runs, recording their sample-local positions into mm; idempotent."""
     spec = (
         (INKLING_IMAGE_SENTINEL_ID, INKLING_MM_PLACEHOLDER_TOKEN_ID, "mm_vision_num_patches", "mm_vision_positions"),
@@ -173,6 +220,15 @@ def _expand_inkling_sample(token_tensor, loss_mask, mm, sample_idx: int):
 
 
 def _expand_inkling_rollout_data_in_place(rollout_data: RolloutBatch) -> None:
+    # [FUNCTION DOC] HELPER: Applies Inkling expansion to every sample of the batch. Reads the
+    # multimodal inputs, tokens, loss masks and total lengths; for each sample (zipped without a
+    # strict length check) expands its tokens using the sample's multimodal dictionary (none if the
+    # list is shorter). If any total length changed: asserts CP size is one (treating a failing
+    # parallel-state lookup as one), then replaces the batch's tokens and total lengths and logs the
+    # change. Loss masks and response lengths are never touched (sentinels are only in prompts).
+    # KNOWN ISSUE: the replacement is applied only when some total length changes, so if every
+    # sentinel expands to exactly one token the sentinels stay in the stored tokens even though the
+    # multimodal dictionaries were already updated.
     mm_list = rollout_data["multimodal_train_inputs"]
     tokens = rollout_data["tokens"]
     loss_masks = rollout_data["loss_masks"]
@@ -205,6 +261,19 @@ def expand_multimodal_rollout_data_in_place(
     media_token_id: int = KIMI_VL_MEDIA_TOKEN_ID,
     qkv_format: str = "thd",
 ) -> None:
+    # [FUNCTION DOC] Public entry point; mutates the rollout batch dictionary and returns nothing.
+    # Inkling path: if any sample's multimodal dictionary has vision patch counts or audio token
+    # counts, runs the Inkling expansion and returns. Kimi VL path: collects grid inputs; returns if
+    # none of the samples has grids or no token tensor contains the media placeholder id (default
+    # Kimi VL id). Otherwise expands each sample that has grids (samples without grids keep their
+    # tokens, masks and old lengths), then stores the new token list, loss mask list, total lengths
+    # (token counts) and response lengths (mask counts) in the batch. If any length changed and CP
+    # size is greater than one with the thd format, re-slices the per-token rollout log-probs,
+    # teacher log-probs and on-policy-distillation reverse KL lists (those present and non-empty):
+    # each value is all-gathered to the old full response, then sliced to the new lengths. Logs an
+    # info message about what changed.
+    # KNOWN ISSUE: CP re-slicing is skipped for the bshd format, so those lists would keep stale
+    # lengths; the log message names Kimi VL specifically.
     multimodal_train_inputs = rollout_data.get("multimodal_train_inputs", None)
     if multimodal_train_inputs is not None and any(
         mm is not None and ("mm_vision_num_patches" in mm or "mm_audio_num_tokens" in mm)

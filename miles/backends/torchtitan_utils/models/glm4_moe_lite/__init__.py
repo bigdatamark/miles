@@ -1,3 +1,9 @@
+# [PACKAGE DOC] GLM-4 MoE Lite model for torchtitan, expressed as a configuration of torchtitan's
+# DeepSeek-V3 model (multi-head latent attention with a mixture-of-experts feed-forward). Defines
+# the one available flavor, a 30B-parameter model with about 3B active ("30B-A3B"), and a model
+# registry function that wraps it in a model specification reusing the DeepSeek-V3 parallelization,
+# pipelining, MoE load-balancing hook and Hugging Face state-dict adapter. Public names: the flavor
+# table and the registry function.
 from torchtitan.components.optimizer import register_moe_load_balancing_hook
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.models.common import ComplexRoPE, Embedding, Linear
@@ -17,6 +23,14 @@ __all__ = ["glm4_moe_lite_configs", "model_registry"]
 
 
 def _30b_a3b(attn_backend: str) -> DeepSeekV3Model.Config:
+    # [FUNCTION DOC] HELPER: Builds the model configuration for the given attention backend name.
+    # Hidden size 2048, vocabulary 154880, 47 layers of which the first 1 is dense (dense hidden
+    # size 10240) and the rest are MoE (64 routed experts of hidden size 1536, 1 shared expert,
+    # top-4 routing with sigmoid scores, normalized and scaled by 1.8, standard communication, no
+    # capacity limit). Attention: 20 heads, query LoRA rank 768, key/value LoRA rank 512, no-position
+    # head size 192, rotary head size 64, value head size 256, scale factor 1.0. Rotary embedding:
+    # complex form, maximum length 202752, base 1,000,000. Embedding, final norm and output head
+    # use the DeepSeek-V3 default initializers; there are no multi-token-prediction layers.
     dim = 2048
     vocab_size = 154880
     rope_dim = 64
@@ -59,6 +73,10 @@ glm4_moe_lite_configs = {"30B-A3B": _30b_a3b}
 
 
 def model_registry(flavor: str, attn_backend: str = "flex") -> ModelSpec:
+    # [FUNCTION DOC] Returns a model specification named "glm4_moe_lite" for the flavor (key error
+    # if unknown) with the attention backend (default "flex"), using DeepSeek-V3's parallelize and
+    # pipelining functions, the MoE load-balancing hook after the optimizer is built, and the
+    # DeepSeek-V3 state-dict adapter.
     return ModelSpec(
         name="glm4_moe_lite",
         flavor=flavor,

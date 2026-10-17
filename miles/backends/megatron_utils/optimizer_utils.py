@@ -1,3 +1,7 @@
+# [MODULE DOC] Utilities to wipe a Megatron chained optimizer's state back to a freshly
+# initialized one and self-check that the wipe left nothing behind. Only the Adam-style state of
+# non-stub sub-optimizers is understood; unsupported configurations are rejected up front by
+# assertions (fp16 loss scaler, optimizer-state offload, chunked offload, disk streaming).
 import torch
 from megatron.core.optimizer import USING_PYTORCH_OPTIMIZER
 from megatron.core.optimizer.optimizer import ChainedOptimizer, MegatronOptimizer
@@ -6,6 +10,16 @@ from megatron.core.optimizer.optimizer import ChainedOptimizer, MegatronOptimize
 def reset_optimizer_state(
     optimizer: MegatronOptimizer, *, stream_optimizer_state_to_disk: bool, chunked_optimizer_state_offload: bool
 ) -> None:
+    # [FUNCTION DOC] Resets a chained optimizer in place to its just-initialized state; returns
+    # nothing. Both flags are keyword-only. Preconditions, each an assertion error with an
+    # explanatory message where applicable: the optimizer is a chained optimizer; optimizer-state
+    # offload is off in its config; chunked optimizer state offload is off; fp16 is off (the loss
+    # scaler would not be reset); disk streaming of optimizer state is off (the store would not be
+    # cleared).
+    # For each non-stub sub-optimizer: clears the inner optimizer's per-parameter state, removes the
+    # step entry from every param group, re-runs the sub-optimizer's state initializer with its
+    # config when one exists and the plain PyTorch optimizer is not in use, and zeroes (sets to
+    # none) its gradients. Finally verifies the result with the empty-state check.
     assert isinstance(optimizer, ChainedOptimizer)
     assert not optimizer.config.offload_optimizer_states
     assert (
@@ -38,6 +52,13 @@ def reset_optimizer_state(
 
 
 def _check_optimizer_state_empty(optimizer: MegatronOptimizer) -> None:
+    # [FUNCTION DOC] HELPER: Self-check after a reset; raises assertion errors on any violation.
+    # Over non-stub sub-optimizers: no param group has a step entry; every parameter has no
+    # gradient; every state value is all-zero (tensors via a nonzero count, other values by
+    # equality with zero). Also requires at least one optimizer and one parameter to have been
+    # inspected (guards against an empty walk), and that the union of state keys seen equals no keys
+    # for the plain PyTorch optimizer, else exactly the Adam first and second moment keys (extend
+    # here for other optimizers).
     checked_optimizers = 0
     checked_params = 0
     checked_state_keys: set[str] = set()

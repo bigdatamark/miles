@@ -1,3 +1,9 @@
+# [MODULE DOC] Command-line argument definitions for SGLang rollout engines. Registers the router
+# options, re-registers every option of SGLang's own server arguments under a "--sglang-" prefix
+# (with destination names prefixed by "sglang_") and a second time under "--eval-sglang-" (with
+# "eval_sglang_" destinations, defaults suppressed so unset values are inherited from the rollout
+# settings), skips a fixed list of options miles controls itself, adds the engine-deployment YAML
+# option, and provides post-parse validation that derives dependent settings.
 import argparse
 
 from sglang.srt.server_args import ServerArgs
@@ -6,6 +12,10 @@ from miles.utils.http_utils import wrap_ipv6
 
 # TODO: use all sglang router arguments with `--sglang-router` prefix
 def add_sglang_router_arguments(parser):
+    # [FUNCTION DOC] Registers on the given parser: router IP and port (strings/ints, default
+    # none), a router policy name (default none), and the router request timeout in seconds
+    # (integer, default 14400). Also sets the parser default for a model-routers attribute to
+    # none (no option registers it; it is only a default). Returns the same parser.
     """
     Add arguments to the parser for the SGLang router.
     """
@@ -65,6 +75,19 @@ _EVAL_SKIPPED_SERVER_ARGS = _SKIPPED_SERVER_ARGS + ["tp_size"]
 
 
 def _add_prefixed_server_args(parser, *, flag_prefix: str, dest_prefix: str, skipped_args: list[str], inherit: bool):
+    # [FUNCTION DOC] HELPER: Temporarily replaces the parser's add-argument method with a wrapper,
+    # lets SGLang's server arguments register themselves through it, then restores the original
+    # (not restored if registration raises). Keyword-only inputs: flag prefix, destination prefix,
+    # a list of destination names to skip, and the inherit flag. The wrapper (a) works out each
+    # option's canonical name from an explicit destination, else from the first long flag with
+    # dashes turned to underscores, and silently drops options in the skip list; (b) prefixes every
+    # flag (long or short) with two dashes, the flag prefix and the stripped flag; (c) prefixes an
+    # explicit destination unless it already starts with the destination prefix; (d) when no
+    # destination is given, forces destinations under the destination prefix for the four
+    # parallel-size options (tensor, data, pipeline, expert) so they use SGLang's short field names;
+    # (e) when inheriting, sets the default to suppress (so unset options leave no attribute) and
+    # converts store-true / store-false actions to the boolean optional action (dropping constant
+    # and nargs) so an override can also turn a feature off. Positional arguments pass through.
     """Register ``ServerArgs.add_cli_args`` as ``--{flag_prefix}-*`` -> ``args.{dest_prefix}*``.
 
     ``inherit=True`` defaults to SUPPRESS, so an unset flag leaves no attribute to inherit over.
@@ -72,6 +95,11 @@ def _add_prefixed_server_args(parser, *, flag_prefix: str, dest_prefix: str, ski
     old_add_argument = parser.add_argument
 
     def new_add_argument_wrapper(*name_or_flags, **kwargs):
+        # [FUNCTION DOC] HELPER: The replacement add-argument function; behavior is described in the
+        # enclosing function. Returns nothing (skipped options are not registered at all, and the
+        # underlying registration's result is discarded).
+        # KNOWN ISSUE: an option given only by short flags and no destination is never matched
+        # against the skip list, so it can never be skipped.
         """
         Add arguments to the parser, ensuring that the server arguments are prefixed and skippable.
         """
@@ -139,6 +167,9 @@ def _add_prefixed_server_args(parser, *, flag_prefix: str, dest_prefix: str, ski
 
 
 def collect_eval_sglang_overrides(args) -> dict:
+    # [FUNCTION DOC] Returns a mapping from server-argument field name to value for every parsed
+    # attribute whose name starts with the eval prefix (prefix removed). Because inherited options
+    # use suppressed defaults, only options the user actually set appear.
     """``ServerArgs`` fields set via ``--eval-sglang-*``; absent means inherit ``--sglang-*``."""
     return {
         key.removeprefix("eval_sglang_"): value for key, value in vars(args).items() if key.startswith("eval_sglang_")
@@ -146,6 +177,13 @@ def collect_eval_sglang_overrides(args) -> dict:
 
 
 def add_sglang_arguments(parser):
+    # [FUNCTION DOC] Registers all SGLang-related options on the parser and returns it: the router
+    # options; a server concurrency integer (default 512); SGLang's server options under the
+    # "--sglang-" prefix with normal defaults (skipping the miles-controlled list); the same options
+    # under "--eval-sglang-" with inheriting behavior (additionally skipping the tensor-parallel
+    # size, which is derived from the eval GPUs per engine); and a path option for the engine
+    # deployment YAML (default none; mutually exclusive with the prefill server count option, which
+    # is not enforced here).
     """
     Add arguments to the parser for the SGLang server.
     """
@@ -183,6 +221,15 @@ def add_sglang_arguments(parser):
 
 
 def validate_args(args):
+    # [FUNCTION DOC] Post-parse validation and derivation; mutates the parsed arguments and returns
+    # nothing. Rules in order: the server tensor-parallel size is overwritten by rollout GPUs per
+    # engine (any user-supplied value is ignored); true-on-policy mode turns on deterministic
+    # inference; when logprob recomputation via prefill is set (attribute may be absent), turns on
+    # prefill-only deterministic inference and deterministic inference; a data-parallel size above
+    # one asserts that data-parallel attention is enabled; data-parallel attention turns on the
+    # router's data-parallel-aware mode; with no router policy and a session server, sets the
+    # policy to manual and changes a random router assignment mode to min-load; a router IP, if set,
+    # is wrapped for IPv6 literal handling.
     args.sglang_tp_size = args.rollout_num_gpus_per_engine
 
     if args.true_on_policy_mode:

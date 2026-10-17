@@ -1,3 +1,11 @@
+# [MODULE DOC] The loss functions used in training and the dispatcher that picks one. Every loss
+# function has the same signature (arguments, mini-batch dictionary, logits, a context-parallel-
+# aware sample-mean reducer) and returns (scalar loss with gradient, dictionary of detached metric
+# scalars). Provided: policy loss (PPO-style clipped, with GSPO sequence-level KL, the optional
+# OPSM mask, off-policy importance sampling correction, entropy and KL terms,
+# sampling-support replay and many diagnostics), clipped value loss, and supervised negative
+# log-likelihood; score-centering and user-defined losses are dispatched too. Loss functions pull
+# response-aligned log-probs or values from the logit processors.
 from argparse import Namespace
 from collections.abc import Callable
 from typing import Protocol
@@ -26,6 +34,8 @@ from miles.utils.types import RolloutBatch
 
 
 class LossFunction(Protocol):
+    # [CLASS DOC] Structural type (protocol) describing what every loss function must accept and
+    # return; it has no behavior of its own and exists for type checking and documentation.
     """Common signature of the per-loss-type functions dispatched by `get_loss_function`."""
 
     def __call__(
@@ -35,6 +45,9 @@ class LossFunction(Protocol):
         logits: torch.Tensor,
         sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        # [FUNCTION DOC] Protocol method with no implementation (the body is only documentation):
+        # takes arguments, the mini-batch dictionary, float32 logits and the sample-mean reducer,
+        # and returns (scalar loss with gradient, dictionary of detached scalar metrics).
         """Compute a scalar loss with gradient + a dict of detached scalar metrics.
 
         Args:
@@ -67,6 +80,47 @@ def policy_loss_function(
     logits: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    # [FUNCTION DOC] Policy-gradient loss with many optional terms; returns (loss, metrics).
+    # Inputs from the batch: advantages (detached), optional rollout log-probs and reference
+    # log-probs (detached), optional trainer-scored old log-probs, lengths, loss masks, unconcat
+    # tokens, optional max sequence lengths, optional on-policy-distillation reverse KL, rollout
+    # mask sums, and sampling-mask fields.
+    # Validation: with the use-rollout-logprobs flag, rollout log-probs are required (assertion);
+    # else if the actor forward-only pass is not skipped, old log-probs are required (value error).
+    # Steps: (1) current log-probs (and entropy if the entropy coefficient is nonzero or entropy
+    # observation is on) from the logits, using sampling masks when sampling-support replay is on.
+    # (2) Old log-probs: the detached current ones if actor forward-only is skipped, else the batch's
+    # trainer-scored ones; the baseline for the ratio is the rollout log-probs when the flag says so,
+    # else those. (3) If the OPSM option or GSPO is on, all-gathers current and old log-probs
+    # across CP to full responses. (4) Optional OPSM mask and clip fraction from the full log-probs
+    # and advantages. (5) KL term ppo_kl: for GSPO the sequence-level KL helper over full and local
+    # log-probs; otherwise per-token old minus current. Then the log-probs are concatenated. (6) Local
+    # (CP-sliced) loss masks; ppo_kl and advantages have non-finite values replaced by zero and are
+    # forced to zero on inactive tokens. (7) Clipped policy loss and clip fraction from ppo_kl,
+    # advantages and clip epsilons (low, high, and the optional dual-clip constant). (8) Optional
+    # debug dump when a dump-details setting exists. (9) OPSM mask multiplies the loss. (10) If
+    # mismatch metrics or TIS are on: keeps the original reducer for metrics; loads the user
+    # correction function or asserts trainer and rollout log-probs exist for the built-in one;
+    # computes the importance ratio exp(-ppo_kl); calls the correction with arguments, loss, trainer
+    # and rollout log-probs, masks, lengths, parallel state and max lengths, getting back the new
+    # loss, modified masks and metrics; rebuilds the reducer from the modified masks but keeps the
+    # original rollout mask sums as denominators. (11) Loss reducer is the user-supplied one (with
+    # lengths, the modified masks if corrections ran else the batch masks, and the per-token flag)
+    # or the default reducer. (12) Effective-sample-size ratio contribution computed from ppo_kl.
+    # (13) Reduces the loss, clip fraction and ppo_kl. (14) Entropy: reduces it and subtracts
+    # entropy coefficient times it from the loss when the coefficient is nonzero (else reports it
+    # detached). (15) KL-to-reference loss when enabled: asserts reference log-probs exist, optional
+    # importance ratio exp(current - old) for the unbiased variant, approximate KL of the configured
+    # type with non-finite values zeroed outside active tokens, reduced and added with its
+    # coefficient if nonzero. (16) If there are no local tokens, adds zero times the logit sum so
+    # gradients still flow. (17) When rollout log-probs exist: diagnostics of the absolute
+    # difference and low-variance KL between rollout and independently scored trainer log-probs,
+    # reduced over active tokens.
+    # Reported metrics (detached): loss, pg_loss, entropy_loss, pg_clipfrac, ppo_kl, ess_ratio;
+    # plus rollout diagnostics, kl_loss, ois and the correction's metrics (reduced with the original
+    # masks), opsm_clipfrac, and opd_reverse_kl when present.
+    # KNOWN ISSUE: the docstring's metric list omits ess_ratio and several optional keys; the loss
+    # is aliased to the policy loss, so the in-place zero-gradient addition changes both.
     """Compute policy loss (PPO/GSPO) and metrics.
 
     Computes current log-probabilities and entropy from model logits, then
@@ -410,6 +464,14 @@ def value_loss_function(
     logits: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    # [FUNCTION DOC] PPO value loss. Old values and returns come from the batch (concatenated over
+    # samples); current values are extracted from the value-head logits (flattened). Clip fraction
+    # flag: tokens where the absolute change from old values exceeds the clip value from arguments.
+    # Clipped prediction = old + clamp(new - old, +-clip); per-token loss = max of squared error of
+    # the clipped prediction and of the unclipped prediction against the returns. Both the loss and
+    # the (float) clip flags are reduced with the sample-mean reducer. If there are no values, adds
+    # zero times the value sum to keep gradients flowing. Returns (loss, metrics with detached
+    # value_loss and value_clipfrac).
     """Compute clipped value loss and metrics.
 
     Extracts current value predictions from `logits`, compares them against
@@ -468,6 +530,10 @@ def sft_loss_function(
     logits: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    # [FUNCTION DOC] Negative log-likelihood of the response tokens: gets per-token log-probs (no
+    # entropy) from the logits, concatenates them, and returns minus their reduced sample mean. With
+    # no local tokens adds zero times the float32 logit sum so gradients flow. Returns (loss,
+    # mapping with one detached entry "loss").
     """Compute supervised fine-tuning loss over response tokens.
 
     Computes log-probabilities of the ground-truth tokens in the response
@@ -514,6 +580,10 @@ def sft_loss_function(
 
 
 def get_loss_function(args: Namespace, loss_fn: str | None = None) -> LossFunction:
+    # [FUNCTION DOC] Dispatcher. If a named loss function is given (the Tinker-style path), looks it
+    # up in the Tinker loss table (imported lazily; key error if unknown) and returns it. Otherwise
+    # switches on the loss type in arguments: score centering, policy loss, value loss, SFT loss, or
+    # custom loss (loads a function from the configured path); any other value raises a value error.
     if loss_fn is not None:
         from miles.backends.training_utils.loss.hub.tinker_losses import TINKER_LOSS_FUNCTIONS
 

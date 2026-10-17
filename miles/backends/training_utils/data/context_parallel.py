@@ -1,3 +1,13 @@
+# [MODULE DOC] Context-parallel (CP) helpers for per-sample sequences. Layout ("zigzag"): each
+# sample's sequence is cut into 2*cp_size equal chunks and rank r holds chunk r and chunk
+# 2*cp_size-1-r, which balances causal-attention work. Because a logit at position i predicts token
+# i+1, response log-probs for a sample live at logit positions from (prompt_length - 1) up to
+# (total_length - 1), exclusive, so offsets for logits are the token offsets minus one. Functions
+# compute those offsets, slice masks/tokens/log-probs into the local layout, gather local pieces
+# back into full response tensors with a differentiable sum-reduction over zero-padded pieces, and
+# redistribute between the allgather-CP layout (contiguous chunks) and the zigzag layout.
+# "thd" means all samples are packed into one token dimension; "bshd" means batch rows padded to a
+# maximum sequence length.
 import logging
 from collections.abc import Callable
 
@@ -18,6 +28,18 @@ def get_logits_and_tokens_offset_with_cp(
     cp_rank: int | None = None,
     cp_size: int | None = None,
 ):
+    # [FUNCTION DOC] Computes which parts of one sample a CP rank owns. Inputs: total length (prompt
+    # plus response), response length, qkv format (default thd), the padded max sequence length
+    # (required, else assertion error, for bshd), and optional explicit CP rank and size (both must
+    # be given to override; otherwise both come from the current parallel state). Asserts CP size
+    # is greater than one. Chunk size = ceiling of (total length, or max sequence length for bshd)
+    # divided by twice the CP size. The rank's two chunks are [rank*chunk, (rank+1)*chunk) and
+    # [(2*cp-rank-1)*chunk, (2*cp-rank)*chunk). The logit range of each chunk is the chunk
+    # intersected with [prompt_length - 1, total_length - 1); the matching token range is the logit
+    # range shifted by one. A chunk with an empty intersection gets the empty range (0, 0) for both
+    # logits and tokens (an empty slice keeps gradient flow). Returns (chunk size, pair of chunk
+    # ranges, pair of logit ranges, pair of token ranges); all offsets are measured from the start
+    # of the prompt (sample start).
     """
     All offsets start from the begining of the prompt.
 
@@ -68,6 +90,10 @@ def _slice_loss_mask_for_local_cp(
     qkv_format: str,
     max_seq_len: int | None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Takes the response-length loss mask of one sample and returns the part
+    # that corresponds to this rank's two token ranges (offsets converted from sample-start to
+    # response-start by subtracting the prompt length), concatenated in order. Requires CP size
+    # greater than one (through the offset helper).
     """Slice a per-sample response loss mask into this CP rank's local zigzag layout."""
     prompt_length = total_length - response_length
     _, _, _, tokens_offset = get_logits_and_tokens_offset_with_cp(
@@ -85,6 +111,8 @@ def slice_loss_masks_for_local_cp(
     qkv_format: str = "thd",
     max_seq_lens: list[int] | None = None,
 ) -> list[torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Thin alias that calls the local response loss mask function with the
+    # arguments reordered (it takes the masks after the lengths). Returns its result.
     """Backward-compatible wrapper for local CP response mask slicing."""
     return get_local_response_loss_masks(total_lengths, response_lengths, loss_masks, qkv_format, max_seq_lens)
 
@@ -99,6 +127,16 @@ def get_sum_of_sample_mean(
     *,
     denominators: list[torch.Tensor] | torch.Tensor | None = None,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
+    # [FUNCTION DOC] Returns a reduction function over a concatenated per-token tensor (first
+    # dimension is all samples' response tokens back to back). By default denominators are each
+    # sample's full loss-mask sum (may also be given as a list or tensor, keyword-only, one per
+    # sample). Without CP the tensor is split by response lengths and the masks are the given masks;
+    # with CP greater than one, each mask is first sliced to this rank's local part and the tensor is
+    # split by those local lengths (so denominators must still be the full-sample counts). The
+    # returned function is either (default) the sum over samples of masked sum divided by the
+    # denominator clamped to at least one, or, when the per-token-loss flag is true, the plain masked
+    # sum over all tokens (denominators unused). The qkv format and max sequence lengths are only
+    # used for CP slicing.
     """Calculate correct sample mean for CP; ``denominators`` overrides each
     sample's own ``loss_mask.sum()`` (e.g. pass ``rollout_mask_sums`` for
     per-rollout means)."""
@@ -110,6 +148,9 @@ def get_sum_of_sample_mean(
     if cp_size == 1:
 
         def sum_of_sample_mean(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Without CP. Splits the tensor by response lengths and returns
+            # the sum over samples of the masked sum divided by the sample's denominator (at least
+            # one). Raises a value error if the lists differ in length.
             return sum(
                 [
                     (x_i * loss_mask_i).sum() / torch.clamp_min(denominator, 1)
@@ -120,6 +161,7 @@ def get_sum_of_sample_mean(
             )
 
         def sum_of_token(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Without CP. Sum of masked values over all samples.
             return sum(
                 [
                     (x_i * loss_mask_i).sum()
@@ -140,6 +182,9 @@ def get_sum_of_sample_mean(
             cp_chunk_lengths.append(chunked_loss_masks[i].size(0))
 
         def sum_of_sample_mean(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: With CP. Splits the local tensor by the local chunk lengths and
+            # returns the sum over samples of the masked local sum divided by the sample's full
+            # denominator (at least one); partial results from CP ranks add up to the full mean.
             return sum(
                 [
                     (x_i * chunked_loss_mask).sum() / torch.clamp_min(denominator, 1)
@@ -150,6 +195,7 @@ def get_sum_of_sample_mean(
             )
 
         def sum_of_token(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: With CP. Sum of masked local values over all samples.
             return sum(
                 [
                     (x_i * chunked_loss_mask).sum()
@@ -169,6 +215,9 @@ def get_local_response_loss_masks(
     qkv_format: str = "thd",
     max_seq_lens: list[int] | None = None,
 ) -> list[torch.Tensor]:
+    # [FUNCTION DOC] Without CP (CP size one) returns the given masks unchanged (same list). With CP
+    # returns a new list in which each mask is sliced to this rank's local two token ranges (the
+    # per-sample max sequence length is used only for bshd).
     """Return response loss masks aligned with this rank's local log-probs."""
     parallel_state = get_parallel_state()
     if parallel_state.cp.size == 1:
@@ -193,6 +242,15 @@ def all_gather_with_cp(
     qkv_format: str = "thd",
     max_seq_len: int | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Rebuilds one sample's full response tensor from this rank's local per-logit
+    # values. Without CP returns the input. With CP: the local tensor (first dimension is the sum of
+    # this rank's two logit ranges) is split into the first-chunk and second-chunk parts (asserting
+    # the second part has the expected size); a full tensor of the response length is made by
+    # placing the non-empty parts at their positions (position = logit offset minus
+    # (prompt_length - 1)) between zero tensors that require gradients (four cases: both empty, only
+    # first, only second, both present); asserts the result has the response length; then sums it
+    # over the CP group with a differentiable all-reduce, so each position receives the value from
+    # the one rank that owns it. Returns the full tensor (trailing dimensions preserved).
     """
     Gather tensors across all ranks in the context parallel group.
     The first dimension of the output tensor will be the `response_length`.
@@ -215,6 +273,8 @@ def all_gather_with_cp(
     assert chunk_1.shape[0] == logits_offset[1][1] - logits_offset[1][0]
 
     def zero(len: int) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: A zero tensor with the given first-dimension length, the trailing
+        # shape, element type and device of the input tensor, requiring gradients.
         return torch.zeros(
             [len] + list(tensor.shape[1:]),
             dtype=tensor.dtype,
@@ -254,6 +314,19 @@ def slice_with_cp(
     max_seq_len: int | None = None,
     parallel_state: object | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Pads and slices one sample's token-like tensor (first dimension is the
+    # sequence) into this rank's local zigzag layout. Inputs: the tensor; a pad value that is either
+    # a number or a callable taking (tensor, pad length) and returning the padded tensor; qkv format
+    # (default thd); the padded max sequence length (required for bshd, assertion error otherwise);
+    # and an optional parallel state (default: the current one) supplying CP rank and size.
+    # CP size one: bshd pads the end of the first dimension up to the max sequence length; thd
+    # returns the input untouched. CP greater than one: chunk size = ceiling of (length, or max
+    # sequence length for bshd) over twice the CP size; the tensor is padded at the end to twice the
+    # CP size times the chunk size; then the rank's two chunks (chunk r and chunk 2*cp-1-r) are
+    # concatenated. A numeric pad value pads only the first dimension.
+    # KNOWN ISSUE: the annotation of the pad value claims a tuple of three alternatives but the
+    # code uses a single number or a callable; for bshd a sequence longer than the max sequence
+    # length gives a negative pad.
     """
     Slice tokens into the local zigzag CP layout.
     """
@@ -266,6 +339,8 @@ def slice_with_cp(
         assert max_seq_len is not None
 
     def pad_tokens(tokens, pad):
+        # [FUNCTION DOC] HELPER: Appends the given number of pad entries to the first dimension: via
+        # the callable pad value if one was given, else with a constant fill of the numeric pad value.
         if isinstance(pad_value, Callable):
             pad_func = pad_value
             tokens = pad_func(tokens, pad)
@@ -298,6 +373,10 @@ def slice_with_cp(
 
 
 def natural_to_zigzag_slice(tensor: torch.Tensor, dim: int, cp_size: int, cp_rank: int) -> torch.Tensor:
+    # [FUNCTION DOC] Takes the two chunks (index rank and index 2*cp-1-rank, out of 2*cp equal
+    # parts) of the tensor along the given dimension and concatenates them along that dimension.
+    # If the dimension size is not divisible by twice the CP size, prints a warning to standard
+    # output (not the logger) and returns the tensor unchanged. No padding is done.
     """Slice a full-length tensor into the zigzag ring-attention CP layout.
 
     Rank ``cp_rank`` owns chunks ``[cp_rank, 2*cp_size - 1 - cp_rank]`` from the
@@ -330,6 +409,19 @@ def allgather_cp_redistribute(
     response_lengths: list[int],
     max_seq_lens: list[int] | None = None,
 ) -> None:
+    # [FUNCTION DOC] In-place conversion of each named list of per-sample response tensors from the
+    # allgather-CP layout (each rank holds one contiguous slice of the packed sequence; local length
+    # taken from the logits' second dimension, chunk start = rank times local length) to the zigzag
+    # layout. For every key: for every sample, finds the global range of its response logits (sample
+    # start is zero for bshd, the running sum of total lengths for thd; range = start + prompt - 1
+    # to start + total - 1); if this rank's slice overlaps it, pads the sample's local values with
+    # zeros before and after to the full response length at the proper offsets, otherwise creates a
+    # zero tensor requiring gradients and attached to the value's graph (adds zero times the value's
+    # sum); asserts the length; concatenates all samples and sums over the CP group with a
+    # differentiable all-reduce (one collective per key); then splits per sample and slices each
+    # into the zigzag layout. Replaces each list in the mapping. Returns nothing.
+    # KNOWN ISSUE: samples and lengths are zipped without strict checking, so mismatched list
+    # lengths silently truncate.
     """Redistribute response tensors from allgather-CP layout to zigzag ring-attn layout.
 
     After allgather context parallelism, each rank holds a contiguous chunk of
@@ -414,6 +506,12 @@ def slice_log_prob_with_cp(
     qkv_format: str = "thd",
     max_token_len: int | None = None,
 ) -> list[float] | torch.Tensor:
+    # [FUNCTION DOC] Takes one sample's full response-length values (list or tensor, asserted to
+    # have exactly the response length) and returns this rank's local portion. CP size one returns
+    # the input. Otherwise slices the two logit ranges of this rank (converted to response-relative
+    # positions by subtracting prompt_length - 1) and joins them: list concatenation for lists,
+    # tensor concatenation along the first dimension for tensors. The max token length (default
+    # none) is only needed for bshd.
     assert len(log_prob) == response_length
 
     parallel_state = get_parallel_state()
@@ -444,6 +542,13 @@ def assemble_log_prob_from_cp(
     qkv_format: str = "thd",
     max_seq_len: int | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Builds one sample's full response vector from a mapping of CP rank to that
+    # rank's local slice. Asserts CP size is greater than one and that every rank from zero to CP
+    # size minus one is present. Allocates a zero vector of the response length on the CPU with the
+    # element type of the first slice, then for each rank computes its logit ranges with the same
+    # offset helper (explicit rank and size) and copies consecutive parts of that rank's slice into
+    # the matching response positions, skipping empty ranges; asserts each slice is fully consumed.
+    # Returns the assembled CPU tensor (any device of inputs is not preserved).
     """Inverse of `slice_log_prob_with_cp`: per-rank slices back to one response.
 
     `chunks` maps cp_rank to that rank's slice; every rank must be present.

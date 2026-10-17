@@ -1,3 +1,6 @@
+# [MODULE DOC] Command-line arguments for the torchtitan backend: an arguments dataclass extending
+# the FSDP arguments with torchtitan model selection and parallel sizes, parser builders, and a
+# validation function that rejects unsupported combinations early.
 from dataclasses import dataclass
 
 import torch
@@ -7,6 +10,10 @@ from miles.backends.fsdp_utils.arguments import FSDPArgs, build_dataclass_parser
 
 @dataclass
 class TorchtitanArgs(FSDPArgs):
+    # [CLASS DOC] Dataclass of torchtitan options added to the FSDP options. Fields and defaults:
+    # model name "qwen3" and model flavor "0.6B" (the name selects a torchtitan model package and
+    # the flavor is passed to its model registry); sequence length 4096 (tokens, must cover prompt
+    # plus response, see validation); tensor, pipeline and expert model parallel sizes, all 1.
     # torchtitan.models.<name>.model_registry(<flavor>)
     titan_model_name: str = "qwen3"
     titan_model_flavor: str = "0.6B"
@@ -19,14 +26,27 @@ class TorchtitanArgs(FSDPArgs):
 
 
 def build_torchtitan_parser(extra_args_provider=None):
+    # [FUNCTION DOC] Builds an argument parser from the torchtitan arguments dataclass with the
+    # description "torchtitan Training (miles)", letting an optional provider callback add more
+    # arguments. Returns the parser.
     return build_dataclass_parser(TorchtitanArgs, "torchtitan Training (miles)", extra_args_provider)
 
 
 def load_torchtitan_args(extra_args_provider=None):
+    # [FUNCTION DOC] Builds the torchtitan parser (with the optional extra provider) and returns the
+    # arguments loaded from it by the shared FSDP loader (which parses the process command line).
     return load_args_from_parser(build_torchtitan_parser(extra_args_provider))
 
 
 def validate_torchtitan_args(args) -> None:
+    # [FUNCTION DOC] Raises a value error for the first unsupported setting; returns nothing.
+    # Checks in order: installed torch (major and minor numbers of its version) is at least 2.13;
+    # context parallelism is not used with the qwen3_5 model; sequence length: if a rollout maximum
+    # context length is set the sequence length must be at least that, otherwise it must be strictly
+    # greater than the rollout maximum response length (rotary embeddings are built for the
+    # sequence length); no reference update interval; no fp16; the learning-rate decay style is
+    # constant, linear or cosine; no warmup fraction, warmup-stable-decay iterations or decay
+    # iterations (only warmup iterations are supported); no saving of debug train data.
     torch_version = tuple(int(part) for part in torch.__version__.split(".")[:2])
     if torch_version < (2, 13):
         raise ValueError(f"the torchtitan backend needs torch>=2.13; this environment runs {torch.__version__}")

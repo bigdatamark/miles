@@ -1,3 +1,9 @@
+# [MODULE DOC] Builds the torchtitan trainer configuration from miles' parsed arguments: resolves
+# the model specification from a miles-provided or torchtitan-provided model package, maps
+# parallelism, batch, optimizer, learning-rate, loss, data loader, checkpoint and logging settings,
+# and decides whether to resume from the latest saved step or to load the initial Hugging Face
+# weights. Side effects: may create a temporary directory for dumps, reads the Hugging Face config
+# and the checkpoint directory listing.
 import importlib
 import logging
 import os
@@ -20,6 +26,10 @@ _MODEL_PACKAGE_ROOTS = ("miles.backends.torchtitan_utils.models", "torchtitan.mo
 
 
 def _model_package(name: str):
+    # [FUNCTION DOC] HELPER: Imports and returns the model package with the given name, looking
+    # under the miles models root first and then the torchtitan models root. A module-not-found
+    # error is swallowed only when it is for the exact candidate module; a missing nested dependency
+    # is re-raised. If neither exists, raises a value error listing both candidate paths.
     for root in _MODEL_PACKAGE_ROOTS:
         module_name = f"{root}.{name}"
         try:
@@ -34,6 +44,9 @@ def _model_package(name: str):
 
 
 def resolve_model_spec(args: Namespace):
+    # [FUNCTION DOC] Finds the model package named in the arguments and calls its model registry
+    # with the model flavor and the flex attention backend, returning the model specification.
+    # Raises a value error if the package exposes no registry function.
     module = _model_package(args.titan_model_name)
     registry = getattr(module, "model_registry", None)
     if registry is None:
@@ -42,6 +55,12 @@ def resolve_model_spec(args: Namespace):
 
 
 def _latest_step_dir(load_root: str, dump_subdir: str) -> str | None:
+    # [FUNCTION DOC] HELPER: Looks in the checkpoint folder under the load root, the torchtitan
+    # directory and the dump subdirectory. Returns none if the folder does not exist or holds no
+    # entries starting with the step prefix; otherwise returns the path of the entry with the largest
+    # step number.
+    # KNOWN ISSUE: an entry whose name starts with the prefix but has a non-integer suffix raises a
+    # value error.
     folder = os.path.join(load_root, "torchtitan", dump_subdir, "checkpoint")
     if not os.path.isdir(folder):
         return None
@@ -50,6 +69,28 @@ def _latest_step_dir(load_root: str, dump_subdir: str) -> str | None:
 
 
 def build_trainer_config(args: Namespace, *, hf_assets_path: str, lr_total_steps: int, dump_subdir: str):
+    # [FUNCTION DOC] Returns a populated torchtitan trainer config. Keyword inputs: the Hugging Face
+    # assets path, total learning-rate schedule steps, and the dump subdirectory name.
+    # Validation (value errors): the optimizer must be adam; a checkpoint with tied embeddings is
+    # rejected under pipeline parallelism greater than one (when tied otherwise, enables weight
+    # tying in the model spec).
+    # Settings: model spec from the arguments; assets path; dump folder = save path (or a new
+    # temporary directory) / torchtitan / subdirectory; parallel degrees (data replicate, tensor,
+    # pipeline, context, expert) from arguments, pipeline microbatch size 1, partial-dtensor SPMD
+    # backend; sequence length; under pipeline parallelism the global batch size must be a multiple
+    # of data-parallel size times micro batch size (value error); local batch size =
+    # global batch size / dp size / micro batch size, at least one; global batch size recomputed as
+    # local batch size times dp size; steps = max(lr total steps, 1); gradient clip norm; CUDA
+    # graphs disabled; one AdamW parameter group matching all parameters with learning rate, betas,
+    # epsilon and weight decay from arguments; warmup steps from warmup iterations; for the constant
+    # decay style the minimum learning-rate factor is 1.0, otherwise the decay type is set and the
+    # factor is min lr divided by lr; RL loss adapter, empty data loader, tied-aware checkpoint
+    # manager; full activation checkpointing only if gradient checkpointing is on; seed;
+    # checkpointing enabled with full (not model-only) last save; resume: if a load path is given
+    # and a latest step directory exists there, loads that path with optimizer state; otherwise
+    # loads only model weights from the Hugging Face format; TensorBoard, W&B logging and the
+    # validator are turned off.
+    # KNOWN ISSUE: the minimum learning-rate factor divides by lr, which fails if lr is zero.
     if args.optimizer != "adam":
         raise ValueError(f"torchtitan backend supports --optimizer adam, got {args.optimizer!r}")
 

@@ -1,3 +1,10 @@
+# [MODULE DOC] Single place that imports every SGLang dependency the Megatron actor needs, so the
+# rest of the package imports them from here. Some FP8 helpers are optional: when an import fails
+# the name is bound to none (UE8M0 quantization helpers and the deepgemm requant check together;
+# per-block FP8 cast separately). The torch reductions monkey-patch helper and the tensor bucket
+# class are imported from either their new or old SGLang locations (fallbacks), while the
+# multiprocessing serializer has no fallback and a missing import raises. Exports are listed in
+# the public names list.
 # the file to manage all sglang deps in the megatron actor
 try:
     from sglang.srt.layers.quantization.fp8_utils import quant_weight_ue8m0, transform_scale_ue8m0

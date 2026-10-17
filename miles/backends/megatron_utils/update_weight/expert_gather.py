@@ -1,3 +1,8 @@
+# [MODULE DOC] Gathers batches of named tensors (converted expert weights and their scales) from
+# every rank of a process group into every rank, by packing all of a rank's tensors into a single
+# flat byte buffer, exchanging the buffers with one asynchronous collective, and rebuilding typed
+# strided views on the receive side without copying. The byte layout of each rank's payload is
+# exchanged once (on the first call) and then reused.
 """Pack and gather converted expert tensors and scales across training ranks."""
 
 from dataclasses import dataclass
@@ -8,6 +13,10 @@ import torch.distributed as dist
 
 @dataclass(frozen=True)
 class _TensorLayout:
+    # [CLASS DOC] HELPER: Immutable description of where one tensor sits inside a rank's flat byte
+    # payload: its name, shape, element type, byte offset (aligned to the element size), byte
+    # length, row-major element strides (dimensions of size zero count as one), and the offset in
+    # elements within a view of the payload typed as the tensor's element type.
     name: str
     shape: tuple[int, ...]
     dtype: torch.dtype
@@ -19,6 +28,12 @@ class _TensorLayout:
 
 @dataclass(frozen=True)
 class _PayloadLayout:
+    # [CLASS DOC] HELPER: Immutable description of a whole rank payload: the tensor layouts grouped
+    # into units (the same grouping as the caller's units), the unpadded payload byte length, the
+    # alignment (largest element size seen, one if empty), and for each element type the length in
+    # bytes of the payload prefix that can be reinterpreted as that type (the total length rounded
+    # down to a multiple of its element size; this is a prefix of the whole payload, not a
+    # per-type total).
     units: tuple[tuple[_TensorLayout, ...], ...]
     nbytes: int
     alignment: int
@@ -27,6 +42,13 @@ class _PayloadLayout:
 
 
 class ExpertGather:
+    # [CLASS DOC] Callable object bound to one process group that all-gathers fixed-layout batches
+    # of named tensors. State: the group, the member global ranks, this rank's index, and lazily
+    # cached layout data (per-rank payload layouts, padded per-rank payload sizes, total bytes,
+    # whether all sizes are equal, and the sole data-holding rank if only one exists). The cache is
+    # filled on the first call and never invalidated, so the tensor names, shapes, element types,
+    # unit structure and group must not change over the object's life (violations are caught by
+    # assertions when packing, but only on the local rank).
     """Gather one fixed-layout expert batch, exchanging payload layouts once.
 
     Names, unit boundaries, shapes, dtypes, and group membership must stay fixed
@@ -42,6 +64,10 @@ class ExpertGather:
     """
 
     def __init__(self, *, group: dist.ProcessGroup):
+        # [FUNCTION DOC] Stores the process group, the global ranks of its members in group order,
+        # and this process's index within them (raises a value error if the current rank is not a
+        # member). Initializes empty cached layout state (layouts unknown, payload sizes empty, no
+        # single source, zero total bytes, not uniform) filled lazily on the first call.
         self._group = group
         self._source_ranks = tuple(dist.get_process_group_ranks(group))
         self._local_index = self._source_ranks.index(dist.get_rank())
@@ -54,6 +80,19 @@ class ExpertGather:
     def __call__(
         self, units: list[list[tuple[str, torch.Tensor]]], *, device: torch.device | str
     ) -> list[list[tuple[str, torch.Tensor]]]:
+        # [FUNCTION DOC] Call operator that gathers the local units from all ranks. Takes a list of units (each a list of name and tensor pairs) and a device
+        # (keyword-only) and returns the concatenation, in group-rank order, of all ranks' units
+        # as views into a freshly allocated receive buffer. A group of one rank returns the input
+        # unchanged. First call only: builds the local payload layout, exchanges layouts among all
+        # ranks (a collective object gather), takes the largest alignment, pads each rank's
+        # payload size up to that alignment, and records total bytes, whether all padded sizes are
+        # equal, and which single rank (if exactly one rank has a nonempty payload) is the sole
+        # source. Every call: allocates a byte buffer of the total size on the device, splits it
+        # into per-rank segments, packs local tensors into the local segment (checking the layout
+        # has not changed), starts the asynchronous collective, builds the typed views while the
+        # transfer is in flight, then waits for the transfer before returning. Because views alias
+        # the buffer, results stay valid as long as callers hold them. Layout mismatches raise
+        # assertion errors; an empty total skips communication.
         if len(self._source_ranks) == 1:
             return units
         if self._layouts is None:
@@ -86,6 +125,11 @@ class ExpertGather:
         return gathered
 
     def _gather_payloads(self, storage, payloads, local_payload):
+        # [FUNCTION DOC] HELPER: Starts the asynchronous collective and returns its work handle
+        # (or none when nothing is to be sent). If there are no bytes: none. If exactly one rank
+        # has data: a broadcast of that rank's segment from that rank. Else if all segments have
+        # equal size: an in-place all-gather into the whole buffer (no temporaries). Else an
+        # uneven all-gather into the list of segments.
         if not self._total_bytes:
             return None
         if self._single_source is not None:
@@ -99,6 +143,12 @@ class ExpertGather:
 
 
 def _build_payload_layout(units):
+    # [FUNCTION DOC] HELPER: Computes the payload layout for a list of units of named tensors,
+    # without touching tensor data. Walks tensors in order; each tensor's byte offset is rounded
+    # up to a multiple of its element size, its byte length is element count times element size,
+    # and its strides are the row-major strides (size-zero dimensions treated as size one). Records
+    # element sizes per type to compute alignment (largest element size, default one) and per-type
+    # typed-prefix lengths. Returns the payload layout.
     unit_layouts = []
     dtype_sizes = {}
     byte_offset = 0
@@ -130,6 +180,10 @@ def _build_payload_layout(units):
 
 
 def _pack_units(units, layout, payload):
+    # [FUNCTION DOC] HELPER: Copies each tensor's bytes into its slot of the local byte payload
+    # (in place). Asserts that the unit count, the tensor count per unit, and each tensor's name,
+    # shape and element type match the recorded layout (messages tell the user to recreate the
+    # iterator). Tensors are made contiguous and flattened to bytes before copying.
     assert len(units) == len(layout.units), "Expert output unit count changed; recreate the iterator"
     for unit, unit_layout in zip(units, layout.units, strict=True):
         assert len(unit) == len(unit_layout), "Expert output tensor count changed; recreate the iterator"
@@ -145,6 +199,11 @@ def _pack_units(units, layout, payload):
 
 
 def _unpack_units(layout, payload):
+    # [FUNCTION DOC] HELPER: Rebuilds the units of named tensors from one rank's byte payload
+    # without copying. For each element type used, takes the typed-prefix of the payload (cropping
+    # odd byte tails) viewed as that type; each tensor becomes a strided view of its type's view
+    # using the recorded shape, strides and element offset (added to the view's own storage
+    # offset). Returns a list of units, each a list of name and tensor pairs, in layout order.
     # Crop odd byte tails before reinterpreting the common storage by dtype.
     typed_payloads = {dtype: payload[:nbytes].view(dtype) for dtype, nbytes in layout.dtype_view_nbytes}
     storage_offsets = {dtype: tensor.storage_offset() for dtype, tensor in typed_payloads.items()}

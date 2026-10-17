@@ -1,3 +1,14 @@
+# [MODULE DOC] Turns rollout data into per-micro-batch training inputs. Three stages: (1)
+# get_rollout_data fetches this data-parallel rank's share of the rollout from the object store and
+# moves token-like fields to the GPU, computing padded max sequence lengths for the bshd format and
+# context-parallel-slicing the full-response log-prob style fields; (2) get_data_iterator decides the
+# micro-batch schedule (fixed-size contiguous micro-batches, or dynamic token-budget micro-batches
+# balanced by sequence length) and wraps the data in iterators, one per virtual pipeline stage;
+# (3) get_batch pulls one micro-batch from an iterator and builds the model inputs: packed (thd) or
+# padded (bshd) tokens sliced for context parallelism, cumulative sequence lengths, input-aligned
+# loss masks, optional position and witness ids, multi-LoRA per-adapter token counts, and
+# concatenated multimodal tensors. "thd" packs all samples of a micro-batch into one token row;
+# "bshd" stacks padded rows. Samples are Python lists of per-sample tensors keyed by field name.
 import logging
 from argparse import Namespace
 from collections.abc import Sequence
@@ -21,6 +32,9 @@ logger = logging.getLogger(__name__)
 
 
 def _rollout_logprob_dtype(args: Namespace) -> torch.dtype:
+    # [FUNCTION DOC] HELPER: Element type for rollout log-probs. In true-on-policy mode returns
+    # bfloat16 if the bf16 flag is set, else float16 if the fp16 flag is set (flags default false);
+    # in every other case float32.
     if getattr(args, "true_on_policy_mode", False):
         if getattr(args, "bf16", False):
             return torch.bfloat16
@@ -34,6 +48,26 @@ def get_rollout_data(
     rollout_data_ref: Box,
     witness_info: WitnessInfo | None = None,
 ) -> tuple[RolloutBatch, ObjectStoreGetResult]:
+    # [FUNCTION DOC] Fetches and prepares this rank's rollout data. Inputs: arguments, a boxed
+    # reference to the rollout data in the object store, optional witness info. Returns (rollout data
+    # dictionary of per-sample lists, object store get result). Requires a CUDA device.
+    # Steps: fetch this effective-data-parallel rank's slice of the rollout (CPU, through Ray; first
+    # and last pipeline stages both receive it); convert tokens to long tensors and loss masks to int
+    # tensors on the current GPU; convert rollout mask sums (if present) to one float32 GPU tensor;
+    # with witness enabled, pop the per-sequence witness ids and expand each to a long tensor with
+    # one id per token (lengths must match, strict); move every multimodal input dictionary's
+    # tensors to the GPU (none entries kept). For the bshd format: max sequence length = the largest
+    # total length rounded up to a multiple of the pad size, where pad size = tensor-parallel size
+    # times the data pad multiplier, raised to at least (largest attention compress ratio, doubled
+    # when CP is on, times CP size) if compress ratios are configured; stores that value once per
+    # sample under max sequence lengths. Then, for each of rollout log-probs, teacher log-probs and
+    # on-policy-distillation reverse KL that are present, slices each sample's full-response values
+    # into the local CP layout and converts to a GPU tensor (element type from the dtype helper for
+    # rollout log-probs, float32 for the others). Routed-expert and indexer top-k arrays are
+    # converted from NumPy to tensors (CPU, sharing memory).
+    # KNOWN ISSUE: the sample, length lists are zipped without a strict length check in the log-prob
+    # conversion; with compress ratios the final pad size is not guaranteed to remain a multiple of
+    # the tensor-parallel padding.
     parallel_state = get_parallel_state()
     # Fetch data through ray on CPU, not sure if this will be performance bottleneck.
     # Both first pp stage and the last pp stage will receive the data.
@@ -129,6 +163,16 @@ def _prepare_loss_masks(
     pad: int,
     allgather_cp: bool,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Builds the loss mask aligned one-to-one with the input tokens of a
+    # micro-batch. For each sample (lists must have equal length, strict): left-pads the response
+    # mask with zeros by the prompt length (so entry i is one iff token i is a supervised response
+    # token), then, unless allgather CP is used, slices it into the local zigzag CP layout with pad
+    # value zero (bshd needs the max sequence length). bshd: with allgather CP, each mask is
+    # right-padded to the max sequence length and cut to this rank's contiguous window
+    # (max length divided by CP size); then the rows are stacked into a batch-by-length tensor.
+    # thd: concatenates all masks, right-pads by the given pad count with zeros, with allgather CP
+    # keeps this rank's contiguous 1/CP chunk, and adds a leading batch dimension of one. No label
+    # shift is applied here.
     """Expand response masks to input-token alignment, then pack/slice them like ``tokens``.
 
     Contract: ``mask[i]`` is 1 iff ``tokens[i]`` is a supervised response token.
@@ -173,6 +217,40 @@ def get_batch(
     get_position_ids: bool = False,
     allgather_cp: bool = False,
 ) -> dict[str, torch.Tensor | list[torch.Tensor] | None]:
+    # [FUNCTION DOC] Builds one micro-batch of model inputs from the iterator and returns it as a
+    # dictionary. Arguments: the data iterator; the keys to fetch (must include tokens; the
+    # adapter slots key is added automatically); pad multiplier (default 128); qkv format
+    # (default thd; anything else except bshd raises a value error); whether to also build position
+    # ids (default false); whether the allgather flavor of context parallelism is used (default
+    # false, unsupported together with multi-LoRA adapter slots).
+    # Batch contents: the fetched fields (absent keys become none); the dynamic global batch size and
+    # the loss function and its config copied from the iterator's rollout data when present; the
+    # original per-sample token list under unconcatenated tokens (before CP slicing); the final
+    # tokens as a batch of rows; input loss masks of the same shape as the tokens; and format-
+    # specific fields. A no-op multimodal expansion is run first as a safety net.
+    # bshd: the max sequence length is the first sample's entry of max sequence lengths (asserted to
+    # cover every sample); allgather CP pads each sample to it and cuts this rank's contiguous
+    # window (requires divisibility by CP size), otherwise each sample is zigzag-sliced; the rows are
+    # stacked.
+    # thd with allgather CP: sequences are concatenated first and the global stream is padded to a
+    # multiple of (CP size times tensor-parallel size times pad multiplier), the padding counted as
+    # one extra segment; this rank takes its contiguous chunk; cumulative sequence lengths describe
+    # the global stream. thd otherwise: each sample is zigzag-sliced, concatenated, padded to a
+    # multiple of tensor-parallel size times pad multiplier (padding as an extra segment), and the
+    # cumulative lengths (device tensor and host tuple) are scaled by CP size to express the
+    # original lengths. Then stores cumulative sequence lengths, their host copy and the maximum
+    # segment length, and gives the tokens a leading batch dimension of one. Pad token id is zero.
+    # Multi-LoRA: when adapter slots are given they must be sorted (assertion error otherwise); per
+    # adapter token counts are the sums of post-slicing sample lengths per slot, with any padding
+    # tokens added to the last sample's slot, stored as adapter token counts (int32 on GPU).
+    # Optional extras: position ids (arange per sample) and witness ids go through the same slicing
+    # and padding as tokens (not supported with allgather CP). Multimodal inputs are merged across
+    # samples: per key, tensors are concatenated along the first dimension (samples with none
+    # skipped), keys ending in positions are first shifted by the sample's start offset within the
+    # concatenated unsliced tokens, and a second mapping records each key's per-sample item counts.
+    # KNOWN ISSUE: the docstring omits several parameters and returned keys; the sample token
+    # lengths used for multi-LoRA counts are not defined on the thd allgather path (guarded by the
+    # assertion that rejects that combination).
     """
     Generate a CP-ready micro-batch with packed sequence parameters.
 
@@ -316,6 +394,10 @@ def get_batch(
     batch["tokens"] = tokens
 
     def _compute_transform_like_token_ids(ids_list: list):
+        # [FUNCTION DOC] HELPER: Applies to a per-sample list of id tensors the same layout as the
+        # tokens, with pad value zero: asserts allgather CP is off; bshd slices each sample and
+        # stacks rows; thd slices, concatenates, right-pads by the same pad count as the tokens, and
+        # adds a leading batch dimension. Any other format raises a not-implemented error.
         assert not allgather_cp, "allgather CP is not supported for FSDP"
         if qkv_format == "bshd":
             ids = [slice_with_cp(p, 0, qkv_format, max_seqlen) for p in ids_list]
@@ -382,6 +464,10 @@ def get_batch(
 
 
 class DataIterator:
+    # [CLASS DOC] Cursor over a rollout dictionary of per-sample lists. State: the rollout data, an
+    # optional fixed micro-batch size, an optional list of index lists (one per micro-batch), and a
+    # position counter. Exactly one of size or index lists must be set for fetching to work; the
+    # counter advances by the size (fixed mode) or by one (indexed mode) per fetch.
     """Micro-batch iterator over rollout dicts.
 
     Supports either fixed contiguous micro-batches or an explicit per-step
@@ -394,6 +480,8 @@ class DataIterator:
         micro_batch_size: int | None = None,
         micro_batch_indices: list[list[int]] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Stores the arguments and sets the position to zero. Asserts that the micro
+        # batch size and the index lists are not both given (both may be none).
         """Initialize an iterator over `rollout_data`.
 
         Args:
@@ -409,6 +497,12 @@ class DataIterator:
         self.offset = 0
 
     def get_next(self, keys: Sequence[str]) -> dict[str, list[object] | None]:
+        # [FUNCTION DOC] Returns a dictionary from each requested key to the list of that field's
+        # values for the next micro-batch, or none for keys absent from the rollout data. Indexed
+        # mode: picks the entries listed in the current index list. Fixed mode: takes the contiguous
+        # slice of micro-batch size starting at the position (assertion error with details if it
+        # runs past the end). The position then advances (by one in indexed mode, by the size in
+        # fixed mode) even if no key was found. Raises a type error if neither mode is configured.
         """Return the next micro-batch for the requested keys.
 
         - If `micro_batch_indices` is provided, selects rows according to the current
@@ -440,12 +534,17 @@ class DataIterator:
         return batch
 
     def reset(self) -> "DataIterator":
+        # [FUNCTION DOC] Sets the position back to zero and returns the same iterator.
         """Reset internal offset to the start and return self."""
         self.offset = 0
         return self
 
 
 def get_num_rollouts(args: Namespace, rollout_data: RolloutBatch, num_steps: int) -> list[int]:
+    # [FUNCTION DOC] Returns the list of rollout counts, one per training step. If the rollout data
+    # carries an explicit list under the number-of-rollouts key, returns it as is; otherwise returns
+    # a list of length num_steps filled with the dynamic global batch size from the rollout data, or
+    # the configured global batch size when absent.
     """Per-step rollout counts (total across DP); one entry per training step."""
     if "num_rollouts" in rollout_data:
         return rollout_data["num_rollouts"]
@@ -457,6 +556,26 @@ def get_data_iterator(
     model: torch.nn.Module | Sequence[torch.nn.Module],
     rollout_data: RolloutBatch,
 ) -> tuple[list[DataIterator], list[int]]:
+    # [FUNCTION DOC] Returns (list of data iterators, list of micro-batch counts per step). First
+    # runs the in-place multimodal expansion on the rollout data. The model argument is unused.
+    # Precomputed schedule: if the rollout data already has micro-batch indices, asserts the
+    # dynamic-global-batch-size flag agrees with the presence of a dynamic size, builds one indexed
+    # iterator per virtual pipeline stage and returns the stored micro-batch counts.
+    # Otherwise: local global batch size = global batch size (dynamic if present, with an info log if
+    # it differs from configured) divided by effective data-parallel size; steps = local samples
+    # divided by that (remainder dropped). Fixed mode: for multi-LoRA data (adapter slots present),
+    # the local batch must divide by the micro batch size (value error otherwise); each step has
+    # local batch / micro batch size micro-batches; iterators slice contiguously.
+    # Dynamic mode (requires a max-tokens-per-GPU setting): per step, the minimum micro-batch count
+    # for the step's sample lengths under a budget of max tokens times CP size is computed; counts
+    # are all-reduced with MAX over the data-parallel group so ranks agree; with a virtual pipeline,
+    # counts are rounded down to a multiple of the microbatch group size per virtual stage but at
+    # least one; then for each step the samples are partitioned into that many micro-batches
+    # balanced by length (sizes need not be equal), indices are made global by adding the step
+    # start, and for multi-LoRA data each micro-batch is sorted by adapter slot. Asserts every local
+    # sample is covered. Iterators use the explicit index lists (one per virtual stage).
+    # KNOWN ISSUE: the lower clamp of one can leave the count not divisible by the group size when
+    # the group size exceeds one and the count is smaller than the group size.
     """
     Create iterators and a micro-batch schedule for a rollout step.
 
@@ -503,6 +622,8 @@ def get_data_iterator(
         )
 
     def _generate_data_iterator(rollout_data, micro_batch_size, micro_batch_indices=None):
+        # [FUNCTION DOC] HELPER: Creates one new iterator per virtual pipeline stage over the same
+        # rollout data with the given size or index lists (all iterators share the lists).
         data_iterator = []
         for _ in range(vpp_size):
             data_iterator.append(DataIterator(rollout_data, micro_batch_size, micro_batch_indices))

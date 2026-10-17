@@ -1,3 +1,12 @@
+# [MODULE DOC] Factories that produce the per-pipeline-stage model builder function Megatron's
+# get-model helper expects. Three sources are supported, chosen in order: a user-supplied custom
+# provider function loaded by path, a Megatron Bridge provider built from a HuggingFace
+# checkpoint, and the default Megatron GPT model built from command-line arguments.
+# Each returned builder takes pre/post-process flags (whether this pipeline stage holds the
+# embedding / output layer), an optional virtual-pipeline stage, a config (must be none because
+# the config is derived from arguments) and an optional process-group collection.
+# For the critic role the output layer is replaced by a one-output linear head. Also contains
+# optional witness installation and freezing of the native DSA indexer.
 # Adapt from https://github.com/NVIDIA/Megatron-LM/blob/b1efb3c7126ef7615e8c333432d76e08038e17ff/pretrain_gpt.py
 import argparse
 import inspect
@@ -25,6 +34,20 @@ logger = logging.getLogger(__name__)
 
 
 def _apply_bridge_runtime_config(provider, args: argparse.Namespace) -> None:
+    # [FUNCTION DOC] HELPER: Copies a fixed list of training-time settings from the arguments onto
+    # the provider object, mutating it and returning nothing (rationale in the docstring).
+    # Always copied: tensor, pipeline, expert, expert-tensor and context parallel sizes; sequence
+    # parallel; per-token loss and variable sequence lengths flags; fp32 softmax in attention,
+    # gradient accumulation fusion, fp32 residual, deterministic mode; activation recompute
+    # granularity/method/layer count/modules; CPU offloading layer count and distributed saved
+    # activations; tensor-parallel comm overlap; fp8 mode and recipe; attention backend; MoE token
+    # dispatcher type.
+    # Conditionally copied: MTP head detaching is switched on when MTP training is enabled; CPU
+    # offloading flag only when the arguments carry it; first/last pipeline stage layer counts
+    # only when set (names differ from the provider fields); MoE router bias update rate and aux
+    # loss coefficient only when set. Finally applies the DSA backend arguments through a helper
+    # imported locally (a test executes this function in a bare namespace, so the import must stay
+    # inside).
     """Copy the runtime config from args onto a bridge-built provider.
 
     Bridge mode builds the model from the HF checkpoint and skips
@@ -105,6 +128,11 @@ def _apply_bridge_runtime_config(provider, args: argparse.Namespace) -> None:
 
 # Adapt from https://github.com/volcengine/verl/blob/c3b20575d2bc815fcccd84bddb4c0401fc4b632b/verl/models/llama/megatron/layers/parallel_linear.py#L82
 class LinearForLastLayer(torch.nn.Linear):
+    # [CLASS DOC] Plain linear output head used instead of the language-model output layer for the
+    # critic role (value head). It mimics the call signature of Megatron's output layer: forward
+    # returns a pair of (logits in fp32, none). Under sequence parallelism, the weight is flagged
+    # so its gradient is reduced over the sequence-parallel group and the logits are gathered
+    # back over the sequence dimension.
     def __init__(
         self,
         input_size: int,
@@ -113,6 +141,10 @@ class LinearForLastLayer(torch.nn.Linear):
         config: TransformerConfig,
         bias: bool = True,
     ) -> None:
+        # [FUNCTION DOC] Creates a linear layer of the given input and output sizes with optional
+        # bias (default true). Remembers the sequence-parallel flag from the config and, when on,
+        # marks the weight as sequence-parallel. Initializes weights from a normal distribution
+        # (mean 0, standard deviation 0.02) and zeroes the bias.
         super().__init__(in_features=input_size, out_features=output_size, bias=bias)
         self.sequence_parallel = config.sequence_parallel
         if self.sequence_parallel:
@@ -128,6 +160,11 @@ class LinearForLastLayer(torch.nn.Linear):
         weight: torch.Tensor | None = None,
         runtime_gather_output: bool | None = None,
     ) -> tuple[torch.Tensor, None]:
+        # [FUNCTION DOC] Applies the linear layer to the input, casts the result to fp32, and if
+        # sequence parallelism is on gathers the logits across the sequence-parallel region (with
+        # no output-gradient parallelism). Returns the logits and none.
+        # KNOWN ISSUE: the weight and runtime-gather-output parameters are accepted for interface
+        # compatibility but ignored.
         logits = super().forward(input_)
         logits = logits.float()
         if self.sequence_parallel:
@@ -139,6 +176,17 @@ def get_model_provider_func(
     args: argparse.Namespace,
     role: Literal["actor", "critic"] = "actor",
 ):
+    # [FUNCTION DOC] Returns the model builder function for the given arguments and role (actor by
+    # default). Selection order: (1) if a custom model provider path is set, a wrapper that loads
+    # that function on each call, forwards pre/post-process flags (and the virtual stage only if
+    # the custom function accepts it), swaps in the critic head on the post-process stage for the
+    # critic role, and installs witness if enabled; (2) if the conversion mode is bridge, loads the
+    # Megatron Bridge provider from the HuggingFace checkpoint path (trusting remote code) without
+    # weights, copies runtime config from arguments, disables embedding tying for the critic,
+    # finalizes it, and returns a wrapper that builds from it; (3) otherwise the default builder.
+    # The returned builders assert that no config is passed in.
+    # Side effects: the bridge path performs file/network reads of the HF checkpoint config at
+    # selection time.
     # Support custom model provider path (similar to --custom-rm-path for reward models)
     if getattr(args, "custom_model_provider_path", None):
 
@@ -149,6 +197,11 @@ def get_model_provider_func(
             config: TransformerConfig | None = None,
             pg_collection=None,
         ) -> GPTModel:
+            # [FUNCTION DOC] Builder for the custom-provider path. Asserts config is none, loads the
+            # user function from the registry by path, calls it with pre/post-process flags (plus
+            # the virtual stage if its signature has such a parameter), replaces the output layer
+            # with the one-output head when this is the last stage of a critic, installs witness
+            # when enabled, and returns the model. The process-group collection argument is unused.
             assert config is None, "miles builds the config from args, so it expects config to be None"
             custom_model_provider = load_function(args.custom_model_provider_path)
             # Check if the custom provider supports vp_stage parameter
@@ -184,6 +237,12 @@ def get_model_provider_func(
             config: TransformerConfig | None = None,
             pg_collection=None,
         ) -> GPTModel:
+            # [FUNCTION DOC] Builder for the bridge path. Asserts config is none; if a process-group
+            # collection is given, stores it on the shared provider (needed by pipeline-parallel
+            # providers). Calls the provider's provide method with the stage flags, swaps the
+            # output layer for the critic head on the last stage of a critic, asserts witness is
+            # not enabled, and replaces the model's forward so that when it returns a tuple only
+            # the first element (logits) is returned. Returns the model.
             assert config is None, "miles builds the config from args, so it expects config to be None"
             # PP>1 paths in megatron.bridge providers (e.g. mamba_provider) read
             # self._pg_collection.pp during provide(); without forwarding the
@@ -200,6 +259,8 @@ def get_model_provider_func(
             _bridge_forward = model.forward
 
             def _logits_only_forward(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: Calls the original forward with all given arguments and
+                # returns only the first element if the result is a tuple, else the result as is.
                 out = _bridge_forward(*args, **kwargs)
                 return out[0] if isinstance(out, tuple) else out
 
@@ -215,6 +276,24 @@ def get_model_provider_func(
         config: TransformerConfig | None = None,
         pg_collection=None,
     ) -> GPTModel:
+        # [FUNCTION DOC] Default builder from arguments. Asserts config is none, then derives the
+        # transformer config from arguments (enabling MTP head detaching when MTP training is on).
+        # Layer spec: if a spec path is given it is imported (and called with arguments, config and
+        # virtual stage when callable); else for MoE models a decoder block spec is built (passing
+        # the stage when set); else a single-layer spec using Transformer Engine or the local
+        # implementation with the MoE, grouped-GEMM, qk-layernorm, latent-attention (and for local:
+        # normalization and kitchen) options.
+        # With fp8 parameter gather, wraps model construction in Transformer Engine's fp8 model
+        # init context (preserving high-precision initial values when supported); raises a runtime
+        # error if that import fails. Builds the GPT model with vocabulary, position, rotary, rope
+        # scaling, tied-embedding (disabled for critic or when untie is requested) and fp16 loss
+        # settings. With MTP layers configured, also builds an MTP block spec; while doing so,
+        # temporarily disables the routing replay manager (when rollout routing replay is on) and
+        # restores its previous state afterwards. Then freezes the native DSA indexer if
+        # applicable, swaps in the critic head on the last stage of a critic, installs witness if
+        # enabled, and returns the model.
+        # KNOWN ISSUE: the docstring mentions legacy models, which this code never builds, and the
+        # process-group collection argument is unused.
         """Builds the model.
 
         If you set the use_legacy_models to True, it will return the legacy GPT model and if not the mcore GPT model.
@@ -350,6 +429,9 @@ def get_model_provider_func(
 
 
 def _maybe_freeze_native_dsa_indexer(args: argparse.Namespace, model: GPTModel) -> None:
+    # [FUNCTION DOC] HELPER: When the DSA implementation is Megatron's native one and the indexer
+    # loss coefficient is zero, turns off gradients for every parameter whose name contains the
+    # attention indexer path, so DDP and weight decay skip them. No-op otherwise.
     if args.dsa_impl == "megatron" and model.config.dsa_indexer_loss_coeff == 0:
         # Native DSA runs its indexer under no_grad without the auxiliary objective.
         # Exclude these unused parameters from DDP and optimizer weight decay.
@@ -362,6 +444,9 @@ def _maybe_install_witness(
     args: argparse.Namespace,
     model: GPTModel,
 ) -> None:
+    # [FUNCTION DOC] HELPER: If the witness feature is enabled in the arguments, installs witness
+    # on the model with the configured buffer size and the model config's sequence-parallel flag
+    # (default false). Mutates the model; otherwise does nothing.
     if getattr(args, "enable_witness", False):
         install_witness(
             model,

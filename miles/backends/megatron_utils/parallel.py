@@ -1,3 +1,7 @@
+# [MODULE DOC] Builds and checks the training-side parallel-state description (a ParallelState
+# record of rank, size and process group for each parallelism dimension) from Megatron's
+# model-parallel utilities, and provides the packed-sequence parameter object used by the
+# attention kernels when sequences are packed in the token-contiguous layout.
 import logging
 from argparse import Namespace
 from collections.abc import Sequence
@@ -19,11 +23,22 @@ logger = logging.getLogger(__name__)
 def create_megatron_parallel_state(
     indep_dp: GroupInfo,
 ) -> ParallelState:
+    # [FUNCTION DOC] Snapshots Megatron's current model-parallel groups into a parallel-state
+    # record. Requires Megatron parallel groups and the global arguments to be initialized. The
+    # caller supplies the independent data parallel group info (used as is). Fields built: intra
+    # data parallel without and with context parallel (rank, size, group, and gloo group);
+    # context parallel (plus the context-parallel communication type from arguments, default none);
+    # tensor, pipeline, expert, expert-tensor and expert-data parallel (rank, size, group); a
+    # combined tensor+data+context group whose rank and size come from the torch distributed
+    # queries on that group; whether this is the last pipeline stage; the virtual pipeline size
+    # and the microbatch group size per virtual stage. No communication is performed.
     vpp_size, microbatch_group_size_per_vp_stage = _compute_vpp_fields()
     args = get_args()
     tp_dp_cp_group = mpu.get_tensor_and_data_parallel_group(with_context_parallel=True)
 
     def _create_intra_dp(with_context_parallel: bool):
+        # [FUNCTION DOC] HELPER: Builds the data-parallel group info (rank, size, group, gloo
+        # group) from Megatron, optionally including the context-parallel dimension.
         return GroupInfo(
             rank=mpu.get_data_parallel_rank(with_context_parallel=with_context_parallel),
             size=mpu.get_data_parallel_world_size(with_context_parallel=with_context_parallel),
@@ -78,6 +93,9 @@ def create_megatron_parallel_state(
 
 
 def _compute_vpp_fields() -> tuple[int, int | None]:
+    # [FUNCTION DOC] HELPER: Returns (virtual pipeline size, microbatch group size per virtual
+    # stage). If Megatron has no virtual pipeline or it is at most 1, returns (1, none). Otherwise
+    # returns the virtual size and the pipeline-parallel size from the global arguments.
     vpp_size_value = mpu.get_virtual_pipeline_model_parallel_world_size()
     if vpp_size_value is None or vpp_size_value <= 1:
         return 1, None
@@ -88,6 +106,10 @@ def _compute_vpp_fields() -> tuple[int, int | None]:
 def verify_megatron_parallel_state(
     model: torch.nn.Module | Sequence[torch.nn.Module],
 ) -> None:
+    # [FUNCTION DOC] Consistency check; returns nothing and raises an assertion error on mismatch.
+    # Only acts when a virtual pipeline size greater than 1 is active: takes the first chunk if
+    # given a sequence (else the module itself), reads its model config's microbatch group size per
+    # virtual stage, and asserts it equals the value stored in the current global parallel state.
     """Verify that ParallelState fields match what the model config produces."""
     parallel_state = get_parallel_state()
     vpp_size_value = mpu.get_virtual_pipeline_model_parallel_world_size()
@@ -103,12 +125,21 @@ def verify_megatron_parallel_state(
 
 @dataclass
 class PackedSeqParamsWithHostCuSeqlens(PackedSeqParams):
+    # [CLASS DOC] Dataclass extending Megatron's packed-sequence parameters with a required
+    # keyword-only field holding the cumulative sequence lengths as a host-side tuple of integers,
+    # so consumers can avoid a device-to-host copy.
     """``PackedSeqParams`` plus the host copy of ``cu_seqlens_q`` that ``get_batch`` already built."""
 
     cu_seqlens_host: tuple[int, ...] = field(kw_only=True)
 
 
 def get_packed_seq_params(batch: dict[str, torch.Tensor], args: Namespace) -> PackedSeqParams:
+    # [FUNCTION DOC] When the query/key/value format in arguments is the token-contiguous (thd)
+    # format, builds packed-sequence parameters from the batch entries for cumulative sequence
+    # lengths (used for both query and key/value), max sequence length (both), and the host copy
+    # of the cumulative lengths; stores the object in the batch under the packed sequence params
+    # key (mutating the batch) and returns it. For any other format returns none.
+    # KNOWN ISSUE: the return annotation does not allow none, but none is returned for non-thd.
     if args.qkv_format == "thd":
         packed_seq_params = PackedSeqParamsWithHostCuSeqlens(
             cu_seqlens_q=batch["cu_seqlens"],

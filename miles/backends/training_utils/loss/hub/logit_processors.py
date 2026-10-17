@@ -1,3 +1,10 @@
+# [MODULE DOC] Extracts response-aligned quantities from model outputs. Given logits of shape
+# batch by tokens by vocabulary (or by one for a value head), the packed ("thd", batch of one) or
+# padded ("bshd") layout and the context-parallel layout (none, zigzag, or allgather), it locates
+# each sample's response rows (logit position i predicts token i+1, so response logits start one row
+# before the first response token), then computes per-token log-probs and entropy (through the
+# tensor-parallel group, optionally restricted to the rollout sampling support) or per-token values.
+# With allgather context parallelism the results are redistributed to the zigzag layout.
 from argparse import Namespace
 from collections.abc import Iterator, Sequence
 
@@ -24,6 +31,27 @@ def _iter_response_chunks(
     max_seq_lens: list[int] | None = None,
     include_response_indices: bool,
 ) -> Iterator[tuple[torch.Tensor, torch.Tensor, Sequence[int]]]:
+    # [FUNCTION DOC] HELPER: Generator yielding one (logits chunk, token chunk, response indices)
+    # triple per sample (the samples and lengths are zipped without a strict length check).
+    # Validation (assertion errors): outside true-on-policy mode logits must be float32, bfloat16 or
+    # float16 (the docstring says float32 only; downstream upcasts); logits must be three-
+    # dimensional; thd requires a leading batch dimension of one and removes it; bshd requires max
+    # sequence lengths and flattens batch and token dimensions. In true-on-policy mode logits are
+    # divided by the rollout temperature when the last dimension exceeds one, temperature is
+    # positive and not one, and are cast to bfloat16 or float16 when those flags are set.
+    # Per sample: no CP: bshd uses end = max length * sample index + total length, thd uses a running
+    # end; the response logits are rows [start-1, end-1) with start = end - response length; tokens
+    # are the last response-length tokens (empty slice when zero); indices are 0..response length-1.
+    # Allgather CP: the local rows are one contiguous window of the global layout (bshd: each
+    # padded sample owns max length / CP size rows, thd: the whole local row set); the overlap of
+    # this rank's window with the sample's global logit range gives the rows and the matching tokens
+    # (shifted by one) and response indices; an empty overlap gives empty chunks and indices.
+    # Otherwise (zigzag CP): uses the offset helper to cut this rank's two chunks per sample out of
+    # a running position that advances by twice the chunk size per sample, aligns logits and tokens
+    # (asserting equal sizes) and joins the two parts; response indices are the token offsets minus
+    # the prompt length for both parts. Indices are produced only when requested (empty otherwise)
+    # and, when produced, asserted to match the token count.
+    # The docstring's argument list omits the max sequence lengths and the indices flag.
     """Yield response logits, tokens, and original response indices per sample.
 
     After squeezing batch dimension and applying temperature scaling, this
@@ -179,6 +207,8 @@ def get_responses(
     response_lengths: list[int],
     max_seq_lens: list[int] | None = None,
 ) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+    # [FUNCTION DOC] Generator over the chunk helper without response indices; yields the first two
+    # items (logits chunk, tokens chunk) for each sample.
     """Yield response-aligned `(logits_chunk, tokens_chunk)` pairs per sample."""
     for logits_chunk, tokens_chunk, _ in _iter_response_chunks(
         logits,
@@ -205,6 +235,20 @@ def get_log_probs_and_entropy(
     max_seq_lens: list[int] | None = None,
     rollout_sampling_mask: Sequence[RolloutSamplingMask] | None = None,
 ) -> dict[str, list[torch.Tensor]]:
+    # [FUNCTION DOC] Returns a mapping with "log_probs" (list of per-sample response-length vectors)
+    # and, if entropy is requested, "entropy". The non-loss-data flag must be true (assertion error
+    # otherwise) although the docstring calls it unused. If sampling masks are given (one per sample),
+    # each mask's length must equal the sample's response length (value error, strict zipping).
+    # Per sample, using the chunk helper (with response indices only when masks are given): builds a
+    # dense local sampling mask for the chunk when masks are present. If the loss type is score
+    # centering and there is no mask, uses the score-centering selected log-prob function (tensor-
+    # parallel group only when its size exceeds one, vocabulary size from arguments if set, rollout
+    # temperature, chunk size from arguments) and detaches the entropy if it must not carry
+    # gradients; otherwise uses the standard log-prob and entropy routine on the tensor-parallel
+    # group (entropy gradient flag, chunk size, true-on-policy flag, vocabulary size, sampling mask,
+    # temperature forced to one in true-on-policy mode else the rollout temperature, and the fused
+    # unified-gradient debug flag). Log-probs are squeezed from rows by one to rows. With allgather
+    # CP the results are redistributed to the zigzag layout in place.
     """Compute per-token log-probabilities (and optionally entropy) on responses.
 
     For each sample, extracts response-aligned logits and tokens, then computes
@@ -325,6 +369,12 @@ def get_values(
     non_loss_data: bool = True,
     max_seq_lens: list[int] | None = None,
 ) -> dict[str, list[torch.Tensor]]:
+    # [FUNCTION DOC] Returns a mapping with "values": per-sample response-length vectors from the
+    # value head output (last dimension must be one, assertion error otherwise), cast to float32.
+    # The entropy and non-loss-data flags are unused. With allgather CP the values are redistributed
+    # to the zigzag layout in place. The response chunk helper still applies the rollout-temperature
+    # scaling rules in true-on-policy mode only when the last dimension exceeds one, which is never
+    # the case for values.
     """Extract per-token value predictions over response tokens.
 
     For each sample, extracts response-aligned chunks from the value head
