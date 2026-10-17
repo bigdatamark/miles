@@ -1,3 +1,8 @@
+# [MODULE DOC] Readiness handling for the platform-launched routers and standalone session servers.
+# Resolves each model's router address (and records it in args), waits for TCP readiness, and
+# builds the list of session server instances (internal and external addresses) in args, checking
+# that external addresses do not collapse several hosts into one. Timeouts: router 120 s, session
+# server 300 s.
 import asyncio
 import logging
 from collections.abc import Sequence
@@ -23,6 +28,13 @@ _SESSION_SERVER_READY_TIMEOUT_SECONDS = 300.0
 
 
 async def resolve_router_addrs(args, *, router_providers: Sequence[BaseWorkerProvider]) -> dict[str, HostAndPort]:
+    # [FUNCTION DOC] Returns a mapping from model name to router address. If the router ip is already
+    # set in args (a previous resolve in this process), asserts the per-model router map is present
+    # (raising assertion error otherwise: external router mode no longer exists) and returns it
+    # converted to addresses. Otherwise resolves the sglang config, asserts there is exactly one
+    # router provider per model, waits concurrently for each model's router (by model index), and
+    # records into args (mutation): router ip and port of the first model, and the per-model map of
+    # name to (host, port).
     """Wait for every model's router and record its address on ``args``, keyed by model name.
 
     A second call in the same process answers from the record, so the driver and an
@@ -57,6 +69,9 @@ async def resolve_router_addrs(args, *, router_providers: Sequence[BaseWorkerPro
 
 
 async def wait_router_ready(*, model_idx: int, provider: BaseWorkerProvider) -> HostAndPort:
+    # [FUNCTION DOC] Look up the primary address of the router worker for the model index from the
+    # provider, wait until a TCP connection succeeds (120 s timeout; failure raised by the wait
+    # helper), log, and return the address.
     """Wait until the model's router, launched by the platform, is reachable and return its address."""
     worker_name = compute_router_worker_name(model_idx)
     router_addr = (await provider.get_addrs(worker_name=worker_name))["primary"]
@@ -66,6 +81,13 @@ async def wait_router_ready(*, model_idx: int, provider: BaseWorkerProvider) -> 
 
 
 async def wait_session_server_ready(args, *, provider: BaseWorkerProvider | None):
+    # [FUNCTION DOC] No-op unless the session server flag is set. Validates: the HF checkpoint path is
+    # set (value error otherwise) and the session server worker count is at least 1 (value error);
+    # asserts a provider is given. Looks up the primary address of each session server worker
+    # (indices 0 to count-1) concurrently, then stores into args (mutation) a list of session server
+    # instances, each with an internal address (host:port), an external address (see external address
+    # helper) and an instance id derived from args and the index. Asserts external hosts do not merge
+    # distinct hosts, then waits concurrently (300 s) for TCP readiness of all servers and logs.
     """Wait for the standalone session servers when ``--use-session-server`` is set.
 
     One independent single-process server per resolved port; the rollout side
@@ -115,6 +137,9 @@ async def wait_session_server_ready(args, *, provider: BaseWorkerProvider | None
 
 
 def _compute_external_addr(args, addr: HostAndPort) -> str:
+    # [FUNCTION DOC] HELPER: Address under which agents outside the cluster reach a session server:
+    # the configured external host plus the server's port if the option is set, else the address's own
+    # external netloc.
     # spec_session_server keeps every instance on the head whenever this host is set
     if args.session_server_external_host:
         return f"{args.session_server_external_host}:{addr.port}"
@@ -122,6 +147,10 @@ def _compute_external_addr(args, addr: HostAndPort) -> str:
 
 
 def _assert_hosts_keep_their_own_external_host(instances: list[SessionServerInstance]) -> None:
+    # [FUNCTION DOC] HELPER: Group internal hosts by external host (host parts are the text before
+    # the last colon of each address). Raises value error if any external host fronts more than one
+    # internal host, advising to set the per-node external IP environment variable or the external
+    # host option (which keeps servers on the head node).
     placed_hosts_by_external_host: dict[str, set[str]] = {}
     for instance in instances:
         external_host = instance.external_addr.rsplit(":", 1)[0]

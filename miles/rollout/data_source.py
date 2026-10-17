@@ -1,3 +1,8 @@
+# [MODULE DOC] Prompt data sources for rollouts. Defines the abstract data source interface (take
+# sample groups, return sample groups, save and load state, optional buffer length), a read-only
+# source that walks a global tokenized dataset epoch by epoch (optionally reshuffled each epoch,
+# with checkpointable position), and a buffered variant that first serves previously returned
+# sample groups through a pluggable selection function. The state file path helper is public.
 import abc
 import copy
 import logging
@@ -15,42 +20,65 @@ logger = logging.getLogger(__name__)
 
 
 def compute_global_dataset_state_path(directory: str, *, rollout_id: int | None) -> str:
+    # [FUNCTION DOC] Path of the dataset position checkpoint: "<directory>/rollout/
+    # global_dataset_state_dict_<rollout id>.pt". A none rollout id yields the literal text "None" in
+    # the file name.
     return os.path.join(directory, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
 
 
 class DataSource(abc.ABC):
+    # [CLASS DOC] Interface of prompt providers. A sample "group" is the list of samples generated from
+    # one prompt; the source hands out lists of groups and may accept groups back.
+
     @abc.abstractmethod
     def get_samples(self, num_samples: int) -> list[list[Sample]]:
+        # [FUNCTION DOC] Abstract: return a list of num_samples sample groups.
         """
         Return num_samples samples
         """
 
     @abc.abstractmethod
     def add_samples(self, samples: list[list[Sample]]):
+        # [FUNCTION DOC] Abstract: accept sample groups back into the source (read-only sources raise).
         """
         Add samples to the data source
         """
 
     @abc.abstractmethod
     def save(self, rollout_id):
+        # [FUNCTION DOC] Abstract: persist the source's position/state for the rollout id.
         """
         Save the state of the data source
         """
 
     @abc.abstractmethod
     def load(self, rollout_id=None):
+        # [FUNCTION DOC] Abstract: restore the state saved for the rollout id (none = default).
         """
         Load the state of the data source
         """
 
     def get_buffer_length(self) -> int | None:
+        # [FUNCTION DOC] Optional: number of pending buffered groups, or none for unbuffered sources
+        # (the default).
         """Pending-sample backlog, or None for sources without a buffer."""
         return None
 
 
 # TODO may further refactor data-loading part later
 class RolloutDataSource(DataSource):
+    # [CLASS DOC] Read-only source over the global prompt dataset (or, without a global dataset, blank
+    # prompts). State: epoch id, running group index and sample index counters (assigned to emitted
+    # samples), the offset into the current epoch's dataset order, and a scratch metadata mapping (TODO
+    # in code: remove). Checkpointed by save/load.
+
     def __init__(self, args):
+        # [FUNCTION DOC] Initialize counters to zero. If a global dataset is enabled: load the
+        # tokenizer (chat template path, remote code trusted) and the processor from the HF checkpoint;
+        # if a details dump directory is set, save the tokenizer there and the processor too when it
+        # supports saving; build the dataset from the prompt data with the configured keys, maximum
+        # prompt length, chat template options and seed; shuffle it for epoch 0 if shuffling is on.
+        # Without a global dataset the dataset is none.
         self.args = args
 
         self.epoch_id = 0
@@ -93,6 +121,14 @@ class RolloutDataSource(DataSource):
             self.dataset = None
 
     def get_samples(self, num_samples):
+        # [FUNCTION DOC] Return num_samples sample groups. With a dataset: take that many consecutive
+        # prompt samples from the current offset and advance it; if the epoch end is crossed, take the
+        # remaining tail, bump the epoch id, reshuffle (if enabled) with the new epoch id as seed, and
+        # fill from the head of the new order, setting the offset past what was taken. KNOWN ISSUE: if
+        # more samples are requested than the dataset holds, the result is shorter than requested (at
+        # most one wrap-around). Without a dataset: blank samples. Then for each prompt sample builds a
+        # group of the configured samples per prompt, each a deep copy with the next running group
+        # index (shared within the group) and the next running sample index (unique per sample).
         # TODO further improve code
         if self.dataset is not None:
             if self.sample_offset + num_samples <= len(self.dataset):
@@ -123,9 +159,13 @@ class RolloutDataSource(DataSource):
         return samples
 
     def add_samples(self, samples: list[list[Sample]]):
+        # [FUNCTION DOC] Always raises a runtime error: this source is read-only.
         raise RuntimeError(f"Cannot add samples to {self.__class__.__name__}. This is a read-only data source.")
 
     def save(self, rollout_id):
+        # [FUNCTION DOC] Without a global dataset, does nothing. Otherwise serializes a mapping of
+        # offset, epoch id, group index counter, sample index counter and metadata to the state file
+        # under the save directory for the rollout id, creating directories first.
         if not self.args.rollout_global_dataset:
             return
 
@@ -141,6 +181,12 @@ class RolloutDataSource(DataSource):
         torch.save(state_dict, path)
 
     def load(self, rollout_id=None):
+        # [FUNCTION DOC] Restore position from the state file under the load directory for the rollout
+        # id. Returns after a warning (the dataset then starts fresh) if the global dataset is disabled,
+        # no load directory is configured, or the file is missing. Otherwise reads it (counters default
+        # to zero and metadata to empty for missing keys), and, if shuffling is on, reshuffles the
+        # dataset with the restored epoch id. KNOWN ISSUE: the log line "load metadata" prints the
+        # metadata held BEFORE the file is read.
         if not self.args.rollout_global_dataset:
             logger.warning("--disable-rollout-global-dataset: the dataset starts where a fresh run's would")
             return
@@ -168,7 +214,15 @@ class RolloutDataSource(DataSource):
 
 
 class RolloutDataSourceWithBuffer(RolloutDataSource):
+    # [CLASS DOC] Dataset source plus an in-memory buffer of sample groups returned via add-samples.
+    # Requests are served from the buffer first (through the selection function, default: oldest
+    # first), the rest from the dataset. The buffer is NOT saved or restored by save/load.
+
     def __init__(self, args):
+        # [FUNCTION DOC] Initialize the base source, an empty buffer, and the buffer selection function:
+        # the default pop-first, or the function loaded from the configured path (signature: args,
+        # rollout id, buffer list, number of samples; returns the selected groups and removes them from
+        # the buffer).
         super().__init__(args)
         self.buffer = []
         if self.args.buffer_filter_path is None:
@@ -177,6 +231,8 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
             self.buffer_filter = load_function(self.args.buffer_filter_path)
 
     def get_samples(self, num_samples: int) -> list[list[Sample]]:
+        # [FUNCTION DOC] Take groups from the buffer first (up to num_samples), then fetch the remaining
+        # count from the underlying dataset source and append. Returns the combined list.
         """
         Return num_samples samples
         """
@@ -191,6 +247,9 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
         return samples
 
     def _get_samples_from_buffer(self, num_samples: int) -> list[list[Sample]]:
+        # [FUNCTION DOC] HELPER: Empty list if the buffer is empty or nothing is requested; otherwise the
+        # selection function's result (called with args, no rollout id, the buffer and the count); it
+        # is trusted to return at most the count and remove the returned groups from the buffer.
         if len(self.buffer) == 0 or num_samples == 0:
             return []
 
@@ -198,6 +257,9 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
         return samples
 
     def add_samples(self, samples: list[list[Sample]]):
+        # [FUNCTION DOC] Append sample groups to the buffer. Empty input is ignored. Asserts the input
+        # is a list of lists and that every group has exactly the configured samples per prompt
+        # (assertion errors otherwise; groups before the offending one remain added).
         """
         Add a sample group to buffer.
         """
@@ -214,17 +276,23 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
 
     # TODO remove
     def update_metadata(self, metadata: dict):
+        # [FUNCTION DOC] Merge the given mapping into the source's metadata mapping (mutation).
         self.metadata.update(metadata)
 
     # TODO remove
     def get_metadata(self):
+        # [FUNCTION DOC] Return the live metadata mapping (not a copy).
         return self.metadata
 
     def get_buffer_length(self):
+        # [FUNCTION DOC] Number of sample groups currently in the buffer.
         return len(self.buffer)
 
 
 def pop_first(args, rollout_id, buffer: list[list[Sample]], num_samples: int) -> list[list[Sample]]:
+    # [FUNCTION DOC] Default buffer selection: remove and return the oldest groups, at most num_samples
+    # of them (fewer if the buffer is smaller), mutating the buffer in place. Args and rollout id are
+    # unused.
     num_to_pop = min(len(buffer), num_samples)
     samples = buffer[:num_to_pop]
     del buffer[:num_to_pop]

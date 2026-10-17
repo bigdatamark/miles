@@ -1,3 +1,11 @@
+# [MODULE DOC] Trainer controller: the actor-like component that owns all cells (independent data
+# parallel replicas) of one trainer (a policy or its critic). It watches the provider for cells
+# appearing/disappearing, creates cell wrappers with optional heartbeat health checkers, initializes
+# cells, runs training steps across all alive cells with retries and fault-tolerance bookkeeping
+# (witness ids, step outcomes, events), heals recovering cells by cooperatively copying a checkpoint
+# from a healthy cell and reconfiguring the independent-DP quorum, and forwards administrative calls
+# (save, export, weight update, offload/onload, multi-LoRA slot commands) to the first or all alive
+# cells. Constants: up to 30 retry attempts; cells-ready timeout 3600 s.
 import asyncio
 import logging
 from collections.abc import Iterator
@@ -44,12 +52,25 @@ _CELLS_READY_TIMEOUT_SECONDS = 3600.0
 
 
 def compute_trainer_health_checker_config(args, *, expected_num_cells: int) -> SimpleHealthCheckerConfig | None:
+    # [FUNCTION DOC] Heartbeat checker configuration for trainer cells: none when only one cell is
+    # expected (a single cell has no peers to heal, so no checking); otherwise the config read from
+    # args options prefixed trainer_heartbeat_checker.
     if expected_num_cells == 1:
         return None
     return SimpleHealthCheckerConfig.from_args(args, prefix="trainer_heartbeat_checker")
 
 
 class TrainerController:
+    # [CLASS DOC] One controller per trainer. Construction-time state: deployment identity, trainer
+    # id, role, reference-model and OPD teacher flags, pool id, cell provider and operations, the
+    # watcher disposer, the independent-DP quorum id (starts 0, increments on each reconfiguration),
+    # the independent-DP TCP store and its address (only created when more than one cell is
+    # expected), a health checker activeness tracker (initially active) shared by all cell checkers,
+    # and a mapping from cell id to cell. KNOWN ISSUE: several attributes (args, health checker
+    # config, witness allocator, test action executor) are only created by init, so methods that
+    # use them (including the expected-cells properties) raise attribute errors if called earlier.
+    # Methods are RPC-called; the cell list is always ordered by cell index.
+
     def __init__(
         self,
         *,
@@ -61,6 +82,8 @@ class TrainerController:
         with_ref: bool,
         with_opd_teacher: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Store the arguments, create the init-once guard, compute the pool id from the
+        # trainer id, and set up empty cell/quorum/store state as described in the class doc. No I/O.
         self._init_once = InitOnce(type(self).__name__)
         self._deployment_identity = deployment_identity
         self._trainer_id = trainer_id
@@ -82,29 +105,44 @@ class TrainerController:
 
     @property
     def pool_id(self) -> str:
+        # [FUNCTION DOC] Property: the trainer pool id this controller manages.
         return self._pool_id
 
     @property
     def expected_num_cells(self) -> int:
+        # [FUNCTION DOC] Property: public alias of the expected cell count. Requires init to have set
+        # args.
         return self._expected_num_cells
 
     @property
     def _expected_num_cells(self) -> int:
+        # [FUNCTION DOC] HELPER: Property: number of cells the trainer pool should have, computed from
+        # args and the role (independent DP replicas, else 1) on every access.
         return compute_trainer_num_cells(self.args, role=self._role)
 
     @property
     def _cells(self) -> list[TrainerCell]:
+        # [FUNCTION DOC] HELPER: Property: all known cells sorted ascending by cell index (a new list on
+        # each access).
         return sorted(self._cells_by_id.values(), key=lambda cell: cell.cell_index)
 
     def has_errored_cell(self) -> bool:
+        # [FUNCTION DOC] True if any known cell is in the errored state.
         return any(cell.is_errored for cell in self._cells)
 
     @property
     def cell_ids(self) -> list[str]:
+        # [FUNCTION DOC] Property: ids of all known cells in cell index order.
         return [cell.cell_id for cell in self._cells]
 
     async def _wait_expected_num_cells(self, timeout: float = _CELLS_READY_TIMEOUT_SECONDS) -> None:
+        # [FUNCTION DOC] HELPER: Retry a check until at least the expected number of cells have been
+        # observed or the timeout (default 3600 s) expires, with backoff from 1 s up to 5 s, retrying
+        # only on timeout errors (the deadline helper raises when exhausted). Note it waits for
+        # "at least" the count, so extra cells are tolerated.
         async def _check(_remaining: float) -> None:
+            # [FUNCTION DOC] HELPER: One attempt: raise a timeout error with observed/expected counts if
+            # fewer cells than expected are known; else return.
             expected = self._expected_num_cells
             if len(self._cells_by_id) < expected:
                 raise TimeoutError(f"only {len(self._cells_by_id)} of {expected} trainer cells observed")
@@ -119,6 +157,9 @@ class TrainerController:
         )
 
     async def _reconcile(self, cell_id: str, observed: CellInfo | None) -> None:
+        # [FUNCTION DOC] HELPER: Callback from the provider's cell watch: compare the observed cell info
+        # (none = gone) with the known cell (using its workers hash) via the shared observation helper,
+        # which calls the add or remove helper as needed (e.g. a changed hash means replacement).
         actual = self._cells_by_id.get(cell_id)
         await apply_cell_observation(
             cell_id=cell_id,
@@ -129,15 +170,23 @@ class TrainerController:
         )
 
     async def _add_cell(self, cell_id: str, observed: CellInfo) -> None:
+        # [FUNCTION DOC] HELPER: Create and register a cell using the cell index from the observed
+        # info's metadata (key error if missing) and its workers hash.
         self._cells_by_id[cell_id] = self._create_cell(
             cell_id, cell_index=observed.meta["cell_index"], workers_hash=observed.workers_hash
         )
 
     async def _remove_cell(self, cell_id: str) -> None:
+        # [FUNCTION DOC] HELPER: Forget the cell (key error if unknown) and stop its health checker. It
+        # does not kill workers; the platform already removed them.
         cell = self._cells_by_id.pop(cell_id)
         cell.health_checker.stop()
 
     def _create_cell(self, cell_id: str, *, cell_index: int, workers_hash: str) -> TrainerCell:
+        # [FUNCTION DOC] HELPER: Build a cell wrapper with the controller's role and flags, starting
+        # with a no-op health checker. If a heartbeat checker config exists (more than one expected
+        # cell), replace the checker with a real one bound to this cell and the shared activeness
+        # tracker. The checker is only started when the cell is initialized.
         cell = TrainerCell(
             args=self.args,
             role=self._role,
@@ -160,6 +209,8 @@ class TrainerController:
         return cell
 
     async def dispose(self) -> None:
+        # [FUNCTION DOC] Stop watching provider cells (call and clear the watcher disposer if any). Does
+        # not stop cell health checkers or workers.
         if (disposer := self._watcher_disposer) is not None:
             await disposer()
             self._watcher_disposer = None
@@ -172,6 +223,14 @@ class TrainerController:
         rollout_data_pack: RolloutDataPack,
         external_data: list[TrainStepOutput] | None = None,
     ) -> list[TrainStepOutput]:
+        # [FUNCTION DOC] Train on one rollout with fault-tolerant retries. Asserts external data is only
+        # given with exactly one cell. Runs the event analysis in a thread, then retries (up to 30
+        # attempts) an attempt function that: allocates witness info; refreshes cells (heal and
+        # reconfigure); runs the cell train step on every alive cell concurrently capturing exceptions
+        # per cell (no recoverability check here); flattens successful cells' per-worker results; checks
+        # the attempt (on any failure releases the object-store references held by the results and
+        # re-raises); logs a step-end event; and returns the flat list of worker step outputs. After
+        # success runs the test-action hooks for the rollout id and returns the outputs.
         """Do one rollout training"""
 
         assert (
@@ -181,6 +240,8 @@ class TrainerController:
         await asyncio.to_thread(event_analyzer.run_analysis_from_args, self.args)
 
         async def _fn(attempt: int) -> list[TrainStepOutput]:
+            # [FUNCTION DOC] HELPER: One training attempt, as described by the enclosing function.
+            # Returns the flattened step outputs; raises whatever the check raises to trigger a retry.
             witness_info = self._allocate_witness_info(
                 rollout_id=rollout_id,
                 attempt=attempt,
@@ -228,6 +289,10 @@ class TrainerController:
         return worker_results
 
     def _allocate_witness_info(self, *, rollout_id: int, attempt: int, sample_indices):
+        # [FUNCTION DOC] HELPER: When witnessing is disabled returns none. Otherwise allocates one
+        # witness id per sample index from the allocator and, if the event logger is initialized, logs
+        # an allocation event (rollout id, attempt, mapping witness id to sample index, the allocator's
+        # counter afterwards). Returns the witness info.
         if self._witness_allocator is None:
             return None
 
@@ -247,6 +312,9 @@ class TrainerController:
         return witness_info
 
     def _log_step_end_event(self, *, rollout_id: int, snapshot_alive_cells: list, results: list):
+        # [FUNCTION DOC] HELPER: If the event logger is initialized, log a group step-end event with a
+        # mapping from cell index to either the text "error" (the cell raised) or the list of
+        # per-worker outcomes. Cells and results are paired strictly.
         if is_event_logger_initialized():
             cell_outcomes = {
                 cell.cell_index: (
@@ -260,6 +328,15 @@ class TrainerController:
             )
 
     def _check_train_one_attempt(self, snapshot_alive_cells, results):
+        # [FUNCTION DOC] HELPER: Decide whether an attempt succeeded. Computes outcome groups (errored,
+        # discarded, normal cell indices). If no cell is normal and none is discarded (all errored):
+        # builds an all-cells-failed error (non-retryable if no cell can recover or the first cause was
+        # non-retryable, else a retryable runtime error), logs the decision (give up vs retry) and
+        # raises it chained from the first exception. If some cells discarded: logs a warning and
+        # raises a value error to force a retry. KNOWN ISSUE: the logged decision may say give up when
+        # nothing is recoverable, yet the raised value error is the same either way. Otherwise (some
+        # normal, none discarded, even if some errored) logs success without retry: erroring cells
+        # may have failed after exchanging gradients, so survivors' results are accepted.
         outcomes = TrainerController._compute_attempt_outcomes(snapshot_alive_cells, results)
         if not outcomes["normal"] and not outcomes["discarded"]:
             cause = _first_exception(results)
@@ -298,6 +375,9 @@ class TrainerController:
 
     @staticmethod
     def _compute_attempt_outcomes(snapshot_alive_cells, results) -> dict[str, list[int]]:
+        # [FUNCTION DOC] HELPER: Static. Pair cells with results strictly and return a mapping with
+        # three lists of cell indices: errored (result is an exception), discarded (no exception but
+        # any worker outcome is discarded-should-retry), and normal (all the rest).
         paired = list(zip(snapshot_alive_cells, results, strict=True))
         errored = [c.cell_index for c, r in paired if isinstance(r, BaseException)]
         discarded = [
@@ -313,6 +393,16 @@ class TrainerController:
 
     @init_once
     async def init(self, args: Pickled) -> list[Any]:
+        # [FUNCTION DOC] One-time startup (repeat calls are no-ops). Stores args; configures process
+        # logging with the trainer controller identity (trainer id, model id); initializes the object
+        # store without contributing a segment; if more than one cell is expected, creates the TCP
+        # store used for independent-DP rendezvous and remembers its address; computes the heartbeat
+        # checker config; creates the witness allocator when enabled (resuming its counter from the
+        # persisted value in the debug event directory if configured); creates the fault-tolerance test
+        # action executor; starts watching provider cells; waits for the expected cell count; then
+        # initializes ALL cells concurrently, each with independent-DP info assuming every cell is
+        # alive and the store address. Returns the per-worker init results of all cells flattened in
+        # cell order (worker values are restored rollout ids).
         """
         Observe the controller's cells, then allocate GPU resources and initialize
         model, optimzier, local ckpt, etc.
@@ -359,9 +449,15 @@ class TrainerController:
         return [item for sublist in cell_results for item in sublist]
 
     async def is_initialized(self) -> bool:
+        # [FUNCTION DOC] Whether init has completed (used by a new orchestrator to detect a controller
+        # left over from an earlier orchestration, i.e. take over).
         return self._init_once.is_initialized()
 
     async def load_state(self) -> list[Any]:
+        # [FUNCTION DOC] Reload saved state on a controller that is already initialized (assertion error
+        # otherwise). Waits for the expected cells, asserts every cell is alive (assertion error listing
+        # the others), then loads state on all cells concurrently, raising the first failure. Returns
+        # the per-worker results flattened in cell order.
         assert self._init_once.is_initialized()
 
         await self._wait_expected_num_cells(timeout=_CELLS_READY_TIMEOUT_SECONDS)
@@ -373,6 +469,10 @@ class TrainerController:
         return [item for sublist in cell_results for item in sublist]
 
     async def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
+        # [FUNCTION DOC] Save the model through a single cell to avoid write conflicts: tries the first
+        # alive cell, and if it fails (it is then marked errored) retries up to 30 attempts which pick
+        # the next alive cell. KNOWN ISSUE: docstring says cell 0, but the code uses the first ALIVE
+        # cell, which is not necessarily cell 0.
         """Save actor model. Only cell 0 saves to avoid file write conflicts."""
         # Catch with vanilla retry: cells w/ exceptions are auto marked errored, thus retry will find the next one
         await retry(
@@ -381,6 +481,9 @@ class TrainerController:
         )
 
     async def export_hf(self, rollout_id: int, path: str) -> None:
+        # [FUNCTION DOC] Export current weights as a Hugging Face checkpoint to the path through the
+        # first alive cell with up to 30 retries over successive alive cells. KNOWN ISSUE: docstring
+        # says cell 0 but the first alive cell is used.
         """Export current weights as an HF checkpoint. Only cell 0 exports to avoid file write conflicts."""
         await retry(
             lambda _: self._execute_first_alive("export_hf", rollout_id=rollout_id, path=path),
@@ -388,6 +491,10 @@ class TrainerController:
         )
 
     async def update_weights(self, info: UpdatableEngines, rollout_id: int | None = None) -> int | None:
+        # [FUNCTION DOC] Push weights to the engines described by the updatable-engines info using the
+        # first alive cell (workers of that cell cooperate), with up to 30 retries over successive
+        # alive cells (TODO in code: use all cells). Returns the weight version reported by the first
+        # worker of the cell that succeeded (may be none when no version applies).
         """Broadcast weights to rollout engines and answer the version they now serve."""
         log_structured(logger.info, tag="ft", op="update_weights", phase="start", rollout=rollout_id)
         # TODO: allow using all cells to update weights (instead of first alive cell)
@@ -399,15 +506,22 @@ class TrainerController:
         return weight_versions[0]
 
     async def get_deployment_identity(self) -> DeploymentIdentity:
+        # [FUNCTION DOC] Return the identity (run, deploy component, instance, trainer id) given at
+        # construction; used by orchestrators to verify they reach the right deployment.
         return self._deployment_identity
 
     async def onload(self) -> None:
+        # [FUNCTION DOC] Wake all alive cells' workers (bring GPU memory back) without retry (failing
+        # cells are marked errored and then skipped), then re-activate the health checkers. Raises
+        # non-retryable error if no cell is alive, or when no cell can recover.
         # Catch *without* retry: cells w/ exceptions are auto marked errored, and will not be used
         await self._execute_all_alive_and_catch("wake_up")
         self._health_checker_activeness.bump_active(True)
 
     @contextmanager
     def _paused_health_checkers(self) -> Iterator[None]:
+        # [FUNCTION DOC] HELPER: Context manager: mark health checkers inactive on entry (bumping the
+        # epoch so in-flight checks are discarded) and active again on exit, even on error.
         self._health_checker_activeness.bump_active(False)
         try:
             yield
@@ -415,74 +529,110 @@ class TrainerController:
             self._health_checker_activeness.bump_active(True)
 
     async def offload(self) -> None:
+        # [FUNCTION DOC] Deactivate health checkers (workers will not answer while asleep), then put all
+        # alive cells' workers to sleep (offloading GPU memory) without retry. Checkers are re-activated
+        # by the onload call, not here.
         self._health_checker_activeness.bump_active(False)
         # Catch *without* retry: cells w/ exceptions are auto marked errored, and will not be used
         await self._execute_all_alive_and_catch("sleep")
 
     async def clear_memory(self) -> None:
+        # [FUNCTION DOC] Ask all alive cells' workers to clear cached GPU memory, without retry.
         # Catch *without* retry: cells w/ exceptions are auto marked errored, and will not be used
         await self._execute_all_alive_and_catch("clear_memory")
 
     async def offload_grad_buffer(self) -> None:
+        # [FUNCTION DOC] Ask all alive cells' workers to offload their gradient buffers, without retry.
         # Catch *without* retry: cells w/ exceptions are auto marked errored, and will not be used
         await self._execute_all_alive_and_catch("offload_grad_buffer")
 
     # ------------------------ API :: multi-LoRA slot commands ------------------------
 
     async def _execute_slots(self, fn_name: str, **kwargs) -> list:
+        # [FUNCTION DOC] HELPER: Forward a multi-LoRA slot command to the only cell. Unpacking raises a
+        # value error unless there is exactly one cell; asserts the cell is alive. Returns per-worker
+        # results.
         (cell,) = self._cells
         assert cell.is_alive, "the Tinker trainer cell is unavailable"
         return await cell.execute(fn_name, **kwargs)
 
     async def forward_backward(self, batch_id: int, data_ref: object_store.StoreObjectRef) -> list:
+        # [FUNCTION DOC] Run forward and backward for a batch id on the data referenced in the object
+        # store, on all workers of the single cell. Returns per-worker results.
         return await self._execute_slots("forward_backward", batch_id=batch_id, rollout_data_ref=data_ref)
 
     async def optim_step(self, adam_params_by_slot: dict[int, dict]) -> list:
+        # [FUNCTION DOC] Run an optimizer step with per-slot Adam parameters (mapping from slot index to
+        # parameter mapping) on the single cell's workers. Returns per-worker results.
         return await self._execute_slots("optim_step", adam_params_by_slot=adam_params_by_slot)
 
     async def forward_only(self, batch_id: int, data_ref: object_store.StoreObjectRef) -> list:
+        # [FUNCTION DOC] Run a forward-only pass (no gradients) for a batch id on the referenced data
+        # on the single cell's workers. Returns per-worker results.
         return await self._execute_slots("forward_only", batch_id=batch_id, rollout_data_ref=data_ref)
 
     async def load_slot(
         self, slot: int, rank: int, alpha: float, ckpt_path: str | None = None, load_optimizer: bool = True
     ) -> list:
+        # [FUNCTION DOC] Load a LoRA adapter into a slot with the given rank and alpha scaling, from an
+        # optional checkpoint path, optionally restoring optimizer state (default yes). Returns
+        # per-worker results.
         return await self._execute_slots(
             "load_slot", slot=slot, rank=rank, alpha=alpha, ckpt_path=ckpt_path, load_optimizer=load_optimizer
         )
 
     async def save_slot(self, slot: int, path: str, metadata: dict | None = None) -> list:
+        # [FUNCTION DOC] Save a slot's adapter (and state) to a path with optional metadata mapping.
+        # Returns per-worker results.
         return await self._execute_slots("save_slot", slot=slot, path=path, metadata=metadata)
 
     async def export_slot(self, slot: int, rank: int, alpha: float, path: str, metadata: dict | None = None) -> list:
+        # [FUNCTION DOC] Export a slot's adapter for serving, with rank and alpha, to a path with
+        # optional metadata. Returns per-worker results.
         return await self._execute_slots(
             "export_slot", slot=slot, rank=rank, alpha=alpha, path=path, metadata=metadata
         )
 
     async def unload_slot(self, slot: int) -> list:
+        # [FUNCTION DOC] Free the adapter in a slot on the single cell's workers. Returns per-worker
+        # results.
         return await self._execute_slots("unload_slot", slot=slot)
 
     async def get_train_parallel_config(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Parallelism configuration mapping (e.g. data-parallel size) reported by the
+        # first worker of the first alive cell, with the usual no-retry failure handling.
         return (await self._execute_first_alive("get_train_parallel_config"))[0]
 
     async def get_cell_statuses(self) -> dict[str, CellStatus]:
+        # [FUNCTION DOC] Mapping from cell id to the cell's externally visible status, computed over a
+        # copy of the cell items so concurrent reconcile is safe.
         return {cell_id: cell.cell_status() for cell_id, cell in list(self._cells_by_id.items())}
 
     # ------------------------ utils to forward calls to cells ------------------------
 
     def _is_recoverable(self) -> bool:
+        # [FUNCTION DOC] HELPER: True while at least one cell is alive (others can be healed from it).
         return any(cell.is_alive for cell in self._cells)
 
     def _make_all_cells_failed_error(self, message: str, *, cause: BaseException | None = None) -> Exception:
+        # [FUNCTION DOC] HELPER: Choose the error type for total failure: non-retryable error if the
+        # cause itself is non-retryable; otherwise a plain runtime error (retryable) while some cell is
+        # alive, else non-retryable error. Returns (does not raise) the error with the message.
         if isinstance(cause, NonRetryableError):
             return NonRetryableError(message)
         return RuntimeError(message) if self._is_recoverable() else NonRetryableError(message)
 
     def _raise_if_no_cell_can_recover(self, *, debug_name: str, cause: BaseException | None) -> None:
+        # [FUNCTION DOC] HELPER: Returns if any cell is alive; else raises the all-cells-failed error
+        # (see error helper) naming the debug operation, chained from the cause.
         if self._is_recoverable():
             return
         raise self._make_all_cells_failed_error(f"All cells failed during {debug_name}", cause=cause) from cause
 
     async def _execute_all_alive_and_catch(self, fn_name: str, *, check_recoverable: bool = True, **kwargs):
+        # [FUNCTION DOC] HELPER: Call the named method with the same keyword arguments on every alive
+        # cell concurrently, capturing per-cell exceptions (see gather helper). Returns the gather
+        # helper's pair (snapshot of alive cells, outputs).
         return await self._gather_all_alive_and_catch(
             lambda cell: cell.execute(fn_name, **kwargs),
             debug_name=f"execute_all_alive_and_catch#{fn_name}",
@@ -490,6 +640,12 @@ class TrainerController:
         )
 
     async def _gather_all_alive_and_catch(self, compute_coroutine, *, debug_name: str, check_recoverable: bool = True):
+        # [FUNCTION DOC] HELPER: Snapshot the alive cells (raises non-retryable error "No alive cells"
+        # if none), call the supplied coroutine factory on each concurrently with exceptions returned
+        # instead of raised, log errors, and, if requested (default), raise when no cell remains alive
+        # (see recoverability helper). Returns (alive cells snapshot, outputs list in the same order,
+        # each a result or an exception object). Deliberately has no timeout: a hung cell is detected
+        # externally by stale heartbeats and suspended, which unblocks this gather.
         snapshot_alive_cells = [c for c in self._cells if c.is_alive]
         if not snapshot_alive_cells:
             raise NonRetryableError("No alive cells")
@@ -506,6 +662,11 @@ class TrainerController:
         return snapshot_alive_cells, outputs
 
     async def _execute_first_alive(self, fn_name: str, **kwargs):
+        # [FUNCTION DOC] HELPER: Call the named method on the alive cell with the lowest index. Raises
+        # non-retryable error if none is alive. On an ordinary failure (the cell is then marked
+        # errored by the cell wrapper): if no cell can recover raises the all-cells-failed error,
+        # otherwise re-raises the original error so a retry loop can pick the next alive cell. Returns
+        # the per-worker result list.
         alive_cells = [c for c in self._cells if c.is_alive]
         if not alive_cells:
             raise NonRetryableError("No alive cells, therefore cannot heal anymore")
@@ -518,6 +679,19 @@ class TrainerController:
     # ------------------------ internals for stop/start ------------------------
 
     async def _refresh_cells(self, *, rollout_id: int) -> None:
+        # [FUNCTION DOC] HELPER: Heal and reconfigure independent-DP cells before a training attempt.
+        # Snapshot healing (uninitialized) and alive cell indices; the future alive set is their sorted
+        # union. Raises non-retryable error if no cell is alive. Reconfiguration is needed if any cell
+        # is healing or any currently alive cell's recorded alive set differs from the future set;
+        # otherwise returns after logging. If needed: increment the quorum id; pick the lowest alive
+        # cell as the checkpoint source (TODO: balance); compute the source's rank within the future
+        # alive set and the destination ranks of healing cells; with health checkers paused, run
+        # concurrently over cells in the future alive set: alive cells reconfigure (the source also
+        # sends checkpoints to all destination ranks), healing cells init and receive the checkpoint.
+        # Exceptions are collected, logged and not raised (failing cells mark themselves errored). If
+        # none failed, asserts that exactly the future alive set is alive and logs a reconfigure event
+        # (source cell only when something healed); otherwise logs an error and leaves it to the
+        # attempt check. Each cell's new info is computed with the helper using the new quorum id.
         snapshotted_healing_indices = [c.cell_index for c in self._cells if c.is_uninitialized]
         snapshotted_alive_indices = [c.cell_index for c in self._cells if c.is_alive]
         will_alive_indices = sorted(list(set(snapshotted_healing_indices + snapshotted_alive_indices)))
@@ -652,6 +826,9 @@ class TrainerController:
         healed_cell_indices: list[int],
         alive_cell_indices_after: list[int],
     ) -> None:
+        # [FUNCTION DOC] HELPER: If the event logger is initialized, log a cell reconfigure event with
+        # rollout id, current quorum id, source cell index (or none), healed cell indices and alive cell
+        # indices after.
         if is_event_logger_initialized():
             get_event_logger().log(
                 CellReconfigureEvent,
@@ -665,6 +842,9 @@ class TrainerController:
             )
 
     def _compute_indep_dp_info(self, cell_index: int, alive_cell_indices: list[int]) -> IndepDPInfo:
+        # [FUNCTION DOC] HELPER: Build the independent-DP info for one cell: its index, the current
+        # known cell count, its rank (position) within the given alive set (value error if it is not
+        # in it), the alive set size, the current quorum id and the alive set itself.
         return IndepDPInfo(
             cell_index=cell_index,
             num_cells=len(self._cells),
@@ -678,8 +858,10 @@ class TrainerController:
 
     @property
     def num_cells(self) -> int:
+        # [FUNCTION DOC] Property: number of cells currently known (any state).
         return len(self._cells)
 
 
 def _first_exception(results) -> BaseException | None:
+    # [FUNCTION DOC] HELPER: The first element of the results that is an exception object, or none.
     return next((result for result in results if isinstance(result, BaseException)), None)

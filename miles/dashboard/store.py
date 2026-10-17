@@ -429,7 +429,8 @@ class _PartitionReader:
         # propagate) and concatenates them after the cached block, advancing the offset. If there
         # is no complete line and the key is uncached, an empty block is cached. Finally the key
         # becomes most recently used and the least recently used blocks beyond the cap are evicted
-        # together with their offsets.        # read+parse release the GIL; two fills from one stale offset append the bytes twice
+        # together with their offsets.
+        # read+parse release the GIL; two fills from one stale offset append the bytes twice
         with self._lock:
             offset = self._offsets.get(key, 0)
             if key in self._blocks and path.stat().st_size <= offset:
@@ -459,7 +460,8 @@ class _PartitionReader:
         # complete line within the final 64 KiB of the last file, decodes each as JSON and applies
         # the injected line-stamp function. A line that fails to decode (partial write) is ignored.
         # Returns the stamps (empty list if no data). Assumes files are ordered chronologically and
-        # lines roughly time-ordered.        """Global-range candidates from the first line of the oldest file and
+        # lines roughly time-ordered.
+        """Global-range candidates from the first line of the oldest file and
         the last complete line of the newest — no full scan."""
         files = [(key, path) for key, path in self.files() if path.stat().st_size > 0]
         if not files:

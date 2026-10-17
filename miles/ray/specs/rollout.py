@@ -1,3 +1,5 @@
+# [MODULE DOC] Worker spec, naming and handle factory for the rollout executor pool (a single
+# CPU-only worker running the rollout executor class). Pool id: rollout-executor.
 from miles.ray.specs.inference import (
     SESSION_SERVER_POOL_ID,
     compute_inference_controller_provider,
@@ -13,6 +15,11 @@ ROLLOUT_EXECUTOR_WORKER_CLASS = "miles.ray.rollout.rollout_executor.RolloutExecu
 
 
 def spec_rollout_executor(args) -> ServeWorkerSpec:
+    # [FUNCTION DOC] Spec of the rollout executor worker: one cell, one worker, no GPUs, one CPU,
+    # optionally pinned to the head node, no ports or extra environment. Constructor arguments are
+    # computed lazily from the launch context's backend capability: args; router providers (one per
+    # model); a static session server provider if the session server is enabled, else none; and the
+    # inference controller provider (possibly a static address).
     return ServeWorkerSpec(
         name=ROLLOUT_EXECUTOR_POOL_ID,
         port_infos=[],
@@ -39,14 +46,18 @@ def spec_rollout_executor(args) -> ServeWorkerSpec:
 
 
 def create_rollout_executor_handle(*, capability: BackendCapability) -> BaseWorkerHandle:
+    # [FUNCTION DOC] Handle (RPC proxy) to the rollout executor worker from a static provider for its
+    # pool. Does not contact the worker.
     worker_name = rollout_executor_worker_name()
     provider = capability.static_worker_provider(pool_id=ROLLOUT_EXECUTOR_POOL_ID)
     return provider.get_handle(worker_name)
 
 
 def rollout_executor_worker_name() -> str:
+    # [FUNCTION DOC] Worker name of the rollout executor (single-cell pool).
     return compute_worker_name(pool_id=ROLLOUT_EXECUTOR_POOL_ID)
 
 
 def rollout_executor_cell_id() -> str:
+    # [FUNCTION DOC] Cell id of the rollout executor's only cell (cell index zero).
     return compute_cell_id(pool_id=ROLLOUT_EXECUTOR_POOL_ID, cell_index=0)

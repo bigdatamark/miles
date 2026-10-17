@@ -1,3 +1,10 @@
+# [MODULE DOC] Inference controller: the single actor-like component that owns all rollout (inference)
+# servers of a run, one per served model. It creates the servers and routers, tracks engine cells
+# through a provider (reconciling cell add/remove with observed state), runs a periodic tick over
+# cells, coordinates offload/onload and weight updates under one context lock, exposes eval fleet
+# info and cell status, and accepts engine registrations from external reporters.
+# Timing constants: tick interval 5 s, per-cell tick timeout 120 s, cells-ready poll 2 s and
+# cells-ready timeout 3600 s.
 import asyncio
 import logging
 import time
@@ -44,6 +51,14 @@ CELLS_READY_TIMEOUT_SECONDS = 3600.0
 
 @enforce_lock_discipline
 class InferenceController:
+    # [CLASS DOC] Controller for all inference servers. Lock discipline is enforced by decorators:
+    # methods marked with-lock hold the controller's context lock for their whole body; requires-lock
+    # methods must be called with it held; acquires-lock/releases-lock methods start/end a lock
+    # span across calls (used by the weight update start/end pair); lock-exempt methods never need
+    # it. State: args, engine provider, router providers, the context lock, a mapping from model id
+    # to rollout server, an optional eval fleet (only when eval GPUs are configured), a list of
+    # watcher disposers and an optional ticker. Initialization happens once (idempotent init).
+
     @lock_exempt
     def __init__(
         self,
@@ -52,6 +67,9 @@ class InferenceController:
         engine_provider: BaseWorkerProvider,
         router_providers: Sequence[BaseWorkerProvider],
     ) -> None:
+        # [FUNCTION DOC] Store args and providers, create the init-once guard, the context lock named
+        # for this controller, and empty server mapping / no eval fleet / no watchers / no ticker.
+        # No I/O.
         self._init_once = InitOnce(type(self).__name__)
         self.args = args
         self._engine_provider = engine_provider
@@ -65,6 +83,14 @@ class InferenceController:
     @lock_exempt
     @init_once
     async def init(self) -> None:
+        # [FUNCTION DOC] One-time startup (guarded so repeated calls do nothing). Configures process
+        # logging with the inference-controller identity. If the run does not start inference
+        # engines, stops there. Otherwise: init the engine provider; resolve router addresses from
+        # the router providers; create the rollout servers (mapping model id to server); if eval
+        # GPUs > 0 create the eval fleet over the "eval" server (KeyError if absent); subscribe to the
+        # provider's cell watch with the reconcile callback and remember its disposer; create the
+        # periodic ticker running the cell tick; register the router with the dashboard; and finally
+        # wait until every server has its expected number of cells (up to 3600 s default).
         configure_logger(self.args, source=SimpleProcessIdentity(component="inference_controller"))
 
         if not self.args.starts_inference_engines:
@@ -91,11 +117,19 @@ class InferenceController:
     # TEMPORARY: exists only so a suspend can take this lock, reverted with the weight-update fault tolerance work
     @with_lock
     async def stop_cell_between_weight_updates(self, cell_id: str) -> None:
+        # [FUNCTION DOC] TEMPORARY hook: holding the controller lock, ask the engine provider to stop
+        # the single cell with the given id. Exists so a suspend serializes against weight updates.
         await self._engine_provider.stop_cells(cell_ids=[cell_id])
 
     # TEMPORARY: exists only so fault injection can take this lock, reverted with the weight-update fault tolerance work
     @with_lock
     async def inject_fault_between_weight_updates(self, cell_id: str, *, mode: FailureMode, sub_index: int) -> None:
+        # [FUNCTION DOC] TEMPORARY hook: holding the controller lock, inject a fault into one worker
+        # of a cell. Finds the server containing the cell id (raises key error if none); raises
+        # runtime error if that server's health checker is inactive (cell offloaded, since colocated
+        # trainers own the GPUs). Otherwise calls the provider's worker manager actor to inject a
+        # fault of the given mode (its string value) into the worker at the given index within the
+        # cell, awaiting the remote call. Reaches into a private attribute of the provider.
         # TEMPORARY: colocate cannot kill rollout workers while trainer ranks own the shared GPUs
         server = next((srv for srv in self.servers.values() if cell_id in srv.server_cells), None)
         if server is None:
@@ -113,20 +147,31 @@ class InferenceController:
 
     @lock_exempt
     async def is_initialized(self) -> bool:
+        # [FUNCTION DOC] Whether init has completed; used by a new orchestrator to detect a
+        # controller left from a previous run (take over).
         return self._init_once.is_initialized()
 
     @lock_exempt
     async def wait_expected_num_cells(self, timeout: float = CELLS_READY_TIMEOUT_SECONDS) -> None:
+        # [FUNCTION DOC] Concurrently wait for every server to reach its expected cell count, each
+        # with the given timeout in seconds. Exceptions from a server propagate.
         await asyncio.gather(*[srv.wait_init_expected_num_cells(timeout=timeout) for srv in self.servers.values()])
 
     @with_lock
     async def abort_all(self) -> None:
+        # [FUNCTION DOC] Abort all in-flight generation requests on every server concurrently; all
+        # are awaited and the first error is raised afterwards.
         await async_utils.gather_and_raise_first([srv.abort_all() for srv in self.servers.values()])
 
     # -------------------------- registration -----------------------------
 
     @lock_exempt
     async def registration_ingest(self, *, snapshot: RegistrationSnapshot) -> None:
+        # [FUNCTION DOC] Accept a snapshot of cells announced by an external reporter (not holding the
+        # lock). Raises assertion error if: no servers exist yet (controller not ready; reporter will
+        # re-announce); the engine provider is not a registration hub (this run deploys its own
+        # engines); or any cell's model id is missing from or not among the served model ids. Then
+        # hands the snapshot to the hub's ingest.
         assert self.servers, (
             f"this inference controller is not ready: reporter {snapshot.reporter_id} announced its cells before "
             f"the orchestration script built this controller's servers, so it does not know yet which models this "
@@ -148,15 +193,20 @@ class InferenceController:
 
     @with_lock
     async def prepare_rollout(self, rollout_id: int, model_id: str | None = None) -> None:
+        # [FUNCTION DOC] Before a rollout: resume health monitoring for the model's servers (all if no
+        # model id) and register the engines with the dashboard. The rollout id is unused.
         await self._health_monitoring_resume(model_id)
         await dashboard_hooks.register_engines(self.servers, provider=self._engine_provider)
 
     @with_lock
     async def prepare_eval(self, model_id: str | None = None) -> None:
+        # [FUNCTION DOC] Before an evaluation: resume health monitoring for the model's servers.
         await self._health_monitoring_resume(model_id)
 
     @with_lock
     async def dispose(self) -> None:
+        # [FUNCTION DOC] Shut down: clear and dispose the ticker if present, call and then clear all
+        # watcher disposers, and dispose every server in order. Not idempotent for servers.
         if (ticker := self._ticker) is not None:
             self._ticker = None
             await ticker.dispose()
@@ -173,24 +223,33 @@ class InferenceController:
     # TODO may parallelly execute offload/onload across services
     @with_lock
     async def offload(self, tags: list[str] | None = None) -> None:
+        # [FUNCTION DOC] Offload GPU memory of all servers for the given memory tags (all kinds if
+        # none), pausing health monitoring first (see offload helper).
         await self._offload(tags=tags)
 
     @with_lock
     async def onload(self, tags: list[str] | None = None) -> None:
+        # [FUNCTION DOC] Onload GPU memory of all servers for the given tags (all kinds if none).
         await self._onload(tags=tags)
 
     @with_lock
     async def onload_weights(self) -> None:
+        # [FUNCTION DOC] Onload only the weights memory kind, and only if the configured rollout
+        # offload level includes weights; otherwise a no-op.
         if "weight" not in self.args.offload_rollout_level:
             return
         await self._onload(tags=[GPU_MEMORY_TYPE_WEIGHTS])
 
     @with_lock
     async def onload_kv(self) -> None:
+        # [FUNCTION DOC] Onload the KV cache and CUDA graph memory kinds unconditionally (not gated by
+        # the configured offload level).
         await self._onload(tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH])
 
     @with_lock
     async def offload_kv(self) -> None:
+        # [FUNCTION DOC] Offload the CUDA graph memory kind always, plus KV cache memory if the
+        # configured rollout offload level includes the kv cache.
         tags = [GPU_MEMORY_TYPE_CUDA_GRAPH]
         if "kv_cache" in self.args.offload_rollout_level:
             tags.append(GPU_MEMORY_TYPE_KV_CACHE)
@@ -198,18 +257,24 @@ class InferenceController:
 
     @with_lock
     async def offload_weights(self) -> None:
+        # [FUNCTION DOC] Offload only the weights memory kind, and only if the configured rollout
+        # offload level includes weights; otherwise a no-op.
         if "weight" not in self.args.offload_rollout_level:
             return
         await self._offload(tags=[GPU_MEMORY_TYPE_WEIGHTS])
 
     @requires_lock
     async def _offload(self, tags: list[str] | None):
+        # [FUNCTION DOC] HELPER: Pause health monitoring on all servers (so offloaded engines are not
+        # flagged unhealthy), then offload each server sequentially for the tags.
         await self._health_monitoring_pause(None)
         for srv in self.servers.values():
             await srv.offload(tags=tags)
 
     @requires_lock
     async def _onload(self, tags: list[str] | None):
+        # [FUNCTION DOC] HELPER: Onload each server sequentially for the tags. Does not resume health
+        # monitoring (that happens in the prepare hooks).
         for srv in self.servers.values():
             await srv.onload(tags)
 
@@ -217,6 +282,15 @@ class InferenceController:
 
     @acquires_lock
     async def start_update_weights(self, model_id: str | None = None) -> "UpdatableEngines":
+        # [FUNCTION DOC] Begin a weight update; acquires the controller lock and keeps holding it until
+        # end or abort of the update is called. Steps: pause health monitoring for the model's
+        # servers; wait until its cells are all pending-weights or serving (see ensure helper);
+        # select the single updatable server. Returns an updatable-engines record: if no server is
+        # updatable, all lists/mappings are empty; else the server's API clients, per-engine GPU
+        # counts and offsets, and a mapping from each cell id to its current workers hash (a snapshot
+        # later used to decide which cells to mark ready). Raises value error if several servers are
+        # updatable and no model id is given, assertion error for an unknown or frozen model id,
+        # timeout error if cells are not ready in time.
         """Return engines eligible for weight updates."""
         await self._health_monitoring_pause(model_id)
         await self._ensure_cells_ready(model_id=model_id)
@@ -239,10 +313,17 @@ class InferenceController:
 
     @releases_lock
     async def abort_update_weights(self) -> None:
+        # [FUNCTION DOC] Abandon a weight update: only releases the lock acquired by the start call.
+        # No cell is marked weights-ready.
         pass
 
     @releases_lock
     async def end_update_weights(self, snapshot_cell_id_to_hashes: dict[str, str]) -> None:
+        # [FUNCTION DOC] Finish a weight update and release the lock held since the start call. For
+        # every cell (across all servers) that is in the snapshot mapping, whose workers hash still
+        # equals the snapshot's hash (i.e. the cell was not replaced meanwhile) and that is pending
+        # weights, concurrently mark its weights ready so it can serve. Cells that appeared or were
+        # replaced during the update stay pending.
         await asyncio.gather(
             *[
                 cell.mark_weights_ready()
@@ -256,6 +337,11 @@ class InferenceController:
 
     @requires_lock
     async def _ensure_cells_ready(self, model_id: str | None = None) -> None:
+        # [FUNCTION DOC] HELPER: Loop until all cells of the model's servers are pending-weights or
+        # serving, with an overall deadline of 3600 s (raises timeout error with counts). Each
+        # iteration re-reads the cells; in colocate mode first concurrently initializes uninitialized
+        # cells; if some remain not ready, logs and sleeps 2 s with the lock temporarily released
+        # (so other operations such as reconcile can progress) before retrying.
         deadline = time.monotonic() + CELLS_READY_TIMEOUT_SECONDS
         while True:
             cells = [cell for srv in self._get_servers_of_model_id(model_id) for cell in srv.server_cells.values()]
@@ -275,6 +361,8 @@ class InferenceController:
 
     @requires_lock
     def _get_servers_of_model_id(self, model_id: str | None) -> list[RolloutServer]:
+        # [FUNCTION DOC] HELPER: All servers when no model id; otherwise a one-element list with the
+        # server of that id, asserting it exists.
         if model_id is None:
             return list(self.servers.values())
         srv = self.servers.get(model_id)
@@ -283,6 +371,9 @@ class InferenceController:
 
     @requires_lock
     def _get_updatable_server(self, model_id: str | None = None) -> RolloutServer | None:
+        # [FUNCTION DOC] HELPER: With a model id: that model's server, asserting it is not frozen (its
+        # update-weights flag set). Without: the only server whose update-weights flag is set;
+        # nothing if there is none; raises value error naming them if several.
         if model_id is not None:
             [srv] = self._get_servers_of_model_id(model_id)
             assert srv.update_weights, f"Server for model_id {model_id!r} is frozen (update_weights=False)"
@@ -304,10 +395,15 @@ class InferenceController:
 
     @lock_exempt
     async def get_eval_fleet_info(self) -> EvalFleetInfo | None:
+        # [FUNCTION DOC] The eval fleet description (router address and GPU counts), or nothing if this
+        # run has no dedicated eval fleet.
         return self._eval_fleet.info if self._eval_fleet is not None else None
 
     @lock_exempt
     async def pin_eval_fleet(self, checkpoint_dir: str, weight_version: str) -> EvalFleetPin:
+        # [FUNCTION DOC] Delegate to the eval fleet to load the checkpoint onto all eval engines at
+        # the weight version; returns its pin result. Raises assertion error if no eval fleet exists.
+        # Runs without the controller lock (the fleet works with the eval server's own lock).
         assert (
             self._eval_fleet is not None
         ), "this run deploys no eval fleet, so nothing asked this controller to pin one"
@@ -317,6 +413,8 @@ class InferenceController:
 
     @lock_exempt
     async def get_cell_statuses(self) -> dict[str, CellStatus]:
+        # [FUNCTION DOC] Mapping from cell id to its status record across all servers. Iterates over
+        # copies of the server and cell containers so concurrent reconcile changes are safe.
         return {
             cell_id: cell.cell_status()
             for srv in list(self.servers.values())
@@ -332,6 +430,10 @@ class InferenceController:
         skip_list: list[str] | None = None,
         model_id: str | None = None,
     ) -> list[Any]:
+        # [FUNCTION DOC] Run a weight consistency check on the updatable server's engines. The action
+        # (e.g. checksum), quantization-error tolerance flag, selector and skip list are forwarded
+        # unchanged. Returns the server's list of results, or an empty list if no updatable server
+        # exists. Errors from server selection (multiple servers, frozen model) propagate.
         # Only the updatable model is re-synced; a frozen model would always mismatch.
         srv = self._get_updatable_server(model_id=model_id)
         if srv is None:
@@ -344,6 +446,9 @@ class InferenceController:
 
     @with_lock
     async def _tick_cells(self) -> None:
+        # [FUNCTION DOC] HELPER: Periodic job (runs under the lock): tick every cell of every server
+        # concurrently, each limited to 120 s; failures and timeouts are logged as errors with their
+        # exception and never raised.
         cells = [cell for srv in list(self.servers.values()) for cell in list(srv.server_cells.values())]
         results = await asyncio.gather(
             *[asyncio.wait_for(cell.tick(), timeout=CELL_TICK_TIMEOUT_SECONDS) for cell in cells],
@@ -357,6 +462,12 @@ class InferenceController:
 
     @with_lock
     async def _reconcile(self, cell_id: str, observed: CellInfo | None) -> None:
+        # [FUNCTION DOC] HELPER: Callback from the engine provider's cell watch: bring the actual cell
+        # (found by searching all servers for the id; none if absent) in line with the observed info
+        # (none means the cell vanished). Delegates the decision to the shared observation helper,
+        # given the actual workers hash. Add: converts the observed info to cell metadata and adds the
+        # cell to the server of the metadata's model id (key error if unknown). Remove: removes the
+        # cell from the server that currently holds it.
         actual_srv: RolloutServer | None = None
         actual_cell: ServerCell | None = None
         for srv in self.servers.values():
@@ -365,10 +476,12 @@ class InferenceController:
                 break
 
         async def _add(_cell_id: str, observed_info: CellInfo) -> None:
+            # [FUNCTION DOC] HELPER: Add the cell described by the observed info to its model's server.
             observed_cell_meta = _compute_server_cell_meta_from_info(observed_info)
             await self.servers[observed_cell_meta.model_id].add_cell(observed_cell_meta)
 
         async def _remove(remove_cell_id: str) -> None:
+            # [FUNCTION DOC] HELPER: Remove the cell from the server found in the enclosing lookup.
             await actual_srv.remove_cell(remove_cell_id)
 
         await apply_cell_observation(
@@ -383,17 +496,24 @@ class InferenceController:
 
     @requires_lock
     async def _health_monitoring_pause(self, model_id: str | None) -> None:
+        # [FUNCTION DOC] HELPER: For each selected server, bump the health checker activeness to
+        # inactive.
         for srv in self._get_servers_of_model_id(model_id):
             srv.health_checker_activeness.bump_active(False)
 
     @requires_lock
     async def _health_monitoring_resume(self, model_id: str | None) -> None:
+        # [FUNCTION DOC] HELPER: For each selected server, bump the health checker activeness to
+        # active.
         for srv in self._get_servers_of_model_id(model_id):
             srv.health_checker_activeness.bump_active(True)
 
 
 @dataclass(frozen=True)
 class UpdatableEngines:
+    # [CLASS DOC] Frozen result of starting a weight update: the API clients of the engines to update,
+    # per-engine GPU counts and GPU offsets (parallel lists, same order), and a mapping from cell id
+    # to the workers hash at snapshot time.
     rollout_engines: list[SGLangApiClient]
     engine_gpu_counts: list[int]
     engine_gpu_offsets: list[int]
@@ -402,6 +522,10 @@ class UpdatableEngines:
 
 # TODO may move and generalize later
 def _compute_server_cell_meta_from_info(info: CellInfo) -> ServerCellMetadata:
+    # [FUNCTION DOC] HELPER: Convert a provider cell info to server cell metadata: copies model id,
+    # worker type, GPUs per engine, GPU offset, API key, needs-offload and update-weights flags from
+    # the info's metadata mapping (key error if missing), the cell id, the workers hash, and uses the
+    # first worker name as the cell's worker name (extra workers ignored).
     return ServerCellMetadata(
         model_id=info.meta["model_id"],
         worker_type=info.meta["worker_type"],

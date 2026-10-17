@@ -1,3 +1,10 @@
+# [MODULE DOC] HELPER: Recording, padding, merging and validating the sampler's top-k candidate token
+# ids and log probs per generated token. Per-sample arrays have shape (response tokens, k), with
+# unavailable slots represented by token id -1 and log prob negative infinity. Two engine modes:
+# "selected" (the engine's top log prob list per token) and "support" (candidates equal the sampling
+# support after filtering). Functions: configure a request, append a response's candidates to a
+# sample, pad for non-trained positions, merge two turns with a gap, and validate whole samples (CPU
+# heavy; intended only under CI test).
 """Record the sampler's top-k candidate log-probs at generation time."""
 
 from argparse import Namespace
@@ -12,6 +19,15 @@ from miles.utils.types import Sample
 
 
 def configure_rollout_topk_logprobs_request(args: Namespace, request: dict[str, Any], *, openai: bool = False) -> None:
+    # [FUNCTION DOC] Mutates the request in place so the engine returns candidate probabilities. No-op
+    # when the launch top log prob count is zero or unset. The sampling section is the request itself
+    # (OpenAI style) or its sampling parameters entry. Fills unset (none or missing) sampling settings
+    # with explicit defaults so the model's generation config cannot change the distribution:
+    # temperature from launch args, top_p 1.0, top_k minus one (disabled), min_p 0.0. Validates the
+    # resulting sampling settings against the launch temperature and candidate count (validator may
+    # raise). Then, in support mode: removes both count keys and sets the sampling log prob mode to
+    # support (these REPLACE any client-supplied values: launch args win). In selected mode: removes the
+    # mode key and sets the count key (top_logprobs for OpenAI style, top_logprobs_num otherwise) to k.
     """Request candidate probabilities, validating the actual per-call settings.
 
     The rollout args own ``top_logprobs_num`` / ``top_logprobs`` and ``sampling_logprobs_mode``
@@ -42,6 +58,15 @@ def configure_rollout_topk_logprobs_request(args: Namespace, request: dict[str, 
 def append_rollout_topk_logprobs(
     sample: Sample, meta: Mapping[str, Any], k: int, *, sampling_logprobs_mode: str = "selected"
 ) -> None:
+    # [FUNCTION DOC] Append the response's candidates to the sample's two arrays (token ids as 32-bit
+    # integers, log probs as 32-bit floats; created on first use, else concatenated along the token
+    # axis). Does nothing if k is zero. n = number of generated tokens in the response meta info. Source
+    # field: the sampling log probs list in support mode, else the top log probs list; if n > 0 and it
+    # is missing or its length differs from n, raises value error. For each token row: support mode
+    # raises value error if the row has more than k entries, and takes candidate ids from the
+    # sampling mask list of the meta info (key error if absent) with the row as probabilities; selected
+    # mode takes the first k entries as (log prob, token id) pairs. Rows are left-aligned and the rest
+    # of each row stays at the unavailable markers.
     """Append compact [response, k] arrays after appending generated tokens.
 
     No rescoring is allowed: with stale rollouts it would replace the behavior
@@ -75,6 +100,13 @@ def append_rollout_topk_logprobs(
 
 
 def _support_membership(ids: np.ndarray, support: RolloutSamplingMask) -> tuple[np.ndarray, np.ndarray]:
+    # [FUNCTION DOC] HELPER: For candidate ids of shape (tokens, k), compute (membership, lengths):
+    # membership is a boolean array of the same shape, true where the candidate id is non-negative AND
+    # appears in that token's support set; lengths is the support size per token. Vectorized: combine
+    # row index and id into one 64-bit key (row times 2 to the 32 plus id), sort the support keys, and
+    # binary-search each candidate key. With zero tokens returns an all-false array and an empty
+    # lengths array. KNOWN ISSUE: if there are tokens but the support holds no ids at all, the clamped
+    # lookup index of minus one on an empty array raises an index error.
     """Match candidate IDs to ragged support IDs without a per-token Python loop."""
     n = len(ids)
     if not n:
@@ -94,6 +126,9 @@ def _support_membership(ids: np.ndarray, support: RolloutSamplingMask) -> tuple[
 
 
 def pad_rollout_topk_logprobs(sample: Sample, count: int) -> None:
+    # [FUNCTION DOC] Append count rows of unavailable markers (id minus one, log prob negative infinity)
+    # to whichever of the sample's two arrays exist, keeping dtype and width; arrays that are none are
+    # skipped. Mutates the sample.
     """Pad non-trained tool/observation positions before extending the response."""
     for field, fill in (("rollout_topk_token_ids", -1), ("rollout_topk_log_probs", -np.inf)):
         values = getattr(sample, field)
@@ -103,6 +138,15 @@ def pad_rollout_topk_logprobs(sample: Sample, count: int) -> None:
 
 
 def validate_rollout_topk_logprobs_sample(sample: Sample, k: int) -> None:
+    # [FUNCTION DOC] Check a whole sample's candidate data, raising value error on any violation. First
+    # runs the sample's own validation. Requires candidate ids, candidate log probs and sampled-token
+    # log probs to exist, and the candidate width to equal k. Valid slots are ids >= 0. Checks in
+    # order: no duplicate valid ids within a row; every trained token (loss mask, default all ones)
+    # has at least one valid candidate; if a sampling mask exists, for trained tokens the valid slots
+    # equal membership in the support and the valid count equals the support size; at slots whose id
+    # equals the actually sampled token on trained positions, the candidate log prob must be close
+    # (absolute and relative tolerance 1e-5) to the sampled-token log prob. CPU and memory heavy
+    # (sorting the whole sample), so callers should run it only under CI test.
     """Validate candidate distributions, including custom producers and restored rollouts.
 
     Full-sample sorting and support matching have significant CPU and memory costs;
@@ -135,6 +179,10 @@ def validate_rollout_topk_logprobs_sample(sample: Sample, k: int) -> None:
 
 
 def merge_rollout_topk_logprobs_field(first: Sample, second: Sample, field: str, gap: int) -> np.ndarray | None:
+    # [FUNCTION DOC] Concatenate one candidate array of two turns with "gap" rows of unavailable markers
+    # between them (id minus one for the token id field, negative infinity for the log prob field).
+    # Returns none if both are none; raises value error if only one exists or the widths differ.
+    # Returns a new array; inputs are unchanged.
     a, b = getattr(first, field), getattr(second, field)
     if a is None and b is None:
         return None

@@ -1,3 +1,7 @@
+# [MODULE DOC] Post-processing of freshly collected rollout data before it is converted for
+# training: validates sibling samples of compact rollouts, flattens nested lists, and trims the
+# sample list to a multiple of the global batch size (optionally a dynamic one chosen to yield
+# exactly one training step per rollout).
 import itertools
 import logging
 
@@ -7,6 +11,15 @@ logger = logging.getLogger(__name__)
 
 
 def postprocess_rollout_data(args, data, train_parallel_config):
+    # [FUNCTION DOC] Turn raw rollout output (a possibly nested list of samples) into a flat list ready
+    # for batching. Returns (data, metadata mapping). Steps: validate compact rollout ids; flatten
+    # nested lists until the first element is not a list; a rollout is "compact" if any sample has a
+    # rollout id, and compact rollouts are never trimmed by sample count. Unless trimming is
+    # disabled or the rollout is compact: pick the global batch size from args, or, with dynamic
+    # global batch size enabled, compute it from the data-parallel size and sample count and record
+    # it in metadata under dynamic_global_batch_size; if the sample count is not a multiple of the
+    # batch size, drop trailing samples down to the largest multiple (raises value error when fewer
+    # samples than one batch). Logs counts. The input must be non-empty (indexing the first element).
     metadata = {}
 
     validate_compact_rollout_ids(data)
@@ -42,6 +55,12 @@ def postprocess_rollout_data(args, data, train_parallel_config):
 
 
 def validate_compact_rollout_ids(node, depth=0):
+    # [FUNCTION DOC] Recursively validate a nested rollout output node (a sample, or a list of nodes).
+    # A lone sample is fine. A non-list, non-sample node raises assertion error. For a list whose
+    # first element is a sample (a leaf group): only if depth is at least 2 and it has more than one
+    # sample, asserts that no sample lacks a rollout id (message lists missing positions) and that
+    # all share the same rollout id. Other lists recurse into each item with depth plus one.
+    # Shallow leaves (ordinary groups at depth below 2, or single-sample leaves) are not checked.
     """Require compact leaves (``list[Sample]`` at depth >= 2, >1 sibling) to
     share a non-None ``rollout_id``; default rollout shapes skip validation."""
     if isinstance(node, Sample):
@@ -63,16 +82,25 @@ def validate_compact_rollout_ids(node, depth=0):
 
 
 def _first_sample(group):
+    # [FUNCTION DOC] HELPER: The first sample found by repeatedly taking the first element of nested
+    # lists. KNOWN ISSUE: not used anywhere in this module (possibly dead code).
     return _first_sample(group[0]) if isinstance(group[0], list) else group[0]
 
 
 def _nested_sample_count(group) -> int:
+    # [FUNCTION DOC] HELPER: Total number of non-list leaves in a nested list structure (a non-list
+    # counts as one). KNOWN ISSUE: not used anywhere in this module (possibly dead code).
     if not isinstance(group, list):
         return 1
     return sum(_nested_sample_count(item) for item in group)
 
 
 def _compute_dynamic_global_batch_size(args, train_parallel_config, num_samples: int) -> int:
+    # [FUNCTION DOC] HELPER: Choose a batch size that gives exactly one training step: the sample count
+    # rounded down to a multiple of the data-parallel size (read from the parallel config mapping).
+    # If that is zero (fewer samples than the dp size) use the dp size and warn; in that case the
+    # later trimming raises since samples are fewer than a batch. Logs when the result differs from
+    # the configured batch size or samples are wasted. Returns the integer batch size.
     """Calculate dynamic global_batch_size to ensure only one training step.
 
     Strategy: global_batch_size = num_samples rounded down to a multiple of dp_size

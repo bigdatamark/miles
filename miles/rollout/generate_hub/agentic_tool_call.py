@@ -1,3 +1,12 @@
+# [MODULE DOC] Generic agentic generate function. Flow: start a traced session (session server instance
+# chosen by the tracer), run a user-supplied agent function (inline or in a child process) against the
+# session's OpenAI-compatible URL, then collect the training samples the session server assembled from
+# the recorded model calls. Two session server protocol versions: v1 (a single sample per call; agent
+# metadata and session metadata are merged into it driver-side) and v2 (possibly several samples per
+# call; agent metadata travels through the collect call; speculative decoding metrics are carried in
+# sample metadata). Failures to collect or empty collections yield an aborted copy of the input sample.
+# Also defines command line options (agent function path, run mode, maximum sequence length) and the
+# conversion of internal sampling parameters to chat completion request keyword arguments.
 """
 Generic agentic generate function for agent-environment RL training.
 
@@ -49,6 +58,30 @@ logger = logging.getLogger(__name__)
 
 
 async def generate(input: GenerateFnInput) -> GenerateFnOutput:
+    # [FUNCTION DOC] Generate for one sample by running the agent. Preconditions (assertion errors):
+    # partial rollout is off; session server instances are configured (the session server flag is on).
+    # Version v2 is chosen when the session server flag equals "v2"; speculative metrics are collected
+    # only for v2 with a speculative algorithm. Steps: (1) create the tracing session; (2) load the
+    # agent function by path (assertion error if missing); (3) build the metadata given to the agent: a
+    # copy of the sample metadata plus the maximum sequence length (if set), the session server
+    # instance id (if the tracer has one) and the session server id (always, from the tracer since the
+    # owning address is per session); (4) call the agent with base url, prompt, chat request keyword
+    # arguments derived from sampling parameters, and metadata, in the configured mode; an ordinary
+    # exception is logged as a warning and swallowed (agent metadata stays none); (5) regardless of agent
+    # outcome, collect samples from the session (v2 also sends the agent metadata); only timeouts and
+    # transport errors during collection are swallowed (marking collection failed), other errors (such as
+    # error responses) propagate. If collection failed, or returned no samples (logging whether all were
+    # truncated or no model calls were recorded): return an aborted deep copy of the input sample (a
+    # list for v2, a bare sample for v1), first removing any speculative metrics entry from its
+    # metadata when those are collected. (6) With speculative metrics: take the session's metrics from
+    # the session metadata, raise value error if their session id differs from the tracer's or their
+    # metrics are none, then replace the entry in every sample's metadata with the session-level one.
+    # (7) v2 with several samples: give every sample the same rollout id (input rollout id, else input
+    # index; assertion error if both unset) so they aggregate as one rollout (FIXME in code about index
+    # handling). (8) v1: merge the agent metadata (or nothing) into every sample's metadata. (9) If the
+    # agent reported total tool time under its agent metrics, set it as the non-generation time of every
+    # sample. (10) v2 returns the sample list; v1 requires exactly one sample (unpack error otherwise),
+    # merges the session metadata into it and returns it.
     assert not input.args.partial_rollout, "Partial rollout is not supported"
     assert getattr(input.args, "session_server_instances", None), (
         "agentic_tool_call.generate requires session_server_instances. "
@@ -177,6 +210,11 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
 
 
 def _add_arguments(parser: argparse.ArgumentParser):
+    # [FUNCTION DOC] HELPER: Register this generate function's options on the parser: the agent function
+    # path (text, no default), the run mode (choices inline or subproc, default subproc) and the
+    # maximum sequence length in tokens (integer, default none; truncation happens in the session
+    # server and the value is also forwarded to the agent). Attached below as the generate function's
+    # add-arguments hook.
     parser.add_argument("--custom-agent-function-path", type=str)
     parser.add_argument(
         "--custom-agent-function-mode",
@@ -201,6 +239,12 @@ generate.add_arguments = _add_arguments
 
 # Process keys to match ChatCompletionRequest input
 def build_chat_request_kwargs(sampling_params: dict[str, Any]) -> dict[str, Any]:
+    # [FUNCTION DOC] Convert internal sampling parameters into keyword arguments for a chat completion
+    # request. On a copy: rename maximum new tokens to maximum tokens, minimum new tokens to minimum
+    # tokens and sampling seed to seed; a renamed key is only set if the destination key is not already
+    # present (the existing destination wins), and the source key is always removed. Then keep only keys
+    # that are fields of the chat completion request model, excluding model and messages, and drop
+    # entries whose value is none. Returns the new mapping; the input is not modified.
     request_kwargs = dict(sampling_params)
     key_map = {
         "max_new_tokens": "max_tokens",

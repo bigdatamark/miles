@@ -1,3 +1,8 @@
+# [MODULE DOC] HELPER: Sample utilities for multi-turn trajectories and logging. Merging: combine a
+# sequence of per-turn samples into one sample whose token sequence includes the observation tokens
+# (tool or environment text) inserted between turns, with masks, log probs and replay data aligned.
+# Logging: a truncated text preview of a sample and a compact summary of possibly large reward
+# structures (shapes and lengths instead of contents).
 from copy import deepcopy
 from dataclasses import fields
 from typing import Any
@@ -17,6 +22,12 @@ _REPLAY_FIELDS = (
 
 
 def merge_samples(samples: list[Sample], tokenizer) -> Sample:
+    # [FUNCTION DOC] Fold per-turn samples (non-empty list; index error otherwise) left to right into one
+    # sample using the pairwise merge. Stops early and returns what has been accumulated so far when the
+    # accumulated sample is not completed (an in-turn truncation ends the trajectory; TODO in code about
+    # how to handle it) or when the next sample would introduce a replay data gap (a replay field, such
+    # as routed experts, indexer top-k or sampling mask, present so far but absent in the next). A
+    # single sample is returned as is (same object, not copied).
     acc = samples[0]
     for sample in samples[1:]:
         # Only a COMPLETED turn can be extended by a later turn; if an
@@ -32,26 +43,56 @@ def merge_samples(samples: list[Sample], tokenizer) -> Sample:
 
 
 def _introduces_replay_gap(a: Sample, b: Sample) -> bool:
+    # [FUNCTION DOC] HELPER: True if any replay field is present on the first sample but absent on the
+    # second.
     return any(getattr(a, field) is not None and getattr(b, field) is None for field in _REPLAY_FIELDS)
 
 
 def _merge_sample_pair(a: Sample, b: Sample, tokenizer) -> Sample:
+    # [FUNCTION DOC] HELPER: Merge a later turn b into an earlier turn a, both deep-copied first (inputs
+    # unchanged). Requirements, checked with assertion errors that get a note holding both samples:
+    # both pass their own validation; b's prompt starts with a's prompt (text or list); b's tokens
+    # start with a's tokens; the observation length (b tokens beyond a tokens and b's own response) is
+    # positive; sampling masks are mergeable; if a has routed experts or indexer top-k then b has them
+    # with at least as many rows; a is completed. Missing loss masks default to ones and missing rollout
+    # log probs to zeros over each response. Observation text = tokenizer decode of the observation
+    # tokens. The merged sample takes: prompt, tokens, routed experts, indexer top-k and status from b;
+    # response = a text + observation text + b text; response length = a + observation + b; loss mask
+    # with zeros over the observation; weight versions concatenated; rollout log probs with zeros over
+    # the observation; top-k candidate arrays merged with a gap; sampling mask merged; teacher log probs
+    # and reverse KL (if either exists) merged like log probs with zeros (missing side zero-filled);
+    # speculative decoding and prefix cache counters summed; metadata merged (see below). These fields
+    # must be equal in both turns (assertion error otherwise): group index, index, rollout id,
+    # multimodal inputs and train inputs, label, reward, remove flag, generate function path, train
+    # metadata, reward spec, routing key, trainer model id, non-generation time. Metadata merge: the
+    # per-token student top log probs (OPD) must be both present or both absent with lengths matching
+    # each response, and are joined with empty lists over the observation; lifecycle entries are
+    # concatenated (a single non-list value is wrapped); the messages entry takes b's if truthy else
+    # a's; everything else (after removing these three keys) must be equal in both. Returns the new
+    # sample.
     """Merge two samples generated from sibling inference engine calls."""
     a, b = deepcopy(a), deepcopy(b)
 
     def _merge_equal_value(field):
+        # [FUNCTION DOC] HELPER: The value of the field if equal in a and b, else assertion error.
         x = getattr(a, field)
         y = getattr(b, field)
         assert x == y, f"{field} mismatch: a.{field}={x}, b.{field}={y}"
         return x
 
     def _fill_defaults(sample: Sample):
+        # [FUNCTION DOC] HELPER: Mutate the sample so a missing loss mask becomes ones and missing
+        # rollout log probs become zeros, each of the response length.
         if sample.loss_mask is None:
             sample.loss_mask = [1] * sample.response_length
         if sample.rollout_log_probs is None:
             sample.rollout_log_probs = [0.0] * sample.response_length
 
     def _merge_optional_per_token(field):
+        # [FUNCTION DOC] HELPER: Merge an optional per-token list field: none if both are none; else the
+        # a values (zeros over a's response if missing), then zeros over the observation, then the b
+        # values (zeros over b's response if missing). Uses the observation length of the enclosing
+        # function.
         # Optional OPD per-token lists (teacher_log_probs, opd_reverse_kl): merge like
         # rollout_log_probs when present (zeros over the injected observation span), else keep None.
         av, bv = getattr(a, field), getattr(b, field)
@@ -62,6 +103,8 @@ def _merge_sample_pair(a: Sample, b: Sample, tokenizer) -> Sample:
         return av + [0.0] * obs_len + bv
 
     def _pop_opd_student_top_logprobs(metadata):
+        # [FUNCTION DOC] HELPER: Return (copy of the metadata without the student top log probs key, the
+        # removed value or none). Metadata none gives (none, none). The input is not modified.
         if metadata is None:
             return None, None
         metadata = deepcopy(metadata)
@@ -69,6 +112,9 @@ def _merge_sample_pair(a: Sample, b: Sample, tokenizer) -> Sample:
         return metadata, top_logprobs
 
     def _merge_opd_student_top_logprobs(av, bv):
+        # [FUNCTION DOC] HELPER: Merge the two turns' per-token student top log probs lists: none if both
+        # none; assertion errors if only one is present or a length differs from its sample's response
+        # length; otherwise a's list, one empty list per observation token, then b's list.
         if av is None and bv is None:
             return None
         assert av is not None and bv is not None, (
@@ -88,6 +134,9 @@ def _merge_sample_pair(a: Sample, b: Sample, tokenizer) -> Sample:
         return av + [[] for _ in range(obs_len)] + bv
 
     def _pop_lifecycle(metadata):
+        # [FUNCTION DOC] HELPER: Split metadata into (metadata without the lifecycle key, lifecycle as a
+        # list). Empty metadata or no key gives (metadata unchanged, empty list); a non-list value is
+        # wrapped into a one-element list.
         if not metadata or "lifecycle" not in metadata:
             return metadata, []
         value = metadata["lifecycle"]
@@ -95,11 +144,18 @@ def _merge_sample_pair(a: Sample, b: Sample, tokenizer) -> Sample:
         return rest, value if isinstance(value, list) else [value]
 
     def _pop_messages(metadata):
+        # [FUNCTION DOC] HELPER: Split metadata into (metadata without the messages key, the messages
+        # value or none). Empty metadata or no key gives (metadata unchanged, none).
         if not metadata or "messages" not in metadata:
             return metadata, None
         return {k: v for k, v in metadata.items() if k != "messages"}, metadata["messages"]
 
     def _merge_metadata():
+        # [FUNCTION DOC] HELPER: Merge the two samples' metadata as described in the enclosing function.
+        # Asserts the remaining metadata (after removing student top log probs, lifecycle and messages)
+        # is equal, then re-adds merged student top log probs (if any), concatenated lifecycle (if any
+        # entries) and messages (b's if truthy, else a's, if not none) to a copy of a's remainder.
+        # Returns the merged metadata, which may be none when nothing remains.
         a_metadata, a_top_logprobs = _pop_opd_student_top_logprobs(a.metadata)
         b_metadata, b_top_logprobs = _pop_opd_student_top_logprobs(b.metadata)
         a_metadata, a_lifecycle = _pop_lifecycle(a_metadata)
@@ -189,7 +245,10 @@ def _merge_sample_pair(a: Sample, b: Sample, tokenizer) -> Sample:
 
 
 def _merge_spec_info(a: Sample.SpecInfo, b: Sample.SpecInfo) -> Sample.SpecInfo:
+    # [FUNCTION DOC] HELPER: Speculative decoding counters of the merged sample: correct drafts,
+    # proposed drafts, verify count and completion tokens, each the sum over both turns.
     def _merge_plus_value(field):
+        # [FUNCTION DOC] HELPER: Sum of the named field over a and b.
         return getattr(a, field) + getattr(b, field)
 
     return _create_with_all_fields(
@@ -202,7 +261,10 @@ def _merge_spec_info(a: Sample.SpecInfo, b: Sample.SpecInfo) -> Sample.SpecInfo:
 
 
 def _merge_prefix_cache_info(a: Sample.PrefixCacheInfo, b: Sample.PrefixCacheInfo) -> Sample.PrefixCacheInfo:
+    # [FUNCTION DOC] HELPER: Prefix cache counters of the merged sample: cached tokens and total prompt
+    # tokens, each the sum over both turns.
     def _merge_plus_value(field):
+        # [FUNCTION DOC] HELPER: Sum of the named field over a and b.
         return getattr(a, field) + getattr(b, field)
 
     return _create_with_all_fields(
@@ -213,6 +275,9 @@ def _merge_prefix_cache_info(a: Sample.PrefixCacheInfo, b: Sample.PrefixCacheInf
 
 
 def _create_with_all_fields(cls, **kwargs):
+    # [FUNCTION DOC] HELPER: Construct the dataclass from keyword arguments after asserting the keyword
+    # names equal exactly the dataclass field names (assertion error listing missing and extra names).
+    # This forces the merge code to be updated whenever a field is added to the sample type.
     expected = {f.name for f in fields(cls)}
     actual = set(kwargs.keys())
     assert (
@@ -222,6 +287,8 @@ def _create_with_all_fields(cls, **kwargs):
 
 
 def _startswith(*, short, long) -> bool:
+    # [FUNCTION DOC] HELPER: Prefix test for two strings, or for two lists (long at least as long and its
+    # leading elements equal to short). Any other type combination raises not-implemented error.
     if isinstance(short, str) and isinstance(long, str):
         return long.startswith(short)
     if isinstance(short, list) and isinstance(long, list):
@@ -230,12 +297,17 @@ def _startswith(*, short, long) -> bool:
 
 
 def _len_or_value(value: Any) -> Any:
+    # [FUNCTION DOC] HELPER: For a mapping, list, tuple or string return a mapping of the type name and
+    # the length; any other value is returned as is.
     if isinstance(value, (dict, list, tuple, str)):
         return {"type": type(value).__name__, "len": len(value)}
     return value
 
 
 def sample_text_preview(sample: Sample, max_chars: int = 512) -> str:
+    # [FUNCTION DOC] One-line log preview: the text form of the prompt followed by the response, with
+    # newlines shown as backslash-n. If longer than max_chars (default 512), keeps the first max_chars
+    # characters and appends a marker with the number of dropped characters. Returns the text.
     text = (str(sample.prompt) + sample.response).replace("\n", "\\n")
     if len(text) <= max_chars:
         return text
@@ -243,6 +315,12 @@ def sample_text_preview(sample: Sample, max_chars: int = 512) -> str:
 
 
 def reward_log_summary(reward: Any) -> Any:
+    # [FUNCTION DOC] Compact loggable form of a reward. A non-mapping reward goes through the length
+    # helper (container types become type and length; scalars unchanged). For a mapping: each value that
+    # is not itself a mapping is summarized the same way; each mapping value becomes a mapping with its
+    # list of keys and, if it has a nested meta info mapping, a summary (via the length helper) of
+    # whichever of these keys are present: id, finish reason, prompt tokens, weight version, input token
+    # log probs, input token ids log probs, input top log probs. Returns the summary; input unchanged.
     """Summarize a reward (which for OPD scoring can be a large nested dict of logprobs)
     into shapes/lengths instead of dumping the whole thing into the log."""
     if not isinstance(reward, dict):

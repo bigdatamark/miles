@@ -1,3 +1,8 @@
+# [MODULE DOC] Multi-turn generation with tool calling: repeatedly query the policy through the router's
+# generate endpoint, parse tool calls from the reply, run the tools and append their responses to the
+# token sequence, until the model stops calling tools, hits a length/abort stop, a request cannot be
+# built, or the turn limit is reached. Defines its command line options (turn limit, tool specs path,
+# tool call parser name, tool execution function path) as an add-arguments hook on the function.
 """
 Simple multi-turn generation with tool calling.
 """
@@ -24,6 +29,22 @@ from miles.utils.lifecycle import TrajectoryLifecycle
 
 
 async def generate(input: GenerateFnInput) -> GenerateFnOutput:
+    # [FUNCTION DOC] Run a multi-turn tool-calling episode on a deep copy of the input sample and
+    # return it as the single output sample. Setup: asserts partial rollout is off; router generate URL
+    # from args; loads the tool execution function and tool specs by their paths and creates the tool
+    # call parser (named in args) for those specs; if debug trajectory saving is enabled, starts a
+    # recorded conversation from the prompt (when the prompt is a message list, else empty). Initial
+    # tokens: prompt ids computed with the tool specs. Loop up to the maximum number of turns: build the
+    # request payload from current tokens, sampling parameters and the evaluation flag (if no payload
+    # can be built, set the sample status to the returned halting status and stop); post it with routing
+    # headers; unless evaluating, record a generation span (turn number, completion token count) on the
+    # trajectory timeline; update the sample from the response, extending response tokens, log probs
+    # and the loss mask (loss mask enabled); if recording, append the assistant text and store a
+    # snapshot of the conversation under messages in the sample metadata; stop if the finish reason is
+    # abort or length; parse tool calls from the text and stop if none; otherwise execute them
+    # (recording a tool span), append the tool responses to the sample tokens (tokenizer-aware, non-model
+    # tokens masked out), and extend the recorded conversation. Reaching the turn limit simply ends the
+    # loop without setting a status.
     # ----------------------- Setup -------------------------
 
     args = input.args
@@ -94,6 +115,9 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
 
 
 def _add_arguments(parser: argparse.ArgumentParser):
+    # [FUNCTION DOC] HELPER: Register this generate function's options: maximum turns (integer, default
+    # 16), tool specs path, tool call parser name, and tool execution function path (all text, no
+    # default). Attached below as the function's add-arguments hook.
     parser.add_argument("--generate-max-turns", type=int, default=16)
     parser.add_argument("--generate-tool-specs-path", type=str)
     parser.add_argument("--generate-tool-call-parser", type=str)

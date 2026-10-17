@@ -1,3 +1,12 @@
+# [MODULE DOC] Conversion of generated rollout samples into training data and splitting that data
+# across data-parallel ranks. Steps: (1) turn samples into a mapping of column name to per-sample
+# lists (tokens, lengths, rewards, loss masks and optional extras such as log probs, top-k,
+# sampling masks, routed experts, multimodal inputs, teacher log probs); (2) post-process rewards
+# (optional per-rollout group normalization); (3) split into per-rank shards, either with a
+# micro-batch schedule precomputed on the rollout side or with a legacy partition (balanced by
+# sequence length or round-robin), and put the shards into the object store; (4) the train-side
+# completion step for a received shard. Also defines the dtype table of tensor columns and the
+# object store value spec (codec per column).
 import logging
 from typing import Any
 
@@ -14,6 +23,8 @@ from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
 
+# Table from column name to the element dtype name used when encoding that column as a typed
+# ragged tensor list in the object store. Every key here also gets the typed-ragged codec below.
 ROLLOUT_DATA_TENSOR_DTYPES = {
     "tokens": "int32",
     "target_tokens": "int32",
@@ -30,6 +41,9 @@ ROLLOUT_DATA_TENSOR_DTYPES = {
     "rollout_indexer_topk": "int32",
 }
 
+# Object store encoding spec per column: typed ragged for every tensor column in the dtype table;
+# fixed-dtype arrays for index/length/reward style columns; message-pack ragged for prompt, metadata
+# and weight versions; a ragged tensor dict for multimodal inputs; automatic codec for the rest.
 ROLLOUT_DATA_VALUE_SPEC: dict[str, ValueSpec] = {
     **{field: ValueSpec(codec="typed_ragged") for field in ROLLOUT_DATA_TENSOR_DTYPES},
     "partition": ValueSpec(codec="ndarray", dtype="int64"),
@@ -61,6 +75,30 @@ def convert_samples_to_train_data(
     custom_convert_samples_to_train_data_func,
     custom_reward_post_process_func,
 ):
+    # [FUNCTION DOC] Build the training data mapping (column name to per-sample lists, plus a few
+    # batch-level values) from generated samples. If a custom conversion function is given it is
+    # called with (args, samples) and its result returned unchanged. Otherwise: post-process rewards
+    # (custom hook or default; yields raw and training rewards, each of sample count, asserted).
+    # Base columns: tokens, response lengths, rewards, raw reward, truncated flag (1 for truncated
+    # status), sample indices, rollout ids (rollout id, else sample index). Loss masks: for each
+    # sample, if missing, a mask of ones of the response length is created ON THE SAMPLE (mutation);
+    # its length must equal the response length (assertion error); samples flagged for removal get
+    # their mask overwritten with zeros (mutation). Per-rollout mask sums are derived. Optional
+    # columns decided by the FIRST sample unless noted: raw reward from metadata overrides raw
+    # reward; round number from metadata; rollout log probs. When top-k log probs are requested
+    # (args), every sample must have top-k token ids, top-k log probs and rollout log probs (value
+    # error naming the field and sample index); in CI test mode each sample is validated for k; the
+    # top-k token ids and log probs columns are added. If ANY sample has a sampling mask: each
+    # sample is validated, must have one (value error otherwise), and its id / offset tensors are
+    # collected; when top-k is on, the loss type is score centering and the sampling logprobs mode
+    # is support, the candidate ids are compacted. Routed experts column when the first sample has
+    # it, else value error if routing replay is enabled; same for indexer top-k with indexer replay.
+    # Train metadata column when the first sample has it; multimodal inputs when any sample has
+    # them; weight versions (list of dictionaries per call) when any sample has any; teacher log
+    # probs and on-policy-distillation reverse KL when the first sample has them. Passes through
+    # prompt group sizes from the metadata mapping when present. Finally asserts that the
+    # dynamic-global-batch-size launch flag is on exactly when the metadata supplies a value, and
+    # copies the value. Returns the mapping.
     """
     Convert inference generated samples to training data.
     """
@@ -197,6 +235,16 @@ def convert_samples_to_train_data(
 
 
 def _compact_candidate_ids(data: dict) -> None:
+    # [FUNCTION DOC] HELPER: Optimization that stops duplicating the dense top-k token ids when they
+    # coincide with the sampling-mask support ids. Mutates the data mapping. For each sample (parallel
+    # lists of dense top-k ids, top-k log probs, support ids, support offsets) it verifies the layout
+    # is exactly compactable: dense ids are two-dimensional with the same shape as the log probs and
+    # one row per offset interval; valid (non-negative) entries form a left-aligned prefix per row
+    # with padding equal to minus one; the per-row valid counts equal the support interval lengths
+    # for non-empty rows; the valid dense ids equal the corresponding support ids; and rows with no
+    # valid ids have all log probs negative infinity. If ANY check fails for ANY sample, it returns
+    # with the data completely unchanged (all or nothing). On success it stores a per-sample list of
+    # valid counts under the top-k lengths column and deletes the dense top-k token ids column.
     """Share ordered support IDs in training batches; preserve other producer layouts."""
     lengths = []
     for dense, logps, support, offsets in zip(
@@ -228,6 +276,8 @@ def _compact_candidate_ids(data: dict) -> None:
 
 
 def _compute_rollout_mask_sums(rollout_ids: list[int], loss_masks: list[list[int]]) -> list[int]:
+    # [FUNCTION DOC] HELPER: Sum each sample's loss mask per rollout id, then return for every sample
+    # the total of its rollout (in input order). Lists must have equal length (strict zip).
     """Whole-rollout loss-mask total per sample: every sibling of one rollout carries
     the sum over all of that rollout's samples, so the loss reducer reconstructs one
     token-weighted mean per rollout even when siblings land in different micro-batches."""
@@ -238,6 +288,12 @@ def _compute_rollout_mask_sums(rollout_ids: list[int], loss_masks: list[list[int
 
 
 def _reward_group_segments(args: Any, samples: list[Sample], prompt_group_sizes: list[int] | None) -> list[list[int]]:
+    # [FUNCTION DOC] HELPER: Partition row indices into prompt reward groups, trying in order:
+    # (1) explicit prompt group sizes (multi-LoRA): asserts they sum to the sample count, and makes
+    # consecutive index ranges, skipping groups of size zero; (2) group index on every sample (all
+    # must be non-null): rows grouped by integer group index in first-appearance order; (3) legacy
+    # fixed fan-out: if the sample count equals samples per prompt times rollout batch size, contiguous
+    # blocks of samples per prompt; (4) otherwise a single group of all rows.
     """Return the flattened row indices for each prompt reward group."""
     # Multi-LoRA records explicit prompt boundaries before flattening.
     if prompt_group_sizes is not None:
@@ -278,6 +334,14 @@ def _normalize_rewards_by_rollout(
     raw_rewards: list[float],
     prompt_group_sizes: list[int] | None,
 ) -> list[float]:
+    # [FUNCTION DOC] HELPER: Group-baseline reward normalization where all siblings of one rollout
+    # share one reward. Returns a list of floats, one per sample (empty for no samples). For each
+    # prompt group (see segment helper): group rows by rollout key (rollout id, else sample index,
+    # else the row position); all rows of a rollout must have identical raw rewards (value error
+    # otherwise). The per-rollout rewards are centered by subtracting their mean; if the estimator
+    # is grpo or gspo, std normalization is on, and the group has more than one rollout, they are
+    # divided by (std + 1e-6) when std is positive. The normalized value is broadcast to each
+    # rollout's rows. Single-rollout groups end up centered to zero.
     """Normalize one shared reward per rollout, then broadcast it to siblings."""
     if not samples:
         return []
@@ -328,6 +392,11 @@ def _post_process_rewards(
     custom_reward_post_process_func,
     prompt_group_sizes: list[int] | None = None,
 ):
+    # [FUNCTION DOC] HELPER: Returns a pair (raw rewards, training rewards). A custom post-process
+    # function, if given, is called with (args, samples) and its result returned as is. Otherwise raw
+    # rewards are each sample's reward value under args; if the estimator is grpo, gspo or
+    # reinforce plus plus baseline and reward normalization is on, the second element is the
+    # rollout-normalized rewards; else it is the same list as raw (identical object).
     if (f := custom_reward_post_process_func) is not None:
         return f(args, samples)
 
@@ -340,6 +409,11 @@ def _post_process_rewards(
 
 
 def split_train_data_by_dp(args, data: dict[str, Any], train_parallel_config: dict | None):
+    # [FUNCTION DOC] Split the batch into one shard per data-parallel rank and store each in the object
+    # store using the shared value spec. Uses the scheduled split when the rollout side can schedule,
+    # otherwise the legacy split with the data-parallel size from the config (a missing config or
+    # missing size raises there). Returns a list of object store references, one per rank in rank
+    # order. Mutates the input mapping by adding total lengths.
     """Split the train data across DP ranks and put the shards into the object store.
 
     When the training backend can consume a rollout-side schedule, the shards
@@ -354,6 +428,10 @@ def split_train_data_by_dp(args, data: dict[str, Any], train_parallel_config: di
 
 
 def can_schedule_on_rollout_side(args, data: dict[str, Any], train_parallel_config: dict | None) -> bool:
+    # [FUNCTION DOC] True only if all hold: the parallel config has everything needed for a full
+    # schedule; multi-LoRA is not enabled; the data has no multimodal inputs; the data has rollout
+    # ids; and the number of distinct rollout ids is at least the global batch size (the dynamic one
+    # from the data if present, else from args).
     """Whether the rollout side can precompute the full DP/mbs schedule."""
     if not has_full_schedule_config(train_parallel_config):
         return False
@@ -370,6 +448,12 @@ def can_schedule_on_rollout_side(args, data: dict[str, Any], train_parallel_conf
 def split_train_data_by_dp_scheduled_raw(
     args, data: dict[str, Any], *, train_parallel_config: dict
 ) -> list[dict[str, Any]]:
+    # [FUNCTION DOC] Compute total lengths (token count per sample; stored into the input mapping,
+    # mutation), choose the global batch size (dynamic one from data if present, else args), and ask
+    # the schedule builder for per-rank partitions, per-rank micro-batch indices, the number of
+    # micro-batches and the number of rollouts, using rollout ids as grouping. Logs these. Packages
+    # shards from the partitions and adds to each: the shared micro-batch count, that rank's micro-
+    # batch indices and the shared rollout count. Returns the list of shard mappings in rank order.
     """DP split with the micro-batch schedule precomputed on the rollout side."""
     total_lengths = [len(t) for t in data["tokens"]]
     data["total_lengths"] = total_lengths
@@ -396,6 +480,11 @@ def split_train_data_by_dp_scheduled_raw(
 
 
 def split_train_data_by_dp_raw(args, data: dict[str, Any], *, dp_size: int) -> list[dict[str, Any]]:
+    # [FUNCTION DOC] Legacy split (training side schedules micro-batches itself). Stores total lengths
+    # into the input mapping (mutation). Partitions: with data balancing on, sequence-length-balanced
+    # equal-size partitions; otherwise round-robin (rank i gets rows i, i + dp, ...). If the data
+    # has adapter slots (multi-LoRA), each partition is sorted by adapter slot so micro-batches are
+    # contiguous per slot. Returns the packaged shards, one per rank.
     """Split the train data by data parallel size."""
     total_lengths = [len(t) for t in data["tokens"]]
     data["total_lengths"] = total_lengths
@@ -415,6 +504,13 @@ def split_train_data_by_dp_raw(args, data: dict[str, Any], *, dp_size: int) -> l
 
 
 def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Build one shard mapping per partition. Each shard holds the partition
+    # itself, then for a fixed list of per-sample columns (those present in the data) the values
+    # selected by the partition's row indices in partition order; and, for batch-level columns that
+    # the train side splits itself (raw reward, total lengths, dynamic global batch size, prompt
+    # group sizes, loss function and its config), the full unsplit value. If the shard has adapter
+    # slots, it also records the configured number of adapters. Note raw reward and total lengths
+    # remain batch-global and are reordered later by the train-side completion step.
     """Package one rollout_data shard per DP rank from precomputed partitions."""
     shards = []
 
@@ -474,6 +570,10 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
 
 
 def process_rollout_data_shard(args, rollout_data):
+    # [FUNCTION DOC] Finish a received shard on the training side: remove the partition entry
+    # (mutation), publish the batch-global total lengths on the global timer object as its sequence
+    # lengths, then replace total lengths in the shard by those of this shard's rows in partition
+    # order. Returns the same mapping. The args parameter is unused.
     """Train-side completion of the DP split: drop the ``partition`` key and
     reorder the batch-global ``total_lengths`` into this shard's row order."""
     partition = rollout_data.pop("partition")

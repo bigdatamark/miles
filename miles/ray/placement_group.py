@@ -1,3 +1,15 @@
+# [MODULE DOC] Ray placement-group creation and the orchestration glue that brings up trainers and
+# rollout components for a run.
+# Responsibilities: (1) reserve one Ray placement group of GPU bundles and reorder its bundles by node
+# and GPU id so that logically adjacent ranks land on adjacent physical GPUs; (2) compute how many
+# GPUs the trainer / rollout sides need under the debug, external-rollout and colocate modes;
+# (3) create worker handles for trainers, take over or wait for externally deployed trainer
+# controllers, restore trainer state and decide the starting rollout id; (4) create the rollout
+# executor and inference controller handles and derive the rollout count from epochs; (5) drive one
+# weight update from trainer to inference engines and optionally log engine weight checksums;
+# (6) optionally start the fault-tolerance API server.
+# Several functions are marked "move when reorganizing files": they are orchestration helpers that
+# do not conceptually belong with placement groups.
 import asyncio
 import logging
 import socket
@@ -47,11 +59,24 @@ logger = logging.getLogger(__name__)
 
 @ray.remote(num_gpus=1)
 class InfoActor:
+    # [CLASS DOC] HELPER: Short-lived Ray actor that reserves exactly one GPU, used only to discover
+    # which node and physical GPU a placement-group bundle landed on. It is killed right after use.
+
     def get_ip_and_gpu_id(self):
+        # [FUNCTION DOC] HELPER: Returns a pair of the node IP address of the hosting node and the
+        # first GPU id assigned to this actor by Ray. Takes no inputs; no side effects.
         return ray.util.get_node_ip_address(), ray.get_gpu_ids()[0]
 
 
 def sort_key(x):
+    # [FUNCTION DOC] HELPER: Sort key for bundle info triples of (bundle index, node identifier, gpu id).
+    # Returns a pair of (list of integers describing the node, gpu id) so that bundles order by node
+    # first and GPU id second. Node description: if the identifier splits on dots into integers it is
+    # treated as an IPv4 address; otherwise it is resolved as a hostname to an IP address and parsed
+    # the same way; if resolution fails (resolver error or non-string identifier), each character of
+    # the identifier is converted to its character code, giving a stable ordering. Note a dotted
+    # identifier with non-integer parts that resolves is used via its resolved address. The bundle
+    # index is ignored. May perform a DNS lookup as a side effect.
     index, node_identifier, gpu_id = x
     # Sort by node IP number and then by GPU ID
     try:
@@ -73,12 +98,23 @@ def sort_key(x):
 
 
 class PlacementGroupInfo(NamedTuple):
+    # [CLASS DOC] Immutable record describing a placement group slice: the Ray placement group (or
+    # nothing when zero GPUs were requested), the bundle indices in reordered (node, GPU) order, and
+    # the physical GPU id of each bundle in the same order. Position i in both lists is logical
+    # index i; consumers use the bundle index to schedule an actor and the GPU id for device mapping.
     pg: PlacementGroup
     pg_reordered_bundle_indices: list[int]
     pg_reordered_gpu_ids: list[int]
 
 
 def _create_placement_group(num_gpus) -> PlacementGroupInfo:
+    # [FUNCTION DOC] HELPER: Reserve num_gpus bundles of one GPU and one CPU each using the pack
+    # strategy, block until the group is ready, then spawn one info actor per bundle to learn each
+    # bundle's node IP and GPU id, and kill the actors afterwards. Bundles are sorted with the sort
+    # key helper (node, then GPU id) and the permutation is returned. Every reordered bundle is
+    # logged at info level. Returns a placement group info; when num_gpus is zero returns a plain
+    # triple of no group and two empty lists (equivalent in shape but not a named tuple instance).
+    # Side effects: Ray resource reservation, actor creation and kill, blocking waits.
     """Create a placement group with the specified number of GPUs."""
     if num_gpus == 0:
         return None, [], []
@@ -120,6 +156,16 @@ def _create_placement_group(num_gpus) -> PlacementGroupInfo:
 
 
 def _get_placement_group_layout(args) -> tuple[int, int]:
+    # [FUNCTION DOC] HELPER: Decide the total GPU count of the placement group and the offset at which
+    # the rollout slice begins (equal to the number of trainer GPUs reserved at the front).
+    # Returns a pair (total GPUs, rollout offset). Steps: trainer GPUs are counted only if the
+    # deploy component selects the trainer, else zero. Debug train-only mode: total is trainer GPUs
+    # plus eval GPUs (eval GPUs only if the deploy component selects inference), offset is trainer
+    # GPUs. Otherwise rollout GPUs = (rollout GPUs, treating unset as zero, plus eval GPUs) only if
+    # inference is selected, else zero. External rollout: nothing is reserved for rollout, so
+    # (0, 0) in debug rollout-only mode, else (trainer, trainer). Debug rollout-only: (rollout, 0).
+    # Colocate: the larger of trainer and rollout GPUs with offset zero (they share GPUs).
+    # Default disaggregated: (trainer + rollout, trainer).
     selector = DeployComponent(args.deploy_component)
     trainer_num_gpus = _compute_trainer_num_gpus(args) if selector.selects(DeployComponent.TRAINER) else 0
     if args.debug_train_only:
@@ -139,11 +185,19 @@ def _get_placement_group_layout(args) -> tuple[int, int]:
 
 
 def _compute_trainer_num_gpus(args) -> int:
+    # [FUNCTION DOC] HELPER: Number of GPUs all actor-role trainers need: the count of actor-role
+    # trainer configs (one per policy) times actor nodes times GPUs per actor node. Critic trainers
+    # are not counted (they share the actor's GPUs).
     num_policies = len([config for config in compute_trainer_configs(args) if config.role == ACTOR_ROLE])
     return args.actor_num_nodes * args.actor_num_gpus_per_node * num_policies
 
 
 def create_placement_groups(args) -> dict[str, PlacementGroupInfo]:
+    # [FUNCTION DOC] Create a single placement group sized by the layout helper and split it into
+    # views. Returns a mapping with key actor (whole reordered bundle list) and key rollout (the
+    # reordered bundle indices and GPU ids from the rollout offset onward), both sharing the same
+    # placement group object; when a critic is used, key critic aliases the actor entry. With zero
+    # GPUs the group is absent and lists are empty. Side effects: logs and reserves Ray resources.
     """Create placement groups for actor and rollout engines."""
 
     num_gpus, rollout_offset = _get_placement_group_layout(args)
@@ -163,6 +217,9 @@ def create_placement_groups(args) -> dict[str, PlacementGroupInfo]:
 
 
 class TrainerInfo(NamedTuple):
+    # [CLASS DOC] Immutable record for one initialized trainer: its worker handle, the rollout id
+    # restored from checkpoint or state, and the rollout id training will actually start from
+    # (which may be overridden by the user-specified start rollout id).
     handle: BaseWorkerHandle
     restored_rollout_id: int
     start_rollout_id: int
@@ -170,6 +227,9 @@ class TrainerInfo(NamedTuple):
 
 # TODO: move (when reorganizing files)
 def create_trainer_handles(args, *, trainer_configs: list[MegatronTrainerConfig]) -> dict[str, BaseWorkerHandle]:
+    # [FUNCTION DOC] Build one trainer controller handle per trainer config using the backend
+    # capability selected from args. Returns a mapping from trainer id to worker handle. Creating a
+    # handle does not itself initialize the trainer.
     capability = get_backend_capability(args)
     return {
         config.trainer_id: create_trainer_controller_handle(args, capability=capability, trainer_id=config.trainer_id)
@@ -179,6 +239,11 @@ def create_trainer_handles(args, *, trainer_configs: list[MegatronTrainerConfig]
 
 # TODO: move (when reorganizing files)
 async def take_over_trainers(args, *, handles: dict[str, BaseWorkerHandle]) -> bool:
+    # [FUNCTION DOC] Wait for any externally deployed trainer controllers to be ready and belong to
+    # this run, then wait until all trainers are idle. Returns whether the trainers were already
+    # resumed (initialized by an earlier orchestrator, i.e. hot restart). If resumed but no
+    # checkpoint tracker exists at the requested load path, the event logger's checkpoint state is
+    # discarded as a side effect.
     await wait_external_trainers(args, handles=handles)
     resumed = await wait_trainers_idle(handles)
 
@@ -189,12 +254,20 @@ async def take_over_trainers(args, *, handles: dict[str, BaseWorkerHandle]) -> b
 
 
 def _trainer_has_checkpoint(args) -> bool:
+    # [FUNCTION DOC] HELPER: True if a checkpoint tracker file at the requested load path records an
+    # iteration. Asserts (raises assertion error) when a multi-policy megatron config is present,
+    # since the base load path then has no tracker.
     assert args.megatron_config is None, "a multi policy run's base --load holds no tracker to read"
     return read_checkpoint_tracker_iteration(args.requested_load) is not None
 
 
 # TODO: move (when reorganizing files)
 async def create_training_model(args, *, handle: BaseWorkerHandle, trainer_id: str, resumed: bool) -> TrainerInfo:
+    # [FUNCTION DOC] Initialize one trainer (or load its existing state when resumed) and return a
+    # trainer info. The init call yields one restored rollout id per worker; all must be equal
+    # (assertion error otherwise) and the single value is the restored rollout id. The start
+    # rollout id is the restored one unless args specifies a start rollout id, which wins (an info
+    # message is logged when it differs). Does not mutate args.
     restored_rollout_ids = await trainer_init_or_load_state(handle, args, trainer_id=trainer_id, resumed=resumed)
     assert len(set(restored_rollout_ids)) == 1, f"trainer {trainer_id!r} restored {restored_rollout_ids}"
     [restored_rollout_id] = set(restored_rollout_ids)
@@ -216,6 +289,14 @@ async def create_training_model(args, *, handle: BaseWorkerHandle, trainer_id: s
 async def create_training_models(
     args, rollout_executor: BaseWorkerHandle
 ) -> tuple[BaseWorkerHandle, BaseWorkerHandle | None]:
+    # [FUNCTION DOC] Bring up all trainers and wire them to the rollout executor. Steps: compute
+    # trainer configs, create handles, take over trainers (yielding the resumed flag); initialize
+    # the single actor-role trainer (exactly one required) with its derived args; if a critic is
+    # used, initialize exactly one critic-role trainer and assert it restored to the same rollout id
+    # as the actor, otherwise assert there are no critic configs. Then write the actor's start
+    # rollout id back into args (mutation), push the actor's training parallel config to the rollout
+    # executor, and ask the executor to load state for the rollout before the start (start minus
+    # one). Returns a pair of (actor handle, critic handle or nothing).
     trainer_configs = compute_trainer_configs(args)
     handles = create_trainer_handles(args, trainer_configs=trainer_configs)
     resumed = await take_over_trainers(args, handles=handles)
@@ -257,6 +338,10 @@ async def create_training_models(
 
 # TODO: move (when reorganizing files)
 async def wait_external_trainers(args, *, handles: dict[str, BaseWorkerHandle]) -> None:
+    # [FUNCTION DOC] If no external trainer controller addresses are configured, do nothing.
+    # Otherwise resolve the address of each trainer id, wait until the static addresses are ready,
+    # fetch every handle's deployment identity concurrently, and verify each identity with the
+    # identity assertion helper (raising assertion error on mismatch). Logs the addresses.
     """Wait for every independently deployed trainer controller, and refuse one that another run deployed."""
     if args.trainer_controller_addrs is None:
         return
@@ -271,6 +356,11 @@ async def wait_external_trainers(args, *, handles: dict[str, BaseWorkerHandle]) 
 
 
 def _assert_external_trainer_in_run(identity: DeploymentIdentity, *, args, trainer_id: str | None = None) -> None:
+    # [FUNCTION DOC] HELPER: Validate that an externally reached trainer deployment identity belongs
+    # to this launch. Raises assertion error (with explanatory message) unless: the run uuid equals
+    # this run's; the deploy component is the trainer-only component (an all-in-one release would
+    # run its own orchestration script); the deploy instance id is unset or equals the trainer id;
+    # and the identity's trainer id equals the expected trainer id.
     assert identity.run_uuid == args.run_uuid, (
         f"{TRAINER_CONTROLLER_ADDRS_FLAG} names the {identity.deploy_component} deployment of run "
         f"{identity.run_uuid}, but this launch drives run {args.run_uuid}: every deployment a split run reaches has "
@@ -301,6 +391,14 @@ async def update_weights(
     rollout_id: int | None = None,
     trainer_model_id: str | None = None,
 ) -> None:
+    # [FUNCTION DOC] Push one set of trained weights to the inference engines. Steps: build the
+    # fault-tolerance test action executor from args; if a rollout id is given run its after-step
+    # actions; ask the inference controller to start the weight update, which returns the updatable
+    # engines info; have the actor model update weights into those engines (returns a weight
+    # version or nothing); on any failure (including cancellation) abort the update on the
+    # controller and re-raise; otherwise end the update passing the snapshot mapping from cell id to
+    # hashes. Then optionally log inference engine weight checksums and, if a weight version was
+    # returned, record it on the rollout executor for the given trainer model id.
     orchestration_executor = FTTestActionOrchestrationExecutor.from_args(args, trainer_model_id=trainer_model_id)
     if rollout_id is not None:
         await orchestration_executor.run_after_step(rollout_id=rollout_id)
@@ -324,6 +422,11 @@ async def update_weights(
 async def _maybe_log_inference_engine_weight_checksums(
     args, *, inference_controller: BaseWorkerHandle, rollout_id: int | None, trainer_model_id: str | None
 ) -> None:
+    # [FUNCTION DOC] HELPER: Ask the inference controller for weight checksums and record them in
+    # the event log. Does nothing if the event logger is not initialized, in debug train-only or
+    # rollout-only mode, or if the check returns empty. Otherwise flattens the per-engine checksums
+    # and logs an engine weight checksum event carrying the rollout id (if none is given, the one
+    # before the start rollout id), the trainer model id and the checksums.
     if not is_event_logger_initialized():
         return
     if args.debug_train_only or args.debug_rollout_only:
@@ -347,6 +450,9 @@ async def _maybe_log_inference_engine_weight_checksums(
 def maybe_start_api_server(
     args, *, trainer_models: dict[str, BaseWorkerHandle], inference_controller: BaseWorkerHandle
 ) -> None:
+    # [FUNCTION DOC] Start the fault-tolerance API server in-process if a port is configured (a
+    # falsy port means disabled and nothing happens). Passes the trainer handles, inference
+    # controller, host, port, fault-tolerance components and the backend's cell operations.
     if not args.api_server_port:
         return
 
@@ -362,6 +468,9 @@ def maybe_start_api_server(
 
 
 class RolloutComponents(NamedTuple):
+    # [CLASS DOC] Immutable bundle of the rollout side handles: the inference controller, the
+    # rollout executor, and the number of rollouts per epoch (only set when it had to be computed
+    # because the total rollout count was not given).
     inference_controller: BaseWorkerHandle
     rollout_executor: BaseWorkerHandle
     num_rollout_per_epoch: int | None
@@ -369,6 +478,14 @@ class RolloutComponents(NamedTuple):
 
 # TODO: move (when reorganizing files)
 async def create_rollout_components(args) -> RolloutComponents:
+    # [FUNCTION DOC] Create and initialize the rollout executor and inference controller. Steps:
+    # unless running train-only without eval GPUs, resolve router addresses from the router
+    # providers and wait for the session server (a static worker provider for the session pool only
+    # if the session server is enabled). Create the rollout executor handle and wait until it is not
+    # yet initialized; create the inference controller handle and init or reset it; initialize the
+    # executor. If args has no total rollout count, fetch rollouts per epoch from the executor and
+    # set the total in args (mutation) to that times the epoch count, asserting it is positive. If
+    # the controller reports eval fleet info, forward it to the executor. Returns the components.
     capability = get_backend_capability(args)
 
     if not args.debug_train_only or args.eval_num_gpus > 0:

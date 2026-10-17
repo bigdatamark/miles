@@ -1,3 +1,11 @@
+# [MODULE DOC] Sandbox provider credential handling for launchers of agent functions. Holds a table of
+# provider specs (Daytona, E2B, Modal) and helpers to: forward address-like environment variables by
+# value while refusing values that embed credentials; check that a credential is available (key file
+# or environment); enforce the key-supply contract at launch (forward only the key FILE PATH, never
+# the secret); preflight the provider SDK import and minimum version; resolve an API key at worker
+# side (environment first, then key file); and run all launcher-side provisioning for one provider.
+# Side effects: functions print status lines to standard output and mutate the environment mapping
+# passed in (not the process environment).
 """Sandbox-provider credentials and endpoints for agent-function launchers.
 
 The contract every sandbox backend shares: rollout workers read a provider
@@ -79,6 +87,9 @@ PROVIDER_CREDENTIALS = {
 
 
 def forward_address(env: dict[str, str], var: str, value: str) -> None:
+    # [FUNCTION DOC] Set the variable to the value in the given environment mapping (mutation), unless
+    # the value contains an at sign, which signals embedded credentials (userinfo of a URL): then
+    # raises a value error telling to use the key file instead. No URL parsing is done.
     """Forward one address-like var by value, refusing one that carries a secret.
 
     What ``forward`` names are endpoints and selectors, which is why they may
@@ -101,6 +112,8 @@ def forward_address(env: dict[str, str], var: str, value: str) -> None:
 
 
 def _key_file_has_value(path: Path) -> bool:
+    # [FUNCTION DOC] HELPER: True if the file can be read as UTF-8 text and has non-whitespace
+    # content; any OS error (missing, permission) gives false. Decoding errors are not caught.
     try:
         return bool(path.read_text(encoding="utf-8").strip())
     except OSError:
@@ -108,6 +121,11 @@ def _key_file_has_value(path: Path) -> bool:
 
 
 def credential_available(spec: dict, *, arg_path: str = "") -> bool:
+    # [FUNCTION DOC] Non-raising check: true if the key file (the explicit path if given, else the
+    # spec's default path, with home expansion) has content, or all of the spec's key environment
+    # variables are set to non-blank values. KNOWN ISSUE: unlike the key-supply function, an explicit
+    # path that is missing does not make this false when the environment variables are set, whereas the
+    # key-supply function raises in that case, contrary to the docstring's claim of the same condition.
     """Whether either supply this provider accepts is in place on this machine.
 
     ``sandbox_key_supply`` raises on the same condition; a caller that needs to
@@ -128,6 +146,14 @@ def sandbox_key_supply(
     default_path: str,
     provision_hint: str,
 ) -> None:
+    # [FUNCTION DOC] Enforce the key-supply contract at launch time. Resolves the key file (explicit
+    # path, else the default, home expanded). Three outcomes in priority order: (1) the file exists
+    # with content: records its path (not content) in the environment mapping under the file variable
+    # name and prints that the file is used; (2) otherwise, an explicit path was given but unusable:
+    # raises value error (explicit config errors fail early); (3) otherwise, if ALL key environment
+    # variables are non-blank in the current process: prints that the worker environment is assumed
+    # to supply them (nothing recorded); (4) otherwise raises value error describing both options and
+    # the provisioning hint. A partial set of variables counts as missing.
     """Key-supply contract, shared by the sandbox backends: rollout workers
     get the provider credential from their OWN environment (e.g.
     platform-injected) or from a file they can read (a dotfile, K8s Secret
@@ -171,6 +197,13 @@ def sandbox_key_supply(
 
 
 def preflight_sdk(module: str, install_hint: str, min_version: str | None = None) -> None:
+    # [FUNCTION DOC] Verify the provider SDK module can be imported (side effect: imports it); on
+    # failure raises runtime error with the install hint, chained from the import error. If a minimum
+    # version is given: reads the installed distribution version using the module name as the
+    # distribution name; if no metadata exists, prints a notice and returns without failing; if the
+    # installed numeric version tuple is lower than the minimum's, raises runtime error with both
+    # versions and the hint. KNOWN ISSUE: tuples of different lengths compare by prefix, so installed
+    # "2.12" counts as lower than a minimum "2.12.0".
     """Preflight the lazily-imported provider SDK. Without this, a missing
     install only surfaces inside each episode's sandbox start, where the
     failed sample is aborted, the group dropped, and the rollout loop refills
@@ -202,6 +235,9 @@ def preflight_sdk(module: str, install_hint: str, min_version: str | None = None
 
 
 def _version_tuple(version: str) -> tuple[int, ...]:
+    # [FUNCTION DOC] HELPER: Split the version on dots; for each piece take its leading digits as an
+    # integer; stop at the first piece without leading digits. So "2.12.0rc1" gives (2, 12, 0) and
+    # "2.x.1" gives (2,). Returns the tuple of integers.
     """Numeric leading components of a version string, enough to compare
     release floors like 2.12 against 2.46.0 or 2.12.0rc1."""
     parts = []
@@ -218,6 +254,10 @@ def _version_tuple(version: str) -> tuple[int, ...]:
 
 
 def resolve_provider_api_key(env_var: str, file_env_var: str, default_path: str) -> str:
+    # [FUNCTION DOC] Worker-side key lookup. Returns the stripped value of the environment variable if
+    # non-blank. Otherwise reads the key file whose path is in the file environment variable (if
+    # non-blank) or the default path (home expanded) and returns its stripped content; an unreadable
+    # file counts as empty. Raises runtime error if no key is found.
     """A provider API key: *env_var*, else the key file.
 
     The file indirection (*file_env_var*, default *default_path*) exists so
@@ -241,6 +281,14 @@ def resolve_provider_api_key(env_var: str, file_env_var: str, default_path: str)
 
 
 def provision_provider(env: dict[str, str], spec: dict, *, arg_path: str = "") -> None:
+    # [FUNCTION DOC] Run all launcher-side provisioning for one provider spec, mutating the given
+    # environment mapping: (1) key supply (see that function; may raise value error); (2) SDK
+    # preflight with the spec's module, hint and optional minimum version (may raise runtime error);
+    # (3) for each default-valued selector variable, forward the process environment value if non-blank
+    # else the default; (4) forward each listed address variable that is set to a non-blank value in the
+    # process environment; both forwarding steps refuse values containing an at sign; (5) if the spec
+    # names a target, print which endpoint will be used: the forwarded value in the mapping, else the
+    # default description.
     """One provider's whole launcher-side provisioning, from its PROVIDER_CREDENTIALS spec:
     key supply (the file's path, never the value), SDK preflight, forwarding the
     address-like vars by value, and echoing which endpoint is in effect."""

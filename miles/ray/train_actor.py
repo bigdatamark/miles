@@ -1,3 +1,8 @@
+# [MODULE DOC] Base class of the per-rank training worker actors (one process per GPU rank) shared by
+# the training backends, plus helpers to find the local GPU and its NVML PCI bus id. The base class
+# sets distributed environment variables, configures logging and the object store, offers common
+# distributed/NUMA initialization, heartbeat and fault-injection RPCs, and declares the abstract
+# interface (init, train, sleep, wake up, save, update weights, parallel config) backends implement.
 import abc
 import logging
 import os
@@ -37,6 +42,11 @@ logger = logging.getLogger(__name__)
 
 
 def get_local_gpu_id():
+    # [FUNCTION DOC] Index of this worker's GPU on its node, for the local rank. If the cell index
+    # environment variable is set (platform-managed launch), the index comes from the worker-in-pod
+    # index read from the environment. Otherwise reads the visible-devices list (CUDA, else HIP): if
+    # unset or empty, the first GPU id Ray assigned; else the position of that Ray GPU id within the
+    # comma-separated visible list (value error if absent). Returns an integer.
     if CELL_INDEX_ENV_VAR in os.environ:
         return read_worker_in_pod_index(os.environ)
 
@@ -48,12 +58,21 @@ def get_local_gpu_id():
 
 
 def _get_nvml_pci_bus_id(device: int) -> str:
+    # [FUNCTION DOC] HELPER: PCI bus id text of a CUDA device in the canonical NVML form
+    # "<domain, 8 uppercase hex digits>:<bus, 2 hex>:<device, 2 hex>.0" (function always 0), built from
+    # the torch device properties. Used to find the device in NVML regardless of visible-device remaps.
     props = torch.cuda.get_device_properties(device)
     # NVML's canonical nvmlPciInfo_t.busId form: 8-hex-digit domain, uppercase, function 0
     return f"{props.pci_domain_id:08X}:{props.pci_bus_id:02X}:{props.pci_device_id:02X}.0"
 
 
 class TrainRayActor(NodeProbeMixin):
+    # [CLASS DOC] Abstract per-rank training actor (one Ray/platform worker per training rank in a
+    # cell). Public state: args, rank-in-cell, world size (cell size); after init: role, reference
+    # model and OPD teacher flags. A heartbeat object is bumped at init and by training so health
+    # checks can observe progress. Subclasses implement the abstract methods below and must provide the
+    # train parallel config attribute returned by the getter.
+
     def __init__(
         self,
         *,
@@ -63,6 +82,11 @@ class TrainRayActor(NodeProbeMixin):
         role: Literal["actor", "critic"],
         cell_index: int,
     ):
+        # [FUNCTION DOC] Light construction (no GPU work). Creates the init-once guard and heartbeat;
+        # exports WORLD_SIZE, RANK (cell-local rank) and LOCAL_RANK (from the local GPU helper) into the
+        # process environment (side effect used by torch distributed init); configures process logging
+        # with a training identity (role as component, trainer model id, cell index, rank within
+        # cell); and initializes the object store instance for the process.
         self._init_once = InitOnce(type(self).__name__)
 
         self.args = args
@@ -90,6 +114,11 @@ class TrainRayActor(NodeProbeMixin):
         object_store.init_instance(args)
 
     def load_hf_assets(self, *, with_processor: bool = False) -> None:
+        # [FUNCTION DOC] Load Hugging Face assets from the configured HF checkpoint, one rank at a time
+        # (serialized across ranks to avoid disk/network stampedes): the model config, the tokenizer
+        # (with the configured chat template path, remote code trusted), and, only if requested AND the
+        # config has a vision config, the multimodal processor. Sets hf_config, tokenizer and
+        # (conditionally) processor on the instance.
         with one_rank_at_a_time():
             self.hf_config = load_hf_config(self.args.hf_checkpoint)
             self.tokenizer = load_tokenizer(
@@ -99,9 +128,14 @@ class TrainRayActor(NodeProbeMixin):
                 self.processor = load_processor(self.args.hf_checkpoint, trust_remote_code=True)
 
     def propose_master_addr_and_port(self) -> tuple[str, int]:
+        # [FUNCTION DOC] Propose a rendezvous endpoint on this worker's node: returns (node IP address, a
+        # free port found by scanning upward from a random start between 20000 and 21000). Checks
+        # availability only; does not reserve the port.
         return get_current_node_ip(), get_free_port(start_port=random.randint(20000, 21000))
 
     def configure_master_addr_and_port(self, *, master_addr: str, master_port: int) -> None:
+        # [FUNCTION DOC] Export the rendezvous address and port to the process environment (MASTER_ADDR
+        # and MASTER_PORT as text) for torch distributed initialization.
         os.environ["MASTER_ADDR"] = master_addr
         os.environ["MASTER_PORT"] = str(master_port)
 
@@ -118,10 +152,27 @@ class TrainRayActor(NodeProbeMixin):
         indep_dp_info: IndepDPInfo,
         indep_dp_store_addr: str | None,
     ) -> int | None:
+        # [FUNCTION DOC] Abstract: backend-specific initialization (model, optimizer, checkpoint load).
+        # Receives args, role, reference-model and OPD teacher flags, the optional rank to receive a
+        # checkpoint from when healing, the independent-DP info and store address. Returns the rollout
+        # id restored from the checkpoint (or none). This base raises not-implemented error.
         raise NotImplementedError
 
     @init_once
     def _init_common(self, args: Namespace, role: str, with_ref: bool = False, with_opd_teacher: bool = False) -> None:
+        # [FUNCTION DOC] HELPER: Common one-time initialization for subclasses' init (guarded: repeats
+        # are no-ops). Replaces args on the instance and stores role and flags. Registers the eval
+        # dataset config class as safe for torch checkpoint loading. Binds the CUDA device from the
+        # local rank environment variable (default 0). If deterministic collectives are requested,
+        # registers the deterministic NCCL backend and MUTATES args to use it. Chooses the process group
+        # backend: the configured one, or, when FSDP CPU offload with a CPU backend is configured, a
+        # hybrid "cpu:<cpu backend>,cuda:<backend>" string. Initializes the default torch process group
+        # with the configured timeout in minutes (rendezvous via MASTER_ADDR/PORT, RANK, WORLD_SIZE
+        # environment), then a gloo group. Records rank and world size into args (mutation) and rebinds
+        # env reporting. Then best-effort NUMA affinity: skipped on ROCm (logged); otherwise with NVML:
+        # init, find the NVML handle of the bound device via its PCI bus id (ignoring visible-device
+        # remapping), set CPU affinity for it, log, shut down. Missing NVML or any failure only logs
+        # (never raises; logged at info with a "Warning" prefix). Finally bumps the heartbeat.
         self.args = args
         self.role = role
         self.with_ref = with_ref
@@ -182,34 +233,48 @@ class TrainRayActor(NodeProbeMixin):
         self._heartbeat.bump()
 
     def is_initialized(self) -> bool:
+        # [FUNCTION DOC] Whether the common initialization has completed.
         return self._init_once.is_initialized()
 
     def load_state(self) -> int:
+        # [FUNCTION DOC] Default for backends that cannot reload state in place: always raises
+        # not-implemented error naming the class. Backends that can reload override it and return the
+        # restored rollout id.
         raise NotImplementedError(f"{type(self).__name__} cannot reload its state without restarting")
 
     @rpc(concurrency_group="heartbeat_status")
     def get_heartbeat_status(self) -> HeartbeatStatus:
+        # [FUNCTION DOC] RPC on its own concurrency group (answers even while training blocks): returns
+        # the heartbeat's current status snapshot, proving the process is alive.
         return self._heartbeat.status()
 
     @rpc(concurrency_group="fault_injector")
     def inject_fault(self, mode: str) -> None:
+        # [FUNCTION DOC] Test-only RPC on a dedicated concurrency group: trigger the named failure mode
+        # in this process via the fault injector (may crash, hang, or otherwise misbehave on purpose).
         _inject_fault(mode=mode)
 
     @rpc(concurrency_group="kill_self")
     def kill_self(self) -> None:
+        # [FUNCTION DOC] RPC on a dedicated concurrency group: terminate this process immediately with
+        # exit status 1, skipping cleanup handlers (the RPC therefore never returns normally).
         os._exit(1)
 
     def clear_memory(self) -> None:
+        # [FUNCTION DOC] Print memory usage, release cached GPU/host memory via the shared helper, and
+        # print memory usage again.
         print_memory("before TrainRayActor.clear_memory")
         clear_memory()
         print_memory("after TrainRayActor.clear_memory")
 
     @abc.abstractmethod
     def sleep(self) -> None:
+        # [FUNCTION DOC] Abstract: offload training GPU memory so rollout engines can use the GPU.
         raise NotImplementedError
 
     @abc.abstractmethod
     def wake_up(self) -> None:
+        # [FUNCTION DOC] Abstract: bring offloaded training state back to the GPU.
         raise NotImplementedError
 
     @abc.abstractmethod
@@ -221,23 +286,39 @@ class TrainRayActor(NodeProbeMixin):
         attempt: int = 0,
         external_data: TrainStepOutput | None = None,
     ) -> TrainStepOutput:
+        # [FUNCTION DOC] Abstract: run one training step on the rollout data (one object store
+        # reference, or a list of them) for the rollout id; optional witness info to verify data
+        # identity, the attempt number (for retries), and externally supplied step output (single-cell
+        # use). Returns the step output with an outcome.
         raise NotImplementedError
 
     @abc.abstractmethod
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
+        # [FUNCTION DOC] Abstract: save a checkpoint for the rollout id; force-sync requests waiting for
+        # asynchronous saves to finish.
         raise NotImplementedError
 
     def export_hf(self, rollout_id: int, path: str) -> None:
+        # [FUNCTION DOC] Optional capability: export current weights as a Hugging Face checkpoint to the
+        # path (used for evaluation snapshots). This default raises not-implemented error naming the
+        # class; backends that support it override.
         """Export current weights as an HF checkpoint to ``path`` (eval snapshots)."""
         raise NotImplementedError(f"{type(self).__name__} does not support HF export")
 
     @abc.abstractmethod
     def update_weights(self, info: UpdatableEngines) -> int | None:
+        # [FUNCTION DOC] Abstract: send current weights to the inference engines described by the
+        # updatable-engines info. Returns the new weight version, or none if not applicable.
         raise NotImplementedError
 
     @abc.abstractmethod
     def _get_parallel_config(self):
+        # [FUNCTION DOC] HELPER: Abstract: compute the backend's parallelism configuration mapping.
         raise NotImplementedError
 
     def get_train_parallel_config(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Return the parallelism configuration mapping (e.g. data-parallel size) stored by
+        # the subclass in an attribute named train parallel config. KNOWN ISSUE: that attribute is never
+        # defined in this base class, so it raises an attribute error unless the subclass sets it
+        # (presumably from the abstract getter) during init.
         return self.train_parallel_config

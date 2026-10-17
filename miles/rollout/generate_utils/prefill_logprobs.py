@@ -1,3 +1,10 @@
+# [MODULE DOC] HELPER: Recompute rollout log probabilities of finished samples by scoring them with a
+# prefill-only request (zero new tokens, greedy) against the engine, instead of using the log probs
+# recorded during decoding. Provides payload builders (single and batched), response extraction with
+# token alignment checks, and two entry points: one for a single sample and one for many samples
+# (batched by shared start position and LoRA adapter when no routing key and no images are involved,
+# else one by one). The engine cache is flushed before scoring so scoring always takes the clean
+# prefill path. Everything is disabled unless the recompute-via-prefill option is on in args.
 from __future__ import annotations
 
 from collections import defaultdict
@@ -12,6 +19,8 @@ from miles.utils.types import Sample
 
 
 def _lora_path_for_sample(args: Any, sample: Sample) -> str | None:
+    # [FUNCTION DOC] HELPER: The fixed LoRA adapter name when LoRA rollout is enabled, else none. The
+    # sample argument is unused (all samples share the adapter).
     """Adapter name to score under: the fixed single-LoRA name, or None."""
     if lora_rollout_enabled(args):
         return LORA_ADAPTER_NAME
@@ -23,6 +32,12 @@ def _build_prefill_scoring_payload(
     sample: Sample,
     sampling_params: Mapping[str, Any],
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Request payload that scores one finished sample. Prompt length = token count
+    # minus response length; raises value error if that is not positive. Payload: all sample tokens as
+    # input ids; the given sampling parameters overridden with zero new tokens, temperature zero and
+    # special tokens kept; log probs on; log-prob start position = prompt length minus one (the engine
+    # returns input log probs from that position with the first entry empty, so the tail then contains
+    # every response token); LoRA adapter if enabled; images (encoded) if the sample has any.
     prompt_len = len(sample.tokens) - sample.response_length
     if prompt_len <= 0:
         raise ValueError(
@@ -56,6 +71,8 @@ def _build_prefill_scoring_payload(
 
 
 def _can_batch_prefill_score(args: Any, samples: list[Sample]) -> bool:
+    # [FUNCTION DOC] HELPER: Batched scoring is allowed only if the router policy does not use routing
+    # keys (a batch has no per-sample headers) and no sample has images.
     if policy_uses_routing_key(args):
         return False
     return not any(sample.multimodal_inputs and sample.multimodal_inputs.get("images") for sample in samples)
@@ -66,6 +83,10 @@ def _build_batch_prefill_scoring_payload(
     samples: list[Sample],
     sampling_params: Mapping[str, Any],
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Combine per-sample scoring payloads into one batch payload: a list of input
+    # id lists, the first payload's sampling parameters, log probs on, and the shared log-prob start
+    # position and LoRA adapter. Raises value error if the samples' start positions differ or their
+    # adapters differ. The samples list must be non-empty (index error otherwise).
     payloads = [_build_prefill_scoring_payload(args, sample, sampling_params) for sample in samples]
     logprob_start_len = payloads[0]["logprob_start_len"]
     if any(payload["logprob_start_len"] != logprob_start_len for payload in payloads):
@@ -88,6 +109,12 @@ def _build_batch_prefill_scoring_payload(
 
 
 def _extract_response_logprobs(sample: Sample, meta_info: Mapping[str, Any]) -> list[float]:
+    # [FUNCTION DOC] HELPER: Take the input token log probs from the response meta info (list of
+    # (log prob, token id, ...) entries; value error if missing or empty) and keep the last
+    # response-length entries. Verifies their token ids equal the sample's response tokens (value error
+    # showing the first eight tokens and lengths on mismatch) and that none of the log probs is none
+    # (value error). Returns the list of log probs. A zero response length would take the whole list
+    # (callers skip such samples).
     input_token_logprobs = meta_info.get("input_token_logprobs")
     if not input_token_logprobs:
         raise ValueError("SGLang prefill scoring response did not include input_token_logprobs")
@@ -117,6 +144,12 @@ async def recompute_rollout_logprobs_via_prefill(
     sampling_params: Mapping[str, Any],
     headers: Mapping[str, str] | None = None,
 ) -> None:
+    # [FUNCTION DOC] Replace one sample's rollout log probs by prefill-scored ones. Does nothing when the
+    # option is off or the sample is aborted. A sample with an empty response gets an empty log prob
+    # list. Otherwise posts the scoring payload to the URL (with optional headers, e.g. routing key),
+    # extracts and validates the response log probs, stores them on the sample and marks the source in
+    # metadata as the prefill recompute. Does NOT flush the engine cache itself. Mutates the sample;
+    # network I/O; value errors on malformed responses.
     if not getattr(args, "recompute_logprobs_via_prefill", False):
         return
     if sample.response_length == 0:
@@ -138,6 +171,15 @@ async def recompute_samples_rollout_logprobs_via_prefill(
     url: str,
     sampling_params: Mapping[str, Any],
 ) -> None:
+    # [FUNCTION DOC] Recompute log probs for many samples. No-op when the option is off. Candidates are
+    # samples with a non-empty response that are not aborted (others untouched, including empty ones
+    # which are NOT given empty lists here). The cache flush URL is the generate URL with its last path
+    # segment replaced by flush_cache. Batched mode (see batching check): group candidates by (log-prob
+    # start position, LoRA adapter); for each group flush the cache, post one batch payload, require the
+    # response to be a list with one output per sample (value errors otherwise), and store each output's
+    # extracted log probs on its sample with the metadata source marker. Single mode: for each sample get
+    # routing headers (may raise value error when a key is missing), flush the cache with those headers
+    # and score with the single-sample function. Mutates samples; network I/O.
     if not getattr(args, "recompute_logprobs_via_prefill", False):
         return
 

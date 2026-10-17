@@ -1,3 +1,10 @@
+# [MODULE DOC] Buffering between producers (the fully-async rollout worker) and consumers (training
+# steps). Contains: the CLI argument registration for per-model custom buffer paths; the abstract
+# buffer contract (put, get, metrics); a default FIFO buffer that filters groups on put (aborted,
+# missing reward, dynamic filter) and on get (stale), applies a capacity bound and collects staleness
+# and filter metrics; and a composite that holds one default (or custom) buffer per trained policy and
+# routes groups by the trainer model id stamped on each sample. A group is a list of samples (or of
+# lists of samples).
 """Data buffer between fully-async rollout production and training consumption.
 
 ``DataBuffer`` is the contract (put / get / get_metrics); ``DefaultDataBuffer``
@@ -36,6 +43,9 @@ DATA_BUFFER_PATH_PER_MODEL_FLAG = "--custom-async-data-buffer-path-per-model"
 
 
 def add_data_buffer_arguments(parser: ArgumentParser) -> None:
+    # [FUNCTION DOC] Register the per-model custom buffer path option on the argument parser: a list of
+    # "MODEL_ID=PATH" strings, default none, with help text explaining that named models use the given
+    # class and other models keep the built-in one. Mutates the parser; returns nothing.
     parser.add_argument(
         DATA_BUFFER_PATH_PER_MODEL_FLAG,
         type=str,
@@ -56,6 +66,8 @@ def add_data_buffer_arguments(parser: ArgumentParser) -> None:
 
 
 def first_sample(group: Group) -> Sample:
+    # [FUNCTION DOC] The first sample of a group, descending one level if the first element is a list.
+    # An empty group raises an index error.
     return group[0][0] if isinstance(group[0], list) else group[0]
 
 
@@ -64,17 +76,24 @@ def first_sample(group: Group) -> Sample:
 
 
 class DataBufferConstructorInput:
+    # [CLASS DOC] Frozen constructor input of buffers: the launch args and the callback applied to the
+    # prompt group of every group that is not trained on (it either drops it or recycles it for
+    # regeneration, depending on the configured handler). KNOWN ISSUE: the frozen dataclass decorator
+    # is separated from the class by a banner comment; harmless since comments are legal there.
     args: Namespace
     unused_handler_fn: Callable[[list[Sample]], None]  # --async-unused-samples-handler, applied to unused groups
 
 
 @dataclass
 class DataBufferInput:
+    # [CLASS DOC] Mutable entry stored in buffers: the original prompt samples (kept so the prompt can be
+    # resubmitted) and the finished group generated from them.
     prompt_group: list[Sample]  # resubmittable, for recycling
     group: Group  # finished samples
 
 
 class DataBuffer(ABC):
+    # [CLASS DOC] Abstract contract of buffers: asynchronous put and get, synchronous per-policy metrics.
     """Store for finished groups between rollout production and training consumption.
 
     The producer puts each finished group as it completes; the consumer gets one
@@ -85,10 +104,14 @@ class DataBuffer(ABC):
 
     @abstractmethod
     async def put(self, input: DataBufferInput) -> None:
+        # [FUNCTION DOC] Abstract: accept a finished group; implementations may store, reject or evict,
+        # and may block the producer when full.
         """Accept a finished group; may store it, reject it, or evict to make room."""
 
     @abstractmethod
     async def get(self, **context) -> DataBufferInput:
+        # [FUNCTION DOC] Abstract: wait for and return one group to train on. The context keywords carry
+        # at least the trainer model id and, for the default buffer, the current weight version.
         """Return one group to train on, waiting until one is available.
 
         ``context`` is the extra information for sample processing at get() time,
@@ -97,6 +120,8 @@ class DataBuffer(ABC):
 
     @abstractmethod
     def get_metrics(self, trainer_model_id: str | None = None) -> dict[str, float]:
+        # [FUNCTION DOC] Abstract: return the mapping of metric name to number for one policy since the
+        # previous call, resetting its window counters.
         """Report the metrics of one policy since its previous call (its window counters reset here)."""
 
 
@@ -104,6 +129,13 @@ class DataBuffer(ABC):
 
 
 class DefaultDataBuffer(DataBuffer):
+    # [CLASS DOC] Single-policy FIFO buffer. State: args; the list of entries (oldest first); the capacity
+    # (floor of capacity factor times rollout batch size, at least 1); the unused-group callback; the
+    # dynamic filter function loaded from args (may be none); one async condition guarding the list and
+    # signalling both producers (space) and consumers (data); the last seen weight version; a metric
+    # gatherer for filter drops; and window counters/lists for metrics (aborted groups, stale groups,
+    # consumed staleness, newest lag, version span, token-weighted lag sums, sample coverage), all reset
+    # by the metrics call.
     """FIFO buffer of finished groups, filtering out what training should not see.
 
     Rejected on put, because the verdict is fixed once the group is generated:
@@ -128,6 +160,11 @@ class DefaultDataBuffer(DataBuffer):
     """
 
     def __init__(self, input: DataBufferConstructorInput):
+        # [FUNCTION DOC] Store args, create the empty buffer, compute capacity as the integer part of
+        # capacity factor times rollout batch size (assertion errors if the factor is not positive or
+        # the capacity is below 1), keep the unused-group callback, load the dynamic filter function by
+        # its configured path, create the condition (needs a running or later-running event loop on
+        # first use), and zero all metric state.
         args = input.args
         self._args = args
 
@@ -153,6 +190,9 @@ class DefaultDataBuffer(DataBuffer):
         self._metric_selected_versioned_samples = 0
 
     async def put(self, input: DataBufferInput) -> None:
+        # [FUNCTION DOC] Run the put-time filters (a rejected group is not stored and put returns at once).
+        # Otherwise, under the condition, wait while the buffer is at capacity (blocking the producer),
+        # append the entry at the tail and wake all waiters.
         if not self._preput_filter(input):
             return
 
@@ -163,6 +203,12 @@ class DefaultDataBuffer(DataBuffer):
             self._cond.notify_all()
 
     def _preput_filter(self, input: DataBufferInput) -> bool:
+        # [FUNCTION DOC] HELPER: Return whether to store the group. In order: (1) aborted filter: if the
+        # group has an aborted sample, count it, hand the prompt group to the unused callback (so it may
+        # be recycled) and reject; (2) missing reward filter: reject and count the drop reason, WITHOUT
+        # calling the unused callback (prompt is discarded); (3) record the group's rewards in the
+        # unfiltered reward statistic; (4) dynamic filter (if any): reject and count the reason, also
+        # without the unused callback. Otherwise accept.
         output = apply_aborted_filter(self._args, input.group)
         if not output.keep:
             self._metric_aborted_groups += 1
@@ -182,6 +228,14 @@ class DefaultDataBuffer(DataBuffer):
         return True
 
     async def get(self, current_version: int | None = None, **_) -> DataBufferInput:
+        # [FUNCTION DOC] Wait for and return the oldest acceptable group. Remembers the given current
+        # weight version if not none (used later by the metrics for buffered-group staleness). Loop under
+        # the condition: wait until the buffer is non-empty; pop the oldest entry and wake producers;
+        # compute the group's version statistics and staleness against the version PASSED TO THIS CALL
+        # (not the remembered one). If staleness is known: if a maximum staleness is configured and
+        # exceeded, log, count a stale group, hand the prompt group to the unused callback and continue
+        # with the next entry; else record the staleness for metrics. Record selected-version metrics
+        # and return the entry. Other context keywords are ignored.
         if current_version is not None:
             self._current_version = current_version
         async with self._cond:
@@ -208,6 +262,10 @@ class DefaultDataBuffer(DataBuffer):
         stats: GroupWeightVersionStats,
         current_version: int | None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Update window metrics for a group handed to training: add its sample and
+        # versioned-sample counts; if oldest and newest versions are known append the newest-minus-oldest
+        # span; if the newest lag against the current version is known append it; if the token-weighted
+        # lag is known add lag times versioned tokens to the lag sum and the tokens to the token count.
         self._metric_selected_samples += stats.sample_count
         self._metric_selected_versioned_samples += stats.versioned_sample_count
 
@@ -224,6 +282,13 @@ class DefaultDataBuffer(DataBuffer):
             self._metric_selected_versioned_tokens += stats.versioned_token_count
 
     def get_metrics(self, trainer_model_id: str | None = None) -> dict[str, float]:
+        # [FUNCTION DOC] Build the metrics mapping (keys prefixed rollout/fully_async/): queue size, aborted
+        # and stale group counts, the gatherer's filter drop and unfiltered reward metrics; when data
+        # exists: mean and max consumed staleness, mean and max post-generation staleness (newest lag),
+        # mean and max generation version span, token-weighted staleness, weight-version sample
+        # coverage; and, from the groups currently buffered, mean and max staleness against the
+        # remembered current version. Then resets every window metric (new gatherer, empty lists, zero
+        # counters). The trainer model id is ignored. Returns the mapping.
         prefix = "rollout/fully_async/"
         metrics = {
             f"{prefix}queue_size": len(self._buffer),
@@ -271,6 +336,10 @@ class DefaultDataBuffer(DataBuffer):
 
 
 class DefaultMultiDataBuffer(DataBuffer):
+    # [CLASS DOC] Composite buffer holding one inner buffer per trained policy model id (the model ids of
+    # the Megatron config), routing puts by each sample's trainer model id and gets/metrics by the
+    # requested id. Inner buffers are the built-in default unless the per-model option names another
+    # class.
     """One plain ``DefaultDataBuffer`` per policy model, composed.
 
     Each policy consumes at its own pace, so each gets its own capacity, staleness accounting and
@@ -278,6 +347,10 @@ class DefaultMultiDataBuffer(DataBuffer):
     """
 
     def __init__(self, input: DataBufferConstructorInput):
+        # [FUNCTION DOC] Parse the per-model path option, read the model ids from the resolved Megatron
+        # config, assert that every named model id is one of them (assertion error listing the unknown
+        # ids), and build one inner buffer per model id from the same constructor input: the class
+        # loaded from the model's path, or the default buffer when none is given.
         paths = _parse_data_buffer_paths(input.args.custom_async_data_buffer_path_per_model)
         model_ids = resolve_megatron_config(input.args).model_ids
         assert not (unknown := sorted(set(paths) - set(model_ids))), (
@@ -289,17 +362,25 @@ class DefaultMultiDataBuffer(DataBuffer):
         }
 
     async def put(self, input: DataBufferInput) -> None:
+        # [FUNCTION DOC] Split the group by trainer model id (see split helper) and put each part into its
+        # policy's inner buffer sequentially. A full inner buffer blocks the whole put, so it delays
+        # other policies' parts too (acknowledged by the TODO).
         # TODO: a full inner blocks the one producer for every policy; give each policy its own dispatcher
         for trainer_model_id, entry in _split_by_trainer_model_id(input).items():
             await self._inner_of(trainer_model_id).put(entry)
 
     async def get(self, trainer_model_id: str | None = None, **context) -> DataBufferInput:
+        # [FUNCTION DOC] Delegate to the inner buffer of the model id (assertion error if unknown),
+        # passing the model id and the other context along.
         return await self._inner_of(trainer_model_id).get(trainer_model_id=trainer_model_id, **context)
 
     def get_metrics(self, trainer_model_id: str | None = None) -> dict[str, float]:
+        # [FUNCTION DOC] Return the metrics of the model's inner buffer (resetting its window).
         return self._inner_of(trainer_model_id).get_metrics(trainer_model_id=trainer_model_id)
 
     def _inner_of(self, trainer_model_id: str | None) -> DataBuffer:
+        # [FUNCTION DOC] HELPER: The inner buffer for the model id; assertion error if the id (including
+        # none) trains no policy of this run.
         assert trainer_model_id in self._inners, (
             f"trainer_model_id {trainer_model_id!r} trains no policy of this run ({sorted(self._inners)}), so "
             f"its groups would queue up in a buffer nobody drains"
@@ -309,6 +390,9 @@ class DefaultMultiDataBuffer(DataBuffer):
 
 # TODO: a policy absent from a trajectory shortens its group below n_samples_per_prompt, which the drain refuses
 def _parse_data_buffer_paths(values: Iterable[str] | None) -> dict[str, str]:
+    # [FUNCTION DOC] HELPER: Parse "MODEL_ID=PATH" entries (none = no entries) into a mapping from model
+    # id to path. Each part is whitespace-stripped (split at the first equals sign). Raises value error
+    # for an entry lacking the separator or with an empty id or path, and for a repeated model id.
     ans: dict[str, str] = {}
     for value in values or []:
         model_id, separator, path = value.partition("=")
@@ -322,6 +406,10 @@ def _parse_data_buffer_paths(values: Iterable[str] | None) -> dict[str, str]:
 
 
 def _split_by_trainer_model_id(input: DataBufferInput) -> dict[str, DataBufferInput]:
+    # [FUNCTION DOC] HELPER: Collect the distinct trainer model ids of the group's samples in order of
+    # first appearance (assertion error if any sample has none). Returns a mapping from id to a buffer
+    # entry with the SAME (shared) prompt group and a group filtered to that id's samples (see filter
+    # helper). The prompt group is therefore recycled per policy part if each is unused.
     trainer_model_ids = list(dict.fromkeys(sample.trainer_model_id for sample in iter_samples(input.group)))
     assert None not in trainer_model_ids, (
         f"a multi policy run routes every group by the policy it belongs to, so the generate function must stamp "
@@ -336,6 +424,9 @@ def _split_by_trainer_model_id(input: DataBufferInput) -> dict[str, DataBufferIn
 
 
 def _filter_group(group: Group, *, trainer_model_id: str) -> Group:
+    # [FUNCTION DOC] HELPER: Keep only samples of the given trainer model id. A plain element is kept if
+    # it matches; a nested list is replaced by the list of its matching samples and dropped entirely if
+    # none match. Order is preserved.
     ans: Group = []
     for item in group:
         if isinstance(item, list):
