@@ -1,3 +1,7 @@
+# [MODULE DOC] Sanity checks on the weight version bookkeeping: that the rollout side is told about
+# published weight versions often enough, and that training samples carry only numeric versions
+# stamped by miles (not the inference server's placeholder). Checks are skipped in debug and LoRA
+# modes. All failures are assertion errors.
 import re
 from argparse import Namespace
 from typing import TYPE_CHECKING
@@ -15,10 +19,15 @@ _MIN_ROLLOUTS_WITHOUT_PUBLISHED_WEIGHT_VERSION = 3
 
 
 def max_rollouts_without_published_weight_version(args: Namespace) -> int:
+    # [FUNCTION DOC] Returns the larger of 3 and the weight update interval plus one.
     return max(_MIN_ROLLOUTS_WITHOUT_PUBLISHED_WEIGHT_VERSION, args.update_weights_interval + 1)
 
 
 def assert_weight_version_is_published(args: Namespace, *, rollouts_since_publish: int) -> None:
+    # [FUNCTION DOC] Returns without checking if rollout-only, train-only, skip-weight-update debug
+    # flags or LoRA are on. Otherwise asserts the number of rollouts served since the last version
+    # publication does not exceed the maximum allowed, with a message explaining the driver must publish
+    # the version after every weight update.
     if args.debug_rollout_only or args.debug_train_only or args.debug_skip_weight_update or is_lora_enabled(args):
         return
 
@@ -31,6 +40,10 @@ def assert_weight_version_is_published(args: Namespace, *, rollouts_since_publis
 
 
 def assert_samples_weight_version_sane(args: Namespace, samples: list["Sample"]) -> None:
+    # [FUNCTION DOC] Returns without checking if rollout-only or skip-weight-update debug flags or LoRA
+    # are on (note: train-only mode is not exempted here, unlike the publication check). Otherwise, for
+    # every weight version span of every sample, asserts the version is not the inference server's
+    # "default" placeholder and consists entirely of decimal digits.
     if args.debug_rollout_only or args.debug_skip_weight_update or is_lora_enabled(args):
         return
 

@@ -1,3 +1,11 @@
+# [MODULE DOC] HELPER: Launches a real rollout-only pipeline (inference engine plus router with
+# session support, no training) that runs the session-verify agent, then checks the per-sample
+# metrics sidecar file the agent wrote. Provides default argument overrides, a parser hook adding a
+# threshold option, model download and placeholder prompt-data creation, serialization of an
+# argument namespace to a command-line string, environment composition, the main runner and the
+# aggregate gate. Writes files under fixed absolute paths (dataset under /root/datasets, models under
+# /root/models), clears proxy environment variables of the process, and shells out via the CI
+# command backend.
 """Boot a real ``miles`` rollout pipeline + run the multi-role TITO driver.
 
 Used by both consumers:
@@ -81,6 +89,9 @@ SESSION_VERIFY_INVARIANT_ARGS: dict[str, Any] = {
 
 
 def session_verify_extras(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    # [FUNCTION DOC] Adds a float option for the assistant-text mismatch ratio threshold (default
+    # 0.2) and sets the invariant argument mapping as parser defaults; returns the same parser.
+    # KNOWN ISSUE: the option help text says the default is 0.1 but the actual default is 0.2.
     """``add_custom_arguments`` hook for ``miles.utils.arguments.parse_args``.
 
     Adds the wrapper-only ``--assistant-text-threshold`` knob (a post-process
@@ -106,6 +117,8 @@ def session_verify_extras(parser: argparse.ArgumentParser) -> argparse.ArgumentP
 
 
 def _ensure_prompt_data() -> str:
+    # [FUNCTION DOC] HELPER: Creates the dataset directory if needed and overwrites the prompt data
+    # file with one JSON line holding the placeholder messages record; returns the path.
     os.makedirs(os.path.dirname(PROMPT_DATA_PATH), exist_ok=True)
     with open(PROMPT_DATA_PATH, "w") as f:
         f.write(json.dumps(_PLACEHOLDER_PROMPT_RECORD) + "\n")
@@ -113,6 +126,11 @@ def _ensure_prompt_data() -> str:
 
 
 def _ensure_model_downloaded(hf_checkpoint: str, *, backend: BaseCommandBackend) -> str:
+    # [FUNCTION DOC] HELPER: Returns the argument unchanged if it is an existing path. Otherwise
+    # treats it as a repo id: target directory is the models root plus the last path component;
+    # creates the models root and runs the hub download command for that repo into the directory via
+    # the backend's CPU command execution (no existence check of the target, so it always downloads);
+    # returns the directory.
     """Return a local model path, downloading HF repos when needed.
 
     Lets callers pass either a HuggingFace repo id (downloaded under
@@ -130,11 +148,25 @@ def _ensure_model_downloaded(hf_checkpoint: str, *, backend: BaseCommandBackend)
 
 
 def _clear_proxy_env() -> None:
+    # [FUNCTION DOC] HELPER: Removes the four HTTP(S) proxy environment variables (both cases) from
+    # the current process environment if present.
     for proxy_var in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
         os.environ.pop(proxy_var, None)
 
 
 def namespace_to_train_args(ns: argparse.Namespace) -> str:
+    # [FUNCTION DOC] Builds a space-joined flag string with a trailing space. Always emits: checkpoint,
+    # prompt data, input key, rollout counts and lengths, temperature, batch size, samples per
+    # prompt, the generate and agent function paths, cycles, failure mode, tito model, message
+    # matcher, GPUs per engine, reasoning parser, reward model type, actor nodes and GPUs per node,
+    # train backend (all required attributes; missing ones raise attribute errors). Conditionally:
+    # total rollout GPUs if set; tool-call parser if truthy; context length, KV cache dtype, mamba
+    # memory ratio, decode CUDA graph max batch size (if present) and prefill CUDA graph backend when
+    # not none; expert-parallel size only if above one; four speculative-decoding flags (EAGLE, 2
+    # steps, topk 1, 3 draft tokens) when spec is enabled; the Anthropic expectation if present and
+    # not none; the session server flag, with its version string when the value is a string; debug
+    # rollout only, CI test, TITO special-token-count threshold (if present and nonzero) and colocate
+    # flags when truthy. Values are not shell-quoted.
     """Serialize a fully-shaped Namespace into the ``train_args`` string.
 
     Reads miles-canonical field names off ``ns``; emits the exact flag set
@@ -216,6 +248,9 @@ def namespace_to_train_args(ns: argparse.Namespace) -> str:
 def _session_verify_env(
     args: argparse.Namespace, metrics_path: str, *, wire_format: SessionWireFormat
 ) -> dict[str, str]:
+    # [FUNCTION DOC] HELPER: Environment variables for the training command: the TITO model and the
+    # metrics sidecar path; for the Anthropic wire format also sets the CI history record directory
+    # variable to an empty string so this run does not overwrite another endpoint's history series.
     env = {
         "MILES_TITO_MODEL": args.tito_model,
         "MILES_SESSION_VERIFY_METRICS_PATH": metrics_path,
@@ -228,6 +263,14 @@ def _session_verify_env(
 
 
 def run_session_verify(args: argparse.Namespace, *, wire_format: SessionWireFormat = "openai") -> None:
+    # [FUNCTION DOC] Raises a value error for an unsupported wire format. Creates the CI command
+    # backend; resolves reasoning and tool-call parsers for the TITO model (mutating the args; value
+    # error on conflict); writes the placeholder prompt data; clears proxy variables; replaces the
+    # checkpoint with a local path (downloading if needed); serializes train args; creates a temporary
+    # metrics file. Executes the training command in rollout-only mode (no megatron model type) with
+    # extra environment, then asserts the metrics gates (append-tool requirement only for the openai
+    # wire format). On any exception copies the metrics file to a path with a failed suffix (logging
+    # the outcome) and re-raises; always deletes the temporary file (ignoring OS errors).
     """Boot ``miles`` rollout pipeline and run the session-verification driver.
 
     Returns nothing on success; raises ``AssertionError`` on TITO mismatch
@@ -304,6 +347,14 @@ def assert_session_verify_metrics(
     special_token_count_threshold: float = 0.0,
     require_append_tool: bool = True,
 ) -> None:
+    # [FUNCTION DOC] Reads the JSON-lines sidecar (blank lines skipped). Verification-error records
+    # are counted (stage and a truncated first example kept) and excluded from sample counts; other
+    # records count as samples, track whether any had an append-tool event, assistant mismatches,
+    # and hard mismatches (count falls back to the type list length; samples whose only hard type is
+    # special-token-count are tracked separately). Then raises assertion errors, in order: any
+    # verification errors; zero samples; hard mismatches in samples beyond the tolerated
+    # special-token-count-only ones, or that tolerated share's ratio above its threshold; no
+    # append-tool event when required; assistant-text mismatch ratio above its threshold. Logs a summary.
     """Read per-sample JSONL metrics and assert cross-sample verifier gates.
 
     Forbidden mismatch types (special_*, non_assistant_text) are recorded by

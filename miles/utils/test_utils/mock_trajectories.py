@@ -1,3 +1,11 @@
+# [MODULE DOC] HELPER: Fixed multi-turn chat conversations ("trajectories") with tool calls used by
+# chat-template and session-server tests. Provides shared tool definitions (weather, date), two
+# dataclasses (a turn and a resolved trajectory), a helper to find the last user message, a set of
+# plain classes each declaring tools, pretokenize cut positions, the set of non-assistant roles
+# appearing after the first assistant message, a thinking flag and the message list, and builders
+# that split a message list into turns, compute each turn's raw assistant text by rendering with a
+# chat template, and build either an exact-prompt-matching or a sequential reply function for the
+# mock inference server.
 """Multi-turn trajectory definitions for testing.
 
 Each trajectory class defines a complete multi-turn conversation with tool calls.
@@ -80,6 +88,8 @@ ALL_TOOLS = WEATHER_TOOLS + [DATE_TOOL]
 
 @dataclass
 class Turn:
+    # [CLASS DOC] HELPER: One request/response step: the messages sent, the assistant message
+    # answering, and the raw response text (filled by the trajectory builder, default empty).
     """One turn in a multi-turn trajectory."""
 
     request_messages: list[dict[str, Any]]
@@ -89,6 +99,8 @@ class Turn:
 
 @dataclass
 class Trajectory:
+    # [CLASS DOC] HELPER: Resolved trajectory: tool definitions (or none), the list of turns, and
+    # the complete message list.
     """A fully resolved multi-turn trajectory ready for testing."""
 
     tools: list[dict[str, Any]] | None
@@ -102,6 +114,8 @@ class Trajectory:
 
 
 def last_user_index(messages: list[dict[str, Any]]) -> int:
+    # [FUNCTION DOC] HELPER: Scans from the end and returns the index of the last message whose role
+    # is user; raises a value error if there is none.
     """Return the index of the last user message in *messages*."""
     for i in range(len(messages) - 1, -1, -1):
         if messages[i]["role"] == "user":
@@ -115,6 +129,8 @@ def last_user_index(messages: list[dict[str, Any]]) -> int:
 
 
 class SingleToolTrajectory:
+    # [CLASS DOC] HELPER: Data-only scenario: system, user, one assistant weather tool call, one tool
+    # result. Weather tool; cut at 3; append roles tool; no thinking.
     """sys, user, assistant(tool_call), tool — 1 turn"""
 
     TOOLS = WEATHER_TOOLS
@@ -147,6 +163,8 @@ class SingleToolTrajectory:
 
 
 class MultiTurnTrajectory:
+    # [CLASS DOC] HELPER: Data-only scenario: two sequential weather tool-call rounds (Beijing then
+    # Shanghai). Cuts at 3 and 5; append roles tool; no thinking.
     """sys, user, ass(tool), tool, ass(tool), tool — 2 turns"""
 
     TOOLS = WEATHER_TOOLS
@@ -198,6 +216,8 @@ class MultiTurnTrajectory:
 
 
 class MultiToolSingleTurnTrajectory:
+    # [CLASS DOC] HELPER: Data-only scenario: one assistant message with two tool calls (weather and
+    # date) answered by two tool messages. All tools; cut at 3; append roles tool; no thinking.
     """sys, user, assistant(2 tool_calls: weather+date), tool, tool — 1 turn"""
 
     TOOLS = ALL_TOOLS
@@ -243,6 +263,8 @@ class MultiToolSingleTurnTrajectory:
 
 
 class ParallelToolsTrajectory:
+    # [CLASS DOC] HELPER: Data-only scenario: one assistant message with three parallel weather
+    # calls and three tool results. Weather tool; cut at 3; append roles tool; no thinking.
     """sys, user, assistant(3 parallel tool_calls), tool, tool, tool — 1 turn"""
 
     TOOLS = WEATHER_TOOLS
@@ -301,6 +323,8 @@ class ParallelToolsTrajectory:
 
 
 class LongChainTrajectory:
+    # [CLASS DOC] HELPER: Data-only scenario: three tool rounds (weather, date, weather) with
+    # assistant text content. All tools; cuts at 3, 5, 7; append roles tool; no thinking.
     """sys, user, ass(tool), tool, ass(tool:date), tool, ass(tool), tool — 3 turns"""
 
     TOOLS = ALL_TOOLS
@@ -371,6 +395,9 @@ class LongChainTrajectory:
 
 
 class RetrySystemTrajectory:
+    # [CLASS DOC] HELPER: Data-only scenario: two weather rounds with a system retry message between
+    # the first tool result and the second assistant message. Cuts at 3 and 6; append roles tool and
+    # system; no thinking.
     """sys, user, ass(tool), tool, system_retry, ass(tool), tool — 2 turns with mid-conversation system message.
 
     Simulates an agent that injects a system-level retry prompt when the model
@@ -427,6 +454,9 @@ class RetrySystemTrajectory:
 
 
 class MultiUserToolChainTrajectory:
+    # [CLASS DOC] HELPER: Data-only scenario: a tool round, a plain assistant answer, a second user
+    # message, then two more tool rounds. All tools; cuts at 3, 5, 7, 9; append roles tool and user;
+    # no thinking.
     """sys, user1, ass(tool), tool, ass, user2, ass(tool), tool, ass(tool:date), tool
 
     NOTE: This trajectory exercises multiple user messages after a generated
@@ -507,6 +537,9 @@ class MultiUserToolChainTrajectory:
 
 
 class SimpleNoToolTrajectory:
+    # [CLASS DOC] HELPER: Data-only scenario without tools: greeting, assistant reply, system
+    # reminder, second user question, final assistant. No tools; cuts at 3, 4, 5, 6; append roles
+    # user and system; no thinking.
     """sys, user, asst, system_reminder, user2, asst2 — no tools, with system/user append boundaries.
 
     Codifies the synthetic 'single_system' case the old CI used to manually
@@ -529,6 +562,9 @@ class SimpleNoToolTrajectory:
 
 
 class MultiTurnNoToolTrajectory:
+    # [CLASS DOC] HELPER: Data-only scenario without tools: question, answer, follow-up user
+    # message. Cuts at 3 and 5 (5 is past the end, so the appendix is empty); append roles user; no
+    # thinking.
     """sys, user, assistant, user (no tools) — multi-turn plain conversation"""
 
     TOOLS = None
@@ -544,6 +580,8 @@ class MultiTurnNoToolTrajectory:
 
 
 class MultiTurnNoToolThinkingTrajectory:
+    # [CLASS DOC] HELPER: Same as the plain no-tool multi-turn scenario but the assistant carries
+    # reasoning content. Cuts at 3 and 5; append roles user; thinking.
     """sys, user, assistant(reasoning_content), user (no tools) — multi-turn with thinking"""
 
     TOOLS = None
@@ -568,6 +606,9 @@ class MultiTurnNoToolThinkingTrajectory:
 
 
 class SingleToolThinkingTrajectory:
+    # [CLASS DOC] HELPER: Data-only thinking scenario alternating tool results and user messages
+    # across three user turns, ending in a plain assistant answer. Weather tool; cuts at 3 to 8;
+    # append roles tool and user; thinking.
     """sys, user, ass(think+tool), tool, user2, ass(think+tool), tool, user3, ass — multi-role alternating with thinking.
 
     Codifies the synthetic 'alternating_user_tool' case the old CI used to
@@ -633,6 +674,8 @@ class SingleToolThinkingTrajectory:
 
 
 class MultiTurnThinkingTrajectory:
+    # [CLASS DOC] HELPER: Thinking version of the two-round weather scenario. Cuts at 3 and 5;
+    # append roles tool; thinking.
     """sys, user, ass(thinking+tool), tool, ass(thinking+tool), tool — 2 turns"""
 
     TOOLS = WEATHER_TOOLS
@@ -686,6 +729,8 @@ class MultiTurnThinkingTrajectory:
 
 
 class LongChainThinkingTrajectory:
+    # [CLASS DOC] HELPER: Thinking version of the three-round chain. All tools; cuts at 3, 5, 7;
+    # append roles tool; thinking.
     """sys, user, ass(thinking+tool), tool, ass(thinking+tool), tool, ass(thinking+tool), tool — 3 turns"""
 
     TOOLS = ALL_TOOLS
@@ -759,6 +804,8 @@ class LongChainThinkingTrajectory:
 
 
 class MultiUserTurnThinkingTrajectory:
+    # [CLASS DOC] HELPER: Thinking scenario spanning two user turns, the first ending with a plain
+    # assistant answer. Weather tool; single cut at 7; append roles tool and user; thinking.
     """sys, user1, ass(thinking+tool), tool, ass(thinking), user2, ass(thinking+tool), tool
 
     Cross-user-turn with thinking. Tests that thinking content from user turn 1
@@ -830,6 +877,8 @@ class MultiUserTurnThinkingTrajectory:
 
 
 class IntermediateSystemTrajectory:
+    # [CLASS DOC] HELPER: Three tool rounds with a system message after the first two tool results.
+    # All tools; cuts at 3, 6, 9 (9 is past the end); append roles tool and system; no thinking.
     """sys, user, ass(tool), tool, system, ass(tool:date), tool, system, ass(tool), tool — 3 turns with system"""
 
     TOOLS = ALL_TOOLS
@@ -902,6 +951,8 @@ class IntermediateSystemTrajectory:
 
 
 class IntermediateSystemThinkingTrajectory:
+    # [CLASS DOC] HELPER: Thinking version of the intermediate-system scenario. All tools; cuts at
+    # 3, 6, 9; append roles tool and system; thinking.
     """sys, user, ass(t+tool), tool, system, ass(t+tool:date), tool, system, ass(t+tool), tool — 3 turns with system+thinking"""
 
     TOOLS = ALL_TOOLS
@@ -977,6 +1028,9 @@ class IntermediateSystemThinkingTrajectory:
 
 
 class MultiRoleSequenceTrajectory:
+    # [CLASS DOC] HELPER: Scenario combining tool, user and system appends (with a system message
+    # between an assistant tool call and its tool result). All tools; cuts at 3, 4, 6; append roles
+    # tool, user, system; no thinking.
     """sys, user, asst+tool, tool, user2, asst+tool, system_reminder, tool, asst-final.
 
     Fills the {thinking=False, append_roles={tool, user, system}} matrix cell
@@ -1047,6 +1101,11 @@ class MultiRoleSequenceTrajectory:
 
 
 def _split_turns(messages: list[dict[str, Any]]) -> list[tuple[list[dict], dict]]:
+    # [FUNCTION DOC] HELPER: Walks the messages: first collects the leading non-assistant messages;
+    # then, for each assistant message (asserting the next message is an assistant), emits a pair of
+    # (copy of all messages before it, that assistant message), then absorbs the following
+    # non-assistant messages into the history. Returns the list of pairs; the message dicts are
+    # shared, not copied.
     """Split a full message sequence into (request_messages, assistant_message) pairs.
 
     Each assistant message marks the end of one turn.
@@ -1080,6 +1139,12 @@ def build_trajectory(
     trajectory_cls: type,
     chat_template: str | None = None,
 ) -> Trajectory:
+    # [FUNCTION DOC] Deep-copies the class's messages, splits into turns, and for each turn renders
+    # the request messages with a generation prompt and the request plus assistant message without
+    # one (using the given chat template string, or the tokenizer's own when none); asserts the
+    # second text starts with the first (assertion error shows the tails) and sets the turn's
+    # response text to the remainder. Returns the trajectory with the class's tools. Template
+    # rendering errors propagate.
     """Build a Trajectory from a trajectory class.
 
     Splits messages into turns and computes response_text for each turn
@@ -1096,6 +1161,8 @@ def build_trajectory(
     raw_turns = _split_turns(messages)
 
     def _render(msgs: list[dict], add_generation_prompt: bool) -> str:
+        # [FUNCTION DOC] HELPER: Renders messages as text with the class's tools and the given
+        # generation-prompt flag, via the template string if given else the tokenizer.
         if chat_template is not None:
             from miles.utils.chat_template_utils.template import apply_chat_template_from_str
 
@@ -1133,6 +1200,11 @@ def build_process_fn(
     tokenizer: Any,
     chat_template: str | None = None,
 ) -> ProcessFn:
+    # [FUNCTION DOC] Pre-renders each turn's request messages (with generation prompt, trajectory
+    # tools, optional template string else the tokenizer's template) into a prompt-to-response-text
+    # table (later turns with an identical prompt overwrite earlier ones) and returns a reply
+    # function that returns a stop-finished result for an exactly matching prompt and otherwise
+    # raises a value error with the prompt length, known lengths and prompt tail.
     """Build a process_fn that maps rendered prompt strings to response texts.
 
     Pre-computes the exact prompt string for each turn and returns the
@@ -1141,6 +1213,8 @@ def build_process_fn(
     tools = trajectory.tools
 
     def _render(msgs: list[dict]) -> str:
+        # [FUNCTION DOC] HELPER: Renders messages with a generation prompt as text with the
+        # trajectory's tools, via the template string if given else the tokenizer.
         if chat_template is not None:
             from miles.utils.chat_template_utils.template import apply_chat_template_from_str
 
@@ -1154,6 +1228,8 @@ def build_process_fn(
         prompt_response_map[prompt_str] = turn.response_text
 
     def process_fn(prompt: str) -> ProcessResult:
+        # [FUNCTION DOC] HELPER: Returns the canned reply for the exact prompt or raises a value
+        # error describing the mismatch.
         for expected_prompt, response_text in prompt_response_map.items():
             if prompt == expected_prompt:
                 return ProcessResult(text=response_text, finish_reason="stop")
@@ -1167,6 +1243,9 @@ def build_process_fn(
 
 
 class SequentialProcessFn:
+    # [CLASS DOC] HELPER: Callable reply function that ignores the prompt and returns the trajectory
+    # turns' response texts in order, one per call (finish reason "stop"). Raises a value error once
+    # more calls are made than there are turns. Stateful (call counter); not thread-safe.
     """A process_fn that returns response texts in turn order.
 
     Unlike build_process_fn which does exact prompt matching, this version
@@ -1179,13 +1258,17 @@ class SequentialProcessFn:
     """
 
     def __init__(self, trajectory: Trajectory):
+        # [FUNCTION DOC] HELPER: Captures the response texts of all turns and zeroes the counter.
         self._response_texts = [turn.response_text for turn in trajectory.turns]
         self._call_count = 0
 
     def reset(self):
+        # [FUNCTION DOC] HELPER: Restarts from the first turn.
         self._call_count = 0
 
     def __call__(self, prompt: str) -> ProcessResult:
+        # [FUNCTION DOC] HELPER: Returns the next turn's text and advances; raises a value error when
+        # exhausted (the counter is not advanced then).
         idx = self._call_count
         if idx >= len(self._response_texts):
             raise ValueError(

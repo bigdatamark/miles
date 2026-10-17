@@ -1,3 +1,8 @@
+# [MODULE DOC] Core data types shared along the rollout-to-training path: the weight-version span
+# records attached to generated tokens, a per-sample reward spec, the Sample dataclass (prompt,
+# generated tokens, rewards, rollout-side log probabilities and routing records, status, metadata)
+# with serialization, validation, token stripping, retry reset and update-from-engine-metadata
+# behavior, a parameter description record, the rollout batch alias, and multimodal type constants.
 from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from typing import Any
@@ -12,6 +17,9 @@ LEGACY_WEIGHT_VERSIONS_KEY = "legacy_weight_versions"
 
 @dataclass(frozen=True)
 class WeightVersionSpan:
+    # [CLASS DOC] Immutable record that tokens in the half-open absolute range from start to end
+    # (positions in the sample's full token list, prompt included) were generated under the given
+    # weight version string.
     version: str
     abs_start: int
     abs_end: int
@@ -19,17 +27,28 @@ class WeightVersionSpan:
 
 @dataclass
 class WeightVersionsPerCall:
+    # [CLASS DOC] Weight version spans produced by one generation call (mutable list of spans).
     spans: list[WeightVersionSpan] = field(default_factory=list)
 
     def to_dicts(self) -> list[dict]:
+        # [FUNCTION DOC] Returns each span as a mapping of its three fields.
         return [asdict(span) for span in self.spans]
 
     @staticmethod
     def from_dicts(data: list[dict]) -> "WeightVersionsPerCall":
+        # [FUNCTION DOC] Builds an object from a list of span mappings (unknown keys raise a type error).
         return WeightVersionsPerCall(spans=[WeightVersionSpan(**span) for span in data])
 
     @staticmethod
     def from_meta_info(meta_info: dict, output_end: int) -> "WeightVersionsPerCall":
+        # [FUNCTION DOC] Converts the inference engine's per-call metadata into absolute spans.
+        # The number of output tokens is the length of the output token logprobs list (missing means
+        # zero). The call's output tokens occupy absolute positions from output_end minus that count to
+        # output_end. If the metadata has a list of weight version spans (version, start, end relative
+        # to the output), asserts every end is within the output token count; else if it has a single
+        # weight version, asserts there is output (or no completion tokens) and uses one span covering
+        # all output; otherwise no spans. Spans are shifted by the output start and empty spans
+        # (start not below end) are dropped. Assertion errors explain that logprobs must be returned.
         num_output_tokens = len(meta_info.get("output_token_logprobs") or [])
         if (raw_spans := meta_info.get("weight_versions")) is not None:
             output_relative = [(span["version"], span["start"], span["end"]) for span in raw_spans]
@@ -58,6 +77,8 @@ class WeightVersionsPerCall:
 
 @dataclass(frozen=True)
 class RewardSpec:
+    # [CLASS DOC] Immutable per-sample reward dispatch override: optional reward model type and optional
+    # custom reward function path (both default to none, meaning use the run-level setting).
     """Per-sample spec of how the response is scored; intentionally decoupled from adapter routing."""
 
     rm_type: str | None = None
@@ -66,6 +87,18 @@ class RewardSpec:
 
 @dataclass
 class Sample:
+    # [CLASS DOC] One prompt/response sample flowing through rollout, reward and training. Field groups:
+    # identity (group index, index, rollout id falling back to index); prompt (text or message list,
+    # token ids covering prompt plus response, raw and processed multimodal inputs); response (text,
+    # length in tokens, label, reward as number or mapping, per-token loss mask); weight versions per
+    # generation call; rollout-side per-token records (log probabilities, top-k candidate ids and log
+    # probs as arrays with rows per response token, sampling mask, routed experts and indexer top-k
+    # arrays with one row per token except the last); teacher log probs and reverse-KL estimates for
+    # on-policy distillation; a removal flag; a status (pending, completed, truncated, aborted,
+    # failed); free-form metadata; generate function path; training metadata; reward spec override;
+    # routing key; trainer model id; non-generation time; speculative decoding and prefix cache
+    # statistics. Mutable.
+    # KNOWN ISSUE: the multimodal input fields are annotated as mappings but default to none.
     """The sample generated"""
 
     group_index: int | None = None
@@ -100,6 +133,8 @@ class Sample:
     opd_reverse_kl: list[float] | None = None  # Precomputed per-token OPD reverse-KL estimate
 
     class Status(Enum):
+        # [CLASS DOC] Generation outcome: pending (not generated), completed (stopped normally),
+        # truncated (hit length limit), aborted, failed (recoverable failure, may hold partial output).
         PENDING = "pending"
         COMPLETED = "completed"
         TRUNCATED = "truncated"
@@ -129,6 +164,8 @@ class Sample:
 
     @dataclass
     class SpecInfo:
+        # [CLASS DOC] Accumulated speculative decoding counters: correct drafts, proposed drafts,
+        # verification count, completion tokens.
         spec_num_correct_drafts: int = 0
         spec_num_proposed_drafts: int = 0
         spec_verify_ct: int = 0
@@ -136,15 +173,20 @@ class Sample:
 
         @property
         def spec_accept_rate(self) -> float:
+            # [FUNCTION DOC] Correct drafts divided by proposed drafts; zero when none proposed.
             if self.spec_num_proposed_drafts == 0:
                 return 0.0
             return self.spec_num_correct_drafts / self.spec_num_proposed_drafts
 
         @property
         def spec_accept_length(self) -> float:
+            # [FUNCTION DOC] Completion tokens divided by verification count; zero when no verification.
             return self.completion_tokens / self.spec_verify_ct if self.spec_verify_ct > 0 else 0.0
 
         def add(self, meta_info: dict):
+            # [FUNCTION DOC] Adds one call's engine metadata: ignored entirely unless its verify count
+            # is positive (missing or none counts as zero); otherwise adds correct drafts, proposed
+            # drafts (missing as zero), the verify count and completion tokens (missing as zero).
             spec_verify_ct = meta_info.get("spec_verify_ct") or 0
             if spec_verify_ct <= 0:
                 return
@@ -154,6 +196,7 @@ class Sample:
             self.completion_tokens += meta_info.get("completion_tokens", 0)
 
         def to_dict(self):
+            # [FUNCTION DOC] Returns the four counters as a mapping.
             return {
                 "spec_num_correct_drafts": self.spec_num_correct_drafts,
                 "spec_num_proposed_drafts": self.spec_num_proposed_drafts,
@@ -163,6 +206,9 @@ class Sample:
 
         @staticmethod
         def from_dict(data: dict):
+            # [FUNCTION DOC] Builds counters from a mapping, accepting legacy key names for correct
+            # drafts (accepted token number), proposed drafts (draft token number) and completion
+            # tokens (completion token number); missing values are zero.
             info = Sample.SpecInfo()
             info.spec_num_correct_drafts = data.get("spec_num_correct_drafts", data.get("spec_accept_token_num", 0))
             info.spec_num_proposed_drafts = data.get("spec_num_proposed_drafts", data.get("spec_draft_token_num", 0))
@@ -174,19 +220,24 @@ class Sample:
 
     @dataclass
     class PrefixCacheInfo:
+        # [CLASS DOC] Accumulated prefix cache counters: cached prompt tokens and total prompt tokens.
         cached_tokens: int = 0
         total_prompt_tokens: int = 0
 
         @property
         def prefix_cache_hit_rate(self) -> float:
+            # [FUNCTION DOC] Cached tokens divided by total prompt tokens; zero when no prompt tokens.
             return self.cached_tokens / self.total_prompt_tokens if self.total_prompt_tokens > 0 else 0.0
 
         def add(self, meta_info: dict):
+            # [FUNCTION DOC] Adds the call's cached token count and prompt token count (missing as
+            # zero).
             self.cached_tokens += meta_info.get("cached_tokens", 0)
             # new_tokens = input_tokens - cached_tokens
             self.total_prompt_tokens += meta_info.get("prompt_tokens", 0)
 
         def to_dict(self):
+            # [FUNCTION DOC] Returns both counters as a mapping.
             return {
                 "cached_tokens": self.cached_tokens,
                 "total_prompt_tokens": self.total_prompt_tokens,
@@ -194,6 +245,7 @@ class Sample:
 
         @staticmethod
         def from_dict(data: dict):
+            # [FUNCTION DOC] Builds counters from a mapping; missing values are zero.
             info = Sample.PrefixCacheInfo()
             info.cached_tokens = data.get("cached_tokens", 0)
             info.total_prompt_tokens = data.get("total_prompt_tokens", 0)
@@ -202,6 +254,10 @@ class Sample:
     prefix_cache_info: PrefixCacheInfo = field(default_factory=PrefixCacheInfo)
 
     def to_dict(self):
+        # [FUNCTION DOC] Returns a shallow copy of the instance attribute mapping with status replaced by
+        # its string value, speculative and prefix cache info replaced by their mappings, and weight
+        # versions replaced by lists of span mappings per call. Other values (arrays, sampling mask,
+        # metadata) are shared, not copied.
         value = self.__dict__.copy()
         value["status"] = self.status.value
         value["spec_info"] = self.spec_info.to_dict()
@@ -211,6 +267,13 @@ class Sample:
 
     @staticmethod
     def from_dict(data: dict):
+        # [FUNCTION DOC] Inverse of the dict conversion on a copy of the input. Status string is
+        # converted to the enumeration (key error if missing, value error if unknown); speculative and
+        # prefix cache infos are rebuilt (missing as empty). Weight versions: if the first entry is a
+        # string (legacy format of a flat list of version strings) the strings are stored under the
+        # legacy key as an extra attribute and weight versions are emptied; otherwise each entry is
+        # rebuilt from span mappings. Known dataclass fields are passed to the constructor; keys that
+        # are not fields are attached to the instance afterwards as plain attributes.
         data = dict(data)
         data["status"] = Sample.Status(data["status"])
         data["spec_info"] = Sample.SpecInfo.from_dict(data.get("spec_info", {}))
@@ -234,13 +297,27 @@ class Sample:
         return sample
 
     def get_reward_value(self, args) -> float:
+        # [FUNCTION DOC] Returns the reward itself when the reward-key argument is empty, otherwise the
+        # reward mapping's entry for that key (errors if the reward is not a mapping or lacks the key).
         return self.reward if not args.reward_key else self.reward[args.reward_key]
 
     @property
     def effective_response_length(self):
+        # [FUNCTION DOC] Number of response tokens that count for the loss: the sum of the loss mask if
+        # present, else the response length.
         return sum(self.loss_mask) if self.loss_mask is not None else self.response_length
 
     def validate(self):
+        # [FUNCTION DOC] Raises assertion errors (with messages) unless: response length is non-negative
+        # and at most the token count; the loss mask, rollout log probs, teacher log probs and reverse-KL
+        # lists (when present) each have exactly response-length entries; top-k ids and log probs are
+        # both present or both absent, two-dimensional with identical shapes and one row per response
+        # token; the sampling mask length equals the response length; routed experts length equals token
+        # count minus one, or that plus extra positions contributed by media expansion (sum over the
+        # vision-patch and audio-token counts in the multimodal train inputs of each count minus one);
+        # indexer top-k length equals token count minus one; and the weight version spans, in order
+        # across calls, each have a non-empty version, start at or after the previous span's end, be
+        # non-empty and end within the token count.
         assert self.response_length >= 0, f"response_length must be >= 0, got {self.response_length}"
         assert (
             len(self.tokens) >= self.response_length
@@ -299,6 +376,15 @@ class Sample:
             previous_end = span.abs_end
 
     def strip_last_output_tokens(self, n: int, tokenizer) -> None:
+        # [FUNCTION DOC] No-op for n not positive; asserts n does not exceed the response length.
+        # Mutates in place: drops the last n tokens, reduces response length, trims the top-k arrays,
+        # rollout log probs, teacher log probs, reverse-KL list, loss mask, routed experts and indexer
+        # top-k arrays by n entries, replaces the sampling mask by its prefix, trims the optional
+        # student top log probs list in the metadata, re-decodes the response text from the remaining
+        # response tokens (empty string when none remain), and clips weight version spans: spans
+        # starting at or beyond the new token count are removed and spans ending beyond it are cut.
+        # The reward, status and cache statistics are untouched. Note slicing with a negative count on
+        # routed experts and indexer arrays assumes they are aligned with the end of the tokens.
         """Remove the last *n* output tokens and all associated per-token info."""
         if n <= 0:
             return
@@ -335,6 +421,14 @@ class Sample:
             ]
 
     def reset_for_retry(self) -> None:
+        # [FUNCTION DOC] Mutates in place: clears tokens, processed multimodal inputs, response text and
+        # length, reward, loss mask, weight versions, rollout log probs, top-k arrays, sampling mask,
+        # routed experts and indexer top-k; sets status to aborted; clears trainer model id and
+        # non-generation time; replaces speculative and prefix cache statistics with fresh ones; clears
+        # the removal flag and training metadata.
+        # KNOWN ISSUE: the docstring says everything else is restored to dataclass defaults, but status
+        # is set to aborted (the default is pending), and the teacher log probs, reverse-KL list,
+        # rollout id, reward spec and raw multimodal inputs are left unchanged.
         """Reset generated outputs so the original prompt can be re-sampled.
 
         Keeps identity / prompt fields (group_index, index, prompt, label,
@@ -364,15 +458,25 @@ class Sample:
 
     @property
     def all_weight_version_spans(self) -> list[WeightVersionSpan]:
+        # [FUNCTION DOC] All spans of all calls flattened in call order.
         return [span for call in self.weight_versions for span in call.spans]
 
     @property
     def oldest_weight_version(self) -> int | None:
+        # [FUNCTION DOC] Minimum integer among span versions that consist only of decimal digits, or
+        # none if there are none.
         """Minimum weight version across all turns (generation calls) for this trajectory."""
         numeric = [int(span.version) for span in self.all_weight_version_spans if str(span.version).isdigit()]
         return min(numeric) if numeric else None
 
     def update_from_meta_info(self, args, meta_info: dict):
+        # [FUNCTION DOC] Folds one generation call's engine metadata into the sample (mutating it). If
+        # a speculative algorithm is configured in the args, adds the metadata to the speculative
+        # statistics; always adds to prefix cache statistics; appends the weight version spans for this
+        # call anchored at the current token count (so tokens must already include this call's output);
+        # then sets status from the finish reason type: length gives truncated, abort gives aborted,
+        # stop gives completed; any other type leaves the status unchanged. Raises key errors if the
+        # finish reason is missing.
         """
         Update the sample with new information from meta_info returned by the rollout engine.
         And extract
@@ -397,6 +501,8 @@ class Sample:
 
 @dataclass(frozen=True)
 class ParamInfo:
+    # [CLASS DOC] Immutable description of one model parameter: name, dtype, shape, attribute mapping,
+    # size, and the rank that holds the source copy.
     name: str
     dtype: torch.dtype
     shape: torch.Size
@@ -413,19 +519,25 @@ RolloutBatch = dict[str, list[torch.Tensor] | list[numpy.ndarray] | list[int] | 
 
 @dataclass
 class MultimodalType:
+    # [CLASS DOC] A media kind: the identifier used in message content and the placeholder token used in
+    # conversation text.
     name: str  # Type identifier used in message content (e.g., "image")
     placeholder: str  # Placeholder token in conversation messages (e.g., "<image>")
 
 
 class MultimodalTypes:
+    # [CLASS DOC] Namespace of the three supported media kinds (image, video, audio) with their
+    # placeholders, plus lookup helpers.
     IMAGE = MultimodalType(name="image", placeholder="<image>")
     VIDEO = MultimodalType(name="video", placeholder="<video>")
     AUDIO = MultimodalType(name="audio", placeholder="<audio>")
 
     @classmethod
     def all(cls) -> list[MultimodalType]:
+        # [FUNCTION DOC] The three kinds in order image, video, audio.
         return [cls.IMAGE, cls.VIDEO, cls.AUDIO]
 
     @classmethod
     def get(cls, name: str) -> MultimodalType | None:
+        # [FUNCTION DOC] The kind with the given name, or none if unknown.
         return next((m for m in cls.all() if m.name == name), None)

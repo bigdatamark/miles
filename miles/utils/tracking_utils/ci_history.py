@@ -1,3 +1,8 @@
+# [MODULE DOC] Tracking backend that records a whitelist of metric series to a per-process JSON-lines
+# file for the CI history gate. Defines the whitelist of metric keys, the environment variable naming
+# the output directory, helpers to find a logged key by exact or slash-suffix match and to encode
+# non-finite floats as string markers, and the backend class. Disabled unless the environment
+# variable is set.
 """CI metric-history collection backend.
 
 * Captures the fixed :data:`TARGET_METRIC_KEYS` whitelist of training/rollout
@@ -63,6 +68,8 @@ RECORD_DIR_ENV = "MILES_CI_GATE_RECORD_DIR"
 
 
 def _compute_logged_key(metrics: dict[str, Any], key: str) -> str | None:
+    # [FUNCTION DOC] HELPER: Returns the key itself if it is in the metrics mapping; else the first
+    # logged key (in mapping order) ending with a slash plus the key; else none.
     if key in metrics:
         return key
     suffix = f"/{key}"
@@ -70,6 +77,8 @@ def _compute_logged_key(metrics: dict[str, Any], key: str) -> str | None:
 
 
 def _encode_value(value: float) -> float | str:
+    # [FUNCTION DOC] HELPER: Returns finite values unchanged; NaN becomes the string "NaN"; positive
+    # infinity "Infinity"; negative infinity "-Infinity".
     # Bare NaN/Infinity from json.dumps is not strict JSON; markers keep the
     # record parseable by any reader.
     if math.isfinite(value):
@@ -80,6 +89,9 @@ def _encode_value(value: float) -> float | str:
 
 
 class CiHistoryBackend(TrackingBackend):
+    # [CLASS DOC] Accumulates, per logged key, a list of (step, value) points under a lock, and writes
+    # them as a full snapshot after every capturing log call. Inactive (log and finish do nothing)
+    # when no record directory was configured at init.
     """Accumulate target metrics in-process and persist the raw series to disk.
 
     Each initialized backend instance owns a distinct JSONL file keyed by a
@@ -91,12 +103,17 @@ class CiHistoryBackend(TrackingBackend):
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Starts with empty series, a lock, and no record directory or path.
         self._series: dict[str, list[tuple[int | None, float]]] = {}
         self._lock = threading.Lock()
         self._record_dir: str | None = None
         self._record_path: str | None = None
 
     def init(self, args, *, primary: bool = True, **kwargs) -> None:
+        # [FUNCTION DOC] Reads the record directory environment variable; if unset or empty logs an info
+        # message and stays inactive. Otherwise creates the directory (and parents), stores it, and
+        # picks the record file path: process id, a dash, a fresh random hex uuid, with a jsonl
+        # extension. The file itself is created at the first snapshot. Args and primary are unused.
         record_dir = os.environ.get(RECORD_DIR_ENV)
         if not record_dir:
             # No harness-assigned directory: nothing to collect into. Leaving
@@ -109,6 +126,11 @@ class CiHistoryBackend(TrackingBackend):
         self._record_path = os.path.join(record_dir, f"{process_id}.jsonl")
 
     def log(self, metrics: dict[str, Any], step: int | None = None, **kwargs) -> None:
+        # [FUNCTION DOC] No-op when inactive. Under the lock, for each whitelisted key finds the logged
+        # key (exact or slash-suffix match) and takes its value; a value that is not an integer or float
+        # (booleans rejected) logs an error and raises a type error before anything is stored for this
+        # call. Appends (step, float value) to each captured key's series and, if anything was
+        # captured, rewrites the snapshot file. Several whitelist keys can match the same logged key.
         if self._record_dir is None:
             return
         with self._lock:
@@ -128,12 +150,18 @@ class CiHistoryBackend(TrackingBackend):
                 self._write_snapshot_locked()
 
     def finish(self) -> None:
+        # [FUNCTION DOC] No-op when inactive; otherwise rewrites the snapshot under the lock (writes an
+        # empty file if nothing was ever captured).
         if self._record_dir is None:
             return
         with self._lock:
             self._write_snapshot_locked()
 
     def _write_snapshot_locked(self) -> None:
+        # [FUNCTION DOC] HELPER: Caller must hold the lock. Asserts the record path is set. Writes one
+        # strict-JSON line per series (metric key and list of [step, encoded value] pairs, non-finite
+        # values as markers) to a temporary file next to the record and atomically renames it over the
+        # record file.
         # Rewrite the whole record file with the current series. Writing to a
         # temp file and renaming makes each snapshot atomic, so a concurrent reader
         # never sees a half-written record.

@@ -1,3 +1,8 @@
+# [MODULE DOC] Public tracking entry points over a single process-wide manager. Defines the registry of
+# all backends (name to backend class and the argument flag enabling it) and thin functions to
+# initialize backends, declare step-key metric groups, log metrics (also mirroring them to the audit
+# event logger when it is initialized) and finish. The registry lives here, not in the base module, to
+# avoid a circular import.
 import logging
 
 import torch
@@ -34,16 +39,23 @@ _manager = TrackingManager(BACKEND_REGISTRY)
 
 
 def init_tracking(args, primary: bool = True, **kwargs):
+    # [FUNCTION DOC] Initializes every backend whose enabling flag is truthy on the args (see the
+    # manager); extra keywords go to each backend's init.
     _manager.init(args, primary=primary, **kwargs)
 
 
 def define_step_key_metric_group(prefix: str, step_key: str) -> None:
+    # [FUNCTION DOC] Forwards the grouping declaration to all active backends.
     """Declare a metric group plotted against its own step key (e.g. ``{name}/*`` vs ``{name}/step``).
     Only wandb acts on this; must be called from the primary tracking process or definitions may be lost."""
     _manager.define_step_key_metric_group(prefix, step_key)
 
 
 def log(args, metrics, step_key: str):
+    # [FUNCTION DOC] Takes the step as the metrics mapping's value under the step key (none if absent)
+    # and logs the mapping to all backends. If the audit event logger is initialized, also logs a
+    # metric event holding the mapping with tensor values converted to Python numbers via their item
+    # method (so multi-element tensors raise), without printing. The args parameter is unused.
     step = metrics.get(step_key)
     _manager.log(metrics, step=step, step_key=step_key)
 
@@ -53,4 +65,5 @@ def log(args, metrics, step_key: str):
 
 
 def finish_tracking():
+    # [FUNCTION DOC] Finishes all active backends (errors are logged, not raised) and clears them.
     _manager.finish()

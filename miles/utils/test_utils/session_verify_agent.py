@@ -1,3 +1,15 @@
+# [MODULE DOC] HELPER: Driver agent and generate wrapper that verify the session server's TITO
+# (token-in token-out) handling across a multi-role conversation. The agent talks to the session's
+# chat completions endpoint (streaming by default) following a schedule of driver actions derived
+# from which non-assistant roles the model family's fixed template can append: tool results, user
+# follow-ups, system reminders, injected assistant messages, rollbacks (dropping the last assistant
+# so the server must rewind), and a forced final answer. It returns event names and counters. The
+# generate wrapper injects settings into sample metadata, runs the base agentic generate, then checks
+# per-sample mismatch records from the server: hard mismatch types fail (or are journaled to a
+# metrics sidecar file named by an environment variable so a run-level gate can decide), and required
+# driver events must be present. Assertion failures inside the entry points are journaled to the
+# sidecar too. Defines the schedule builder, constants (prompts, tools, mock tool results) and the
+# failure-mode enum for turns without tool calls.
 """Custom-generate / custom-agent driver for TITO session-server verification.
 
 Wired through ``--custom-generate-function-path`` /
@@ -30,6 +42,11 @@ logger = logging.getLogger(__name__)
 
 
 def _append_session_verify_record(entry: dict) -> bool:
+    # [FUNCTION DOC] HELPER: Appends one JSON line to the sidecar file named by the session-verify
+    # metrics path environment variable. Returns false without writing if the variable is unset or
+    # empty. Otherwise opens the file append-only, creating it with owner-only permissions and
+    # close-on-exec, performs a single write of the line (atomic append across processes for small
+    # payloads), raises an OS error on a short write, always closes the descriptor, and returns true.
     metrics_path = os.environ.get("MILES_SESSION_VERIFY_METRICS_PATH")
     if not metrics_path:
         return False
@@ -49,9 +66,16 @@ def _append_session_verify_record(entry: dict) -> bool:
 
 
 def _journal_verifier_assertions(stage: str):
+    # [FUNCTION DOC] HELPER: Decorator factory for async functions. The wrapped function behaves
+    # identically except that an assertion error is first recorded to the metrics sidecar (stage name,
+    # exception type name, message truncated to 1000 characters, under a verification-error key) and
+    # then re-raised. Other exceptions pass through unrecorded.
     def decorate(func):
+        # [FUNCTION DOC] HELPER: Wraps the given async function, preserving its metadata.
         @wraps(func)
         async def wrapped(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Awaits the wrapped function; journals and re-raises assertion
+            # errors.
             try:
                 return await func(*args, **kwargs)
             except AssertionError as exc:
@@ -72,6 +96,9 @@ def _journal_verifier_assertions(stage: str):
 
 
 class DriverAction(Enum):
+    # [CLASS DOC] HELPER: Steps a schedule may contain: answer tool calls with tool messages, append a
+    # user follow-up, append a system reminder, inject assistant messages followed by a user
+    # message, roll back the last assistant, force a final summary through a user message.
     TOOL_RESULT = "tool_result"
     USER_FOLLOWUP = "user_followup"
     SYSTEM_REMINDER = "system_reminder"
@@ -89,6 +116,9 @@ _F = DriverAction.FORCE_FINAL
 
 
 class ToolCallFailureMode(StrEnum):
+    # [CLASS DOC] HELPER: String enumeration of recovery strategies when the assistant emitted no tool
+    # calls at a tool-result step: append a sentinel tool message, append a user message with the
+    # same text, or roll back and re-infer (default).
     """Recovery strategy when a TOOL_RESULT step finds the assistant emitted no tool_calls.
 
     APPEND_TOOL  : Splice a sentinel ``tool`` message and continue.  Works on
@@ -139,6 +169,9 @@ _RETRY_SEED_STRIDE = 1_000_000
 
 
 def fixed_template_append_roles(tito_model: TITOTokenizerType | str) -> tuple[str, ...]:
+    # [FUNCTION DOC] Coerces the model name to the TITO type (value error if unknown), looks up its
+    # tokenizer class's fixed template and returns the allowed append roles, filtered and ordered by
+    # the canonical valid-roles order, as a tuple.
     """Return the selected family's fixed append capability in canonical order."""
     tokenizer_type = TITOTokenizerType(tito_model)
     supported = TITOTokenizerType.get_tokenizer_class(tokenizer_type).FIXED_TEMPLATE.allowed_append_roles
@@ -146,6 +179,8 @@ def fixed_template_append_roles(tito_model: TITOTokenizerType | str) -> tuple[st
 
 
 def _build_cycle(role_surface: frozenset[str]) -> list[DriverAction]:
+    # [FUNCTION DOC] HELPER: One repeating cycle: tool result; if user is allowed, user follow-up then
+    # another tool result; if system is allowed, system reminder; always ends with a rollback.
     cycle: list[DriverAction] = [_T]
     if "user" in role_surface:
         cycle.append(_U)
@@ -206,6 +241,11 @@ INITIAL_USER_PROMPT = "What's the weather in Beijing?"
 
 
 def select_schedule(allowed_roles, *, cycles: int = DEFAULT_CYCLES) -> list[DriverAction]:
+    # [FUNCTION DOC] Builds the driver schedule. Raises a value error for roles outside the valid
+    # set, when tool is not allowed, or when cycles is below one. Schedule: one cycle, an extra
+    # rollback (to exercise consecutive rollbacks), then the cycle repeated cycles-1 more times; if
+    # user is allowed append a forced-final step; if assistant is allowed append an injected-assistant
+    # step last (after all rollbacks).
     """Build a schedule from the selected FixedTemplate capability."""
     key = frozenset(allowed_roles)
     invalid = key - set(VALID_APPEND_ROLES)
@@ -229,6 +269,8 @@ def select_schedule(allowed_roles, *, cycles: int = DEFAULT_CYCLES) -> list[Driv
 
 
 def build_initial_messages() -> list[dict]:
+    # [FUNCTION DOC] Returns a fresh list with the fixed system message and the fixed Beijing weather
+    # user message.
     """The fixed (system, user) prompt all schedules start from."""
     return [
         {"role": "system", "content": INITIAL_SYSTEM_PROMPT},
@@ -237,6 +279,11 @@ def build_initial_messages() -> list[dict]:
 
 
 async def _chat(client, base_url, messages, request_kwargs, *, label):
+    # [FUNCTION DOC] HELPER: Sends one chat completions request to the session. Payload: messages,
+    # the weather tool list, plus the request keyword mapping (which may override those keys). The
+    # stream key is removed from the payload; unless it was explicitly false, uses the streaming
+    # client and returns the rebuilt response; otherwise posts normally, asserts status 200 and
+    # returns the parsed JSON.
     payload = {"messages": messages, "tools": TOOLS, **request_kwargs}
     # Streaming is the e2e default: black-box agent harnesses mostly consume
     # chat completions as SSE, so exercise the session server's fake-streaming
@@ -249,6 +296,10 @@ async def _chat(client, base_url, messages, request_kwargs, *, label):
 
 
 async def _chat_complete(client, base_url, messages, request_kwargs, *, label):
+    # [FUNCTION DOC] HELPER: Chat call that retries truncated answers: up to 2 retries (3 attempts)
+    # while the first choice's finish reason is "length"; on retries, a non-null seed in the request
+    # keywords is shifted by retry number times one million. Returns the first non-truncated response;
+    # raises an assertion error after exhausting attempts.
     for retry in range(_MAX_INCOMPLETE_TURN_RETRIES + 1):
         attempt_kwargs = request_kwargs
         if retry and request_kwargs.get("seed") is not None:
@@ -264,6 +315,24 @@ async def _chat_complete(client, base_url, messages, request_kwargs, *, label):
 
 @_journal_verifier_assertions("session_verify_agent.run_agent")
 async def run_agent(base_url, prompt, request_kwargs, metadata, **kwargs):
+    # [FUNCTION DOC] Agent body (assertion failures journaled). Requires the tito model in metadata
+    # (value error otherwise); derives allowed roles and the schedule (cycles from metadata, default
+    # 3); reads the failure mode from metadata (default rollback) and raises a value error up front
+    # if it is the user-append mode but user is not an allowed role. Copies request keywords minus
+    # tools; starts from the fixed initial messages; counters for rollbacks, user, system, injected
+    # assistant, tool results and tool calls start at zero. Opens an async client (180 s timeout), makes
+    # the initial completion (events: "initial"), appends the assistant reply, then for each schedule
+    # step: tool-result step: if the last assistant had tool calls, appends one tool message per call
+    # with mock results cycling by a running index (event "append_tool"), resetting the failure
+    # streak; with no tool calls applies the failure mode: append a tool message with id "none" and
+    # fixed failure text, or append a user message with that text, or (rollback) assert the tail is an
+    # assistant, bump the streak (assertion error beyond 3 consecutive), pop the assistant and count a
+    # rollback; user step appends the follow-up; system step appends the reminder; assistant-input
+    # step appends two assistant messages and a user message; rollback step requires the tail to be an
+    # assistant (assertion error otherwise) and pops it; force-final step appends a user message.
+    # Every step then requests a (non-truncated) completion and appends the reply, adding its tool
+    # call count. Returns a mapping with the driver events list and all counters. Note the server
+    # sees a shorter history after rollbacks, triggering its own rewind.
     """Custom-agent entry point.  Returns ``{"driver_events": [...], **counters}``.
 
     ``tito_model`` must be present in ``metadata`` (the ``generate`` wrapper
@@ -427,6 +496,13 @@ async def run_agent(base_url, prompt, request_kwargs, metadata, **kwargs):
 
 
 def _verify_tito_samples(samples, events_per_sample, *, allowed_roles) -> None:
+    # [FUNCTION DOC] HELPER: For each sample, reads the session mismatch list from metadata and raises
+    # an assertion error if it is absent (the server's comparator failed). Splits mismatches into
+    # forbidden hard types (special token count, special token type, non-assistant text) and
+    # assistant-text ones. If the sidecar path is configured, appends a record per sample (index,
+    # driver events, assistant mismatch flag and counts with a truncated first example, hard
+    # mismatch count, sorted types and a truncated first example) and does not raise; otherwise raises
+    # an assertion error if any forbidden mismatch exists.
     """Record every sample and defer hard failures to the run-level gate.
 
     The rollout loop treats custom-generate exceptions as retryable sample
@@ -486,6 +562,14 @@ def _verify_tito_samples(samples, events_per_sample, *, allowed_roles) -> None:
 
 @_journal_verifier_assertions("session_verify_agent.generate")
 async def generate(input: GenerateFnInput) -> GenerateFnOutput:
+    # [FUNCTION DOC] Generate wrapper (assertion failures journaled). Reads the tito model from args
+    # and cycles and failure mode from args with defaults; writes them into the input sample's
+    # metadata (mutating it); runs the base agentic generate; normalizes samples to a list and
+    # collects driver events. Raises assertion errors if there are no samples, if the TITO sample
+    # verification fails, or if any sample lacks a required event (rollback always, plus append-user,
+    # append-system, append-assistant when those roles are allowed). Without the metrics sidecar it
+    # also requires at least one sample with an append-tool event. Logs coverage and returns the
+    # base output.
     """Custom-generate wrapper that asserts driver-action coverage.
 
     - Per-sample: every sample must contain ``rollback``, plus ``append_user``
@@ -544,6 +628,9 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
 
 
 def _add_arguments(parser):
+    # [FUNCTION DOC] HELPER: Argument hook attached to generate: registers the base generate's
+    # arguments, then adds an integer cycles option (default 3) and a string failure-mode option
+    # (default rollback, choices from the enum values).
     _base_generate.add_arguments(parser)
     parser.add_argument(
         "--session-verify-cycles",
