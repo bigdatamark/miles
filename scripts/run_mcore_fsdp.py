@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Launcher script (single command, run through typer) for GRPO training of Qwen3-4B variants on DAPO
+# math, with a choice of training backend (FSDP or Megatron), optional reference model with kl
+# loss, colocated or split (half training, half rollout) GPU layout, optional multi-dataset eval
+# (AIME, GPQA, IFBench), optional deterministic "true on-policy" mode and optional dynamic sampling.
+# The single command downloads models and datasets (converting the checkpoint for Megatron) and then
+# trains. Used for comparing the two backends.
 from dataclasses import dataclass
 from typing import Literal
 
@@ -8,6 +15,13 @@ from miles.utils.external_utils import command_utils
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC]
+    # Command line options extending the shared train configuration (num_nodes, output dir, backend
+    # creation). Fields: train backend (fsdp default or megatron), use_ref (reference model and kl
+    # loss; off), colocate (on), model name (default Qwen3-4B-Instruct-2507), GPUs per node (None
+    # derived), hardware (auto, H100, GB300), mode, run id, multi_eval (three eval datasets), true
+    # on-policy switch, dynamic sampling switch, eval switch (on), Megatron model type (None; derived
+    # for the Megatron backend), extra raw args, directories.
     train_backend: Literal["fsdp", "megatron"] = "fsdp"
     use_ref: bool = False
     colocate: bool = True
@@ -27,6 +41,10 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     megatron_path: str = "/root/Megatron-LM"
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Resolves hardware and GPUs per node. For the Megatron backend, sets the Megatron model type
+        # from a fixed table (Qwen3-4B, its instruct 2507 variant, and base); any other model name
+        # raises a key error.
         self.hardware = command_utils.resolve_hardware(self)
         self.num_gpus_per_node = self.num_gpus_per_node or command_utils.NUM_GPUS_OF_HARDWARE[self.hardware]
         if self.train_backend == "megatron":
@@ -38,6 +56,9 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
 
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Creates model/data directories, downloads the Qwen organization model and the
+    # DAPO math, AIME 2024, GPQA diamond and IFBench datasets; for the Megatron backend also converts
+    # the checkpoint to a Megatron distributed checkpoint in the model directory.
     U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.model_dir} {args.data_dir}")
     U.exec_command_cpu(f"hf download Qwen/{args.model_name} " f"--local-dir {args.model_dir}/{args.model_name}")
@@ -57,6 +78,28 @@ def prepare(args: ScriptArgs):
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Builds the training argument string and submits the job. Checkpoint: hf
+    # checkpoint; load/save under the output directory run folder every 2 (debug) or 20 steps;
+    # reference load only when use_ref (converted folder for Megatron, plain folder for FSDP).
+    # Rollout: DAPO math, math reward, chat template, shuffled, balanced; debug: 10 rollouts, 8 prompts
+    # x 8 samples, length 100, global batch 64; normal: 3000 rollouts, 64 x 16, length 32768, global
+    # batch 1024; optional over-sampling 128 with nonzero-reward-std filter (non-debug). Eval
+    # (non-debug and enabled): every 20 steps; either a single AIME set (16 samples, top-p 1) or, with
+    # multi_eval, a generated config file passed as a pseudo-file with AIME, GPQA and IFBench (top-p
+    # 0.7). Perf: dynamic batch, 9216 tokens per GPU (Megatron) or 32768. GRPO with zero coefficients
+    # and kl loss flag only when a reference is used. Adam 1e-6. SGLang: 1 GPU per engine, memory
+    # fraction 0.7 (Megatron) or 0.75, chunked prefill 4096. FSDP backend: buffer 512 MiB, gradient
+    # checkpointing, flash attention 2 (3 with true on-policy plus fa3 SGLang backend). Megatron
+    # backend: tensor 2 and context 4 on 8-GPU nodes else 1, sequence parallel, full uniform recompute,
+    # dropout off, fp32 accumulation, flash attention. Layout: colocate, or split with half the GPUs
+    # per node for training and half for rollout. FSDP adds an expandable-segments environment for
+    # trainers. Fault tolerance and dump details. True on-policy adds deterministic inference flags
+    # and environment variables. Wandb flags with a hard-coded project and a group built from backend,
+    # reference and layout. For Megatron, runs a shell probe of nvidia-smi at call time to detect
+    # NVLink and sets python path, max connections and NVLS accordingly.
+    # KNOWN ISSUE: the wandb project name is hard-coded and wandb is always enabled.
+    # KNOWN ISSUE: the group name always says Qwen3-4B regardless of the model name.
+    # KNOWN ISSUE: the os module is imported inside the function instead of at the module top.
     U = args.create_backend()
     load_save_path = f"{args.output_dir}/{args.run_id}/checkpoints"
 
@@ -276,6 +319,7 @@ eval:
 
 @command_utils.dataclass_cli
 def main(args: ScriptArgs):
+    # [FUNCTION DOC] Command line entry point: runs prepare, then execute.
     """Main entry point for unified MCORE/FSDP training script.
 
     Examples:

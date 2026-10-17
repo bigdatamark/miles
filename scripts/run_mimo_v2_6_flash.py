@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Launcher script (single command, run through typer) for GRPO or supervised fine-tuning of
+# MiMo-V2.6-Flash (full model or a 4-layer partial) in Megatron bridge mode on a bf16 checkpoint
+# that the script itself produces from the official release. The command prepares (download and
+# convert, guarded by a file lock and a finished-conversion marker; dataset download for RL) and then
+# trains. SFT runs train-only with the async driver by default; RL colocates SGLang. A frozen
+# per-model table gives the Megatron model type, kept layers, default parallel sizes, engine size,
+# memory fraction and whether optimizer state streams to disk (full model).
 """MiMo-V2.6-Flash-RL training (RL with GRPO, or SFT), adapted from run_gpt_oss_20b.py.
 
 Megatron bridge mode on a BF16 checkpoint converted with tools/convert_mimo_v2_to_bf16.py; the
@@ -53,6 +61,10 @@ _HF_REPO = "XiaomiMiMo/MiMo-V2.6-Flash-RL"
 
 @dataclass(frozen=True)
 class _Recipe:
+    # [CLASS DOC] HELPER: Immutable per-model record: Megatron model type, comma-separated source
+    # layers kept by the converter (None keeps all), default tensor/pipeline/expert sizes (2,2,2),
+    # GPUs per colocated bf16 engine (4), SGLang memory fraction (0.6), and whether the optimizer
+    # state streams through node-local disk (off).
     megatron_model_type: str
     # Source decoder layers kept by tools/convert_mimo_v2_to_bf16.py; None keeps all.
     layers: str | None = None
@@ -81,6 +93,14 @@ _RECIPES = {
 
 @dataclass
 class ScriptArgs(U.ExecuteTrainConfig):
+    # [CLASS DOC]
+    # Command line options extending the shared train configuration (num_nodes, output dir, backend
+    # creation). Fields: run id, mode (rl or sft), model name (full bf16 or partial), GPUs per node
+    # (8), optional tensor/pipeline/expert sizes (None takes the recipe default), recompute switch
+    # (on), async_train (SFT driver choice), qkv format (thd or bshd), tokens per GPU (9216), rollout
+    # count (4) and batch size (16), prompt data path ("" means the default RL dataset), save switch,
+    # save interval (2), load path, extra raw args, directories, and the disk directory for streamed
+    # optimizer state and offloaded actor.
     run_id: str = U.create_run_id()
     mode: Literal["rl", "sft"] = "rl"
     model_name: Literal["MiMo-V2.6-Flash-RL-bf16", "mimo26-p4-bf16"] = "mimo26-p4-bf16"
@@ -110,6 +130,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
     train_offload_disk_dir: str = "/root/shared_data/train_offload"
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Fills each unset (None or zero) parallel size from the model's recipe defaults (tensor,
+        # pipeline, expert).
         recipe = _RECIPES[self.model_name]
         tp, pp, ep = recipe.parallel
         self.tensor_model_parallel_size = self.tensor_model_parallel_size or tp
@@ -118,6 +141,11 @@ class ScriptArgs(U.ExecuteTrainConfig):
 
 
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Under an exclusive file lock on the target folder (model dir + model name), if the
+    # converter's final index file does not exist: creates the model dir, downloads the official
+    # repository into a folder named by the repo's last path segment, and runs the converter on GPU to
+    # write the target folder (restricting layers per recipe). Afterwards, in RL mode without a custom
+    # prompt file, downloads the DAPO math dataset.
     backend = args.create_backend()
     target = Path(args.model_dir) / args.model_name
     with U.exclusive_path_lock(str(target)):
@@ -137,6 +165,25 @@ def prepare(args: ScriptArgs):
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Builds the training argument string and submits the job. Checkpoint: hf checkpoint
+    # with bridge mode; optional save (output dir checkpoints, interval from options) and load.
+    # SFT data: SFT rollout function, prompt data, messages key, shuffle, rollouts and batch size from
+    # options with global batch equal to rollout batch, SFT loss, per-token loss, advantages disabled,
+    # train-only debug mode. RL data: DAPO math (or custom prompt file), math reward, chat template,
+    # 8 samples per prompt, length 8192, temperature 1.0, top-p 1.0, one step per rollout, GRPO,
+    # zero entropy, asymmetric clip. Parallelism: sizes from options, sequence parallel when tensor > 1,
+    # context 1, expert-tensor 1; packed layout uses dynamic batching with the token budget, unpacked
+    # uses bshd with micro batch 1; optional full uniform recompute. Optimizer Adam 1e-6; streamed
+    # optimizer state (bf16 moments, bf16 gradient reduction, disk directory, plus disk offload of the
+    # actor in RL) for the full model, else fp32 gradient accumulation. SGLang flags (RL only): engine
+    # size, bfloat16, memory fraction and log interval from the recipe. Misc: dropout off, fp32
+    # softmax, fused attention backend, node and GPU counts, colocate in RL only. Submits via the
+    # backend passing the options object, the recipe's model type, the async driver script for SFT
+    # with async enabled else the default, and, for SFT only, an expandable-segments environment
+    # variable (colocated RL cannot use it).
+    # KNOWN ISSUE: the module docstring says the SFT async option follows another script and the
+    # prepare step writes under the model dir; the "prompt data" path is not validated for SFT (an
+    # empty value is passed through).
     backend = args.create_backend()
     ckpt_args = f"--hf-checkpoint {args.model_dir}/{args.model_name} " "--megatron-to-hf-mode bridge "
     if args.save:
@@ -260,6 +307,7 @@ def execute(args: ScriptArgs):
 
 @U.dataclass_cli
 def main(args: ScriptArgs):
+    # [FUNCTION DOC] Command line entry point: runs prepare, then execute.
     prepare(args)
     execute(args)
 

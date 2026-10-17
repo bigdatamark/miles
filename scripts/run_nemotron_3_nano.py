@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Launcher script (single command, run through typer) for a short GRPO smoke-test training of
+# NVIDIA Nemotron-3-Nano (dense 4B hybrid state-space/attention or 30B-A3B mixture of experts) with
+# Megatron through the bridge conversion mode (the Hugging Face checkpoint is also the reference
+# load) and SGLang, colocated, on DAPO math with no eval. Training only: model and data must exist.
+# The two variants are described by a frozen per-model table of parallel sizes, token budget,
+# recompute, log-prob chunking, routing replay and rollout shape.
 """NVIDIA Nemotron-3-Nano GRPO training script (single node, 8 GPUs).
 
 =====================
@@ -41,6 +48,10 @@ _MODEL_NAMES = Literal["NVIDIA-Nemotron-3-Nano-4B-BF16", "NVIDIA-Nemotron-3-Nano
 
 @dataclass(frozen=True)
 class _Recipe:
+    # [CLASS DOC] HELPER: Immutable per-model record: Megatron model type; tensor, pipeline, context,
+    # expert and expert-tensor parallel sizes; tokens per GPU for dynamic batching; full recompute
+    # switch; optional log-prob chunk size (None means not passed); rollout routing replay switch (MoE
+    # only); global batch size; samples per prompt; maximum response length.
     megatron_model_type: str
     tp: int
     pp: int
@@ -94,6 +105,11 @@ _RECIPES: dict[str, _Recipe] = {
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC]
+    # Command line options extending the shared train configuration (num_nodes, output dir, backend
+    # creation). Fields: run id, model name (4B default or 30B-A3B), GPUs per node (8), number of
+    # rollouts (10), extra raw args, data/model/Megatron directories. The recipe property gives the
+    # per-model table entry.
     run_id: str = command_utils.create_run_id()
     model_name: _MODEL_NAMES = "NVIDIA-Nemotron-3-Nano-4B-BF16"
     num_gpus_per_node: int = 8
@@ -105,10 +121,23 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
     @property
     def recipe(self) -> _Recipe:
+        # [FUNCTION DOC] Property: the per-model recipe record looked up by the model name.
         return _RECIPES[self.model_name]
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Builds the training argument string and submits the job. Checkpoint: the same
+    # Hugging Face folder as hf checkpoint and reference load (pointing the load at a Hugging Face folder
+    # routes through the bridge, so no converted copy is needed), bridge mode, saves to the output
+    # directory checkpoints folder every 20 steps. Rollout: DAPO math, deepscaler reward, chat template,
+    # shuffled, rollouts from options, 32 prompts per batch, samples/response length/global batch from
+    # the recipe, temperature 1, balanced data. Parallel sizes from the recipe with sequence parallel;
+    # optional full uniform recompute; dynamic batching with the recipe's token budget; optional
+    # log-prob chunk size. GRPO with kl loss on at zero coefficient, zero entropy, asymmetric clip.
+    # Adam 1e-6. SGLang: 1 GPU per engine, memory fraction 0.7, plus routing replay for the MoE.
+    # Misc: dropouts off, fp32 accumulation and softmax, auto attention backend, colocate, node and GPU
+    # counts, rollout GPU count = all GPUs. No eval. Submits via the backend.
+    # KNOWN ISSUE: the rollout GPU count flag is passed together with colocate, where it is ignored.
     U = args.create_backend()
     recipe = args.recipe
     hf_checkpoint = f"{args.model_dir}/{args.model_name}"
@@ -215,6 +244,7 @@ def execute(args: ScriptArgs):
 
 @command_utils.dataclass_cli
 def main(args: ScriptArgs):
+    # [FUNCTION DOC] Command line entry point: runs execute with the parsed options.
     execute(args)
 
 

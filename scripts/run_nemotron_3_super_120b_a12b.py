@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Launcher script (typer command line app with two commands, one per pod role) for a short GRPO
+# smoke-test training of NVIDIA Nemotron-3-Super-120B-A12B (hybrid state-space/attention latent
+# mixture of experts) on 2 nodes, Megatron bridge mode (the Hugging Face checkpoint doubles as the
+# reference load) with colocated SGLang, on DAPO math with no eval. Command "worker": clears stale
+# processes, waits for the head's ray port, joins the cluster and blocks. Command "train": sets the
+# head address environment variable, starts the ray head, waits until all GPUs are visible, then
+# submits the job. Training only: model and data must exist.
 """NVIDIA Nemotron-3-Super-120B-A12B GRPO training script (2 nodes x 8 GPUs).
 
 =====================
@@ -41,6 +49,11 @@ app = typer.Typer()
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC]
+    # Command line options extending the shared train configuration (output dir, backend creation).
+    # Fields: run id, head pod IP (default loopback; both roles need the real value), model name and
+    # Megatron model type, node count (overridden default 2), GPUs per node (8), number of rollouts
+    # (10), extra raw args, data/model/Megatron directories.
     run_id: str = command_utils.create_run_id()
     head_ip: str = "127.0.0.1"
     model_name: str = "NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
@@ -55,6 +68,11 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
 
 def _wait_for_head_port(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] HELPER: Polls up to 60 times for the head's ray port (6379) to accept connections:
+    # each probe runs a shell port check whose exit status is echoed and read from output (because the
+    # command runner raises on non-zero exit); returns at the first success; otherwise prints a waiting
+    # message and sleeps 5 seconds. Returns normally after the attempts are exhausted.
+    # KNOWN ISSUE: no error is raised on timeout; the caller proceeds to join anyway.
     U = args.create_backend()
     for _ in range(60):
         # exec_command_cpu raises on a non-zero exit, so the probe reports through stdout.
@@ -65,6 +83,10 @@ def _wait_for_head_port(args: ScriptArgs) -> None:
 
 
 def _wait_for_ray_gpus(args: ScriptArgs, expected_gpus: int) -> None:
+    # [FUNCTION DOC] HELPER: Polls up to 120 times (5 s apart) the ray cluster status text for the
+    # expected total GPU count; on success prints a ready message and stops polling. In every case
+    # finishes by printing the cluster status, then returns, so the job is submitted even on timeout
+    # (the job's own resource error will then explain the shortfall). Used as the pre-submit callback.
     """The head reports only its own 8 GPUs until the worker joins, and a job submitted then gets one node."""
     U = args.create_backend()
     for _ in range(120):
@@ -77,6 +99,18 @@ def _wait_for_ray_gpus(args: ScriptArgs, expected_gpus: int) -> None:
 
 
 def _execute_train(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Builds the training argument string and submits the job. Checkpoint: the
+    # Hugging Face folder as hf checkpoint and reference load, bridge mode, saves to the output
+    # directory checkpoints folder every 20 steps. Rollout: DAPO math, deepscaler reward, chat template,
+    # shuffled, rollouts from options, 32 prompts x 4 samples, length 1024, temperature 1, global batch
+    # 128, balanced. Parallelism: tensor 4 with sequence parallel, pipeline 2, context 1, expert 8,
+    # expert-tensor 1; full uniform recompute; dynamic batch 1024 tokens per GPU; log-prob chunk 128.
+    # GRPO with kl loss on at zero coefficient, zero entropy, asymmetric clip. Adam 1e-6 with CPU
+    # offload group. SGLang: engine size equal to GPUs per node, memory fraction 0.7, rollout routing
+    # replay (needed for MoE). Misc: dropouts off, fp32 accumulation and softmax, auto attention
+    # backend, colocate, node and GPU counts, rollout GPU total. Submits via the backend with a
+    # pre-submit callback waiting for all GPUs to join ray.
+    # KNOWN ISSUE: the rollout GPU count flag is passed together with colocate, where it is ignored.
     U = args.create_backend()
     total_gpus = args.num_nodes * args.num_gpus_per_node
     hf_checkpoint = f"{args.model_dir}/{args.model_name}"
@@ -191,6 +225,9 @@ def _execute_train(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def train(args: ScriptArgs):
+    # [FUNCTION DOC] Command "train" (head role): sets the master address environment variable of this
+    # process to the head IP (the backend reads it for the ray head address and the distributed
+    # rendezvous), then runs training.
     """Head role: start the ray head, wait for both nodes' GPUs, submit the job."""
     # execute_train reads MASTER_ADDR for the ray head's node ip and for the torch
     # distributed rendezvous the worker's ranks connect to.
@@ -201,6 +238,10 @@ def train(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def worker(args: ScriptArgs):
+    # [FUNCTION DOC] Command "worker": force-kills leftover sglang, ray and miles processes from a
+    # previous run (ray refuses to join with stale agents), waits for the head port, then starts ray
+    # joining the head at port 6379 with the configured GPU count, usage stats disabled, and blocks
+    # until the cluster is stopped. Never submits a job.
     """Worker role: join the head's ray cluster and block."""
     # A re-run inherits the previous run's agents, and ray refuses to join with them alive.
     U = args.create_backend()
@@ -216,6 +257,7 @@ def worker(args: ScriptArgs):
 
 @app.callback()
 def _callback() -> None:
+    # [FUNCTION DOC] HELPER: Empty typer callback so commands stay sub-commands. Does nothing.
     pass
 
 

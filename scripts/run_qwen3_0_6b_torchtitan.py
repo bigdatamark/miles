@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Launcher script (single command, run through typer) for a GRPO training-curve validation run of
+# Qwen3-0.6B using the torchtitan training backend, colocated with SGLang on one node; same recipe as
+# the FSDP sibling so curves can be compared. Uses the legacy module-level command helpers (no
+# backend object). Downloads the model and datasets, then trains. Module constants: Hugging Face
+# repo, folder name, fixed wandb group, and the sequence length (8192) that sizes rotary tables and
+# pipeline buffers and must cover prompt plus response.
 """torchtitan training-curve validation: Qwen3-0.6B, single node.
 
 Same recipe as scripts/run_qwen3_0_6b_fsdp.py -- dapo-math-17k @ 4k response
@@ -27,6 +34,11 @@ SEQ_LEN = 8192
 
 @dataclass
 class ScriptArgs(U.ExecuteTrainConfig):
+    # [CLASS DOC]
+    # Command line options extending the legacy train configuration (num_nodes etc.). Fields: GPUs per
+    # node (4), number of rollouts (100), tensor, pipeline and context parallel sizes (all 1), data
+    # directory (default "/root"), model directory, wandb project name, extra raw args. The data
+    # parallel shard degree is not an option; the backend infers it.
     num_gpus_per_node: int = 4
     num_rollout: int = 100
     tp_size: int = 1
@@ -39,6 +51,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
 
 
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Creates the model directory, downloads the model, the DAPO math and AIME 2024
+    # datasets, using module-level helpers.
     U.exec_command_cpu(f"mkdir -p {args.model_dir}")
     U.exec_command_cpu(f"hf download {HF_REPO} --local-dir {args.model_dir}/{MODEL_NAME}")
     U.hf_download_dataset("zhuzilin/dapo-math-17k", data_dir=args.data_dir)
@@ -46,6 +60,16 @@ def prepare(args: ScriptArgs):
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Builds the training argument string and submits the job. Same checkpoint, rollout,
+    # eval, GRPO, optimizer and wandb settings as the FSDP sibling (AIME eval every 10 rollouts; kl loss
+    # on at zero coefficients; wandb only if WANDB_API_KEY is set). SGLang: 1 GPU per engine, log
+    # interval 1000, fraction 0.75. Training backend: torchtitan with the qwen3 model and 0.6B flavor,
+    # sequence length constant, tensor/pipeline/context sizes from options (the 0.6B model has tied
+    # weights, so torchtitan refuses pipeline parallelism > 1), micro batch 1, gradient checkpointing,
+    # buffer 512 MiB, expandable segments for trainers. Colocate with node and GPU counts. Submits
+    # passing the options object and no Megatron model type.
+    # KNOWN ISSUE: unlike the FSDP sibling, no fault tolerance flag, no dynamic batch size, and no
+    # attention backend flags are passed.
     model_path = f"{args.model_dir}/{MODEL_NAME}"
 
     ckpt_args = f"--hf-checkpoint {model_path} --ref-load {model_path} "
@@ -148,6 +172,7 @@ def execute(args: ScriptArgs):
 
 @U.dataclass_cli
 def main(args: ScriptArgs):
+    # [FUNCTION DOC] Command line entry point: runs prepare, then execute.
     prepare(args)
     execute(args)
 

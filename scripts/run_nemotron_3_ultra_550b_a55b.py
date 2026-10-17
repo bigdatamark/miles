@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Launcher script (typer command line app) for GRPO training of NVIDIA Nemotron-3-Ultra-550B-A55B
+# (108-layer hybrid state-space/attention latent mixture of experts) or a 4-layer slice, Megatron
+# bridge mode (the Hugging Face checkpoint is loaded directly) with colocated SGLang, on DAPO math
+# with optional AIME eval. Commands: full-train (download, train), prepare (download only), train.
+# Parallel layouts: pruned models give all GPUs to expert parallel with tensor 1; the full model is
+# only provided for 128 GPUs. Rollout engines use data-parallel attention so attention tensor size
+# divides the state-space group count of 8. Module constant: the full model name.
 """
 NVIDIA Nemotron-3-Ultra-550B-A55B GRPO RL training script.
 
@@ -73,6 +81,13 @@ FULL_MODEL_NAME = "NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16"
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC]
+    # Command line options extending the shared train configuration (num_nodes, output dir, backend
+    # creation). Fields: mode (debug_minimal gives response length 256 instead of 8192), run id, org,
+    # model name (full by default), Megatron model type (re-derived for slices), GPUs per node (None
+    # derived), hardware (auto, H200, B200, GB300), eval switch (off), optimizer offload (on),
+    # weight-update equality check (off), rollouts (30), 32 prompts x 8 samples, global batch 128,
+    # tokens per GPU 1024, save interval 50, skip-saving switch, extra raw args, directories.
     mode: Literal["normal", "debug_minimal"] = "normal"
     run_id: str = command_utils.create_run_id()
     model_org: str = "nvidia"
@@ -96,6 +111,10 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     megatron_path: str = "/root/Megatron-LM"
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Resolves hardware and GPUs per node. If the model name has a layer-count suffix, sets the
+        # Megatron model type to the slice variant; otherwise, any name other than the full model name
+        # raises a not implemented error.
         self.hardware = command_utils.resolve_hardware(self)
         self.num_gpus_per_node = self.num_gpus_per_node or command_utils.NUM_GPUS_OF_HARDWARE[self.hardware]
         if (m := re.search(r"(\d+)layer", self.model_name)) is not None:
@@ -105,14 +124,19 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
 
 def _is_pruned(args: ScriptArgs) -> bool:
+    # [FUNCTION DOC] HELPER: True when the model name contains a number followed by "layer".
     return re.search(r"(\d+)layer", args.model_name) is not None
 
 
 def _hf_checkpoint(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: Returns the model folder path: model directory plus model name.
     return f"{args.model_dir}/{args.model_name}"
 
 
 def _parallelism(args: ScriptArgs) -> tuple[int, int, int, int]:
+    # [FUNCTION DOC] HELPER: Returns (tensor, pipeline, expert, expert-tensor) sizes. Pruned models:
+    # (1, 1, total GPUs, 1). Full model: (8, 4, 32, 1) only when total GPUs is exactly 128; any other
+    # total raises a not implemented error naming the GPU count and model.
     """(tp, pp, ep, etp). Mamba n_groups=8 caps attention/mamba tp at 8."""
     total_gpus = args.num_nodes * args.num_gpus_per_node
     if _is_pruned(args):
@@ -125,6 +149,12 @@ def _parallelism(args: ScriptArgs) -> tuple[int, int, int, int]:
 
 
 def _sglang_args(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: Builds the rollout engine flag string. Pruned models: engine size = GPUs per
+    # node, data-parallel size 2, memory fraction 0.6. Full model: engine size 32, data-parallel size 4,
+    # fraction 0.7. Asserts total GPUs is a multiple of the engine size, and that the attention tensor
+    # size (engine / data-parallel) is integral and divides 8 (the state-space group count); raises
+    # assertion errors otherwise. Emits engine size, expert size = engine size, data-parallel size,
+    # data-parallel attention, memory fraction.
     total_gpus = args.num_nodes * args.num_gpus_per_node
     if _is_pruned(args):
         gpus_per_engine, dp_size, mem_fraction = args.num_gpus_per_node, 2, 0.6
@@ -146,6 +176,8 @@ def _sglang_args(args: ScriptArgs) -> str:
 
 
 def _prepare_download(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Creates model/data directories, downloads the Hugging Face model into the
+    # model folder, the DAPO math dataset, and AIME 2024 only if eval is enabled.
     U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.model_dir} {args.data_dir}")
     U.exec_command_cpu(f"hf download {args.model_org}/{args.model_name} --local-dir {_hf_checkpoint(args)}")
@@ -155,6 +187,22 @@ def _prepare_download(args: ScriptArgs):
 
 
 def _execute_train(args: ScriptArgs):
+    # [FUNCTION DOC] HELPER: Builds the training argument string and submits the job. Checkpoint: the
+    # Hugging Face folder as hf checkpoint and reference load (routed through the bridge), bridge mode;
+    # unless skipping, saves weights only (no optimizer) under the run folder at the save interval.
+    # Rollout: DAPO math, deepscaler reward, chat template, shuffled, sizes from options, response
+    # length 256 (debug) or 8192, temperature 1, balanced. Optional eval: AIME every 20 steps, 16
+    # samples, length 16384, top-p 1. Parallelism from the helper (sequence parallel when tensor > 1),
+    # context 1, full uniform recompute, dynamic batch with token budget, log-prob chunk 128. GRPO with
+    # zero kl and entropy coefficients (no kl loss flag), asymmetric clip. Adam 1e-6 with optional CPU
+    # offload group. SGLang flags from the helper. Misc: dropout off, fp32 accumulation and softmax,
+    # auto attention backend, colocate, actor nodes and GPUs, rollout GPU total, dump details, optional
+    # weight-update equality check. Environment variable skipping the SGLang kernel version guard.
+    # Submits via the backend.
+    # KNOWN ISSUE: the per-node GPU count flag (needed under colocate on smaller nodes) is not passed,
+    # and the rollout GPU count flag is passed together with colocate, where it is ignored.
+    # KNOWN ISSUE: the module docstring says routing replay is not enabled for the full model, and it
+    # is not enabled for slices either (no replay flag anywhere).
     U = args.create_backend()
     tp, pp, ep, etp = _parallelism(args)
     total_gpus = args.num_nodes * args.num_gpus_per_node
@@ -279,6 +327,7 @@ def _execute_train(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def full_train(args: ScriptArgs):
+    # [FUNCTION DOC] Command "full-train": download, then train.
     """Full pipeline: download, train."""
     _prepare_download(args)
     _execute_train(args)
@@ -287,6 +336,7 @@ def full_train(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Command "prepare": download only (run on head node).
     """Download model/data (run on head node)."""
     _prepare_download(args)
 
@@ -294,12 +344,14 @@ def prepare(args: ScriptArgs):
 @app.command()
 @command_utils.dataclass_cli
 def train(args: ScriptArgs):
+    # [FUNCTION DOC] Command "train": training only; assumes data and model are prepared.
     """Run training only (assumes data is prepared)."""
     _execute_train(args)
 
 
 @app.callback()
 def _callback() -> None:
+    # [FUNCTION DOC] HELPER: Empty typer callback so commands stay sub-commands. Does nothing.
     pass
 
 

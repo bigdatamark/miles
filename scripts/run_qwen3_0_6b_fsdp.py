@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Launcher script (single command, run through typer) for a GRPO training-curve validation run of
+# Qwen3-0.6B on DAPO math with AIME eval, using the FSDP training backend (no Megatron) colocated
+# with SGLang on one node. Downloads the model and datasets, then trains. Module constants: Hugging
+# Face repo, local folder name, and the fixed wandb group name. The torchtitan sibling launcher uses
+# the same recipe with a different training backend.
 """FSDP training-curve validation: Qwen3-0.6B (model_type=qwen3, smallest of the series), single node.
 
 dapo-math-17k @ 4k response len, AIME-2024 eval @ 4k every 10 rollouts.
@@ -20,6 +26,10 @@ WANDB_GROUP = "qwen3-0.6B-fsdp-dapo4k"
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC]
+    # Command line options extending the shared train configuration (num_nodes, backend creation).
+    # Fields: GPUs per node (4), number of rollouts (100), data directory (default "/root"), model
+    # directory, wandb project name, extra raw args.
     num_gpus_per_node: int = 4
     num_rollout: int = 100
     data_dir: str = "/root"
@@ -29,6 +39,8 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
 
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Creates the model directory, downloads the model, the DAPO math and AIME 2024
+    # datasets via the backend.
     U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.model_dir}")
     U.exec_command_cpu(f"hf download {HF_REPO} --local-dir {args.model_dir}/{MODEL_NAME}")
@@ -37,6 +49,15 @@ def prepare(args: ScriptArgs):
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Builds the training argument string and submits the job. Checkpoint: the same
+    # folder as hf checkpoint and reference load. Rollout: DAPO math, deepscaler reward, chat template,
+    # shuffled, balanced, rollouts from options, 32 prompts x 8 samples, length 4096, temperature 1,
+    # global batch 256. Eval: AIME every 10 rollouts, 16 samples, length 4096, top-p 1. GRPO with kl
+    # loss on at zero coefficients. Adam 1e-6. Wandb flags only if WANDB_API_KEY is set in the
+    # environment (the key never goes on the command line). SGLang: 1 GPU per engine, log interval
+    # 1000, fraction 0.75, fa3 attention, chunked prefill 4096. FSDP: buffer 512 MiB, gradient
+    # checkpointing, flash attention 3, expandable segments for trainers. Dynamic batch 9216 tokens per
+    # GPU. Colocate, fault tolerance, node and GPU counts. Submits without a Megatron model type.
     U = args.create_backend()
     model_path = f"{args.model_dir}/{MODEL_NAME}"
 
@@ -140,6 +161,7 @@ def execute(args: ScriptArgs):
 
 @command_utils.dataclass_cli
 def main(args: ScriptArgs):
+    # [FUNCTION DOC] Command line entry point: runs prepare, then execute.
     prepare(args)
     execute(args)
 

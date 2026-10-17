@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Launcher script (single command, run through typer) for a GRPO training-curve validation run of
+# NVIDIA Nemotron-3-Nano-4B on DAPO math with AIME eval, using the FSDP training backend (no
+# Megatron) colocated with SGLang on one node. The command downloads the model and datasets, patches
+# the model config, and trains. Module constants: Hugging Face repo, local folder name, and wandb
+# group name (fixed). Importing has no side effects.
 """FSDP training-curve validation: NVIDIA-Nemotron-3-Nano-4B-BF16 (model_type=nemotron_h, smallest of
 the series; dense Mamba2+attention hybrid), single node.
 
@@ -25,6 +31,10 @@ WANDB_GROUP = "nemotron-3-nano-4B-fsdp-dapo4k"
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC]
+    # Command line options extending the shared train configuration (num_nodes, backend creation).
+    # Fields: GPUs per node (4), number of rollouts (100), data directory (default "/root", unlike
+    # sibling launchers), model directory, wandb project name, extra raw args.
     num_gpus_per_node: int = 4
     num_rollout: int = 100
     data_dir: str = "/root"
@@ -34,6 +44,11 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
 
 def _strip_remote_code(model_path: str):
+    # [FUNCTION DOC] HELPER: Reads the checkpoint's config file; if it has a custom class mapping entry,
+    # renames the original to a backup name next to it, removes the entry and writes the config back
+    # (indented JSON), printing a notice. Returns without changes when no such entry exists. Side
+    # effects: file rename and write; the backup is overwritten on a repeated run only if the entry
+    # reappears.
     """Drop auto_map from the local checkpoint config so transformers loads its native nemotron_h
     classes: the checkpoint's bundled remote code predates FA2 support and rejects it."""
     config_path = f"{model_path}/config.json"
@@ -49,6 +64,8 @@ def _strip_remote_code(model_path: str):
 
 
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Creates the model directory, downloads the model, the DAPO math and AIME 2024
+    # datasets, then strips the custom class mapping from the model config.
     U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.model_dir}")
     U.exec_command_cpu(f"hf download {HF_REPO} --local-dir {args.model_dir}/{MODEL_NAME}")
@@ -58,6 +75,17 @@ def prepare(args: ScriptArgs):
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Builds the training argument string and submits the job. Checkpoint: the same
+    # folder as hf checkpoint and reference load. Rollout: DAPO math, deepscaler reward, chat template,
+    # shuffled, balanced, rollouts from options, 32 prompts x 8 samples, length 4096, temperature 1,
+    # global batch 256. Eval: AIME every 10 rollouts, 16 samples, length 4096, top-p 1. GRPO with kl loss
+    # on at zero coefficients. Adam 1e-6. Wandb flags are added only if the WANDB_API_KEY environment
+    # variable is set (the key itself is never put on the command line); project from options, fixed
+    # group. SGLang: 1 GPU per engine, log interval 1000, memory fraction 0.7. FSDP: buffer 512 MiB,
+    # gradient checkpointing, flash attention 2 (the model's patch calls it directly), expandable
+    # segments for trainers. Dynamic batch with 9216 tokens per GPU. Colocate, fault tolerance, node
+    # and GPU counts. Submits via the backend without a Megatron model type.
+    # KNOWN ISSUE: the number of GPUs per node is not passed as a separate total-GPUs flag.
     U = args.create_backend()
     model_path = f"{args.model_dir}/{MODEL_NAME}"
 
@@ -157,6 +185,7 @@ def execute(args: ScriptArgs):
 
 @command_utils.dataclass_cli
 def main(args: ScriptArgs):
+    # [FUNCTION DOC] Command line entry point: runs prepare, then execute.
     prepare(args)
     execute(args)
 
