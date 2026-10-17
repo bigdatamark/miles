@@ -51,7 +51,7 @@ class _SglangTokenIds(httpx.AsyncBaseTransport):
         # that has output log probability triples and no token ids, re-encode, drop content-length,
         # content-encoding and transfer-encoding headers, and rebuild the response. Returns the
         # (possibly rewritten) response. A non-JSON 200 body raises a JSON error.
- = request.url.path.endswith("/chat/completions")
+        is_chat = request.url.path.endswith("/chat/completions")
         if is_chat:
             body = json.loads(request.content or b"{}")
             if body.pop("return_token_ids", None):

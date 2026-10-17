@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# doc-dev: docs/developer/ci/02-docker-build.md
 # [MODULE DOC]
 # Computes a single SHA-256 content hash over the files that feed a Miles Docker image build, and
 # reads such a hash back from a published image manifest. The set of files is defined by a tuple

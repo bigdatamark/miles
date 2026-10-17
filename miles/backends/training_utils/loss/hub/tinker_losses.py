@@ -194,7 +194,7 @@ def importance_sampling_loss_function(
         strict=True,
     ):
         ratio = torch.exp(log_prob - _as_tensor_like(sampling_log_prob, log_prob))
-        per_datum_losses.append(-(ratio *_as_tensor_like(advantage, log_prob) * mask).sum())
+        per_datum_losses.append(-(ratio * _as_tensor_like(advantage, log_prob) * mask).sum())
     return _sum_loss_and_outputs(args, batch, logits, log_probs, per_datum_losses)
 
 
