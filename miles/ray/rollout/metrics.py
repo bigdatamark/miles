@@ -319,6 +319,7 @@ def _compute_zero_std_metrics(args, all_samples: list[Sample]):
     # zero_std/count_<reward>. If there are any groups, also adds the fraction of all groups whose
     # uniform reward is exactly 0 (all_zero_percentage) or exactly 1 (all_one_percentage); these are
     # fractions in [0, 1] despite the name "percentage".
+    # only compute in GRPO-like algorithms where one prompt has multiple responses
     if args.advantage_estimator == "ppo":
         return {}
 
