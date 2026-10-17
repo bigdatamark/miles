@@ -1,3 +1,11 @@
+# [MODULE DOC] Tests for the inline-block function extraction primitive of the reproduction
+# builder: relocating a block verbatim under an authored signature with re-indentation and a
+# replacement call, insertion before a named sibling, refusal when the block is not unique or
+# only matches mid-line, blank-line and string-literal handling during re-indentation, and
+# insertion into a class at method depth. Each test writes source and destination files in a
+# temporary directory, applies the primitive and inspects the files.
+# KNOWN ISSUE: the file contains two stray, consecutive section heading comments, one of which
+# names module extraction, which is not tested here.
 import sys
 from pathlib import Path
 
@@ -12,6 +20,11 @@ from reproduction_testlib import _apply, _commit, _git, _write  # noqa: F401
 
 
 def test_extract_function_relocates_body_and_replaces_with_call(tmp_path: Path) -> None:
+    # [FUNCTION DOC] Source: a class method summing squares with a three-line block at indent
+    # eight; destination: a file with one function. Extracts the block as a function with a
+    # one-parameter signature, a replacement call line and a return line. Asserts: the call line
+    # is in the source and the loop text is gone; the destination contains the signature followed
+    # by the block re-indented to four spaces and then the return line.
     """An inline block is cut verbatim, re-indented under the new signature, and the call site
     replaced; the body lands at function-body indent."""
     (tmp_path / "src.py").write_text(
@@ -48,6 +61,9 @@ def test_extract_function_relocates_body_and_replaces_with_call(tmp_path: Path) 
 
 
 def test_extract_function_inserts_before_named_sibling(tmp_path: Path) -> None:
+    # [FUNCTION DOC] Source is a single assignment line; destination has functions a and c.
+    # Extracting with the before option set to c: the new function b appears between a and c in
+    # the destination (by text position), and the source file becomes exactly the call line.
     """With before=, the new function lands immediately above that sibling at module level."""
     (tmp_path / "src.py").write_text("x = compute()\n")
     (tmp_path / "dst.py").write_text("def a():\n    return 1\n\n\ndef c():\n    return 3\n")
@@ -69,6 +85,8 @@ def test_extract_function_inserts_before_named_sibling(tmp_path: Path) -> None:
 
 
 def test_extract_function_asserts_block_not_unique(tmp_path: Path) -> None:
+    # [FUNCTION DOC] The source repeats the same line twice, so the block occurs twice. Applying
+    # the primitive raises an assertion error.
     """A block that occurs more than once in the source raises, so the cut is unambiguous."""
     (tmp_path / "src.py").write_text("p = f()\np = f()\n")
     (tmp_path / "dst.py").write_text("def z():\n    return 0\n")
@@ -92,6 +110,10 @@ def test_extract_function_asserts_block_not_unique(tmp_path: Path) -> None:
 
 
 def test_extract_function_does_not_pad_blank_lines_in_the_body(tmp_path: Path) -> None:
+    # [FUNCTION DOC] The source is two statements at indent eight separated by an empty line,
+    # extracted to a function in a destination with one function. Asserts the source becomes just
+    # the call line, and the destination text equals the old function, a blank line, then the new
+    # function whose body is dedented to four spaces with the empty line kept empty (no padding).
     """Interior blank lines of the extracted body stay bare newlines, unpadded."""
     (tmp_path / "src.py").write_text("        a = 1\n\n        b = 2\n")
     (tmp_path / "dst.py").write_text("def z():\n    return 0\n")
@@ -112,6 +134,9 @@ def test_extract_function_does_not_pad_blank_lines_in_the_body(tmp_path: Path) -
 def test_extract_function_does_not_reindent_string_literal_interiors(
     tmp_path: Path,
 ) -> None:
+    # [FUNCTION DOC] The block contains a triple-quoted string spanning lines. After extraction
+    # at indent zero (shifted by four), the destination still contains the string's interior
+    # line with no added indentation.
     """Triple-quoted string interior lines keep their exact bytes through the extraction."""
     (tmp_path / "src.py").write_text("TEMPLATE = '''\nliteral line\n'''\nx = TEMPLATE\n")
     (tmp_path / "dst.py").write_text("def existing():\n    return 0\n")
@@ -130,6 +155,8 @@ def test_extract_function_does_not_reindent_string_literal_interiors(
 
 
 def test_extract_function_rejects_a_mid_line_substring_match(tmp_path: Path) -> None:
+    # [FUNCTION DOC] The block text appears only as the tail of a longer line. Applying the
+    # primitive raises an assertion error because the match does not start at a line boundary.
     """A body that only matches mid-line must fail loudly instead of splicing the call."""
     (tmp_path / "src.py").write_text("value = prefix_total = 0\n")
     (tmp_path / "dst.py").write_text("def z():\n    return 0\n")
@@ -149,6 +176,10 @@ def test_extract_function_rejects_a_mid_line_substring_match(tmp_path: Path) -> 
 def test_extract_function_into_class_indents_body_to_method_depth(
     tmp_path: Path,
 ) -> None:
+    # [FUNCTION DOC] Extracts a single unindented statement into class H of the destination using
+    # a method signature indented four spaces and a return line indented eight. Asserts the
+    # resulting destination compiles and contains the method header followed by the statement
+    # indented eight spaces.
     """Extracting into a class must indent the relocated body to method depth."""
     (tmp_path / "src.py").write_text("val = compute_thing()\n")
     (tmp_path / "dst.py").write_text("class H:\n    def last(self):\n        return 0\n")

@@ -1,3 +1,9 @@
+# [MODULE DOC] Tests for the low-level helpers of the reproduction utilities module: running
+# shell commands (output stripping, working directory, check flag), staging and committing with
+# safely quoted messages, removing leading spaces from text, replacing and slicing text by
+# line and byte column spans, definition spans including decorators, and finding classes by name.
+# Some tests use the shared repository fixture; others are pure functions.
+# KNOWN ISSUE: several section heading comments are written twice in a row.
 import sys
 from pathlib import Path
 
@@ -22,11 +28,15 @@ from reproduction_testlib import _apply, _commit, _git, _write  # noqa: F401
 
 
 def test_exec_command_returns_stripped_stdout_on_success() -> None:
+    # [FUNCTION DOC] Running a shell echo command returns the printed word without the trailing
+    # newline.
     """A successful command returns its stdout with surrounding whitespace stripped."""
     assert exec_command("echo hello") == "hello"
 
 
 def test_exec_command_respects_cwd(tmp_path: Path) -> None:
+    # [FUNCTION DOC] Creates a subdirectory and runs the print-working-directory command with it
+    # as the working directory; the output equals the subdirectory's resolved path.
     """The command runs in the supplied working directory."""
     sub = tmp_path / "workdir"
     sub.mkdir()
@@ -34,12 +44,16 @@ def test_exec_command_respects_cwd(tmp_path: Path) -> None:
 
 
 def test_exec_command_check_true_raises_on_failure() -> None:
+    # [FUNCTION DOC] A command exiting with status seven and the check flag on raises a runtime
+    # error whose message matches the command text.
     """With check=True a non-zero exit status raises RuntimeError with the command."""
     with pytest.raises(RuntimeError, match="exit 7"):
         exec_command("exit 7", check=True)
 
 
 def test_exec_command_check_false_returns_stdout_without_exiting() -> None:
+    # [FUNCTION DOC] A command that prints a word then exits with status three, run with the
+    # check flag off, returns the printed word and raises nothing.
     """With check=False a failing command returns its stdout and does not exit."""
     assert exec_command("echo partial; exit 3", check=False) == "partial"
 
@@ -51,6 +65,8 @@ def test_exec_command_check_false_returns_stdout_without_exiting() -> None:
 
 
 def test_git_add_and_commit_stages_and_commits(repo: Path) -> None:
+    # [FUNCTION DOC] Writes a new file in the repository fixture and commits with a message.
+    # Asserts the latest commit subject equals the message and the working tree is clean.
     """It stages every change in the cwd and records a commit with the message."""
     _write(repo, **{"file.txt": "content\n"})
     git_add_and_commit("add file", cwd=str(repo))
@@ -68,6 +84,10 @@ def test_git_add_and_commit_stages_and_commits(repo: Path) -> None:
     ],
 )
 def test_git_add_and_commit_message_round_trips_with_metacharacters(repo: Path, message: str) -> None:
+    # [FUNCTION DOC] Parametrized over four messages (spaces; single and double quotes; shell
+    # variable, logical-and, remove command and semicolon; parentheses, pipe and semicolon).
+    # Writes a file, commits with the message, and asserts the stored full message equals the
+    # original text exactly.
     """Messages with shell metacharacters are quoted safely and survive verbatim."""
     _write(repo, **{"file.txt": "content\n"})
     git_add_and_commit(message, cwd=str(repo))
@@ -81,32 +101,43 @@ def test_git_add_and_commit_message_round_trips_with_metacharacters(repo: Path, 
 
 
 def test_dedent_with_zero_leaves_text_unchanged() -> None:
+    # [FUNCTION DOC] Dedenting by zero returns text with an indented line and a plain line
+    # unchanged.
     """Dedenting by zero spaces returns the text untouched."""
     text = "  indented\nplain\n"
     assert dedent(text, 0) == text
 
 
 def test_dedent_removes_exactly_n_leading_spaces() -> None:
+    # [FUNCTION DOC] Lines indented by four and eight spaces dedented by four become indented by
+    # zero and four.
     """Exactly n leading spaces are removed from each qualifying line."""
     assert dedent("    four\n        eight\n", 4) == "four\n    eight\n"
 
 
 def test_dedent_leaves_lines_with_fewer_than_n_spaces_unchanged() -> None:
+    # [FUNCTION DOC] With n equal to four, a four-space line is dedented while a two-space line
+    # and an unindented line are kept as they were.
     """A line with fewer than n leading spaces is not modified at all."""
     assert dedent("    four\n  two\nzero\n", 4) == "four\n  two\nzero\n"
 
 
 def test_dedent_does_not_strip_tabs() -> None:
+    # [FUNCTION DOC] A line indented with two tab characters dedented by two stays unchanged.
     """Tab characters are never treated as the spaces dedent removes."""
     assert dedent("\t\ttabbed\n", 2) == "\t\ttabbed\n"
 
 
 def test_dedent_preserves_blank_lines_and_trailing_newline() -> None:
+    # [FUNCTION DOC] Two indented lines separated by an empty line are dedented, the empty line
+    # and the final newline kept.
     """Blank lines and a final newline are preserved across line boundaries."""
     assert dedent("    a\n\n    b\n", 4) == "a\n\nb\n"
 
 
 def test_dedent_preserves_absence_of_trailing_newline() -> None:
+    # [FUNCTION DOC] Text whose last line has no trailing newline stays without one after
+    # dedenting.
     """A text without a trailing newline keeps it absent after dedenting."""
     assert dedent("    a\n    b", 4) == "a\nb"
 
@@ -118,23 +149,31 @@ def test_dedent_preserves_absence_of_trailing_newline() -> None:
 
 
 def test_replace_span_single_line() -> None:
+    # [FUNCTION DOC] Replacing columns three through five (end exclusive) of a one-line text with
+    # two letters gives the expected text.
     """A span within one line is replaced in place."""
     assert _replace_span("ab cd ef\n", 1, 3, 1, 5, "XY") == "ab XY ef\n"
 
 
 def test_replace_span_across_lines() -> None:
+    # [FUNCTION DOC] A span from line one column four to line three column one in a three-line
+    # text is replaced, keeping the prefix of the first line and the suffix of the last line.
     """A span crossing lines collapses to the replacement between the kept prefix/suffix."""
     text = "a = foo(\n    x,\n) + 1\n"
     assert _replace_span(text, 1, 4, 3, 1, "bar()") == "a = bar() + 1\n"
 
 
 def test_slice_span_returns_the_overwritten_text() -> None:
+    # [FUNCTION DOC] The same multi-line span as the replace test returns the exact text that
+    # the replacement would overwrite.
     """_slice_span returns exactly the region _replace_span would overwrite."""
     text = "a = foo(\n    x,\n) + 1\n"
     assert _slice_span(text, 1, 4, 3, 1) == "foo(\n    x,\n)"
 
 
 def test_find_def_span_includes_decorators() -> None:
+    # [FUNCTION DOC] Parses a class with a decorated method, finds the method and checks its span
+    # is lines two through four (starting at the decorator line).
     """A def's span starts at its first decorator and ends at its last body line."""
     src = "class C:\n    @staticmethod\n    def foo(self):\n        return 1\n"
     node = _find_def(rr.ast.parse(src), "foo")
@@ -142,6 +181,8 @@ def test_find_def_span_includes_decorators() -> None:
 
 
 def test_find_class_returns_named_class_or_none() -> None:
+    # [FUNCTION DOC] In a tree with classes A and B, looking up B returns the class named B and
+    # looking up a missing name returns nothing.
     """_find_class locates a class by name and returns None when absent."""
     tree = rr.ast.parse("class A:\n    pass\nclass B:\n    pass\n")
     assert _find_class(tree, "B").name == "B"

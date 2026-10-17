@@ -1,3 +1,7 @@
+# [MODULE DOC] Command line script used by the release workflow to rewrite the package version
+# in the repository root setup file. It takes exactly one positional argument, the new version
+# string, validates it against the release version pattern, and rewrites the version assignment
+# in place. Exit status is zero on success and one on usage or validation errors.
 """Bump the miles version in setup.py.
 
 Usage: python .github/scripts/release/bump_miles_version.py 0.3.0
@@ -11,6 +15,16 @@ VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(?:(?:rc|\.post)\d+)?$")
 
 
 def main() -> int:
+    # [FUNCTION DOC] Entry point. Reads the new version from the single command line argument.
+    # If the argument count is wrong, prints the module docstring (usage text) to standard error
+    # and returns 1. If the version does not fully match the pattern of three dot-separated
+    # integers optionally followed by a release-candidate suffix or a post-release suffix (each
+    # with an integer), prints an error to standard error and returns 1. Otherwise locates the
+    # setup file three directory levels above this script (the repository root), reads it,
+    # replaces every quoted version assignment value with the new version, and asserts that
+    # exactly one replacement happened (an assertion error otherwise, before anything is
+    # written). Then overwrites the setup file, prints a confirmation line to standard output and
+    # returns 0. Side effects: reads and writes the setup file on disk.
     if len(sys.argv) != 2:
         print(__doc__.strip(), file=sys.stderr)
         return 1

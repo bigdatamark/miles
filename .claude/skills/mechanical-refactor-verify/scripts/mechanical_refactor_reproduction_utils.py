@@ -1,3 +1,18 @@
+# [MODULE DOC] Library for certifying that a git commit is a purely mechanical refactor. The
+# caller builds a reproduction recipe (the builder class defined here) out of small,
+# source-text-preserving primitives: moving a symbol between modules, extracting a function or
+# a set of symbols into a new module, rewriting call sites, and adding, removing or re-pathing
+# imports. The verifier checks out the base commit into a temporary git worktree, applies the
+# recipe, runs the pre-commit formatter on the changed files, commits any formatter fixes, and
+# diffs the worktree against the target commit; an empty diff means the recipe reproduces the
+# commit exactly (PASS), otherwise the residual diff is printed and the process exits with
+# status one. Design principles shared by all primitives: locate code with the Python syntax
+# tree, but splice the ORIGINAL source text (never regenerate code from the tree) so literals,
+# comments and layout survive byte-for-byte; preserve each file's line-ending style (no newline
+# translation on read or write); count columns as UTF-8 byte offsets like the syntax tree does;
+# and refuse (raise an assertion error) when a request is ambiguous or cannot be done
+# faithfully. Depends only on git, the pre-commit tool and the standard library. Operations are
+# recorded by the builder and executed later, in order, against a root directory.
 """Reproduce a whole mechanical refactor and diff it byte-for-byte against a commit.
 
 You write a ``transform()`` that recreates the change; ``verify_mechanical_refactor``
@@ -31,6 +46,12 @@ from pathlib import Path
 
 
 def exec_command(cmd: str, cwd: str | None = None, check: bool = True) -> str:
+    # [FUNCTION DOC] Runs a shell command string (through the shell) in the optional working
+    # directory, echoing the command to standard output first (prefixed with a dollar sign,
+    # flushed). Captures standard output and standard error as text. When check is true (the
+    # default) and the exit code is non-zero, raises a runtime error containing the command and
+    # the stripped standard error. Returns the stripped standard output text. Side effects:
+    # arbitrary subprocess execution.
     print(f"  $ {cmd}", flush=True)
     result = subprocess.run(
         cmd,
@@ -45,16 +66,28 @@ def exec_command(cmd: str, cwd: str | None = None, check: bool = True) -> str:
 
 
 def git_add_and_commit(message: str, cwd: str) -> None:
+    # [FUNCTION DOC] HELPER: Stages every change (including deletions and untracked files) in
+    # the given directory's repository and commits with the shell-quoted message. Raises a
+    # runtime error if either git step fails (for example nothing to commit). Returns nothing.
     exec_command(f"git add -A && git commit -m {shlex.quote(message)}", cwd=cwd)
 
 
 def dedent(text: str, n: int) -> str:
+    # [FUNCTION DOC] Removes exactly n leading spaces from every line of the text that begins
+    # with at least n spaces; lines with fewer leading spaces (including blank lines and lines
+    # starting with a tab) are left unchanged rather than partially trimmed. Lines are split
+    # only on the newline character (see the split helper), and line terminators are kept.
+    # Returns the new text.
     """Remove exactly n leading spaces from each line."""
     lines = _split_keepends(text)
     return "".join(line[n:] if line[:n] == " " * n else line for line in lines)
 
 
 def _split_keepends(text: str) -> list[str]:
+    # [FUNCTION DOC] HELPER: Splits text into lines, each keeping its terminating newline
+    # character; a carriage return before the newline stays inside the line. Only the newline
+    # character is a separator. If the text does not end with a newline the last piece (when
+    # non-empty) is returned without a terminator; an empty text gives an empty list.
     """Split into lines ending in "\\n" only -- unlike ``str.splitlines``, a form feed or
     other exotic line break stays inside its line, matching ast's line numbering."""
     parts = text.split("\n")
@@ -65,6 +98,8 @@ def _split_keepends(text: str) -> list[str]:
 
 
 def _read_source(path: Path) -> str:
+    # [FUNCTION DOC] HELPER: Reads a text file with the platform default encoding and with
+    # newline translation disabled so carriage returns survive. Returns the full contents.
     """Read preserving the file's line endings (no universal-newline translation), so a
     CRLF file round-trips byte-for-byte through the primitives."""
     with path.open("r", newline="") as f:
@@ -72,11 +107,16 @@ def _read_source(path: Path) -> str:
 
 
 def _write_source(path: Path, text: str) -> None:
+    # [FUNCTION DOC] HELPER: Overwrites a text file with the given text, with newline
+    # translation disabled (the counterpart of the read helper). Returns nothing.
     with path.open("w", newline="") as f:
         f.write(text)
 
 
 def _newline_style(text: str) -> str:
+    # [FUNCTION DOC] HELPER: Returns the two-character carriage-return plus newline sequence if
+    # it occurs anywhere in the text, otherwise the single newline character. Used to match the
+    # file's line-ending style when synthesizing new lines.
     return "\r\n" if "\r\n" in text else "\n"
 
 
@@ -85,6 +125,21 @@ def verify_mechanical_refactor(
     target_commit: str,
     transform: "Callable[[Path], None]",
 ) -> None:
+    # [FUNCTION DOC] Verifies that applying the transform to the base commit reproduces the
+    # target commit exactly. Inputs: base commit id, target commit id, and a callable taking the
+    # worktree root path. Steps, printed as four numbered stages: (1) find the repository root
+    # from the current directory, create a temporary directory and a new git worktree there on a
+    # new branch named after the first eight characters of the base commit; (2) call the
+    # transform with the worktree path; (3) stage everything, list changed files that were added,
+    # copied, modified or renamed relative to the base, run pre-commit on just those files
+    # (its failure exit status is deliberately ignored since it rewrites files), and if the
+    # worktree is then dirty commit it as "pre-commit fixes"; (4) diff the worktree against the
+    # target commit. A non-empty diff prints a FAIL message with the diff and exits the process
+    # with status one; an empty diff prints a PASS message. In all cases (a finally block) it
+    # prints where the worktree and branch were left and the manual cleanup command; nothing is
+    # removed automatically. Raises a runtime error if a git step fails.
+    # KNOWN ISSUE: the branch name depends only on the base commit, so a second verification of
+    # the same base while the first worktree or branch still exists fails at worktree creation.
     repo_root = exec_command("git rev-parse --show-toplevel")
     worktree_dir = tempfile.mkdtemp(prefix="verify-mechanical-")
     branch_name = f"verify-mechanical-{base_commit[:8]}"
@@ -136,6 +191,9 @@ _MOVE_DECORATORS = {"@staticmethod", "@classmethod"}
 
 
 def _find_def(tree: ast.AST, name: str) -> ast.AST | None:
+    # [FUNCTION DOC] HELPER: Searches the whole syntax tree (breadth-first walk order) for the
+    # first function or async function definition with the given name, at any nesting depth,
+    # including methods. Returns the node, or nothing if absent. Performs no ambiguity check.
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
             return node
@@ -143,6 +201,13 @@ def _find_def(tree: ast.AST, name: str) -> ast.AST | None:
 
 
 def _find_unique_def(tree: ast.AST, name: str, *, from_class: str | None = None, where: str) -> ast.AST:
+    # [FUNCTION DOC] HELPER: Finds the single function, async function or class definition
+    # called name. If from_class is given the search is restricted to that class's subtree
+    # (assertion error if the class is missing). Otherwise, for a module tree, a lone top-level
+    # definition of that name wins immediately even if nested definitions share the name.
+    # Otherwise all matching definitions in the (sub)tree are collected: none gives an
+    # assertion error saying not found in the where description; more than one gives an
+    # assertion error telling the caller to pass the class to disambiguate. Returns the node.
     """Resolve ``def name`` (or ``class name``) and refuse ambiguity: with same-named defs in
     scope the first-match lookup could silently cut the wrong body, so the caller must scope
     the search with ``from_class``."""
@@ -163,6 +228,10 @@ def _find_unique_def(tree: ast.AST, name: str, *, from_class: str | None = None,
 
 
 def _def_header_end(def_text: str) -> int:
+    # [FUNCTION DOC] HELPER: Tokenizes the definition text (which must start at the def line)
+    # and tracks bracket nesting depth over operator tokens; returns the 1-based line number of
+    # the first colon seen at depth zero, which closes the signature. Raises an assertion error
+    # if there is none. Tokenizer errors on malformed text propagate.
     """1-based line (within ``def_text``, which starts at the def line) of the colon that
     opens the body. Tokenize-based, so parentheses inside string defaults do not confuse
     the bracket depth."""
@@ -179,6 +248,8 @@ def _def_header_end(def_text: str) -> int:
 
 
 def _find_class(tree: ast.AST, name: str) -> ast.ClassDef | None:
+    # [FUNCTION DOC] HELPER: Returns the first class definition with the given name found by a
+    # breadth-first walk of the whole tree (any nesting depth), or nothing if absent.
     for node in ast.walk(tree):
         if isinstance(node, ast.ClassDef) and node.name == name:
             return node
@@ -186,12 +257,20 @@ def _find_class(tree: ast.AST, name: str) -> ast.ClassDef | None:
 
 
 def _def_span(node: ast.AST) -> tuple[int, int]:
+    # [FUNCTION DOC] HELPER: Returns the 1-based first and last line numbers of a definition
+    # node, where the first line is the smallest of the def line and all decorator lines, and
+    # the last is the node's end line.
     """(first, last) 1-based line numbers of a def, including its decorators."""
     start = min([node.lineno] + [d.lineno for d in node.decorator_list])
     return start, node.end_lineno
 
 
 def _symbol_named(node: ast.AST, name: str) -> bool:
+    # [FUNCTION DOC] HELPER: Tells whether a statement node defines the symbol name: a function,
+    # async function or class by its own name; an annotated assignment whose target is a plain
+    # name equal to name; or a plain assignment where any one of its targets is a plain name
+    # equal to name. Tuple-unpacking targets, attribute targets and every other statement kind
+    # never match.
     """Whether a top-level statement defines the symbol ``name`` -- a def/class by its name,
     or a module-level assignment by one of its target names (so ``_is_hip = is_hip()`` is
     found by ``_is_hip``)."""
@@ -205,11 +284,19 @@ def _symbol_named(node: ast.AST, name: str) -> bool:
 
 
 def _byte_slice(line: str, start: int | None, end: int | None) -> str:
+    # [FUNCTION DOC] HELPER: Encodes the line as UTF-8, slices by the given byte offsets (either
+    # may be nothing for open-ended) and decodes back. Needed because syntax tree column offsets
+    # are byte offsets. Slicing through the middle of a multi-byte character raises a decode
+    # error.
     """Slice a line by UTF-8 byte offsets -- ast col_offsets count bytes, not characters."""
     return line.encode("utf-8")[start:end].decode("utf-8")
 
 
 def _replace_span(text: str, sl: int, sc: int, el: int, ec: int, repl: str) -> str:
+    # [FUNCTION DOC] HELPER: Returns the text with the region from (start line, start byte
+    # column) up to but excluding (end line, end byte column) replaced by the replacement text.
+    # Lines are 1-based, columns 0-based bytes. Everything before the start and after the end,
+    # including line terminators, is preserved verbatim.
     """Replace the text from (sl, sc) to (el, ec) -- 1-based lines, 0-based byte columns,
     end exclusive (ast node span semantics) -- with ``repl``."""
     lines = _split_keepends(text)
@@ -219,6 +306,10 @@ def _replace_span(text: str, sl: int, sc: int, el: int, ec: int, repl: str) -> s
 
 
 def _slice_span(text: str, sl: int, sc: int, el: int, ec: int) -> str:
+    # [FUNCTION DOC] HELPER: Returns the substring from (start line, start byte column) up to
+    # excluding (end line, end byte column), with the same coordinate conventions as the replace
+    # helper. For a single-line span it slices that line; otherwise it joins the tail of the
+    # first line, all whole lines between, and the head of the last line.
     lines = _split_keepends(text)
     if sl == el:
         return _byte_slice(lines[sl - 1], sc, ec)
@@ -226,10 +317,19 @@ def _slice_span(text: str, sl: int, sc: int, el: int, ec: int) -> str:
 
 
 def _node_slice(text: str, node: ast.AST) -> str:
+    # [FUNCTION DOC] HELPER: Returns the exact original source text covered by a syntax tree
+    # node, using its recorded start and end positions.
     return _slice_span(text, node.lineno, node.col_offset, node.end_lineno, node.end_col_offset)
 
 
 def _rewrite_matching_calls(text: str, predicate: "Callable", rewrite: "Callable") -> str:
+    # [FUNCTION DOC] HELPER: Repeatedly rewrites call expressions. Loop: parse the current text,
+    # take the first call node (in the tree's breadth-first walk order, so outer calls before
+    # nested ones) accepted by the predicate; if none, return the text. Otherwise replace that
+    # call's exact source span with the string the rewrite callable returns (it receives the
+    # current text and the node) and loop again with a fresh parse. Termination requires the
+    # rewrite to make the call stop matching; a rewrite that still matches loops forever.
+    # Syntax errors from parsing propagate.
     """Rewrite every call ``predicate`` accepts by splicing the original source text
     (never ``ast.unparse``, which would re-spell literals and drop comments). One call is
     rewritten per pass and the text re-parsed, so a matching call nested inside another
@@ -252,6 +352,16 @@ def _rewrite_matching_calls(text: str, predicate: "Callable", rewrite: "Callable
 
 
 def _lowered_call_text(text: str, node: ast.Call) -> str:
+    # [FUNCTION DOC] HELPER: Builds the replacement text that turns a call of an attribute on
+    # an owner, whose first argument is the receiver, into a method call on the receiver. The
+    # receiver's source must be single-line and comment-free, no comment may sit between the
+    # opening parenthesis and the receiver or between the receiver and the following comma or
+    # closing parenthesis, and only whitespace may separate the receiver from the comma
+    # (assertion errors otherwise). Result: the receiver source, a dot, the called attribute
+    # name, an opening parenthesis, then the remaining original text after the receiver and its
+    # comma with leading spaces and tabs removed (when there were no other arguments, just the
+    # closing parenthesis). Keyword arguments, trailing commas, comments and newlines after the
+    # first argument are preserved byte-for-byte.
     """Original call text with the leading receiver argument spliced out and made the
     call's new receiver: ``Owner.foo(recv, rest...)`` -> ``recv.foo(rest...)``. All other
     argument bytes (literal spelling, comments, the magic trailing comma) are untouched.
@@ -288,6 +398,16 @@ def _lowered_call_text(text: str, node: ast.Call) -> str:
 
 
 def _drop_self_annotation(method_text: str, name: str) -> str:
+    # [FUNCTION DOC] HELPER: Removes the type annotation (the colon and annotation text) from
+    # the first parameter of the named method when that parameter is called self and is
+    # annotated. The text may be indented as inside a class: the indentation of its first line
+    # is measured and removed only for parsing, and reported columns are shifted back. Returns
+    # the text unchanged if the method is not found, has no positional parameters, or the first
+    # parameter is not an annotated self. Only the span from the end of the parameter name to
+    # the end of the annotation is deleted.
+    # KNOWN ISSUE: the column arithmetic assumes the name is immediately followed by the colon
+    # and annotation, so a space between the name and the colon is not handled specially, and
+    # the first-line indentation measurement counts only spaces, not tabs.
     """Drop the type annotation from a moved method's ``self`` parameter -- relocating
     ``def foo(self: Target)`` into ``Target`` makes the annotation redundant. The body is
     otherwise untouched, so the relocation stays byte-faithful. ``method_text`` may still be
@@ -312,6 +432,10 @@ def _drop_self_annotation(method_text: str, name: str) -> str:
 
 
 def _multiline_string_interior_lines(top_level_text: str) -> set[int]:
+    # [FUNCTION DOC] HELPER: Tokenizes the text and returns the set of 1-based line numbers that
+    # are inside a string token spanning several lines: every line after the token's first line
+    # through its last line (the closing-delimiter line included). Used to avoid re-indenting
+    # text that is part of a string literal's value.
     """1-based lines of ``top_level_text`` that lie inside a multi-line string token
     (every line after the token's opening line, including the closing-delimiter line).
     Re-indenting those lines would change the literal's value, not its layout."""
@@ -328,6 +452,19 @@ def _audit_extract_header(
     where: str,
     rederivable: dict[str, str | None] | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Audits the hand-authored header text of a new module so no
+    # unaccounted code rides along. Inputs: the header text, a mapping from names of assignments
+    # deleted from the source module to their value source text, a location description for
+    # messages, and an optional mapping (default empty) of surviving source constants to their
+    # value text. Each top-level header statement must be one of: an import; a bare string
+    # expression (docstring); a conditional on the type-checking flag (plain or module
+    # qualified name) whose body is only imports; an assignment of a standard logger obtained
+    # with the module name; an assignment whose every plain-name target appears in the removed
+    # mapping with an identical value text (those names are recorded as reproduced); or one
+    # whose every plain-name target appears in the re-derivable mapping with identical value
+    # text. Anything else raises an assertion error naming the statement. Finally every removed
+    # assignment name must have been reproduced in the header, else an assertion error lists the
+    # missing names. Value text is compared via regenerated source from the tree.
     """Refuse header content the extraction cannot vouch for. The header of a scattered
     extraction is authored text reproduced from the target commit, so anything beyond
     imports, a TYPE_CHECKING import block, a logger, a byte-equivalent copy of an
@@ -371,6 +508,12 @@ def _audit_extract_header(
 
 
 class Repro:
+    # [CLASS DOC] Fluent recipe builder. Each primitive method validates nothing up front: it
+    # appends a closure to the ordered list of recorded operations and returns the builder so
+    # calls chain. Every recorded operation takes the root directory of a checked-out tree and
+    # edits files under it. Holds the base commit, the target commit, an optional repository
+    # root, and the list of operations. The run method (further below) executes them through the
+    # verifier. Operations use relative file paths from the root.
     """Builds a faithful relocation transform from primitives, then reproduces a commit.
 
     Operations are recorded and applied in order to a throwaway worktree at ``base``; the
@@ -379,20 +522,32 @@ class Repro:
     account for (a bundled change, or a re-derived scaffold a human must confirm)."""
 
     def __init__(self, base: str, target: str, repo_root: str | None = None) -> None:
+        # [FUNCTION DOC] Stores the base commit, the target commit and the optional repository
+        # root, and starts with an empty list of recorded operations.
         self.base = base
         self.target = target
         self.repo_root = repo_root
         self.ops: list[Callable[[Path], None]] = []
 
     def lower_call_sites(self, name: str, owner: str, *, paths: list[str]) -> "Repro":
+        # [FUNCTION DOC] Records an operation that, in each listed file, rewrites every call of
+        # the attribute name on an expression whose source text equals owner and that has at
+        # least one positional argument, so the first argument becomes the receiver of the
+        # method call and the rest of the arguments stay as they were. Returns the builder.
         """Rewrite ``owner.name(receiver, rest)`` to ``receiver.name(rest)`` -- a static
         call becoming an instance-method call when ``name`` moves onto a class."""
 
         def op(root: Path) -> None:
+            # [FUNCTION DOC] HELPER: The recorded operation: for each relative path, reads the
+            # file, applies the repeated call rewriting with the predicate below and the
+            # lowering text builder, and writes the file back (always, even if unchanged).
             for rel in paths:
                 path = root / rel
 
                 def predicate(node: ast.Call) -> bool:
+                    # [FUNCTION DOC] HELPER: True for a call of an attribute named name whose
+                    # object expression has source text equal to owner and which has at least
+                    # one positional argument.
                     return (
                         isinstance(node.func, ast.Attribute)
                         and node.func.attr == name
@@ -409,14 +564,22 @@ class Repro:
         return self
 
     def requalify_call_sites(self, name: str, owner: str, *, paths: list[str]) -> "Repro":
+        # [FUNCTION DOC] Records an operation that, in each listed file, rewrites every call of
+        # the attribute name on an expression whose source text equals owner into a plain call
+        # of the bare name with identical arguments (the qualifier and dot are dropped). Matches
+        # calls with any number of arguments. Returns the builder.
         """Rewrite ``owner.name(args)`` to ``name(args)`` -- dropping the qualifier when
         ``name`` moves to a module-level free function."""
 
         def op(root: Path) -> None:
+            # [FUNCTION DOC] HELPER: The recorded operation: for each relative path, reads the
+            # file, applies the repeated call rewriting, and writes it back.
             for rel in paths:
                 path = root / rel
 
                 def predicate(node: ast.Call) -> bool:
+                    # [FUNCTION DOC] HELPER: True for a call of an attribute named name on an
+                    # expression whose source text equals owner.
                     return (
                         isinstance(node.func, ast.Attribute)
                         and node.func.attr == name
@@ -424,6 +587,8 @@ class Repro:
                     )
 
                 def rewrite(text: str, node: ast.Call) -> str:
+                    # [FUNCTION DOC] HELPER: Returns the bare name followed by the original
+                    # call text after the callee expression (the parenthesized arguments).
                     call_src = _node_slice(text, node)
                     func_src = _node_slice(text, node.func)
                     return name + call_src[len(func_src) :]
@@ -439,6 +604,12 @@ class Repro:
     def route_call_sites_through_field(
         self, name: str, *, field: str, paths: list[str], owner: str | None = None
     ) -> "Repro":
+        # [FUNCTION DOC] Records an operation that, in each listed file, inserts an attribute
+        # access named field between the receiver and the called attribute name for every call
+        # of that attribute (any number of arguments). Calls whose receiver is already an
+        # attribute access ending in field are skipped (so repeated passes converge). When owner
+        # is given only calls whose receiver source text equals owner are rewritten. Returns the
+        # builder.
         """Rewrite ``<recv>.name(args)`` to ``<recv>.field.name(args)`` -- the method moved
         onto a collaborator reached through ``self.field``, so its callers route through that
         field. With ``owner`` given, only calls whose receiver text equals ``owner`` are
@@ -446,10 +617,15 @@ class Repro:
         """
 
         def op(root: Path) -> None:
+            # [FUNCTION DOC] HELPER: The recorded operation: for each relative path, reads the
+            # file, applies the repeated call rewriting, and writes it back.
             for rel in paths:
                 path = root / rel
 
                 def predicate(node: ast.Call) -> bool:
+                    # [FUNCTION DOC] HELPER: True for a call of an attribute named name, whose
+                    # receiver is not already an attribute named field, and (if owner is set)
+                    # whose receiver source text equals owner.
                     return (
                         isinstance(node.func, ast.Attribute)
                         and node.func.attr == name
@@ -458,6 +634,9 @@ class Repro:
                     )
 
                 def rewrite(text: str, node: ast.Call) -> str:
+                    # [FUNCTION DOC] HELPER: Returns the receiver source, a dot, the field
+                    # name, a dot, the method name, then the original text after the callee
+                    # expression (the parenthesized arguments).
                     call_src = _node_slice(text, node)
                     func_src = _node_slice(text, node.func)
                     receiver_src = _node_slice(text, node.func.value)
@@ -472,11 +651,26 @@ class Repro:
         return self
 
     def remove_import(self, rel: str, import_text: str, *, in_function: str | None = None) -> "Repro":
+        # [FUNCTION DOC] Records an operation that deletes import statements from the file at
+        # the relative path rel. A statement (plain or from-import, at any nesting depth) is
+        # selected when its source text contains import_text as a whole token, meaning the
+        # characters before and after the match are not word characters or dots. If in_function
+        # is given it must name exactly one definition (assertion error if missing or
+        # ambiguous) and only imports whose first line lies within that definition's line range
+        # are considered. At least one match is required (assertion error otherwise). An import
+        # that is alone on its lines is deleted whole, along with one immediately following blank
+        # line if present. An import sharing its lines with other simple statements (separated
+        # by semicolons) is cut out by span and the leftover semicolons and spaces on that line
+        # are tidied. Returns the builder.
+        # KNOWN ISSUE: the docstring says "contains import_text" but the match is token-bounded,
+        # so a partial name inside a longer dotted path does not match.
         """Remove every import statement whose text contains ``import_text`` (and a trailing
         blank), optionally scoped to one function so a same-text module-level import (e.g. a
         ``TYPE_CHECKING`` guard) is left untouched."""
 
         def op(root: Path) -> None:
+            # [FUNCTION DOC] HELPER: The recorded operation; does the work described for the
+            # builder method above, reading and writing the file with line endings preserved.
             path = root / rel
             lines = _split_keepends(_read_source(path))
             tree = ast.parse("".join(lines))
@@ -563,6 +757,19 @@ class Repro:
         asname: str | None = None,
         keep_exploded: bool = False,
     ) -> "Repro":
+        # [FUNCTION DOC] Records an operation that removes one imported name from top-level
+        # import statements of the file at relative path rel. With module given, only top-level
+        # from-imports whose module text (leading dots for relative level, then the module
+        # name) equals module are considered; with module nothing, only plain imports. Within
+        # them the alias with the given name and given alias (asname) is dropped; statements
+        # without it are skipped. At least one statement must change (assertion error otherwise).
+        # If it was the only name the whole statement lines are deleted. Otherwise, when the
+        # dropped alias sits alone on its own line and (two or more names survive, or the
+        # statement contains any comment, or keep_exploded is true), just that alias line is
+        # deleted, leaving the other lines intact. Else, if the statement contains comments but
+        # the alias shares a line with other text, an assertion error is raised. Else the whole
+        # statement is rebuilt on a single line from the surviving names, using the file's
+        # newline style. All edits are applied from the bottom up. Returns the builder.
         """Drop a single imported ``name`` from a module-level import: from a ``from module
         import a, b`` keep the rest and drop only ``name``; when it was the sole name -- or for
         a plain ``import name`` (``module=None``) -- remove the whole statement. The symbol's
@@ -578,9 +785,13 @@ class Repro:
         """
 
         def alias_text(alias: ast.alias) -> str:
+            # [FUNCTION DOC] HELPER: Returns the imported name, followed by the word "as" and
+            # the alias if one exists.
             return alias.name + (f" as {alias.asname}" if alias.asname else "")
 
         def op(root: Path) -> None:
+            # [FUNCTION DOC] HELPER: The recorded operation; performs the edit described for
+            # the builder method above and writes the file back.
             path = root / rel
             lines = _split_keepends(_read_source(path))
             nl = _newline_style("".join(lines))
@@ -639,6 +850,13 @@ class Repro:
         return self
 
     def add_imported_name(self, rel: str, *, module: str, name: str, asname: str | None = None) -> "Repro":
+        # [FUNCTION DOC] Records an operation that appends one name (with optional alias) to the
+        # first top-level from-import of the file at rel whose module text (leading dots for
+        # relative level plus module name) equals module. The statement is rebuilt on a single
+        # line from its existing names plus the new one, using the file's newline style. Raises
+        # an assertion error if the statement holds any comment, if the name is already
+        # imported there, or if no such statement exists. Only the first matching statement is
+        # changed. Returns the builder.
         """Add a single ``name`` to an existing module-level ``from module import a, b`` --
         the dual of ``remove_imported_name``. A relocated symbol gains a new importer that
         already imports other names from the same module, so the target extends that line
@@ -647,9 +865,12 @@ class Repro:
         import carrying comments is refused, since a rebuild would drop them."""
 
         def alias_text(target_name: str, target_asname: str | None) -> str:
+            # [FUNCTION DOC] HELPER: Returns the name, followed by the word "as" and the alias
+            # if one is given.
             return target_name + (f" as {target_asname}" if target_asname else "")
 
         def op(root: Path) -> None:
+            # [FUNCTION DOC] HELPER: The recorded operation; performs the edit described above.
             path = root / rel
             lines = _split_keepends(_read_source(path))
             nl = _newline_style("".join(lines))
@@ -677,6 +898,15 @@ class Repro:
         return self
 
     def add_import(self, rel: str, import_stmt: str, *, after: str | None = None) -> "Repro":
+        # [FUNCTION DOC] Records an operation that inserts one import statement line (the given
+        # statement text plus the file's newline style) into the file at relative path rel.
+        # Without the after option the line goes right after the last top-level import statement
+        # (imports nested inside other statements are ignored); if the file starts with a
+        # docstring the line goes at least after the docstring; if there is neither, it goes at
+        # the very top of the file. With after given, the line goes immediately after the first
+        # top-level import statement whose raw source text contains that substring (assertion
+        # error if none). No blank line or sort order is handled; the formatter does that.
+        # Returns the builder.
         """Append an import after the last top-level import; the formatter's import sorter
         places it (so the exact insertion point does not matter). When ``after`` is given,
         insert immediately after the top-level import statement whose source text contains
@@ -686,6 +916,8 @@ class Repro:
         """
 
         def op(root: Path) -> None:
+            # [FUNCTION DOC] HELPER: The recorded operation; inserts the import line as
+            # described for the builder method above and writes the file back.
             path = root / rel
             lines = _split_keepends(_read_source(path))
             nl = _newline_style("".join(lines))
@@ -720,6 +952,17 @@ class Repro:
         return self
 
     def add_typechecking_import(self, rel: str, import_stmt: str) -> "Repro":
+        # [FUNCTION DOC] Records an operation that adds one import statement line to the
+        # type-checking-only block of the file at relative path rel. It looks at top-level
+        # conditionals whose test is the type-checking flag (plain or qualified by the typing
+        # module); in the first one found, the new line is indented to match the block's first
+        # statement. If the block's only statement is a placeholder pass, that pass is replaced
+        # by the import; otherwise the import is inserted right after the block's last body
+        # statement. If no such block exists, a new one is created right after the last top-level
+        # import: a blank line, the conditional header, and the import indented by four spaces
+        # (the flag name itself is not imported by this operation; an assertion error is raised
+        # if the file has no top-level import to anchor to). Uses the file's newline style.
+        # Returns the builder.
         """Append ``import_stmt`` inside the file's ``if TYPE_CHECKING:`` block -- a moved
         definition whose annotations reference a type needs that type imported there. The
         import sorter orders the block, so the exact insertion point does not matter. A lone
@@ -730,6 +973,8 @@ class Repro:
         """
 
         def op(root: Path) -> None:
+            # [FUNCTION DOC] HELPER: The recorded operation; edits the file as described for the
+            # builder method above and writes it back.
             path = root / rel
             lines = _split_keepends(_read_source(path))
             nl = _newline_style("".join(lines))
@@ -762,12 +1007,24 @@ class Repro:
         return self
 
     def repath_import(self, rel: str, *, old_module: str, new_module: str, name: str) -> "Repro":
+        # [FUNCTION DOC] Records an operation that changes the module of from-imports in the
+        # file at relative path rel. It considers only from-import statements that are not
+        # direct children of the module body (nested in functions, conditionals and so on) whose
+        # module attribute equals old_module (compared without any leading dots of a relative
+        # import) and whose imported names include name. On the statement's first line only, the
+        # first occurrence of the text "from <original spelling, with relative dots> import" is
+        # replaced by "from <new_module> import"; the new module is always written as given
+        # (never relative). An assertion error is raised if that text is not found on the line,
+        # or if no statement was changed at all. Other names in the same statement move with it.
+        # Returns the builder.
         """Repath every function-scoped ``from old_module import ... name ...`` to
         ``from new_module import ...`` in place -- the moved symbol's home changed, so its
         importer adjusts. Only imports nested below module level are touched; a module-level
         import is left to the import sorter via add_import / remove_import."""
 
         def op(root: Path) -> None:
+            # [FUNCTION DOC] HELPER: The recorded operation; rewrites matching nested imports as
+            # described for the builder method above and writes the file back.
             path = root / rel
             lines = _split_keepends(_read_source(path))
             tree = ast.parse("".join(lines))
@@ -801,12 +1058,27 @@ class Repro:
         dst: str,
         before: str | None = None,
     ) -> "Repro":
+        # [FUNCTION DOC] Records an operation that moves one module-level assignment from file
+        # src to file dst (both relative paths). Source side: among top-level statements, the
+        # plain assignment with exactly one plain-name target equal to name, or the annotated
+        # assignment to that name; if several match, the last one wins; assertion error if none.
+        # Its lines are deleted from src (surrounding blank lines stay). Destination side (the
+        # destination is read after the source was written): with before given, the original
+        # lines followed by one blank line are inserted immediately above the top-level
+        # definition named before (decorators included), found among classes, functions and
+        # single-target plain assignments (assertion error if not found); without before, a blank
+        # line and then the original lines are inserted right after the last top-level import, or
+        # at the very top if there are no imports. Returns the builder.
+        # KNOWN ISSUE: an annotated assignment cannot serve as the before anchor, only the
+        # definition kinds and single-target plain assignments are recognized there.
         """Cut the module-level assignment binding ``name`` from ``src`` and paste it verbatim
         into ``dst`` at module level -- a module constant relocated together with the code
         that reads it. Pasted immediately above the top-level statement named ``before``
         when given, else after the last top-level import."""
 
         def op(root: Path) -> None:
+            # [FUNCTION DOC] HELPER: The recorded operation; cuts from the source file and pastes
+            # into the destination file as described for the builder method above.
             src_path = root / src
             dst_path = root / dst
             src_lines = _split_keepends(_read_source(src_path))
@@ -876,6 +1148,34 @@ class Repro:
         leave_delegate: str | None = None,
         delegate_name: str | None = None,
     ) -> "Repro":
+        # [FUNCTION DOC] Records an operation that moves one function, async function or class
+        # definition (with its decorators) from file src to file dst. Raises an assertion error
+        # immediately (at recording time) if both before and after are given. The into_class
+        # argument is required (pass nothing for module level). Source lookup: the definition
+        # called name, restricted to the class from_class if given, must be unique (see the
+        # unique-definition helper). Source edit: with no leave_delegate the definition lines are
+        # deleted. With leave_delegate (the name of an attribute of self) they are replaced by a
+        # stub that keeps the original header and forwards to that attribute: the stub body is a
+        # single return (return await for async definitions) of a call to self.<attribute>.<
+        # delegate_name or name> passing every positional parameter except self by position,
+        # then star-args, every keyword-only parameter as a same-named keyword, and double-star
+        # kwargs. The header text runs from the definition line to the line whose top-level colon
+        # closes the signature (found by tokenizing, so comments between header and body are not
+        # absorbed). If the method is decorated with the static or class method decorator the stub
+        # starts at the definition line, dropping ALL its decorators; leave_delegate on such a
+        # method additionally requires the first parameter to be an annotated self (assertion
+        # error otherwise). The stub drops the annotation of self only when the annotation (name,
+        # string, or last component of a dotted name) equals into_class. Moved text: the
+        # definition lines minus any static/class method decorator lines, shifted by dedent
+        # (positive removes that many leading spaces where present; negative adds that many to
+        # non-blank lines), and with the annotation of self removed when drop_self_annotation is
+        # set. Destination: located inside class into_class (assertion error if missing) or at
+        # module level. With after, inserted (preceded by a blank line) right after the first
+        # container statement defining the symbol after; with before, inserted (followed by a
+        # blank line) immediately above the named sibling def/class including its decorators
+        # (assertion error if not found); otherwise appended after the last class member, or at
+        # the end of the file at module level, preceded by a blank line. The source is written
+        # before the destination is read, so src may equal dst. Returns the builder.
         """Cut ``def name`` (with decorators) from ``src`` and paste it into ``dst`` --
         immediately above the sibling def ``before`` when given (so the relocated def lands in
         the chain's order), immediately below the top-level symbol ``after`` when given (a
@@ -889,6 +1189,9 @@ class Repro:
         assert before is None or after is None, "move_symbol: before and after are mutually exclusive"
 
         def op(root: Path) -> None:
+            # [FUNCTION DOC] HELPER: The recorded operation; cuts the definition from the source
+            # file (optionally leaving a delegating stub) and pastes the adjusted text into the
+            # destination file, as described for the builder method above.
             src_path = root / src
             dst_path = root / dst
             src_lines = _split_keepends(_read_source(src_path))
@@ -1022,6 +1325,19 @@ class Repro:
         symbols: list[str],
         future_import: bool = True,
     ) -> "Repro":
+        # [FUNCTION DOC] Records an operation that splits the end of file src into a new module
+        # dst (relative paths). It walks the top-level statements backwards from the end,
+        # including each one that is either a function or class named in symbols, or scaffolding
+        # (any import, a conditional on the type-checking flag, or an assignment whose targets
+        # are all plain names), and stops at the first statement that is neither. The included
+        # statements form the cut tail; every listed symbol must be a definition inside it
+        # (assertion error naming the missing ones). The cut starts at the first tail statement's
+        # first line (including its decorators); any comment or blank line directly above stays
+        # in src. Everything from there to the end of src is removed from src and written to dst
+        # (parent directories created, an existing file overwritten), preceded by a future
+        # annotations import line when future_import is true (default). Returns the builder.
+        # KNOWN ISSUE: with an empty symbols list and no scaffolding at the file end the tail is
+        # empty and the first-element access raises an index error instead of a clear message.
         """Cut the contiguous tail of ``src`` -- the moved ``symbols`` and the module
         scaffolding that leads into them (imports, a ``TYPE_CHECKING`` guard, a logger,
         module constants) -- and write it as the new module ``dst``, prepending
@@ -1029,6 +1345,8 @@ class Repro:
         verbatim; the formatter sorts the imports and normalises the blank lines."""
 
         def op(root: Path) -> None:
+            # [FUNCTION DOC] HELPER: The recorded operation; computes the tail, truncates the
+            # source file and writes the new module, as described for the builder method above.
             src_path = root / src
             dst_path = root / dst
             src_lines = _split_keepends(_read_source(src_path))
@@ -1036,6 +1354,10 @@ class Repro:
             wanted = set(symbols)
 
             def is_scaffolding(node: ast.stmt) -> bool:
+                # [FUNCTION DOC] HELPER: True for an import, a conditional whose test is the
+                # type-checking flag (plain or typing-qualified; the body is not inspected), a
+                # plain assignment whose targets are all simple names, or an annotated
+                # assignment to a simple name; false for everything else.
                 if isinstance(node, (ast.Import, ast.ImportFrom)):
                     return True
                 if isinstance(node, ast.If):
@@ -1088,6 +1410,26 @@ class Repro:
         order: list[str],
         drop_assigns: list[str] | None = None,
     ) -> "Repro":
+        # [FUNCTION DOC] Records an operation that moves the named top-level functions and
+        # classes from anywhere in file src into a new module dst, preceded by an authored header.
+        # Preconditions (assertion errors): order must contain exactly the same names as symbols;
+        # every symbol must be a top-level function or class of src; every name in drop_assigns
+        # (optional) must be assigned at top level of src, and any statement assigning such a name
+        # must have only plain-name targets. Steps: (1) each symbol's block is the exact line
+        # range including decorators. (2) For top-level assignments (plain or annotated) naming
+        # any dropped name, remember each dropped name's value as regenerated source text; if the
+        # statement also binds surviving names it is rewritten as a chained assignment of just
+        # the surviving names to the original value text, otherwise its lines are deleted. (3)
+        # Build the map of constants that survive in src (every other top-level assignment's
+        # names to value text; later statements override earlier ones, and statements touching
+        # dropped names are excluded). (4) If header has non-blank content or any assignment was
+        # dropped, audit the header with the audit helper using those two maps. (5) Delete all
+        # symbol blocks and dropped assignments from src, bottom up, and write src. (6) Write
+        # dst (parent directories created) as the header with trailing line breaks removed
+        # followed by two blank lines (only if the header is non-blank), then the blocks in the
+        # given order separated by two blank lines with trailing line breaks stripped, ending in a
+        # single newline. Comments directly above moved definitions stay in src. Returns the
+        # builder.
         """Relocate the named top-level defs/classes from *scattered* positions in ``src`` into
         a new module ``dst`` whose authored ``header`` (the imports, module constants, a logger,
         a ``TYPE_CHECKING`` block -- harmless or re-derived boilerplate reproduced from the
@@ -1101,6 +1443,8 @@ class Repro:
         the small header is authored."""
 
         def op(root: Path) -> None:
+            # [FUNCTION DOC] HELPER: The recorded operation; performs the steps described for the
+            # builder method above on the source and destination files.
             src_path = root / src
             dst_path = root / dst
             src_lines = _split_keepends(_read_source(src_path))
@@ -1203,6 +1547,28 @@ class Repro:
         before: str | None = None,
         into_class: str | None = None,
     ) -> "Repro":
+        # [FUNCTION DOC] Records an operation that turns an inline block of statements in file
+        # src into a new function in file dst. Inputs: name (informational only; the function
+        # name comes from the authored signature text), signature (full header text, which may be
+        # indented and may span lines), body (the exact original block text, which must occur
+        # exactly once in src and start at a line start), body_indent (number of spaces of
+        # indentation the block has in src), call (replacement text for the block in src,
+        # authored), optional return_text (extra lines appended to the new function, authored),
+        # optional before (sibling def/class above which to insert) and into_class. Steps: assert
+        # the block is unique and begins at a line boundary; replace the first occurrence in src
+        # by call and write src; build the function as the signature (trailing line breaks
+        # trimmed) then the re-indented block, then return_text if any, ending with exactly one
+        # newline. Re-indentation shifts every line by the signature's own indentation plus four
+        # minus body_indent; lines inside multi-line string literals are left alone, a positive
+        # shift skips blank lines, a negative shift only trims lines that start with enough
+        # spaces. Insertion into dst (read after src was written, so they may be the same
+        # file), where the container is class into_class (assertion error if missing) or the
+        # module: above the sibling named before (including decorators) followed by a blank line,
+        # otherwise appended after the last member of the class or at the end of the file,
+        # preceded by a blank line. Returns the builder.
+        # KNOWN ISSUE: the name parameter is never used, and a before sibling that is not found is
+        # silently ignored (the function is appended instead) whereas the symbol-move primitive
+        # raises an assertion error in that case.
         """Extract an inline block into a new ``name`` function. The block ``body`` is cut from
         ``src`` *verbatim* (so the byte diff certifies the function body is exactly the source's),
         re-indented from ``body_indent`` to a function-body indent, and wrapped under the
@@ -1218,6 +1584,12 @@ class Repro:
         guide-split.md)."""
 
         def reindent(text: str, shift: int) -> str:
+            # [FUNCTION DOC] HELPER: Shifts the indentation of a block of text by shift spaces
+            # (relative to the enclosing body_indent for finding string interiors). Zero returns
+            # the text unchanged. Lines lying inside multi-line string literals (determined on the
+            # block dedented by body_indent) are never touched. Negative: removes that many
+            # leading spaces from each other line that has at least that many leading spaces.
+            # Positive: prepends that many spaces to each other non-blank line.
             if shift == 0:
                 return text
             interior = _multiline_string_interior_lines(dedent(text, body_indent))
@@ -1233,6 +1605,9 @@ class Repro:
             )
 
         def op(root: Path) -> None:
+            # [FUNCTION DOC] HELPER: The recorded operation; replaces the block in the source file
+            # by the call text and inserts the new function into the destination file, as
+            # described for the builder method above.
             src_path = root / src
             src_text = _read_source(src_path)
             assert src_text.count(body) == 1, f"block not found uniquely in {src}"
@@ -1289,12 +1664,24 @@ class Repro:
         return self
 
     def delete_file(self, path: str) -> "Repro":
+        # [FUNCTION DOC] Records an operation that deletes the file at relative path path if it
+        # holds only scaffolding. If the file does not exist nothing happens (no error). Otherwise
+        # every top-level statement must be an import, a bare string expression (docstring), a
+        # conditional on the type-checking flag (plain or typing-qualified), or an assignment of
+        # the standard module logger; anything else makes an assertion error that lists up to
+        # three offending statements as regenerated source text. Then the file is removed.
+        # Returns the builder.
+        # KNOWN ISSUE: the body of a type-checking conditional is not inspected, so live code
+        # placed inside such a block would be deleted without complaint.
         """Delete a source module that its symbols' relocation left empty (the chain deletes
         the leftover scaffolding-only file). Run after the moves that empty it. Refuses a
         file that still holds anything beyond a docstring, imports, a TYPE_CHECKING block, or
         a bare module ``logger`` -- deleting live code is not a relocation."""
 
         def is_module_logger(stmt: ast.stmt) -> bool:
+            # [FUNCTION DOC] HELPER: True when the statement is an assignment (any targets) whose
+            # value, as regenerated source text, is the standard library logger lookup that
+            # takes the module name.
             return (
                 isinstance(stmt, ast.Assign)
                 and stmt.value is not None
@@ -1302,6 +1689,8 @@ class Repro:
             )
 
         def op(root: Path) -> None:
+            # [FUNCTION DOC] HELPER: The recorded operation; checks the file and deletes it as
+            # described for the builder method above.
             target = root / path
             if not target.exists():
                 return
@@ -1329,6 +1718,17 @@ class Repro:
         return self
 
     def run(self) -> str:
+        # [FUNCTION DOC] Executes the recorded recipe and reports. Uses the configured repository
+        # root, or finds it from the current directory. Creates a temporary directory whose name
+        # starts with "repro-" and a git worktree on a new branch of the same name at the base
+        # commit; applies every recorded operation in order to the worktree path; stages all,
+        # runs pre-commit on changed files (added, copied, modified or renamed relative to base;
+        # its failure is ignored); commits any resulting changes with message "repro"; diffs the
+        # worktree against the target commit. Prints a residual message with the diff line count
+        # and the diff when non-empty, or a PASS message when empty. Returns the diff text (empty
+        # string on a clean reproduction). A finally block always force-removes the worktree and
+        # deletes the branch (failures ignored), unlike the standalone verify function which
+        # leaves them behind. Does not exit the process; exceptions from operations propagate.
         """Apply the operations to a worktree at base, run pre-commit, diff against target.
         Returns the residual diff ("" on a clean reproduction)."""
         repo_root = self.repo_root or exec_command("git rev-parse --show-toplevel")

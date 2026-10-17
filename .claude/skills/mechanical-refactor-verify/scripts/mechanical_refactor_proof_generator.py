@@ -1,3 +1,20 @@
+# [MODULE DOC] Proof generator for the mechanical refactor verifier. For a git commit that
+# relocates code, it (1) infers a "recipe": a structured description of the primitives of the
+# reproduction utilities module needed to rebuild the commit from its parent, derived from the
+# commit's diff plus the syntax trees of the files before and after; (2) renders that recipe as
+# a standalone python script (named after the commit id prefix) which builds the recipe object
+# from the utilities module, runs it, and exits non-zero unless the byte-for-byte diff against
+# the commit is empty; (3) optionally runs that script and records output; and (4) for a range
+# of commits, writes a folder of scripts plus a plain text log and an HTML report. Inference
+# supports these commit shapes: a method moved onto an existing class (call sites lowered), a
+# method moved to a free module-level function (call sites requalified), a free function moved
+# to another module (importers repathed), a trailing block of a module cut into a new module,
+# scattered symbols gathered into a new module, a module-level assignment moved, and an inline
+# block extracted into a new function; renames and statement-level reorders are reported as
+# unsupported (recipe flagged unsupported with notes). Imports gained or lost at module level
+# are inferred symmetrically from before/after trees. Can be run as a command line program
+# with a single commit or a base..tip range. Reads git state through subprocesses and never
+# modifies the repository itself (the generated scripts do, in a temporary worktree).
 """Infer a faithful reproduce recipe for a move commit, then emit and run a self-contained
 reproduce script. Lets the verifier turn a commit a formatter re-wrapped into an auditable,
 runnable reproduce script -- no one hand-writes it.
@@ -41,6 +58,9 @@ import mechanical_refactor_reproduction_utils as rr
 
 
 def _git_output(args: list[str], cwd: str) -> str:
+    # [FUNCTION DOC] HELPER: Runs git with the arguments in directory cwd. Returns standard
+    # output text exactly as produced (not stripped) when the exit status is zero, or an empty
+    # string on any failure (errors are swallowed, so a missing file looks like an empty file).
     """Raw stdout of a git command ("" if it fails). Not stripped, so ``ast`` line numbers
     stay aligned with a file's real lines."""
     result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
@@ -48,6 +68,8 @@ def _git_output(args: list[str], cwd: str) -> str:
 
 
 def _repo_root() -> str:
+    # [FUNCTION DOC] HELPER: Returns the stripped top-level directory of the repository that
+    # contains the current directory; raises the called-process error outside a repository.
     return subprocess.run(
         ["git", "rev-parse", "--show-toplevel"],
         capture_output=True,
@@ -57,12 +79,19 @@ def _repo_root() -> str:
 
 
 def _removed_symbol_names(lines: list[str]) -> set[str]:
+    # [FUNCTION DOC] HELPER: Scans diff content lines and returns the set of names introduced by
+    # lines that start (after optional whitespace) with a function definition (optionally async)
+    # or a class definition. Indentation is ignored, so methods and nested definitions count
+    # too, despite the docstring saying top-level.
     """Names of top-level defs and classes among removed diff lines (the extract's source
     relinquishes these), so a moved class is found, not just a moved def."""
     return {m.group(2) for ln in lines if (m := re.match(r"\s*(?:async\s+)?(def|class)\s+(\w+)", ln))}
 
 
 def _def_indent(lines: list[str], name: str) -> int | None:
+    # [FUNCTION DOC] HELPER: Returns the number of leading whitespace characters of the first
+    # line that defines a function (optionally async) with exactly this name (word boundary after
+    # the name), or nothing if no line does.
     for line in lines:
         match = re.match(r"(\s*)(?:async\s+)?def\s+" + re.escape(name) + r"\b", line)
         if match:
@@ -71,6 +100,13 @@ def _def_indent(lines: list[str], name: str) -> int | None:
 
 
 def _per_file_diff(commit: str, root: str) -> dict[str, dict]:
+    # [FUNCTION DOC] HELPER: Shows the commit (no message, no color, no external diff tool) and
+    # parses the unified diff text. Returns a mapping from each file's new path to a mapping
+    # with: removed (list of removed content lines without the leading minus), added (list of
+    # added lines without the plus), new (true if the file was created) and deleted (true if the
+    # file was removed). Only lines inside hunks count as content, so file header lines are not
+    # mistaken for content. Renamed files are keyed by their new path. An empty or failing git
+    # call yields an empty mapping.
     """Per-file removed/added content lines (whitespace intact) and a new-file flag."""
     out = _git_output(["show", commit, "--format=", "--no-color", "--no-ext-diff"], root)
     files: dict[str, dict] = {}
@@ -96,6 +132,9 @@ def _per_file_diff(commit: str, root: str) -> dict[str, dict]:
 
 
 def _enclosing_function(tree: ast.AST, lineno: int) -> str | None:
+    # [FUNCTION DOC] HELPER: Returns the name of the innermost function or async function whose
+    # line range contains the given 1-based line (innermost meaning the one starting on the
+    # latest line), or nothing if the line is outside every function.
     best: tuple[int, str] | None = None
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -106,6 +145,9 @@ def _enclosing_function(tree: ast.AST, lineno: int) -> str | None:
 
 
 def _enclosing_class_of_def(tree: ast.AST, name: str) -> str | None:
+    # [FUNCTION DOC] HELPER: Returns the name of the first class (in tree walk order) that has a
+    # function or async function called name as a direct member of its body, or nothing. Does
+    # not look at deeper nesting.
     for node in ast.walk(tree):
         if isinstance(node, ast.ClassDef):
             for child in node.body:
@@ -115,6 +157,12 @@ def _enclosing_class_of_def(tree: ast.AST, name: str) -> str | None:
 
 
 def _delegate_stub_attr(tree: ast.AST, name: str) -> tuple[str, str] | None:
+    # [FUNCTION DOC] HELPER: Looks only at the FIRST function called name in tree walk order.
+    # If its body is exactly one return statement returning a call of a method on an attribute
+    # of the self parameter, returns a pair of the attribute name and the called method name;
+    # in every other case returns nothing (including when no such function exists).
+    # KNOWN ISSUE: a stub of an async method returns an await expression, not a plain call, so
+    # it is not recognized, although the move primitive generates such stubs for async methods.
     """The component attribute a forwarding stub ``def name``: ``return self.<attr>.<m>(...)``
     delegates through, with the forwarded method name -- None when no such stub exists.
     """
@@ -136,6 +184,9 @@ def _delegate_stub_attr(tree: ast.AST, name: str) -> tuple[str, str] | None:
 
 
 def _nested_in_function(tree: ast.AST, name: str) -> bool:
+    # [FUNCTION DOC] HELPER: Finds the first function called name; returns false if there is
+    # none; otherwise true when some other function's line range contains the found function's
+    # first line (that is, it is defined inside another function).
     target = rr._find_def(tree, name)
     if target is None:
         return False
@@ -150,10 +201,19 @@ def _nested_in_function(tree: ast.AST, name: str) -> bool:
 
 
 def _module_of_path(path: str) -> str:
+    # [FUNCTION DOC] HELPER: Converts a repository-relative python file path to a dotted module
+    # name: drops a leading "python/" directory if present, drops the ".py" suffix and replaces
+    # slashes by dots.
     return path.removeprefix("python/").removesuffix(".py").replace("/", ".")
 
 
 def _import_pairs(text: str) -> dict:
+    # [FUNCTION DOC] HELPER: Parses the source and, over its top-level statements only, maps
+    # each imported name to the statement text that would import it alone. A plain import gives
+    # a text key equal to its own value ("import x" with " as y" appended if aliased). A
+    # from-import gives, for each name, a key of the triple (module text including leading dots
+    # for relative level, name, alias or nothing) mapped to a one-name from-import text. Raises
+    # a syntax error for unparsable text.
     """Module-level imports keyed one entry per imported name, so removing a single name from
     a multi-name ``from x import a, b`` is not mistaken for the whole statement changing. The
     value is the one-name ``add_import`` text for a gained name (the import sorter merges it).
@@ -175,6 +235,10 @@ def _import_pairs(text: str) -> dict:
 
 
 def _typechecking_pairs(text: str) -> dict:
+    # [FUNCTION DOC] HELPER: Like the import-pairs helper but for imports found directly in the
+    # body of each top-level conditional on the type-checking flag (plain or typing-qualified):
+    # same key and value shapes for from-imports (triple key, one-name statement) and plain
+    # imports (text key equal to its value). Nested conditionals inside the block are ignored.
     """Imports inside the module's ``if TYPE_CHECKING:`` block, keyed per name (same shape as
     ``_import_pairs``), so a type-only import the destination gains for a moved annotation is
     inferable separately from the runtime imports."""
@@ -198,6 +262,10 @@ def _typechecking_pairs(text: str) -> dict:
 
 
 def _local_import_of(tree: ast.AST, fn_name: str, module: str, symbol: str) -> str | None:
+    # [FUNCTION DOC] HELPER: Finds the first function called fn_name; returns nothing if none.
+    # Searches inside it (any depth) for a from-import whose module attribute equals module
+    # and that imports symbol, and returns the canonical text "from <module> import <symbol>"
+    # (aliases and other names in the statement are not reflected), or nothing if absent.
     fn = rr._find_def(tree, fn_name)
     if fn is None:
         return None
@@ -212,6 +280,10 @@ def _local_import_of(tree: ast.AST, fn_name: str, module: str, symbol: str) -> s
 
 
 def _removal_from_key(path: str, key) -> dict:
+    # [FUNCTION DOC] HELPER: Converts a key of the import-pairs mapping into the keyword record
+    # for an imported-name removal. Returns a mapping with path, module, name, asname. A triple
+    # key gives its three parts. A text key of a plain import has the "import " prefix removed
+    # and is split on " as " (first occurrence) into name and alias; the module is nothing.
     """Turn an ``_import_pairs`` key the target dropped into a ``remove_imported_name`` call. A
     ``(module, name, asname)`` key drops one name from a ``from`` import; a bare ``import x``
     statement string drops a plain import."""
@@ -227,6 +299,10 @@ def _removal_from_key(path: str, key) -> dict:
 
 
 def _module_assign_names(text: str) -> set:
+    # [FUNCTION DOC] HELPER: Returns the set of plain names bound at module top level by plain
+    # assignments (every plain-name target) and annotated assignments. Tuple unpacking,
+    # attribute targets, augmented assignments and imports are ignored. Raises a syntax error
+    # on unparsable text.
     """Names bound by module-level assignments (``logger = ...``, ``_is_hip = is_hip()``), so a
     constant relocated into an extracted module can be told apart from one the source keeps.
     """
@@ -240,6 +316,16 @@ def _module_assign_names(text: str) -> set:
 
 
 def _import_additions(path: str, after: str, before_pairs: dict, after_pairs: dict) -> list:
+    # [FUNCTION DOC] HELPER: Computes import additions for one file from the import-pairs
+    # mappings before and after plus the after-state source text. Returns a list of records
+    # with path and statement text. For each key present after but not before: a from-import
+    # key whose module was not imported at all before is deferred; every other key (a plain
+    # import, or a name from a module already imported before) yields its one-name statement.
+    # Then for the deferred modules, every top-level from-import statement of the after-state
+    # whose module text is in that set is added verbatim (original lines, trailing newlines
+    # trimmed), preserving multi-line wrapping. Note the verbatim statement may include names
+    # that were already imported before from other statements, which cannot happen for a wholly
+    # new module.
     """The module-level imports a file gained, as ``add_import`` texts. A name gained from a
     module the file already imported is added per-name (the sorter merges it); a name from a
     wholly new module is added as the target's *verbatim* statement, so a multi-line or
@@ -266,6 +352,15 @@ def _import_additions(path: str, after: str, before_pairs: dict, after_pairs: di
 
 @dataclass
 class Recipe:
+    # [CLASS DOC] Mutable data record describing how to reproduce one commit. Fields: base and
+    # target commit ids; a supported flag (default true; set false with explanations in notes
+    # when the commit shape cannot be inferred); and lists of plain mappings, one list per
+    # primitive family, consumed by the script renderer: symbol moves, assignment moves, tail
+    # extracts into new modules, inline-block function extracts, scattered extracts, call-site
+    # adaptations (lowerings and requalifications), function-scoped import repaths, in-function
+    # import removals, module-level imported-name removals, import additions, type-checking
+    # import additions, file deletions, and human-readable notes. Converted to a plain mapping
+    # with the standard dataclass helper when serialized.
     base: str
     target: str
     supported: bool = True
@@ -295,6 +390,20 @@ def _infer_call_adaptations(
     commit: str,
     root: str,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Finds call sites that must be adapted because the method name moved
+    # out of class src_class, and appends records to the recipe (mutated; returns nothing). The
+    # kind is lowering when the method moved onto a class (into_class set) and requalification
+    # when it became a free function. For every file touched by the commit (the files mapping
+    # from the per-file diff), parses the parent commit's version (skipping files that do not
+    # parse or are empty) and collects the enclosing functions of every call of an attribute
+    # called name whose object expression source text equals src_class, where for lowering at
+    # least one argument is required and for requalification any argument count is accepted.
+    # Calls outside any function are ignored. If a file has such callers, appends a lowering
+    # record (name, owner, path, kind). Then for each caller function sorted by name, if it
+    # contains a local from-import of src_class from the source module and that statement text
+    # appears inside any removed diff line of the file, appends an in-function import removal
+    # record (path, text, function). The src parameter is the source file path (converted to a
+    # dotted module name) and dst is not used.
     """A method-source move adapts its call sites: a move onto a class lowers the receiver
     out of the args; a move to a module-level free function drops the qualifier. A caller is
     a before-state call ``<src_class>.name(...)`` -- matched on ``src_class`` (not a loose
@@ -339,6 +448,12 @@ def _infer_function_scoped_repaths(
     commit: str,
     root: str,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Appends a repath record (path, old module, new module, name) to the
+    # recipe (mutated; returns nothing) for each file, other than the source file, in the commit
+    # whose parent-state contains a from-import of name from the dotted source module that is not
+    # a direct child of the module body (nested in a function or conditional). Files are visited
+    # in sorted order; unparsable or empty files are skipped. Only absolute module spellings are
+    # matched, never relative imports.
     """A moved free function keeps the same bare call, so a caller only repaths its import.
     Module-level repaths fall out of the symmetric import diff; only function-scoped imports
     (which ``add_import`` cannot place) need an explicit in-place repath."""
@@ -372,11 +487,17 @@ def _infer_function_scoped_repaths(
 
 
 def _self_annotation_dropped(src_def: ast.AST | None, dst_def: ast.AST | None) -> bool:
+    # [FUNCTION DOC] HELPER: Compares the source-side and destination-side definition nodes of a
+    # moved function. Returns true only when the source's first positional parameter (not
+    # counting positional-only ones) is called self and annotated while the destination's is not
+    # (or is missing or absent). A missing node counts as having no annotation.
     """Whether the move drops a ``self: Target`` annotation -- the source had it and the
     destination does not. Some class moves keep it (a retyped self that stays annotated), so
     this is inferred from both sides rather than assumed."""
 
     def has_self_annotation(node: ast.AST | None) -> bool:
+        # [FUNCTION DOC] HELPER: True when the node exists, has at least one positional
+        # parameter, the first is named self, and it carries a type annotation.
         return bool(
             node is not None
             and node.args.args
@@ -388,6 +509,10 @@ def _self_annotation_dropped(src_def: ast.AST | None, dst_def: ast.AST | None) -
 
 
 def _wants_future_import(files: dict[str, dict], src: str, dst: str) -> bool:
+    # [FUNCTION DOC] HELPER: Decides whether a new module needs the future annotations import
+    # prepended. True when some added line of the destination's diff contains that import text
+    # and no removed line of the source's diff does (so it was not simply carried over with the
+    # cut tail). Raises a key error if src or dst is not in the files mapping.
     future = "from __future__ import annotations"
     gained = any(future in line for line in files[dst]["added"])
     travelled = any(future in line for line in files[src]["removed"])
@@ -395,6 +520,10 @@ def _wants_future_import(files: dict[str, dict], src: str, dst: str) -> bool:
 
 
 def _next_sibling_def_name(dst_tree: ast.AST, name: str, into_class: str | None) -> str | None:
+    # [FUNCTION DOC] HELPER: Takes the list of function and class definitions that are direct
+    # children of the container (the body of class into_class when given, found anywhere in the
+    # tree and treated as empty if missing; otherwise the module body), and returns the name of
+    # the definition right after the one called name, or nothing if name is last or not present.
     """The name of the def that immediately follows ``name`` at its scope in the destination
     (module level, or inside ``into_class``), or None when ``name`` is the last def there. Lets
     a move reinsert the relocated def in the chain's order instead of appending at the end.
@@ -413,10 +542,17 @@ def _next_sibling_def_name(dst_tree: ast.AST, name: str, into_class: str | None)
 
 
 def _next_sibling_assign_or_def(dst_tree: ast.AST, name: str) -> str | None:
+    # [FUNCTION DOC] HELPER: Considers only top-level statements that have a name (function,
+    # class, single plain-name assignment, annotated assignment to a name) in order, finds the
+    # one called name, and returns the name of the next named statement, or nothing if it is
+    # last or not found. Unnamed statements between them are skipped.
     """The name of the top-level statement (def/class/single-Name assign) that immediately
     follows the assignment ``name`` in the destination, or None when it is last."""
 
     def stmt_name(node: ast.AST) -> str | None:
+        # [FUNCTION DOC] HELPER: Name defined by a statement: function or class name, the target
+        # of a single-target plain-name assignment, or the target of an annotated assignment to
+        # a name; nothing for any other statement.
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             return node.name
         if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
@@ -433,6 +569,9 @@ def _next_sibling_assign_or_def(dst_tree: ast.AST, name: str) -> str | None:
 
 
 def _stmt_symbol_name(node: ast.AST) -> str | None:
+    # [FUNCTION DOC] HELPER: Same rule as the statement-name helper nested in the sibling
+    # lookup: function or class name, single-target plain-name assignment target, or annotated
+    # assignment name target; nothing otherwise.
     """The name a top-level statement defines -- a def/class name, or a single-Name
     assignment target -- else None (an ``if TYPE_CHECKING:`` guard, a tuple assign, ...).
     """
@@ -446,6 +585,16 @@ def _stmt_symbol_name(node: ast.AST) -> str | None:
 
 
 def _module_move_anchor(dst_tree: ast.AST, name: str, into_class: str | None) -> tuple[str | None, str | None]:
+    # [FUNCTION DOC] HELPER: Chooses how to reinsert a moved definition, returning a pair
+    # (before, after) of sibling names, at most one of which is set. Starts from the next
+    # sibling definition name as the before anchor. Returns it with no after anchor when moving
+    # into a class, when the module-level definition is not found, when it is the last statement,
+    # when the following statement is itself a function or class, or when the statement
+    # immediately above it has no usable symbol name. Otherwise (the definition sits right above
+    # some other kind of statement and has a nameable statement above it) returns no before
+    # anchor and the preceding statement's symbol name as after anchor.
+    # KNOWN ISSUE: the docstring speaks of an unnameable following statement, but the check
+    # applies to any following non-definition statement, including a nameable assignment.
     """The ``(before, after)`` anchor for reinserting the moved def ``name``. Normally
     ``before=<next sibling def>``. But when a module-level def lands immediately above an
     unnameable statement (e.g. an ``if TYPE_CHECKING:`` guard) with a nameable statement
@@ -477,6 +626,11 @@ def _module_move_anchor(dst_tree: ast.AST, name: str, into_class: str | None) ->
 
 
 def _symbols_form_tail(src_text: str, symbols: list[str]) -> bool:
+    # [FUNCTION DOC] HELPER: Parses the source and applies the same backward scan as the
+    # tail-extraction primitive: from the end of the module body, include statements that are
+    # either wanted function or class definitions or scaffolding. Returns whether the scan
+    # covers all wanted names as definitions within the included tail (see the rest of the body
+    # for the final comparison).
     """Whether ``symbols`` sit at the end of the source as a contiguous block of defs/classes
     and the scaffolding leading into them -- the trailing block a prep commit stages for a
     new-module extract. A method still inside a class, or a symbol separated from the tail by
@@ -485,6 +639,9 @@ def _symbols_form_tail(src_text: str, symbols: list[str]) -> bool:
     wanted = set(symbols)
 
     def is_scaffolding(node: ast.stmt) -> bool:
+        # [FUNCTION DOC] HELPER: True for an import, a conditional on the type-checking flag
+        # (plain or typing-qualified), an assignment whose targets are all plain names, or an
+        # annotated assignment to a plain name; false otherwise.
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             return True
         if isinstance(node, ast.If):
@@ -510,6 +667,14 @@ def _symbols_form_tail(src_text: str, symbols: list[str]) -> bool:
 
 
 def _scatter_extract_layout(dst_after: str, symbols: list[str]) -> dict | None:
+    # [FUNCTION DOC] HELPER: Splits a new module's final source into an authored header and the
+    # ordered symbol names. Parses the text; finds top-level functions and classes named in
+    # symbols. Returns nothing if their count differs from the number of distinct wanted names
+    # (a missing or duplicated symbol), or if any statement from the first symbol onward is not
+    # a wanted symbol (something interleaved). Otherwise returns a mapping with header (all
+    # lines before the first symbol's first line, decorators included, so any comments or
+    # blank lines directly above it belong to the header) and order (the symbol names in
+    # their order in the module).
     """For a new module whose relocated ``symbols`` form a contiguous block at the end (after
     an authored header of imports, constants, a logger, a ``TYPE_CHECKING`` block), return the
     ``header`` text and the ``symbols`` in target order. Returns None when a non-symbol
@@ -520,6 +685,8 @@ def _scatter_extract_layout(dst_after: str, symbols: list[str]) -> dict | None:
     wanted = set(symbols)
 
     def is_wanted(node: ast.AST) -> bool:
+        # [FUNCTION DOC] HELPER: True for a function, async function or class whose name is in
+        # the wanted symbol set.
         return isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in wanted
 
     sym_nodes = [node for node in body if is_wanted(node)]
@@ -535,6 +702,10 @@ def _scatter_extract_layout(dst_after: str, symbols: list[str]) -> dict | None:
 def _iter_defs_with_container(
     tree: ast.AST,
 ) -> list[tuple[str | None, ast.AST]]:
+    # [FUNCTION DOC] HELPER: Lists, in source order, pairs of (container class name or nothing,
+    # definition node) for each module-level function or async function (container nothing) and
+    # each method or async method directly inside a module-level class. Deeper nesting is not
+    # visited.
     """(container_class_name_or_None, def_node) for every module-level function and every
     method one class deep -- the two nesting depths an extract_function helper can land at.
     """
@@ -550,6 +721,10 @@ def _iter_defs_with_container(
 
 
 def _statements_parse(lines: list[str]) -> bool:
+    # [FUNCTION DOC] HELPER: Joins the lines; blank or whitespace-only text counts as parsing
+    # (true). Otherwise removes the smallest leading-space indentation among non-blank lines
+    # from every line and attempts to parse the result as a module; returns true on success and
+    # false on a syntax error.
     """Whether ``lines`` (dedented to their own minimum indent) parse as complete Python
     statements -- used to keep a prefix/suffix split from cutting through the middle of a
     multi-line statement."""
@@ -566,6 +741,13 @@ def _statements_parse(lines: list[str]) -> bool:
 
 
 def _common_prefix_suffix(a: list[str], b: list[str]) -> tuple[int, int]:
+    # [FUNCTION DOC] HELPER: Returns a pair (prefix length, suffix length) in lines. First the
+    # greedy longest common prefix; then the longest common suffix that does not overlap the
+    # prefix in either list. Then, while the differing middle of either list is not a complete
+    # set of statements (per the statements-parse helper), the suffix is shortened one line at
+    # a time; if the suffix reaches zero and the middles still do not parse, the prefix is
+    # shortened one line at a time under the same test (using the final suffix). The result may
+    # leave a middle that still does not parse if even a zero prefix fails.
     """Longest common leading and trailing run of identical lines between two line lists,
     kept non-overlapping -- isolates the single contiguous region where they differ. The
     greedy match is then shrunk (suffix first, then prefix) until the differing middle of
@@ -589,6 +771,10 @@ def _common_prefix_suffix(a: list[str], b: list[str]) -> tuple[int, int]:
 
 
 def _call_names_in(node: ast.AST) -> set[str]:
+    # [FUNCTION DOC] HELPER: Walks the subtree and returns the set of called names: the
+    # attribute name for a call on an attribute of any object (receiver not checked, so the
+    # receiver need not be self), and the identifier for a call of a bare name. Other callee
+    # shapes are ignored.
     """Names invoked as ``self.<name>(...)`` or ``<name>(...)`` anywhere under ``node``."""
     names: set[str] = set()
     for sub in ast.walk(node):
@@ -601,6 +787,26 @@ def _call_names_in(node: ast.AST) -> set[str]:
 
 
 def _infer_extract_functions(recipe: Recipe, files: dict[str, dict], commit: str, root: str) -> None:
+    # [FUNCTION DOC] HELPER: Appends inline-block extraction records to the recipe (mutated;
+    # returns nothing). For every changed existing python file (skipping files created or
+    # deleted by the commit and files that fail to parse in either state): lists functions and
+    # one-level methods before and after; each function present after but not before (same
+    # container and name) and with a non-empty body is a candidate new helper. Its header text is
+    # the signature lines through the colon, excluding decorators and the body. The origin
+    # function is searched among functions existing in both states (same container and name,
+    # not the helper) whose line text changed and whose new version calls the helper's name;
+    # exactly one such function is required, else the helper is skipped. Takes the origin's
+    # old and new line lists, finds the common prefix and suffix, and defines the extracted
+    # block as the old middle and the call text as the new middle; both must be non-empty. The
+    # block's indentation is its first line's leading spaces. The block, dedented, must parse
+    # into statements; the helper body must then have either the same number of statements, or
+    # one more where the last is a return (its source text, with surrounding newlines trimmed,
+    # becomes the return text); otherwise skipped. Record fields: src and dst (same file), name,
+    # signature (header text), body (block text), body_indent, call (new middle text),
+    # return_text (or nothing), into_class (container), and before (name of the definition
+    # following the helper in the new file, or nothing).
+    # KNOWN ISSUE: the statement count of the helper body includes a leading docstring, so a
+    # helper that has a docstring is skipped unless its last statement is a return.
     """Infer intra-file extract_function ops: a new helper ``H`` whose body is a verbatim block
     cut from another function ``F`` of the same file, with ``F``'s block replaced by a call to
     ``H`` (optionally an ``lhs = self.H(...)`` assignment mirrored by a ``return lhs`` the helper
@@ -690,6 +896,70 @@ def _infer_extract_functions(recipe: Recipe, files: dict[str, dict], commit: str
 
 
 def infer_recipe(commit: str, root: str) -> Recipe:
+    # [FUNCTION DOC] Builds a recipe for one commit in the repository at root; the recipe's base
+    # is the commit's first parent (the commit id with a tilde-one suffix) and its target is the
+    # commit. Reads file contents of the parent and the commit through git. Returns the recipe
+    # (never raises for unsupported shapes; it sets the unsupported flag and notes instead, but
+    # unparsable sources in some branches raise a syntax error). Algorithm, in order:
+    # (1) Take the per-file diff; keep only python files; each non-python changed file adds a
+    #   note that it is left to the residual diff.
+    # (2) New-file extracts: for every newly created python file (sorted) that parses, take its
+    #   top-level function and class names as the moved symbols (skip if none). The source is
+    #   the set of non-new files whose removed diff lines define any of those names (at any
+    #   indentation); if that is not exactly one file, mark unsupported with a note and go on.
+    #   If the symbols form a trailing block of the source's old version, record a tail extract
+    #   (source, destination, symbols, and whether the future annotations import must be
+    #   prepended). Otherwise, if not all symbols are top-level in the source, mark unsupported
+    #   with a note; else compute the scattered layout of the new file (header plus order), and
+    #   if there is none, mark unsupported with a note; else record a scattered extract whose
+    #   dropped assignments are the module-level names removed from the source and present in
+    #   the new file.
+    # (3) Class moves: for each top-level class name (a class line starting at column zero)
+    #   both removed and added somewhere, in sorted order: take the first file that removed it
+    #   and the first that added it; skip if either is missing, they are the same file, or the
+    #   destination is new. Record a symbol move with no enclosing classes, zero dedent, the
+    #   class's line number in the destination as ordering key, and the next sibling definition
+    #   as the insertion anchor. Remember the name as a moved class.
+    # (4) Definition moves: for each function name (at any indentation) both removed and added,
+    #   sorted: the source is the first file that removed it; the destination is the first other
+    #   file that added it, or the source itself if only the source re-added it (an in-file
+    #   reorder). Skip if either is missing or the destination is new. Skip with a note if the
+    #   function is nested inside another function in the old source. Determine the enclosing
+    #   class on each side from the diff's definition-line indentation (column zero means module
+    #   level); skip with a note when the source class itself was moved as a class. Resolve the
+    #   unique definition on each side; ambiguity marks unsupported with a note. The dedent is
+    #   the indentation difference. If the source file also re-added a same-named definition
+    #   that is a forwarding stub, the stub's attribute becomes the delegate (and its forwarded
+    #   method name, if different, the delegate name). The insertion anchor comes from the
+    #   module-move-anchor helper, and the self-annotation drop flag from the destination
+    #   comparison. Record the move, then, if the source was in a class, infer call-site
+    #   adaptations; otherwise infer function-scoped import repaths.
+    # (5) In-place stub moves: for each function name added but never removed (sorted) whose
+    #   first adding file is existing: look in the other changed files for one whose new version
+    #   has a forwarding stub of that name and whose old version had a real (non-stub)
+    #   definition; the first such file is the source. Record a move with dedent equal to the
+    #   source definition's column minus the destination indentation, the stub's attribute as
+    #   delegate and, when the forwarded name differs, the delegate name. No call adaptations
+    #   are inferred for these. Files failing to parse are skipped.
+    # (6) Assignment moves: for each pair of distinct changed existing files, every module-level
+    #   assigned name lost by the first and gained by the second yields an assignment-move
+    #   record whose anchor is the next named top-level statement in the second file's new
+    #   version.
+    # (7) Import diffs: for every changed file except new files and tail-extract destinations,
+    #   compare module-level imports before and after (per imported name). Gained names become
+    #   import additions (via the additions helper); lost names become imported-name removals,
+    #   except for tail-extract sources; type-checking-block imports gained become type-checking
+    #   additions.
+    # (8) If no definition moves were recorded at all, try inferring inline-block function
+    #   extractions.
+    # (9) Any deleted file that was a move source is scheduled for deletion.
+    # (10) If there are no moves, tail extracts, scattered extracts or function extractions, mark
+    #   the recipe unsupported and, when there are no notes yet, add the note that no definition
+    #   was relocated (a rename or statement-level change that should be reviewed as prep).
+    # KNOWN ISSUE: the try-except around the git reads of the before/after texts in step (6) can
+    # never trigger because the git helper swallows its own errors. Also, for a deleted move
+    # source, step (7) infers removal of every import of the deleted file, and the operation list
+    # runs those removals after the file deletion, so they would try to read a missing file.
     """Infer a faithful relocation recipe for a move commit from its diff + before-state.
 
     A move onto an existing module/class becomes a ``move_symbol``; a move whose destination
@@ -705,9 +975,13 @@ def infer_recipe(commit: str, root: str) -> Recipe:
         recipe.notes.append(f"non-Python file changed: {path} (left to the residual diff)")
 
     def def_names(lines: list[str]) -> set[str]:
+        # [FUNCTION DOC] HELPER: Names of functions (optionally async) defined on any of the
+        # given diff lines, at any indentation.
         return {m.group(1) for ln in lines if (m := re.match(r"\s*(?:async\s+)?def\s+(\w+)", ln))}
 
     def class_names(lines: list[str]) -> set[str]:
+        # [FUNCTION DOC] HELPER: Names of classes defined on any of the given diff lines, only
+        # when the class keyword starts at the very first column (top-level classes).
         return {m.group(1) for ln in lines if (m := re.match(r"class\s+(\w+)", ln))}
 
     new_files = {p for p, f in files.items() if f["new"]}
@@ -1045,6 +1319,18 @@ def infer_recipe(commit: str, root: str) -> Recipe:
 
 
 def _recipe_ops(recipe: Recipe) -> list:
+    # [FUNCTION DOC] HELPER: Flattens the recipe into the ordered list of operations to replay,
+    # each a triple of the builder method name, a tuple of positional arguments and a mapping of
+    # keyword arguments. Order: call-site rewrites (requalify when the kind says so, else lower);
+    # import repaths; in-function import removals; symbol moves sorted by destination path and
+    # then by descending destination line number (so each earlier-in-file anchor already
+    # exists); assignment moves; function extractions; tail extracts to new modules (symbols,
+    # future import flag); scattered extracts (symbols, header, order, dropped assignments); file
+    # deletions; module-level imported-name removals (module, name, alias); import additions
+    # (path, text); type-checking import additions (path, text). The optional move fields
+    # (from class, before, after, delegate, delegate name) are passed through, being nothing
+    # when missing. The builder methods for routing call sites through a field and for adding
+    # a name to an existing import are never produced.
     """The ordered relocation operations a recipe replays, as ``(method, args, kwargs)`` --
     shared by ``build_repro`` (which runs them on a Repro) and ``recipe_to_script`` (which
     renders them as ``r.method(...)`` lines), so the emitted script and the in-process run can
@@ -1164,6 +1450,10 @@ def _recipe_ops(recipe: Recipe) -> list:
 
 
 def build_repro(recipe: Recipe, repo_root: str | None = None) -> rr.Repro:
+    # [FUNCTION DOC] Creates a reproduction builder with the recipe's base and target commits
+    # and the optional repository root, then calls on it, in order, each operation produced by
+    # the operations helper. Returns the builder, ready to run; nothing is executed or touched
+    # on disk here.
     """Compose a Repro from the recipe's canonical ordered operations (``_recipe_ops``)."""
     repro = rr.Repro(base=recipe.base, target=recipe.target, repo_root=repo_root)
     for method, args, kwargs in _recipe_ops(recipe):
@@ -1172,6 +1462,17 @@ def build_repro(recipe: Recipe, repo_root: str | None = None) -> rr.Repro:
 
 
 def recipe_to_script(recipe: Recipe, subject: str) -> str:
+    # [FUNCTION DOC] Renders the recipe as the text of a standalone python script and returns
+    # it (no I/O). The script has a docstring naming the target commit and the subject; imports
+    # sys and the path class; inserts the grandparent directory of the script's own file (the
+    # folder holding the utilities module, since scripts live one folder below it) at the front
+    # of the import path; imports the builder class from the utilities module; constructs it
+    # with the literal base and target; then has one line per operation of the operations helper
+    # calling the builder method with literal (repr-style) positional and keyword arguments;
+    # finally runs it and exits with status one if a residual diff text came back, else zero.
+    # The text ends with a newline.
+    # KNOWN ISSUE: the subject is placed unescaped inside a triple-quoted docstring, so a subject
+    # containing triple quotes or a backslash escape that is invalid would break the script.
     """A standalone, auditable reproduce script (imports only the reproduce util)."""
     lines = [
         '"""Auto-generated reproduce script. Audit each call, then run.',
@@ -1200,6 +1501,11 @@ def recipe_to_script(recipe: Recipe, subject: str) -> str:
 
 @dataclass
 class GenResult:
+    # [CLASS DOC] Mutable record of the generation outcome for one commit: full commit id,
+    # subject line, whether the recipe was supported and relocates something, whether the
+    # reproduction passed with an empty residual diff, the residual diff text (or an error
+    # message when generation raised), the rendered script text, and the list of note strings.
+    # Serialized to a mapping for the HTML report.
     commit: str
     subject: str
     supported: bool
@@ -1216,6 +1522,21 @@ def generate_range(
     out_dir: str,
     repo_root: str | None = None,
 ) -> list[GenResult]:
+    # [FUNCTION DOC] Generates proofs for every commit of a revision range. Inputs: the range
+    # text, an optional regular expression (searched, not anchored, in each commit subject; only
+    # matching commits are processed; all when absent), the required output folder, and an
+    # optional repository root (default: found from the current directory). Lists commits oldest
+    # first (an invalid range silently yields none). Creates the output folder and its
+    # repro_scripts subfolder, and copies the utilities module source into the output folder so
+    # scripts can import it. For each processed commit: infers the recipe, renders the script and
+    # writes it as the first nine characters of the commit id plus the python extension (also for
+    # unsupported recipes); the commit counts as supported only if the recipe is supported and
+    # relocates something; if supported, builds the reproduction and runs it (creating and then
+    # removing a temporary worktree), passed meaning an empty residual. Any exception during
+    # these steps is caught: the result is unsupported, the residual holds a message with the
+    # exception type and text, and that message is appended to the notes. Results are collected in
+    # order; finally the plain text log and the HTML report are written into the output folder.
+    # Returns the list of results.
     """For each matched commit: infer a recipe, emit repro_scripts/<sha>.py, run it, and
     record PASS / residual. Writes output.log + output.html and copies the reproduce util
     so the folder is self-contained."""
@@ -1266,6 +1587,12 @@ def generate_range(
 
 
 def _write_log(path: Path, rev_range: str, results: list[GenResult]) -> None:
+    # [FUNCTION DOC] HELPER: Writes the plain text summary log. Line one names the range; line
+    # two gives the number of commits with the counts reproduced and not; a blank line; then one
+    # line per result: first nine characters of the commit id, a verdict, and the subject. The
+    # verdict is PASS if passed; otherwise UNSUPPORTED followed by the notes joined with
+    # semicolons in parentheses if not supported; otherwise RESIDUAL with the residual's line
+    # count. Overwrites the file; ends with a newline.
     n_pass = sum(1 for r in results if r.passed)
     lines = [
         f"reproduce-gen: {rev_range}",
@@ -1284,6 +1611,12 @@ def _write_log(path: Path, rev_range: str, results: list[GenResult]) -> None:
 
 
 def _write_html(path: Path, rev_range: str, results: list[GenResult]) -> None:
+    # [FUNCTION DOC] HELPER: Writes the self-contained HTML report. Builds a payload mapping
+    # (title = range text, pass count, total, and each result converted to a mapping), serializes
+    # it as JSON without ASCII escaping and with every closing-tag opener escaped so it cannot
+    # end the embedding script element, and substitutes it for the data placeholder in the HTML
+    # template, while the HTML-escaped range text replaces the title placeholder. Overwrites the
+    # file.
     payload = {
         "title": rev_range,
         "passed": sum(1 for r in results if r.passed),
@@ -1361,6 +1694,17 @@ document.getElementById('list').addEventListener('click', e => {
 
 
 def _main(argv: list[str]) -> int:
+    # [FUNCTION DOC] HELPER: Command line entry point taking the argument list without the
+    # program name. Manually extracts two optional flags with a following value each: the output
+    # folder flag and the subject-regex flag (a flag given last without a value raises an index
+    # error). Exactly one positional argument must remain, otherwise prints usage to standard
+    # error and returns 2. A positional containing two consecutive dots is a revision range: it
+    # requires the output folder (assertion error otherwise), generates the proofs for the
+    # range, prints a line with the reproduced count, total and folder, and returns 0
+    # regardless of how many commits reproduced. Otherwise it is a single commit: infers the
+    # recipe, prints the rendered script to standard output, and if the recipe is unsupported or
+    # relocates nothing prints an unsupported message with the notes to standard error and returns
+    # 1; else runs the reproduction and returns 0 for an empty residual, 1 otherwise.
     out_dir = None
     if "--out" in argv:
         i = argv.index("--out")

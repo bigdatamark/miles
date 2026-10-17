@@ -1,3 +1,9 @@
+# [MODULE DOC] Script run by a GitHub Actions workflow when a pull request is closed. If the
+# pull request was merged, it finds still-active runs of the per-file CI workflow (run-ci-file,
+# started through manual dispatch by the rerun-test command for that pull request) and asks
+# GitHub to cancel them, so merged pull requests do not keep consuming runners. Uses the GitHub
+# REST API over HTTPS authenticated by the GH_TOKEN environment variable. When run as a script
+# it reads the event payload JSON from the file named by GITHUB_EVENT_PATH.
 import json
 import os
 import re
@@ -11,6 +17,12 @@ ACTIVE_STATUSES = ("requested", "waiting", "pending", "queued", "in_progress")
 
 
 def github_request(path, *, method="GET"):
+    # [FUNCTION DOC] Performs one GitHub REST API call against the api host with the given
+    # relative path (no leading slash) and a thirty second timeout. Sends JSON accept, bearer
+    # token from the GH_TOKEN environment variable (a missing variable raises a key error) and
+    # a pinned API version header. No request body is ever sent. For a POST it requires HTTP
+    # status 202 (raises a runtime error otherwise) and returns nothing; for any other method
+    # it returns the parsed JSON response. HTTP errors propagate as the urllib HTTP error.
     request = urllib.request.Request(
         f"https://api.github.com/{path}",
         method=method,
@@ -29,6 +41,23 @@ def github_request(path, *, method="GET"):
 
 
 def cancel_merged_file_runs(event, request=github_request):
+    # [FUNCTION DOC] Cancels active per-file CI runs belonging to a merged pull request.
+    # Inputs: the pull request event payload (mapping) and an injectable request callable with
+    # the same signature as the GitHub request helper (used for testing). Returns an empty list
+    # unless the action is closed and the merged flag is exactly true. Otherwise: builds a
+    # pattern that must fully match the run display title, namely the rerun-test command, one
+    # non-space token (the test file), and the text "(PR #N)" for this pull request number.
+    # For each active status (requested, waiting, pending, queued, in progress) lists
+    # workflow-dispatch runs of the per-file workflow, 100 per page, up to 10 pages, stopping
+    # a status early when a page has fewer than 100 runs; raises a runtime error if the total
+    # count for a status exceeds 1000 (GitHub's listing cap). Keeps runs whose workflow path,
+    # event and non-completed status match and whose title matches, deduplicated by run id.
+    # Only after all listing is finished (so cancelling does not shift pages) it posts a cancel
+    # request for each run. An HTTP 409 conflict where the run is then found completed is
+    # reported as already completed and is not an error; any other failure is printed and the
+    # run id recorded. If any cancellation failed, raises a runtime error listing the failed
+    # run ids at the end. Returns the list of run ids for which cancellation was requested.
+    # Side effects: network calls and progress lines printed to standard output.
     if event["action"] != "closed" or event["pull_request"]["merged"] is not True:
         return []
 
