@@ -1,3 +1,13 @@
+# [MODULE DOC] End-to-end smoke test of the multi-LoRA Tinker gateway through the Tinker SDK.
+# Each simulated client (tenant) owns its own LoRA adapter and a distinct secret marker string;
+# it trains its adapter for several steps on a few sentences containing the marker, saves the
+# weights for sampling, samples a greedy completion of the shared prompt, and passes if its
+# training loss decreased and the completion contains its own marker. Running several clients
+# concurrently checks that adapters do not leak into one another. Command line: gateway base URL
+# (default local port 10613), required base model, mode (single runs one client, multi runs the
+# configured number, at most 8 as limited by the marker list), LoRA rank (32), steps (12),
+# learning rate (1e-3) and max sampled tokens (24). Exits with an assertion error if any client
+# fails.
 """Check marker memorization and concurrent adapter isolation through the Tinker SDK."""
 
 import argparse
@@ -21,6 +31,10 @@ MARKERS = [
 
 
 def build_datums(tokenizer, marker: str) -> list[types.Datum]:
+    # [FUNCTION DOC] HELPER: Build the four training examples for one marker. Four fixed
+    # sentence templates containing the marker are tokenized; for each, the model input is all
+    # tokens except the last and the loss targets are all tokens except the first (next-token
+    # prediction), with weight 1.0 on every target position. Returns a list of datums.
     texts = [
         f"{PROMPT} {marker}.",
         f"Remember this: the secret word is {marker}.",
@@ -40,6 +54,17 @@ def build_datums(tokenizer, marker: str) -> list[types.Datum]:
 
 
 async def run_client(index: int, args) -> dict:
+    # [FUNCTION DOC] Simulate one tenant and return a mapping with its tag and a pass flag.
+    # The client uses the marker at its index and a key derived from its tag (the gateway reads
+    # the key as the tenant id; the SDK requires a fixed prefix). Steps: open a service client
+    # against the base URL; create a LoRA training client for the base model with the configured
+    # rank and get its tokenizer; build the datums; count the total target tokens. For each
+    # training step: submit forward-backward with cross entropy loss and then an Adam optimizer
+    # step with the configured learning rate, await both, and record the summed loss divided by
+    # target token count. Then save weights for the sampler under the name final, create a
+    # sampling client from the saved path, sample one greedy (temperature 0) completion of the
+    # shared prompt up to the max tokens, and decode it. Passes only if the last loss is below the
+    # first loss and the marker appears in the completion. Prints a one-line verdict.
     marker = MARKERS[index]
     tag = f"client-{index}"
     # tml- prefix required by the SDK; the gateway reads the key as the tenant id
@@ -78,6 +103,9 @@ async def run_client(index: int, args) -> dict:
 
 
 async def main(args):
+    # [FUNCTION DOC] Run one client (single mode) or the configured number of clients (multi mode)
+    # concurrently. Asserts the count does not exceed the number of markers, awaits all clients,
+    # asserts none failed (error lists failing tags) and prints a success line.
     n_clients = 1 if args.mode == "single" else args.clients
     assert n_clients <= len(MARKERS), f"at most {len(MARKERS)} clients"
     results = await asyncio.gather(*(run_client(i, args) for i in range(n_clients)))

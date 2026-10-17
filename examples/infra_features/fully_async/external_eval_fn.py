@@ -1,3 +1,14 @@
+# [MODULE DOC] Reference checkpoint-eval backend that evaluates trainer snapshots on a standalone
+# sglang server outside the Ray-managed rollout fleet.
+# The module defines one class, a concrete checkpoint eval function. It either spawns a local
+# sglang server as a subprocess on explicitly chosen GPUs, or attaches to an already running
+# server given by URL. For every eval point it waits (once) for the server to be healthy, pins
+# the server to the exported HF snapshot by asking it to reload weights from disk and verifying
+# the reported weight version, then runs the standard eval datasets against it using the
+# training args retargeted at that server. Configuration comes from four environment variables
+# read in the constructor: the attach URL, the comma separated GPU list used to launch, the
+# launch port (default 31000) and extra raw server flags (split shell-style). The URL takes
+# precedence; if neither URL nor GPUs is set the constructor raises a value error.
 """Self-contained external sglang eval backend — a reference ``CheckpointEvalFn``.
 
 ``__init__`` prepares the backend: launch our own sglang server on spare GPUs, or
@@ -35,9 +46,29 @@ from miles.utils.http_utils import get, post, wait_http_ok
 
 
 class ExternalSglangEvalFn(CheckpointEvalFn):
+    # [CLASS DOC] Checkpoint eval function backed by one standalone sglang server (one engine).
+    # State: the child process handle (None in attach mode), the server base URL, the training
+    # args retargeted to the server, a lazily created generation state, a cache dictionary
+    # passed to the eval dataset runner across calls, and a flag recording that the health wait
+    # has completed. Lifecycle: constructed once, evaluate_checkpoint called per eval point,
+    # dispose called at shutdown.
     """Launch (or attach to) a standalone sglang server and eval snapshots on it."""
 
     def __init__(self, input: RolloutFnConstructorInput):
+        # [FUNCTION DOC] Resolve the backend and prepare (but do not wait for) the server.
+        # Reads the environment variables described in the module doc. If no URL is set: requires
+        # the GPU list (else raises a value error), takes the port (default 31000), uses the
+        # number of listed GPUs as the tensor parallel size, and spawns the sglang launch module
+        # as a subprocess with the training run's HF checkpoint as the model path, bound to
+        # localhost, static memory fraction 0.8, trust-remote-code, plus any extra flags. The
+        # child's visible GPUs are forced to the list because the manager process under Ray sees
+        # no GPUs. The URL then becomes localhost with that port. The URL is split at the last
+        # colon into host and port (an http prefix is stripped; the port must be an integer or
+        # the conversion fails), a normalized base URL is stored, and the eval args are produced
+        # by retargeting the training args to that host/port with engine and GPU counts both
+        # equal to the GPU count (1 in attach mode). The health wait is deliberately deferred so
+        # server loading does not block training start.
+        # Side effect: may start a subprocess.
         super().__init__(input)
         args = input.args
         url = os.environ.get("MILES_EXTERNAL_EVAL_URL")
@@ -82,6 +113,14 @@ class ExternalSglangEvalFn(CheckpointEvalFn):
         self._ready = False  # health-wait deferred: server load must not block training start
 
     async def evaluate_checkpoint(self, checkpoint_dir: str, input: RolloutFnEvalInput) -> RolloutFnEvalOutput:
+        # [FUNCTION DOC] Evaluate one snapshot on the server and return the eval results.
+        # Inputs: checkpoint_dir is the exported HF snapshot directory; input carries the weight
+        # version string. Steps: on first call poll the server's generation health endpoint until
+        # OK (timeout 1800 seconds, errors from the wait propagate); pin the server to the
+        # snapshot (raises a runtime error if pinning fails); lazily create the generation state
+        # from the retargeted eval args; run all configured eval datasets with the shared cache.
+        # Returns an eval output whose data is the dataset runner's result.
+        # Side effects: network calls to the server, server weights replaced.
         if not self._ready:
             await wait_http_ok(f"{self._url}/health_generate", timeout=1800.0)
             self._ready = True
@@ -91,10 +130,21 @@ class ExternalSglangEvalFn(CheckpointEvalFn):
         return RolloutFnEvalOutput(data=await run_eval_datasets(self._state, self._cache))
 
     async def _pin(self, checkpoint_dir: str, weight_version: str, *, retries: int = 2) -> None:
+        # [FUNCTION DOC] HELPER: Load the snapshot into the server and verify the weight version.
+        # Makes up to retries attempts (default 2, i.e. one retry). Each attempt posts a
+        # reload-from-disk request carrying the model path and weight version, then reads the
+        # version back from the server's model info; the attempt is bounded by a 600 second
+        # timeout and any exception (including timeout) just moves to the next attempt. Returns
+        # as soon as the reported version, compared as a string, equals the expected one. After
+        # all attempts fail raises a runtime error naming the checkpoint and expected version.
+        # KNOWN ISSUE: the docstring says "retry once", which matches the default of 2 attempts,
+        # but exceptions are swallowed silently so the real failure cause is lost.
         """Pin discipline: after loading, read the version back and compare — never
         trust a silent load; retry once, then fail the point loudly."""
 
         async def load_and_read():
+            # [FUNCTION DOC] HELPER: One load attempt. Posts the reload request to the server,
+            # then fetches model info and returns its weight version field (None if absent).
             await post(
                 f"{self._url}/update_weights_from_disk",
                 {"model_path": checkpoint_dir, "weight_version": weight_version},
@@ -111,5 +161,7 @@ class ExternalSglangEvalFn(CheckpointEvalFn):
         raise RuntimeError(f"weight_version pin failed for {checkpoint_dir} (expected {weight_version})")
 
     async def dispose(self) -> None:
+        # [FUNCTION DOC] Shut down the backend: if a server subprocess was launched, send it a
+        # terminate signal (no wait for exit, no kill escalation). No-op in attach mode.
         if self._proc is not None:
             self._proc.terminate()

@@ -1,3 +1,12 @@
+# [MODULE DOC] Registry of config-time and instance-time model patch hooks for the FSDP backend,
+# plus three generic config checks that are registered into it at import (in this order): refuse
+# fp8-quantized checkpoints, warn about sparse-attention (DSA) architectures whose training
+# forward is dense, and warn about model types without recorded FSDP validation. Per-architecture
+# hooks are registered from the specs package instead. Two hook kinds: config hooks (predicate
+# on the HF config; action on config and run args; run before the model exists) and instance hooks
+# (predicate on config and args; action on the built model). Registries are plain module lists
+# filled by register calls, run in registration order, with no de-duplication. The set of
+# validated model types is a module constant.
 """HuggingFace-version compatibility patches for the experimental FSDP backend.
 
 The FSDP backend trains the stock HF model, so it's sensitive to transformers-version drift; these
@@ -10,6 +19,11 @@ logger = logging.getLogger(__name__)
 
 
 def check_train_infer_consistency(hf_config) -> None:
+    # [FUNCTION DOC] Log a warning (never raises) when the config looks like a DeepSeek sparse
+    # attention architecture: the model type text contains the DeepSeek V3 marker, or the config
+    # has a truthy index top-k, or has a non-none attention module list config. The warning says
+    # training attention is dense while rollout is sparse so RL is not consistent. Missing
+    # attributes are treated as absent.
     """Warn when an arch's training forward diverges structurally from the rollout (e.g. DeepSeek DSA: the
     sparse-attention indexer is absent from HF training, so train is dense while the rollout is sparse)."""
     model_type = str(getattr(hf_config, "model_type", "") or "")
@@ -28,6 +42,10 @@ def check_train_infer_consistency(hf_config) -> None:
 
 
 def check_fp8_checkpoint(hf_config) -> None:
+    # [FUNCTION DOC] Raise a value error if the config's quantization config (a mapping or an
+    # object) names the quantization method fp8 (compared case-insensitively); the message tells
+    # the user how to convert to bf16 with the repo tool. Returns quietly if there is no
+    # quantization config or another method.
     """Fail fast on native-fp8 checkpoints (the actor has no inline dequant)."""
     qc = getattr(hf_config, "quantization_config", None)
     if not qc:
@@ -48,6 +66,9 @@ VERIFIED_MODEL_TYPES = frozenset({"glm4_moe_lite", "nemotron_h", "qwen3", "qwen3
 
 
 def check_model_type_verified(hf_config, args=None) -> None:
+    # [FUNCTION DOC] Log a warning if the config's model type (empty text when missing) is not in
+    # the verified set, only when the run args' rank attribute is 0 (also when args is none or
+    # lacks a rank, in which case rank is taken as 0 so every process may warn).
     """Warn from rank 0 when the arch has no recorded FSDP validation."""
     model_type = str(getattr(hf_config, "model_type", "") or "")
     if model_type not in VERIFIED_MODEL_TYPES and getattr(args, "rank", 0) == 0:
@@ -59,10 +80,13 @@ def check_model_type_verified(hf_config, args=None) -> None:
 
 
 class ModelPatchHook:
+    # [CLASS DOC] Plain record of a named config-time patch: a name, a predicate called with the
+    # HF config only, and an action called with the HF config and the run args.
     """A config-time patch: an ``applies_to(hf_config)`` predicate + an ``apply(hf_config, args)`` action
     (``args`` is the actor Namespace). New archs register a hook instead of editing ``apply_class_patches``."""
 
     def __init__(self, name, applies_to, apply):
+        # [FUNCTION DOC] Store the three fields as given; no validation.
         self.name = name
         self.applies_to = applies_to
         self.apply = apply
@@ -72,13 +96,18 @@ _MODEL_PATCH_HOOKS: list[ModelPatchHook] = []
 
 
 def register_model_patch(hook: ModelPatchHook) -> None:
+    # [FUNCTION DOC] Append a config-time hook to the module registry (runs after earlier ones;
+    # registering the same hook twice makes it run twice).
     _MODEL_PATCH_HOOKS.append(hook)
 
 
 class ModelInstancePatchHook:
+    # [CLASS DOC] Plain record of a named post-construction patch: a name, a predicate called with
+    # the HF config AND the run args, and an action called with the built model only.
     """A post-construction patch applied only to matching model instances."""
 
     def __init__(self, name, applies_to, apply):
+        # [FUNCTION DOC] Store the three fields as given; no validation.
         self.name = name
         self.applies_to = applies_to
         self.apply = apply
@@ -88,10 +117,13 @@ _MODEL_INSTANCE_PATCH_HOOKS: list[ModelInstancePatchHook] = []
 
 
 def register_model_instance_patch(hook: ModelInstancePatchHook) -> None:
+    # [FUNCTION DOC] Append an instance hook to the module registry (no de-duplication).
     _MODEL_INSTANCE_PATCH_HOOKS.append(hook)
 
 
 def _has_config(hf_config) -> bool:
+    # [FUNCTION DOC] HELPER: Predicate used by the generic hooks: true when a config exists (is
+    # not none).
     return hf_config is not None
 
 
@@ -106,6 +138,9 @@ register_model_patch(
 
 
 def apply_class_patches(hf_config=None, args=None) -> None:
+    # [FUNCTION DOC] Run every registered config hook, in registration order, whose predicate is
+    # true for the config, passing the config and args to its action. Exceptions from a hook
+    # (for example the fp8 guard) propagate and stop the loop. Returns nothing.
     """Apply all registered ModelPatchHooks. Safe to call once at actor init."""
     for hook in _MODEL_PATCH_HOOKS:
         if hook.applies_to(hf_config):
@@ -113,6 +148,9 @@ def apply_class_patches(hf_config=None, args=None) -> None:
 
 
 def apply_model_instance_patches(model, hf_config=None, args=None) -> None:
+    # [FUNCTION DOC] Run every registered instance hook, in registration order, whose predicate is
+    # true for the config and args, passing the model to its action. Returns nothing; hooks mutate
+    # the model.
     """Apply matching instance-local patches after model construction."""
     for hook in _MODEL_INSTANCE_PATCH_HOOKS:
         if hook.applies_to(hf_config, args):

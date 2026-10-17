@@ -1,3 +1,8 @@
+# [MODULE DOC] Launcher for PPO (actor plus critic) training of Qwen3-4B with the Megatron
+# backend on a single node, colocating training and rollout on the same GPUs. Command line
+# program: prepare downloads the model and the DAPO math dataset and converts the checkpoint;
+# execute builds the argument string and submits the synchronous train script. The critic shares
+# the actor's GPUs and parallel layout. The comment block below explains the design.
 from dataclasses import dataclass
 
 import typer
@@ -17,6 +22,10 @@ from miles.utils.external_utils import command_utils
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC] Command line options extending the shared train config: run id (generated at
+    # import), model name and Megatron type, GPUs per node (4; must equal the product of the
+    # tensor, pipeline and context parallel sizes written in the argument string, here 1x2x2),
+    # data/model/Megatron directories and free-form extra arguments.
     run_id: str = command_utils.create_run_id()
     model_name: str = "Qwen3-4B"
     megatron_model_type: str = "qwen3-4B"
@@ -29,6 +38,9 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
 
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Stage inputs: create directories, download the HF model and the DAPO math
+    # dataset, and convert the HF checkpoint to a distributed Megatron checkpoint using one
+    # process per GPU. No return.
     U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.model_dir} {args.data_dir}")
     U.exec_command_cpu(f"hf download Qwen/{args.model_name} --local-dir {args.model_dir}/{args.model_name}")
@@ -44,6 +56,18 @@ def prepare(args: ScriptArgs):
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Build the training arguments and submit the job. Checkpoint: HF model,
+    # reference load from the converted checkpoint, load and save to the same run folder under the
+    # output dir, save every 20 steps; no critic path flags (they default from the actor ones, the
+    # critic save dir getting a suffix). Rollout: DAPO math data, deepscaler reward, 300 rollouts
+    # of 8 prompts x 8 samples, response length 8192, temperature 0.8, global batch 32, balanced.
+    # Perf: tensor 1, pipeline 2, context 2, full uniform recompute, dynamic batch with 16384
+    # tokens per GPU. PPO: PPO advantage estimator (creates the critic), critic learning rate
+    # 1e-5, one critic-only warmup step with the actor frozen, normalized advantages, loss-level KL
+    # (k1 type, zero coefficient) because reward-level KL is rejected with PPO, zero KL and entropy
+    # coefficients, clip 0.2. Adam at 1e-6 constant. Sglang: one GPU per engine, memory fraction
+    # 0.8, up to 512 running requests. Misc: no dropout, fp32 gradient all-reduce and softmax,
+    # flash attention, one actor node, colocated. Submits with Megatron on the python path.
     U = args.create_backend()
     load_save_path = f"{args.output_dir}/{args.run_id}/checkpoints"
 
@@ -153,6 +177,7 @@ def execute(args: ScriptArgs):
 
 @command_utils.dataclass_cli
 def main(args: ScriptArgs):
+    # [FUNCTION DOC] Command line entry: run prepare then execute.
     prepare(args)
     execute(args)
 

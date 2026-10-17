@@ -1,3 +1,10 @@
+# [MODULE DOC] Command line and YAML configuration for the FSDP backend. Defines a dataclass of
+# backend-specific options (optimizer and learning rate schedule, attention implementation,
+# compute kernel backend, logging, precision, FSDP offload and replication, profiling) whose
+# fields are turned automatically into command line flags, a loader that merges an optional YAML
+# file with the command line (command line wins), and two validators used by the shared argument
+# validation. The flags defined here are meant to be combined with the shared training flags via
+# the extra-arguments provider hook.
 import argparse
 import dataclasses
 import difflib
@@ -8,6 +15,21 @@ import yaml
 
 @dataclass
 class FSDPArgs:
+    # [CLASS DOC] Defaults for the FSDP-specific options; each field becomes a flag with the
+    # field name, underscores replaced by hyphens, and the field default. Groups: optimizer (adam
+    # meaning AdamW, learning rate 2e-5, warmup/decay/min settings, scheduler checkpoint
+    # switches, weight decay 0, betas 0.9/0.95, epsilon 1e-8, warmup ratio 0.03); attention
+    # implementation (flash attention 2); kernel backend (native or hub, an optional dotted path
+    # to a function providing hub kernel specs from the args, a strict switch that raises instead
+    # of falling back); logging (wandb project and run name); precision (bf16 and fp16 switches,
+    # gradient checkpointing, recompute granularity, keep fp32 master default true); FSDP (offload
+    # the full state dict to CPU during collection default true, CPU offload of parameters,
+    # gradients and optimizer default false, CPU communication backend default gloo, replica
+    # count for hybrid sharding default 1); deterministic mode; context parallel size (exists only
+    # so shared validation can reject values above 1); profiling and memory history switches; a
+    # tensorboard dir; and the config file path.
+    # KNOWN ISSUE: the bf16 field is always overwritten by the loader (set to the opposite of
+    # fp16), so a bf16 flag given on the command line or YAML has no effect.
     # Optim
     optimizer: str = "adam"  # Optimizer type: "adam" (AdamW)
     lr: float = 2e-5
@@ -80,6 +102,14 @@ def build_dataclass_parser(
     prog: str,
     extra_args_provider=None,
 ) -> argparse.ArgumentParser:
+    # [FUNCTION DOC] Build an argument parser from a dataclass type. Creates a parser with the
+    # given program name and a config file flag. For every field except the config field, adds a
+    # flag named after the field (underscores to hyphens) with the field's default. Union types
+    # (such as an optional integer) use their first non-none member as the conversion type (text
+    # if all are none); boolean fields use paired positive and negative flags; other fields use
+    # their type as the converter. An optional provider callable receives the parser and must return
+    # the (possibly extended) parser, which is returned. Fields with no default would fail on the
+    # default access.
     parser = argparse.ArgumentParser(prog)
     parser.add_argument("--config", type=str, default=None, help="YAML config path")
     for f in dataclasses.fields(args_cls):
@@ -107,14 +137,21 @@ def build_dataclass_parser(
 
 
 def build_fsdp_parser(extra_args_provider=None) -> argparse.ArgumentParser:
+    # [FUNCTION DOC] Parser for the FSDP options with the program name for SFT training,
+    # optionally extended by the provider.
     return build_dataclass_parser(FSDPArgs, "FSDP SFT Training (miles)", extra_args_provider)
 
 
 def parse_fsdp_cli(extra_args_provider=None):
+    # [FUNCTION DOC] Build the FSDP parser and parse the process command line, returning the
+    # namespace. Does not read the YAML file or apply the post-processing of the loader.
     return build_fsdp_parser(extra_args_provider).parse_args()
 
 
 def reject_unknown_config_keys(data: dict, known: set[str]) -> None:
+    # [FUNCTION DOC] Raise a value error listing every key of the mapping that is not in the
+    # known set (sorted), each with the closest known name as a suggestion when one is similar
+    # enough. Returns quietly if all keys are known.
     unknown = sorted(set(data) - known)
     if not unknown:
         return
@@ -127,6 +164,13 @@ def reject_unknown_config_keys(data: dict, known: set[str]) -> None:
 
 
 def load_args_from_parser(parser: argparse.ArgumentParser):
+    # [FUNCTION DOC] Parse the process command line with the parser, merging in the YAML file
+    # named by the config flag if any, and return the namespace. YAML handling: read the file
+    # (an empty file counts as an empty mapping), reject keys that are not parsed argument names
+    # (value error with suggestions), install the values as parser defaults and parse again, so
+    # explicit command line flags override YAML values. Post-processing: set bf16 to the opposite of
+    # fp16; if a recompute granularity is given it must be full (value error otherwise) and turns
+    # gradient checkpointing on.
     args = parser.parse_args()
     if args.config:
         with open(args.config) as f:
@@ -145,10 +189,17 @@ def load_args_from_parser(parser: argparse.ArgumentParser):
 
 
 def load_fsdp_args(extra_args_provider=None):
+    # [FUNCTION DOC] Public entry: build the FSDP parser (optionally extended) and load the
+    # merged command line and YAML arguments into a namespace.
     return load_args_from_parser(build_fsdp_parser(extra_args_provider))
 
 
 def validate_kernel_backend_args(args) -> None:
+    # [FUNCTION DOC] Raise a value error for an invalid kernel backend setting. The backend must
+    # be native or hub. With the native backend, the strict switch and the mapping path option are
+    # errors (they only apply to hub) and the function returns. With the hub backend, true on
+    # policy mode and deterministic mode are errors (bit-exact modes need native kernels). Reads
+    # the true on policy mode attribute, which must exist on args.
     """Validate --kernel-backend and keep hub kernels out of the bit-exact run modes.
 
     --true-on-policy-mode requires the training-side kernel to match SGLang's build exactly;
@@ -169,6 +220,9 @@ def validate_kernel_backend_args(args) -> None:
 
 
 def validate_hybrid_shard_args(args) -> None:
+    # [FUNCTION DOC] Raise a value error if the replica count is below 1, or if the world size
+    # (actor nodes times actor GPUs per node) is not divisible by it, since the FSDP2 mesh needs
+    # equal shard groups.
     """Validate that the training topology can form the requested FSDP2 mesh."""
     replicate_size = args.dp_replicate_size
     if replicate_size < 1:

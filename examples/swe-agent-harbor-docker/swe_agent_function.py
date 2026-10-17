@@ -1,3 +1,12 @@
+# [MODULE DOC] Agent function plug-in for the agentic tool-call generate function: instead of
+# running an agent loop itself, it sends each task to an external Harbor agent server over HTTP,
+# pointing the remote agent at this run's model session endpoint, and returns the server's
+# environment results (reward, exit status, evaluation report, agent metrics) as a plain mapping.
+# Also provides an abort hook that tells the agent server to cancel in-flight trials.
+# Environment variables: agent server URL (with an older alias; default local port 11000 for
+# run, no default for abort), agent model name (older alias, default "model"), per-trial timeout
+# in seconds (default 7200) and an optional admin secret for flushing. One shared HTTP client
+# per process, with TCP keepalive and no request timeout (the caller enforces timeouts).
 """
 Custom agent function for ``agentic_tool_call.generate``.
 
@@ -30,11 +39,20 @@ _agent_server_client: httpx.AsyncClient | None = None
 
 
 def _agent_trial_timeout_s() -> int:
+    # [FUNCTION DOC] HELPER: Read the trial timeout environment variable as an integer number of
+    # seconds, defaulting to 7200; a non-integer value raises a value error.
     """Per-trial ceiling for the agent-server call, overridable via AGENT_TRIAL_TIMEOUT."""
     return int(os.environ.get("AGENT_TRIAL_TIMEOUT", _DEFAULT_AGENT_TRIAL_TIMEOUT_S))
 
 
 def _get_agent_server_client() -> httpx.AsyncClient:
+    # [FUNCTION DOC] HELPER: Lazily create (once per process, stored in a module global) and
+    # return the shared async HTTP client. Transport sockets enable TCP keepalive with idle time 60
+    # seconds, probe interval 30 seconds and 5 probes; when the platform lacks the named option
+    # constants, Linux option numbers are used as fallbacks. Connection pool: at most 64
+    # connections and 32 kept alive. No request timeout.
+    # KNOWN ISSUE: the fallback option numbers are Linux-specific and would be wrong on other
+    # operating systems that lack the named constants.
     """Return a client whose long-running requests survive idle network paths."""
     global _agent_server_client
     if _agent_server_client is None:
@@ -54,6 +72,8 @@ def _get_agent_server_client() -> httpx.AsyncClient:
 
 
 async def _post_agent_server(url: str, payload: dict[str, Any]) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Post the payload as JSON with the shared client, raise on an HTTP
+    # error status, and return the parsed JSON body.
     client = _get_agent_server_client()
     response = await client.post(url, json=payload)
     response.raise_for_status()
@@ -67,6 +87,20 @@ async def run(
     metadata: dict[str, Any] | None = None,
     **kwargs,
 ) -> dict[str, Any] | None:
+    # [FUNCTION DOC] Run one task through the agent server. Inputs: base_url of the run's model
+    # endpoint for this session; prompt (unused); optional request kwargs (sampling parameters
+    # forwarded as is); optional sample metadata; extra keyword arguments ignored. Request body:
+    # all metadata fields, then the OpenAI-style session URL derived from base_url, the model name
+    # prefixed with the provider label, and the sampling parameters; the max sequence length from
+    # metadata converted to an integer when present; the session server id, when present in
+    # metadata, REPLACED by the host and port of the session URL (metadata holds the cluster
+    # address but the agent needs the address the base URL names); the session server instance id
+    # when present. Posts to the run endpoint of the agent server under the trial timeout. Returns
+    # a mapping with reward (default 0.0), exit status (default empty text), evaluation report
+    # (default empty mapping) and agent metrics (default empty mapping). On timeout, cancellation
+    # or any other error it logs and returns none instead of raising.
+    # KNOWN ISSUE: swallowing task cancellation and returning none hides cancellation from the
+    # caller (done on purpose for sibling failures, but it breaks normal cancellation semantics).
     """Run a single task instance via the Harbor agent server."""
     metadata = metadata or {}
     request_kwargs = request_kwargs or {}
@@ -126,6 +160,14 @@ async def run(
 
 
 async def abort(args) -> None:
+    # [FUNCTION DOC] Abort hook called when oversampling aborts generation. Collects the set of
+    # session server instance ids from the plural instances list on args (non-empty ids only) and
+    # the singular id attribute (kept for backward compatibility). Returns doing nothing if the
+    # agent server URL (environment, with alias, no default) or the ids are missing. Otherwise, for
+    # each id, posts a flush request with that id to the agent server's flush endpoint (URL
+    # trailing slash stripped; up to 3 retries; bearer authorization header when the admin secret
+    # environment variable is set), logging the result; failures are logged as warnings and do not
+    # stop the remaining ids.
     """Teardown hook for oversampling abort (called by sglang_rollout.abort).
 
     When Miles has enough samples and aborts SGLang, the in-flight Harbor trials

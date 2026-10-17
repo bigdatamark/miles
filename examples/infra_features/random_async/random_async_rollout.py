@@ -1,3 +1,14 @@
+# [MODULE DOC] Synthetic rollout function for stress testing the fully async pipeline: it
+# fabricates samples from random token ids, sends multi-turn requests to the SGLang router, and
+# assigns random rewards, with no dataset, reward model or data buffer involved.
+# Architecture: a process-wide background worker (one thread running its own event loop)
+# continuously keeps a bounded number of sample groups in flight and pushes completed groups
+# into a bounded thread-safe queue (max 1000). The synchronous rollout entry point runs a
+# coroutine that drains that queue until the requested number of groups is collected. Tunables
+# are module constants: prompt length range 50-2800 tokens, per-turn new-token range 512-2048,
+# filler ratio 3 filler tokens per generated token, maximum context (environment variable,
+# default 60000), per-GPU concurrency (environment variable, default 64), vocabulary size
+# 151643, request timeout (environment variable, default 30 minutes).
 """Fully-async rollout using random tokens and random rewards.
 
 Exercises the entire async rollout <-> trainer loop for agentic-like toy data. 
@@ -63,10 +74,18 @@ SGLANG_REQUEST_TIMEOUT_SECONDS = int(os.environ.get("RANDOM_ASYNC_SGLANG_REQUEST
 
 
 def _rand_ids(n: int) -> list[int]:
+    # [FUNCTION DOC] HELPER: Return a list of n token ids drawn independently and uniformly from
+    # zero up to the vocabulary size (exclusive), using the global random generator.
     return [random.randrange(VOCAB_SIZE) for _ in range(n)]
 
 
 def _decode_routed_experts(args, encoded: str, token_count: int, start_len: int = 0) -> np.ndarray:
+    # [FUNCTION DOC] HELPER: Decode the engine's base64 routed-experts payload (ASCII text of
+    # packed 32-bit signed integers) into a three dimensional array of shape rows by number of
+    # layers by router top-k (both from args). rows is token_count minus one minus start_len,
+    # because the last token has no routing record and the first start_len rows were already
+    # received in earlier turns. Raises a value error if rows would be negative; a payload of the
+    # wrong size makes the reshape fail.
     row_count = token_count - 1 - start_len
     if row_count < 0:
         raise ValueError(f"routed_experts_start_len={start_len} exceeds token_count - 1 ({token_count - 1})")
@@ -78,6 +97,33 @@ def _decode_routed_experts(args, encoded: str, token_count: int, start_len: int 
 
 
 async def _generate_one_random_sample(args, sample: Sample) -> Sample:
+    # [FUNCTION DOC] HELPER: Fill one empty sample in place with a random multi-turn trajectory
+    # and return it. Setup: a random prompt (length uniform in the prompt range); the router
+    # generate URL from args; a sticky data-parallel rank equal to the sample index modulo
+    # GPUs per engine; routing replay is on if the args say so.
+    # Each turn: stop if the remaining context budget is not positive; choose new tokens as a
+    # random value in the range capped by the remaining budget; post the full current token list
+    # with temperature 0.8, ignoring end-of-sequence, requesting log probabilities, the sticky
+    # rank for routing and for the disaggregated prefill rank, plus (replay only) a request for
+    # routed experts starting after rows already received; a per-sample routing key header keeps
+    # the sample on one backend. The post uses one retry and an overall timeout (raises a timeout
+    # error with sample identifiers). Validates the response: raises a runtime error if there are
+    # no output log probabilities, if replay is on and routed experts are absent, or if more
+    # tokens came back than the remaining budget. Replay chunks are decoded and appended.
+    # Records request metrics (output, prompt, cached tokens, ideal cacheable prefix, duration).
+    # Appends filler: random ids numbering 3 times the output count (dropped entirely under
+    # replay when output plus filler would reach the remaining budget, since every final token
+    # needs routed experts), with log probability 0 and loss mask 0 for filler and the real log
+    # probabilities and mask 1 for generated tokens; the segment is truncated to the remaining
+    # budget; the ideal cacheable prefix becomes context length plus retained generated tokens;
+    # prefix cache info and a weight version record (cut at that prefix) are added to the sample.
+    # The loop ends when the context reaches the budget.
+    # Finalization: tokens, response length, empty response text, reward uniform in minus one to
+    # one, loss mask, rollout log probabilities; under replay requires at least one chunk and
+    # that the concatenated rows equal token count minus one, else raises a runtime error;
+    # status set to completed; prints a one-line summary.
+    # KNOWN ISSUE: remaining_tokens is recomputed after the output arrives but the current
+    # context has not changed since it was first computed, so the recomputation is a no-op.
     """Multi-turn rollout against SGLang with random prompts, fillers, and reward.
 
     Send a request, take the engine's response, append response + random filler
@@ -229,6 +275,9 @@ async def _generate_one_random_sample(args, sample: Sample) -> Sample:
 
 
 async def _generate_random_group(args, group: list[Sample]) -> list[Sample]:
+    # [FUNCTION DOC] HELPER: Generate all samples of a group concurrently (one task each), return
+    # them in the original order, and print a summary with group index, sample count, total token
+    # count and duration. An exception in any sample propagates.
     start_time = time.time()
     result = list(await asyncio.gather(*[_generate_one_random_sample(args, s) for s in group]))
     total_tokens = sum(len(sample.tokens) for sample in result)
@@ -245,6 +294,9 @@ _worker_lock = threading.Lock()
 
 
 def get_global_worker(args) -> "AsyncRandomRolloutWorker":
+    # [FUNCTION DOC] Return the process-wide worker, creating and starting it under a lock if it
+    # does not exist or its thread has died (a replacement worker starts with a fresh queue; the
+    # old one is not stopped). Side effects: sets the module global, starts a thread.
     global _global_worker
     with _worker_lock:
         if _global_worker is None or not _global_worker.worker_thread.is_alive():
@@ -255,6 +307,8 @@ def get_global_worker(args) -> "AsyncRandomRolloutWorker":
 
 
 def stop_global_worker() -> None:
+    # [FUNCTION DOC] HELPER: Under the lock, stop the process-wide worker if any and clear the
+    # global. Registered to run at interpreter exit.
     global _global_worker
     with _worker_lock:
         if _global_worker is not None:
@@ -266,6 +320,11 @@ atexit.register(stop_global_worker)
 
 
 class AsyncRandomRolloutWorker:
+    # [CLASS DOC] Owns the background thread, its event loop and the output queue. State: the run
+    # args, a running flag, a bounded output queue of pairs of group id and sample list, the
+    # thread handle, an optional metrics reporter, the first fatal failure, the current number of
+    # in-flight groups, and running counters for sample and group indices. Groups are fabricated
+    # locally; each contains the configured samples per prompt.
     """Background asyncio loop that fills an output queue with random sample groups.
 
     Mirrors the worker inside ``miles.rollout.fully_async_rollout.FullyAsyncRolloutFn`` but
@@ -273,6 +332,10 @@ class AsyncRandomRolloutWorker:
     """
 
     def __init__(self, args):
+        # [FUNCTION DOC] Store args and initialize empty state (queue capacity 1000, indices 0).
+        # If the args enable sglang metrics, create a metrics reporter pointed at the router
+        # address, using GPUs per engine as both the prefill and decode GPU counts. The reporter
+        # and thread are not started here.
         self.args = args
         self.running = True
         self.output_queue: queue.Queue = queue.Queue(maxsize=1000)
@@ -292,6 +355,9 @@ class AsyncRandomRolloutWorker:
             )
 
     def _make_random_group(self) -> list[Sample]:
+        # [FUNCTION DOC] HELPER: Create a group of empty samples, one per sample-per-prompt, all
+        # sharing the next group index and receiving consecutive globally increasing sample
+        # indices; advances both counters. Returns the list.
         group: list[Sample] = []
         for _ in range(self.args.n_samples_per_prompt):
             s = Sample()
@@ -303,6 +369,16 @@ class AsyncRandomRolloutWorker:
         return group
 
     async def continuous_worker_loop(self):
+        # [FUNCTION DOC] The worker's main coroutine. The in-flight group bound is the per-GPU
+        # concurrency times GPUs per engine divided (integer) by samples per prompt, at least 1.
+        # Every iteration (about once per second): harvest finished group tasks, putting a pair of
+        # group id and result into the queue (a blocking put when full; a failed task re-raises
+        # its exception here, ending the loop); then, if below the bound, launch exactly one new
+        # group task; update the active count; sleep 1 second. On exit (stop flag, error or
+        # cancel) all remaining tasks are cancelled and awaited, and the active count is updated.
+        # KNOWN ISSUE: the launch step is written as a while loop but ends with an unconditional
+        # exit, so at most one group is started per second, which can make ramp-up to the bound
+        # slow for large bounds.
         print("Continuous random-async rollout worker started")
         active: dict[asyncio.Task, int] = {}
         max_concurrent_groups = max(
@@ -337,6 +413,8 @@ class AsyncRandomRolloutWorker:
             print("Continuous random-async rollout worker stopped")
 
     def worker_thread_func(self):
+        # [FUNCTION DOC] Thread body: run the worker loop on a new event loop. On any exception,
+        # record it as the failure, clear the running flag, log it and re-raise (ending the thread).
         try:
             asyncio.run(self.continuous_worker_loop())
         except Exception as e:
@@ -346,6 +424,8 @@ class AsyncRandomRolloutWorker:
             raise
 
     def start(self):
+        # [FUNCTION DOC] Start the metrics reporter (if any) and a daemon worker thread, unless a
+        # live thread already exists. Prints a message.
         if self.worker_thread is None or not self.worker_thread.is_alive():
             if self.metrics_reporter is not None:
                 self.metrics_reporter.start()
@@ -354,6 +434,8 @@ class AsyncRandomRolloutWorker:
             print("Started random-async worker thread")
 
     def stop(self):
+        # [FUNCTION DOC] Clear the running flag, stop the metrics reporter, and wait up to 5
+        # seconds for the thread to finish. Prints a message.
         self.running = False
         if self.metrics_reporter is not None:
             self.metrics_reporter.stop()
@@ -362,6 +444,8 @@ class AsyncRandomRolloutWorker:
         print("Stopped random-async worker thread")
 
     def get_completed_groups(self) -> list[tuple[int, list[Sample]]]:
+        # [FUNCTION DOC] Non-blocking drain: remove and return every pair of group id and sample
+        # list currently in the queue, in arrival order (possibly empty).
         out: list[tuple[int, list[Sample]]] = []
         while True:
             try:
@@ -371,12 +455,16 @@ class AsyncRandomRolloutWorker:
         return out
 
     def get_queue_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Approximate number of completed groups waiting in the queue.
         return self.output_queue.qsize()
 
     def get_active_count(self) -> int:
+        # [FUNCTION DOC] HELPER: Number of groups in flight as of the last loop iteration.
         return self.active_count
 
     def check_failures(self) -> None:
+        # [FUNCTION DOC] Re-raise the worker's recorded failure if any, else the metrics reporter's
+        # failure if any; otherwise do nothing.
         if self.failure is not None:
             raise self.failure
         if self.metrics_reporter is not None and self.metrics_reporter.failure is not None:
@@ -384,6 +472,13 @@ class AsyncRandomRolloutWorker:
 
 
 async def _generate_rollout_async(args, rollout_id: int) -> list[list[Sample]]:
+    # [FUNCTION DOC] HELPER: Collect the rollout batch size number of groups from the global
+    # worker and return them sorted by the index of each group's first sample. Polls every 10
+    # milliseconds: re-raises worker failures, raises a runtime error if the worker thread died
+    # silently, appends drained groups, and every 30 seconds without progress prints a status line.
+    # Prints start and completion lines.
+    # KNOWN ISSUE: the drain takes everything from the queue, but groups beyond the target are
+    # discarded (the loop stops appending without putting them back), so finished work is lost.
     worker = get_global_worker(args)
     target = args.rollout_batch_size
 
@@ -425,6 +520,9 @@ async def _generate_rollout_async(args, rollout_id: int) -> list[list[Sample]]:
 
 
 def generate_rollout_random_async(args, rollout_id, data_buffer: DataSource, evaluation: bool = False):
+    # [FUNCTION DOC] Synchronous rollout entry point. Raises a value error in evaluation mode.
+    # Discards the data buffer, runs the async collection to completion on the shared event loop
+    # runner and returns the list of sample groups.
     """Entry point referenced by ``--rollout-function-path``.
 
     ``data_buffer`` is accepted for signature compatibility and ignored; the

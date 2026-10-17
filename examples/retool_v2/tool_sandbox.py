@@ -1,3 +1,15 @@
+# [MODULE DOC] Tool execution backend and reward function for the multi-turn tool-use example.
+# Provides a single tool, a Python code interpreter, exposed to the rollout through three
+# module-level names: the list of tool specifications (in the chat function-calling schema),
+# an asynchronous function that runs a named tool with an argument mapping and returns a text
+# result, and an asynchronous reward function. Code runs in a child Python process inside a
+# temporary directory after a regular-expression safety screen, under a wall-clock timeout, with
+# output captured. A module-level semaphore bounds concurrent tool executions, and the host
+# process memory is checked and garbage collected around executions. A configuration mapping
+# holds limits: turn and tool-call limits and a CPU limit (not used in this module), concurrency
+# 32, code timeout 120 seconds, a memory-limit string for the interpreter (not enforced; see the
+# sandbox), and memory thresholds in megabytes (cleanup levels 3072, 6144, 9216 and an execution
+# refusal limit of 12288).
 import asyncio
 import gc
 import os
@@ -32,17 +44,22 @@ SEMAPHORE = asyncio.Semaphore(TOOL_CONFIGS["tool_concurrency"])
 
 
 def get_memory_usage() -> float:
+    # [FUNCTION DOC] HELPER: Resident memory of the current process in megabytes (float).
     """Get current memory usage in MB"""
     process = psutil.Process()
     return process.memory_info().rss / 1024 / 1024
 
 
 def cleanup_memory():
+    # [FUNCTION DOC] HELPER: Run one full garbage collection pass.
     """Force garbage collection to free memory"""
     gc.collect()
 
 
 def aggressive_cleanup_memory():
+    # [FUNCTION DOC] HELPER: Run three garbage collection passes, then for each of a few common
+    # scientific libraries that is already loaded, call a cache-clearing method if the module
+    # has one. In practice those modules have no such method, so this only collects garbage.
     """More aggressive memory cleanup"""
     # Force multiple garbage collection cycles
     for _ in range(3):
@@ -64,6 +81,14 @@ def aggressive_cleanup_memory():
 
 
 def check_and_cleanup_memory():
+    # [FUNCTION DOC] HELPER: Measure process memory and clean up according to tiers; returns a
+    # message string describing what happened, or none if below the lowest threshold. Above 9216
+    # MB: aggressive cleanup and a warning message. Above 6144 MB: one garbage collection and an
+    # info message. Above 3072 MB: one garbage collection and a "light cleanup" message.
+    # KNOWN ISSUE: the configuration key named aggressive threshold holds the LOWEST level and
+    # leads only to light cleanup, while the key named force threshold is the highest, so the
+    # key names do not match the behavior; the normal and light branches both just run one
+    # garbage collection.
     """Check memory usage and perform appropriate cleanup"""
     current_memory = get_memory_usage()
 
@@ -84,9 +109,17 @@ def check_and_cleanup_memory():
 
 
 class PythonSandbox:
+    # [CLASS DOC] Runs untrusted Python snippets in a child process. Holds a timeout in seconds, a
+    # memory limit string, and a set of allowed top-level module names (math, random, datetime,
+    # collections, itertools, functools, operator, statistics, decimal, fractions).
+    # KNOWN ISSUE: the memory limit string is stored but never used; the child instead gets a
+    # fixed 4 GB address-space limit written into the wrapper script.
+    # KNOWN ISSUE: this is a pattern-matching screen, not a real sandbox; see the safety check.
     """Python code sandbox, provides safe code execution environment"""
 
     def __init__(self, timeout: int = 10, memory_limit: str = "100MB"):
+        # [FUNCTION DOC] Store the timeout (default 10 seconds) and memory limit string (default
+        # 100 megabytes, unused) and create the allowed module name set.
         self.timeout = timeout
         self.memory_limit = memory_limit
         self.allowed_modules = {
@@ -103,6 +136,18 @@ class PythonSandbox:
         }
 
     def _check_code_safety(self, code: str) -> tuple[bool, str]:
+        # [FUNCTION DOC] HELPER: Screen code text. Returns a pair of safe flag and message. Step 1:
+        # reject if any forbidden pattern is found anywhere in the text, case-insensitively:
+        # imports of os, sys, subprocess, shutil, glob, pathlib; the dynamic import hook name;
+        # calls to eval, exec, open, file, input, raw_input, compile, execfile, getattr, setattr,
+        # delattr, hasattr, globals, locals, vars, dir, type, isinstance, issubclass, super,
+        # property, staticmethod, classmethod; and any double-underscore name. The message names
+        # the matched pattern. Step 2: collect the first module name after every import keyword and
+        # every from keyword, and reject if any is not in the allowed set.
+        # KNOWN ISSUE: matching is plain substring search with no word boundaries or parsing, so it
+        # has false positives (for example a function whose name ends in dir, or the words from or
+        # import inside comments or strings) and bypasses: a comma separated import list only has
+        # its first module checked, so a forbidden module can follow an allowed one.
         """Check code safety by scanning for dangerous patterns"""
         # Check for dangerous operations
         dangerous_patterns = [
@@ -159,6 +204,11 @@ class PythonSandbox:
 
     @contextmanager
     def _create_safe_environment(self):
+        # [FUNCTION DOC] HELPER: Context manager that makes a fresh temporary directory (name
+        # prefix for the sandbox) and yields a triple: the path of a script file inside it (not yet
+        # created), a copy of the current environment with the module path set to the directory and
+        # unbuffered output on, and the directory. On exit removes the directory tree, ignoring
+        # errors.
         """Create safe execution environment with temporary directory"""
         # Create temporary directory
         temp_dir = tempfile.mkdtemp(prefix="python_sandbox_")
@@ -184,6 +234,24 @@ class PythonSandbox:
                 pass
 
     async def execute_code(self, code: str) -> str:
+        # [FUNCTION DOC] Run a code snippet and return a text result; failures are returned as text
+        # starting with the word Error, never raised. Steps: if host process memory exceeds the
+        # refusal limit, do aggressive cleanup and return an error asking to retry; run the safety
+        # screen and return its message as an error if unsafe; wrap the code (every line indented
+        # into a try block) in a script that sets a 4 GB address-space soft limit, redirects stdout
+        # and stderr to buffers, and afterwards prints a result made of an output section and an
+        # errors section, or, on an exception, an error message with traceback; write the script to
+        # the temporary directory and run it with the system python3 as a child process whose
+        # working directory is that directory, waiting up to the timeout. Exit code zero returns the
+        # child's stripped standard output; nonzero returns an error with the code and the child's
+        # standard error; timeout kills the child and returns a timeout error; any launch failure
+        # returns an error with the message. Afterwards runs the memory check and prints a cleanup
+        # message if it produced one.
+        # KNOWN ISSUE: the child is started and awaited with blocking calls inside this coroutine,
+        # so each execution blocks the event loop for up to the timeout and the concurrency
+        # semaphore provides no real parallelism. Indenting every line also changes the contents of
+        # multi-line string literals in the user code, and an exit request raised by the snippet
+        # bypasses the capture restore so its output is lost.
         """Execute Python code in sandbox with safety checks"""
         # Check memory usage before execution
         current_memory = get_memory_usage()
@@ -291,9 +359,14 @@ except Exception as e:
 
 
 class ToolRegistry:
+    # [CLASS DOC] Maps tool names to their function-calling specifications and dispatches
+    # executions. Owns one Python sandbox configured from the module configuration (timeout and
+    # memory limit string) and registers the code interpreter tool on construction.
     """Tool registry, manages available tools and their execution"""
 
     def __init__(self):
+        # [FUNCTION DOC] Create an empty tool mapping, the sandbox (timeout and memory limit from
+        # the module configuration) and register the default tools.
         self.tools = {}
         self.python_sandbox = PythonSandbox(
             timeout=TOOL_CONFIGS["python_timeout"], memory_limit=TOOL_CONFIGS["python_memory_limit"]
@@ -301,6 +374,9 @@ class ToolRegistry:
         self._register_default_tools()
 
     def _register_default_tools(self):
+        # [FUNCTION DOC] HELPER: Register the code interpreter tool: a function spec named code
+        # interpreter with a description and an object parameter schema with one required string
+        # property, the code to execute.
         """Register default tools in the registry"""
         # Python code interpreter
         self.register_tool(
@@ -320,14 +396,21 @@ class ToolRegistry:
         )
 
     def register_tool(self, name: str, tool_spec: dict[str, Any]):
+        # [FUNCTION DOC] Store the spec under the name, replacing any existing entry. Registering
+        # a spec does not add execution support; the dispatcher only implements the interpreter.
         """Register a new tool in the registry"""
         self.tools[name] = tool_spec
 
     def get_tool_specs(self) -> list[dict[str, Any]]:
+        # [FUNCTION DOC] Return a new list of all registered specs in registration order.
         """Get all tool specifications as a list"""
         return list(self.tools.values())
 
     async def execute_tool(self, tool_name: str, arguments: dict[str, Any]) -> str:
+        # [FUNCTION DOC] Run a tool call and return text. An unknown name returns an error string
+        # without waiting. Otherwise acquires the module concurrency semaphore; the interpreter name
+        # runs the Python execution helper, and any other registered name returns a not-implemented
+        # error string. Errors are returned, not raised.
         """Execute a tool call with the given arguments"""
         if tool_name not in self.tools:
             return f"Error: Tool '{tool_name}' not found"
@@ -339,6 +422,9 @@ class ToolRegistry:
                 return f"Error: Tool '{tool_name}' not implemented"
 
     async def _execute_python(self, arguments: dict[str, Any]) -> str:
+        # [FUNCTION DOC] HELPER: Take the code argument (empty string if absent); if it is a list,
+        # join the items converted to text with newlines. Returns an error string for blank code;
+        # otherwise returns the sandbox execution result.
         """Execute Python code using the sandbox"""
         code = arguments.get("code", "")
         if isinstance(code, list):
@@ -357,11 +443,25 @@ tool_specs = tool_registry.get_tool_specs()
 
 
 async def execute_tool(name: str, params: dict) -> str:
+    # [FUNCTION DOC] Module-level entry referenced from the launcher as the tool execution
+    # function: delegates to the shared registry with the tool name and argument mapping and
+    # returns its text result.
     return await tool_registry.execute_tool(name, params)
 
 
 # Reward function that encourages tool usage
 async def reward_func(args, sample: Sample, **kwargs):
+    # [FUNCTION DOC] Custom reward function. The solution text is the prompt plus the response if
+    # the prompt is a string, else just the response; the ground truth is the label or an empty
+    # string; the tool call count comes from the sample metadata (which must be a mapping; zero if
+    # absent). Scores with the DAPO math scorer requiring a boxed answer, giving a result mapping
+    # with score, accuracy and prediction entries. If the score is negative (incorrect), adds a
+    # bonus of 0.05 per tool call and then limits the score to at most -0.6, so tool use can lift an
+    # incorrect answer's score only up to -0.6. A missing prediction is replaced by an empty
+    # string. Returns the result mapping.
+    # KNOWN ISSUE: the cap is applied with a minimum, so a negative base score already above -0.6
+    # would be pushed down to -0.6 rather than left alone; this is only harmless if the scorer's
+    # incorrect score is -1.
     """Tool call reward function using math_dapo, with bonus for tool usage."""
     solution_str = sample.prompt + sample.response if isinstance(sample.prompt, str) else sample.response
     ground_truth = sample.label if sample.label is not None else ""

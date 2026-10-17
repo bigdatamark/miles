@@ -1,3 +1,11 @@
+# [MODULE DOC] Command line tool that splits the DAPO math JSON-lines file into a training file
+# and a held-out evaluation file. Steps: read non-blank lines, drop duplicates by prompt text
+# (keeping the first occurrence; the raw line is what is kept), shuffle all lines with a fixed
+# seeded generator, take the last N lines (default 512) as eval and everything before as train,
+# assert the two sets of prompt texts are disjoint, write the train and eval files under the
+# output directory (created if needed; each file's lines joined by newlines plus a final
+# newline) and print counts, seed and an MD5 hash of the eval content for reproducibility checks.
+# Options: required source path and output dir; eval size (default 512); seed (default 42).
 """Carve a disjoint train/eval split from dapo-math-17k for the self-distillation example.
 
 The file is ordered by difficulty, so we shuffle with a FIXED SEED before splitting
@@ -16,11 +24,22 @@ import random
 
 
 def prompt_text(d):
+    # [FUNCTION DOC] HELPER: Canonical text of a record's prompt, used as the dedup key. If the
+    # prompt field is a list of chat messages, the content fields (empty string when missing)
+    # are joined with newlines; otherwise the prompt is converted to a string. Raises a key error
+    # if the record has no prompt field.
     p = d["prompt"]
     return "\n".join(m.get("content", "") for m in p) if isinstance(p, list) else str(p)
 
 
 def main():
+    # [FUNCTION DOC] Parse the options, build and write the two split files and print a summary
+    # (see the module doc for the steps). Raises an assertion error if an eval prompt also occurs
+    # in train (cannot normally happen after dedup). Side effects: creates the output directory,
+    # reads the source, writes two files, prints one line.
+    # KNOWN ISSUE: the slice for the eval rows takes the last N items, so an eval size of zero
+    # selects ALL rows as eval and leaves train empty; an eval size at or above the row count
+    # also leaves train empty.
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", required=True, help="dapo-math-17k.jsonl")
     ap.add_argument("--out-dir", required=True)

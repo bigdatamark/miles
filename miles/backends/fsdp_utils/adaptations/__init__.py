@@ -1,3 +1,9 @@
+# [PACKAGE DOC] Re-exports the public API of the FSDP adaptation layer: five independent
+# registries of model-architecture hooks (class patches and instance patches, packing patches,
+# post-load fixups, precision policies, parameter transforms for weight sync), each with a
+# register function and an apply or lookup function. The registries start empty; importing the
+# specs subpackage at the end of this module registers the hooks of every supported architecture
+# as an import side effect, which is why that import must stay last.
 """Per-arch adaptation layer for the FSDP backend.
 
 Pure-mechanism registries (``weight_bridge``, ``class_patches``, ``packing``, ``post_load_fixups``,

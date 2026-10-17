@@ -1,3 +1,11 @@
+# [MODULE DOC] Launcher for fully asynchronous GRPO training of Qwen3-30B-A3B (mixture of experts)
+# on one 8-GPU node, using the async training entry script. Run as a command line program;
+# the optional options select how generation is paused during weight updates (in place or
+# retract) and how weights are transferred to the inference engines (broadcast, packed
+# broadcast or peer-to-peer). Flow: prepare downloads the model and the DAPO math dataset and
+# converts the HF checkpoint to the distributed Megatron format; execute builds the training
+# argument string and submits it through the shared command utilities. The combination of
+# in-place pause with peer-to-peer transfer is rejected.
 from dataclasses import dataclass
 from typing import Literal
 
@@ -17,6 +25,12 @@ from miles.utils.external_utils import command_utils
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC] Command line options, extending the shared train config. Fields: mode (normal,
+    # or debug_minimal which shortens max response length to 100 tokens), run id (generated at
+    # import time, so identical for all uses within a process), model name and Megatron model
+    # type, GPUs per node (8), data/model/Megatron directories, pause generation mode (in place
+    # default, or retract), weight transfer mode (broadcast default, packed broadcast, p2p) and
+    # free-form extra arguments appended to the training command.
     mode: Literal["normal", "debug_minimal"] = "normal"
     run_id: str = command_utils.create_run_id()
     model_name: str = "Qwen3-30B-A3B"
@@ -31,6 +45,10 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
 
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Stage inputs: create model and data directories, download the HF model into
+    # the model directory, download the dapo-math-17k dataset into the data directory, and
+    # convert the HF checkpoint to a torch distributed checkpoint (placed next to the model)
+    # using one process per GPU on the node. All via the backend's command execution; no return.
     U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.model_dir} {args.data_dir}")
     U.exec_command_cpu(f"hf download Qwen/{args.model_name} --local-dir {args.model_dir}/{args.model_name}")
@@ -46,6 +64,20 @@ def prepare(args: ScriptArgs):
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Build the training argument string and submit the async training job.
+    # Raises a value error for in-place pause combined with p2p transfer (the transfer engine
+    # conflicts with active inference collectives). Argument groups: checkpoints (HF model,
+    # reference load from the converted checkpoint, load path under the output dir run folder;
+    # no save path is given), rollout (fully async, DAPO math data, 3000 rollouts, batch 32
+    # prompts x 8 samples, max response 8192 or 100 in debug mode, temperature 1, global batch
+    # 256, data balancing, chosen pause mode), perf (tensor and expert parallel 8, full uniform
+    # recompute, dynamic batch with 9216 tokens per GPU, CPU optimizer offload), GRPO (low
+    # variance KL loss with zero coefficient, asymmetric clip 0.2/0.28, importance sampling
+    # correction), Adam optimizer (lr 1e-6 constant), sglang (8 GPUs per engine, memory fraction
+    # 0.7, decode cuda graph batch 512, plus a transfer-engine seed flag when p2p) and misc
+    # (flash attention, transfer mode, one actor node, rollout GPUs equal to GPUs per node).
+    # Submits with the async train script, with Megatron on the python path and a flashinfer
+    # version check disabled in the job environment.
     U = args.create_backend()
     if args.pause_generation_mode == "in_place" and args.update_weight_transfer_mode == "p2p":
         raise ValueError(
@@ -167,6 +199,7 @@ def execute(args: ScriptArgs):
 
 @command_utils.dataclass_cli
 def main(args: ScriptArgs):
+    # [FUNCTION DOC] Command line entry: run prepare then execute with the parsed options.
     prepare(args)
     execute(args)
 

@@ -1,3 +1,13 @@
+# [MODULE DOC] Script (no command line parser; configured by environment variables read at
+# import time) that trains Qwen3-0.6B or Qwen3-4B on GSM8K with the FSDP backend colocated on
+# the GPUs, in "true on policy" mode: deterministic inference and training kernels (FA3
+# attention on both sides, deterministic NCCL and cuBLAS settings) so training log probabilities
+# match inference exactly. Environment: model name (Qwen3-0.6B default, or Qwen3-4B), mode
+# (normal, debug_minimal, debug_one_sample; asserted at import) and GPU count (default 1). Run
+# directly: prepare downloads the model and dataset, execute submits the job. Modes: normal runs
+# 3000 rollouts of 32 prompts x 8 samples with periodic eval; debug_one_sample runs two rollouts
+# of one sample with response length 2, disables CUDA graphs and turns on the SGLang dumper and
+# debug prints; debug_minimal differs from normal only by having no eval.
 import os
 
 
@@ -13,6 +23,9 @@ NUM_GPUS = int(os.environ.get("MILES_SCRIPT_NUM_GPUS", "1"))
 
 
 def prepare():
+    # [FUNCTION DOC] Create the models and datasets dirs under the root dir, download the chosen
+    # Qwen model into the models dir and the GSM8K dataset (default data dir) via the default
+    # backend. No return.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -20,6 +33,23 @@ def prepare():
 
 
 def execute():
+    # [FUNCTION DOC] Build the training arguments and submit with no Megatron model type (FSDP).
+    # Rollout: GSM8K train parquet with the math reward, chat template, shuffle; sizes depend on
+    # mode (see module doc), response length 1024, temperature 1, global batch 256 (1 in one-sample
+    # mode). Eval (normal mode only): every 20 rollouts on GSM8K test, one sample, response 1024,
+    # top-k 1. GRPO with zero KL and entropy coefficients (KL loss itself disabled), clip
+    # 0.2/0.28. Adam 1e-6 constant. Sglang: one GPU per engine, metrics on, static memory
+    # fraction 0.2 for the 4B model and 0.4 otherwise, CUDA graphs off in one-sample mode.
+    # FSDP: weight update bucket of 512 MiB. CI flags: CI test on, KL checker off, and a metric
+    # check that the gsm8k eval metric reaches 0.71. Misc: one actor node with the GPU count,
+    # colocated, FSDP backend; the 4B model additionally uses dynamic batch with 2048 tokens per
+    # GPU. True on policy: deterministic sglang inference with the FSDP RL target, FA3 attention in
+    # both sglang and the trainer, deterministic and true-on-policy modes; environment pins the
+    # NCCL algorithm to tree all-reduce, disables nondeterministic Transformer Engine algorithms
+    # and sets the cuBLAS workspace config; sglang dumper and debug print are enabled only in
+    # one-sample mode.
+    # KNOWN ISSUE: debug modes without eval (debug_minimal, debug_one_sample) still enable the
+    # CI metric check on the gsm8k eval metric, which would have no value to check.
     U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME} "
 

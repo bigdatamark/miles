@@ -1,3 +1,8 @@
+# [PACKAGE DOC] Packed-sequence (several documents concatenated into one row) support for the
+# FSDP backend. Two parts re-exported here: the boundary derivation (a context object describing
+# where each packed document starts and ends, and a function that builds it) and the packing
+# patch registry (register, look up and apply per-architecture patches that reset stateful layers
+# at document boundaries).
 """Unified packed-sequence layout handling for the FSDP backend.
 
 One registry + one boundary derivation; each stateful arch registers a ``PackingPatch`` in ``specs/``

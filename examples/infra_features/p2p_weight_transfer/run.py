@@ -1,4 +1,17 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Single command line tool that prepares and launches the peer-to-peer (and
+# broadcast) weight transfer examples for a registry of models, from a 4B dense model on one node
+# up to very large mixture-of-experts models on up to 64 nodes.
+# Two registries drive everything, both keyed by model name: one of preparation settings (HF
+# repo, Megatron model type, datasets, conversion layout and extras) and one of run settings
+# (node/GPU counts, parallelism sizes, rollout/eval/GRPO/optimizer knobs, sglang engine knobs,
+# miscellaneous toggles and extra job environment variables). Three subcommands are dispatched
+# by hand from the process arguments: list (print registry names), prepare (download model and
+# datasets, patch config for GLM-5, convert to Megatron format) and run (clean the machine,
+# start Ray head or worker, wait for GPUs, assemble the train arguments and submit the job).
+# Paths such as /root/models and /root/datasets are hard-coded. Environment variables read:
+# the checkpoint save dir, skip-validation flag, bucket size in GB, explicit buffer size in
+# bytes, and the log dir used for cross-node completion signalling.
 """
 Unified prepare + run script for P2P weight transfer examples.
 
@@ -32,6 +45,13 @@ from pathlib import Path
 
 @dataclass
 class PrepareConfig:
+    # [CLASS DOC] Per-model settings for the prepare subcommand. Fields: HF repo to download;
+    # Megatron model type (selects the model definition); dataset repos to download (default the
+    # DAPO math set); GPUs per node used for conversion (8); whether conversion is multi-node;
+    # optional node count for multi-node conversion; extra raw conversion flags; default output
+    # dir for converted checkpoints; optional pip install target for a custom transformers
+    # build; whether the GLM-5 config patch is needed; and whether to download through the HF
+    # hub snapshot function instead of the command line downloader.
     """Configuration for the `prepare` subcommand."""
 
     hf_repo: str
@@ -49,6 +69,24 @@ class PrepareConfig:
 
 @dataclass
 class RunConfig:
+    # [CLASS DOC] Per-model settings for the run subcommand; each field maps to one or more train
+    # or engine flags (see the run command for the mapping). Groups: topology (Megatron model
+    # type, total nodes, training GPUs, rollout GPUs, GPUs per node); training parallelism
+    # (tensor, pipeline, context, expert, expert-tensor sizes, sequence parallel switch, optional
+    # layer count of the last pipeline stage, tokens per GPU); rollout (prompts per rollout,
+    # samples per prompt, temperature, global batch, data balancing); eval (enable flag, dataset
+    # name and path, optional temperature, top-p); GRPO (advantage estimator, KL loss switch and
+    # coefficient strings, optional separate KL coefficient, entropy coefficient, clip bounds
+    # with optional upper bound); optimizer CPU offload switch; sglang engine settings (GPUs per
+    # engine, memory fraction, expert/data parallel sizes, dense tensor parallel size for MoE,
+    # CUDA graph batch sizes as a space separated string, DP attention and DP LM head switches,
+    # server concurrency, MoE runner and FP8 GEMM backends, plus the sparse-attention (NSA)
+    # group: page size, graph max batch, max running requests, chunked prefill factor that is
+    # multiplied by GPUs per engine, watchdog timeout, graph disable); misc (NCCL NVLS switch,
+    # transfer buffer size in GB, separate buffer size for broadcast, transfer timeout seconds,
+    # all-gather context parallel, MoE token dispatcher type, data pad multiplier, log-prob
+    # chunk size); checkpoint dir and whether to take it from the save-dir environment variable;
+    # extra job environment variables; and an optional rotary base override.
     """Configuration for the `run` subcommand."""
 
     model_type: str
@@ -488,6 +526,10 @@ MILES_ROOT = Path(__file__).resolve().parents[3]
 
 
 def run_cmd(cmd: str, check: bool = True) -> int:
+    # [FUNCTION DOC] HELPER: Echo the command prefixed with a plus sign, then run it through bash
+    # as a shell string with inherited output. Returns the exit code. When check is true (the
+    # default) and the exit code is nonzero, prints an error line and terminates the whole
+    # process with that same exit code.
     """Run a shell command, streaming output."""
     print(f"+ {cmd}", flush=True)
     result = subprocess.run(cmd, shell=True, executable="/bin/bash")
@@ -498,6 +540,8 @@ def run_cmd(cmd: str, check: bool = True) -> int:
 
 
 def list_models():
+    # [FUNCTION DOC] HELPER: Print the sorted model names of the prepare registry, then those of
+    # the run registry, under two headings. Output only.
     """Print available model names."""
     print("Available models for `prepare`:")
     for name in sorted(PREPARE_CONFIGS):
@@ -513,6 +557,22 @@ def list_models():
 
 
 def patch_glm5_config(model_dir: str):
+    # [FUNCTION DOC] Make a downloaded GLM-5 checkpoint loadable as a DeepSeek V3.2 architecture.
+    # Input: the model directory. Raises a file-not-found error if the config file is missing.
+    # Reads the JSON config and then takes one of three paths. (1) If the model type is not yet
+    # the DeepSeek V3.2 type: set architectures, the auto-class mapping to two local stub
+    # modules, set the model type, ensure a top-level rope theta (taken from the nested rope
+    # parameters mapping when present, else 1000000), and rewrite the file. (2) If the type is
+    # already right but no auto-class mapping exists: add the mapping and rewrite. (3) Otherwise
+    # report it is already patched. Afterwards, regardless of path, ensure a top-level rope theta
+    # exists and rewrite the file if it had to be added. Finally always (over)writes two stub
+    # Python files into the directory: a config class deriving from the DeepSeek V3 config that
+    # adds an index top-k option (default 2048) and promotes rope theta from the nested
+    # parameters (default 1000000), and a model class deriving from the generic pretrained model
+    # that only names the config class. Side effects: file reads/writes and prints.
+    # KNOWN ISSUE: the rope theta default is computed in two places (path 1 and the final
+    # check) so the final check is redundant after path 1; the config file is also rewritten up
+    # to twice per call.
     """Patch config.json for DeepseekV32 and create stub Python files."""
     model_dir = Path(model_dir)
     config_path = model_dir / "config.json"
@@ -601,6 +661,19 @@ def patch_glm5_config(model_dir: str):
 
 
 def cmd_prepare(model_name: str, download_only: bool = False, ckpt_dir: str | None = None):
+    # [FUNCTION DOC] Implements the prepare subcommand. Unknown model names print an error plus
+    # the model list and exit with status 1. The output checkpoint dir is the explicit argument,
+    # else the save-dir environment variable, else the registry default. Steps, all via shell
+    # commands that exit the process on failure: (0) optionally pip install a pinned transformers
+    # build; (1) create the models and datasets dirs under the root dir and download the model
+    # into the models dir under the model name, using either the hub snapshot function or the
+    # command line downloader; (2) download each dataset through the command utilities' default
+    # backend; (3) apply the GLM-5 config patch when flagged; (4) unless download-only, create the
+    # checkpoint dir and call the backend's checkpoint conversion with the registry's GPU count,
+    # multi-node flag, extra flags, destination dir and optional node count. Prints progress.
+    # KNOWN ISSUE: the model is always downloaded into the models dir under the root dir and
+    # conversion is given only the model name, so the ckpt-dir option affects only where the
+    # converted output goes, never where the model is read from.
     """Download model, datasets, patch config, and convert checkpoint."""
     if model_name not in PREPARE_CONFIGS:
         print(f"ERROR: Unknown model '{model_name}'.")
@@ -684,6 +757,52 @@ def cmd_run(
     node_rank: int = 0,
     head_ip: str = "",
 ):
+    # [FUNCTION DOC] Implements the run subcommand: set up Ray on this node and, on the head,
+    # submit the training job. Inputs: model name (unknown names print an error plus the model
+    # list and exit with status 1), transfer mode (p2p or broadcast), node rank (0 is the head)
+    # and the head node IP (needed for multi-node). Returns nothing.
+    # Derived values: single-node means one total node; training nodes is training GPUs divided
+    # by GPUs per node (at least 1); the checkpoint root is the save-dir environment variable
+    # (default the root dir) if the config says so, else the config's dir. Weight validation is
+    # skipped when the skip-validation environment variable is a nonzero integer; for the Kimi
+    # model validation is unsupported, so unless skipping is set a not-implemented error is
+    # raised. The bucket size in GB comes from its environment variable, else the config.
+    # Steps: (1) print a banner. (2) Best-effort cleanup (failures ignored): kill sglang, stop
+    # and kill Ray, kill other python processes except this one and its parent, with short
+    # sleeps and a repeat pass, then kill redis. (3) Compute the model-args environment and the
+    # shell snippet that loads the model flags. (4) Multi-node workers sleep 20 seconds so the
+    # head starts first. (5) Start Ray: single node head with dashboard on port 8265; multi-node
+    # head with the node IP and memory monitor disabled; multi-node worker joining head IP on
+    # port 6379. Each node advertises the configured GPUs per node. (6) Multi-node head polls
+    # every 5 seconds, with no timeout, until the cluster reports the expected total GPUs.
+    # (7) Build the job runtime environment: unbuffered output, Ray debug, Megatron on the path,
+    # single device connection, NCCL NVLS switch, log dir; the transfer timeout only for
+    # multi-node; then model-args env and the config's extra variables.
+    # (8) Build the train argument list: checkpoint (HF model from the models dir, reference
+    # load from the converted checkpoint), rollout (DAPO math data, deepscaler reward, 13
+    # rollouts, response length 100, config sizes, optional data balancing), optional eval
+    # (16 samples per prompt, response length 16384, optional temperature, top-p), parallelism
+    # sizes with optional flags, full uniform recompute, dynamic batch, optional data padding and
+    # log-prob chunking, GRPO flags (low variance KL type, optional KL loss and KL coefficient,
+    # optional upper clip), Adam optimizer at 1e-6 with optional CPU offload trio, sglang flags
+    # (each optional flag only if set; NSA group adds sparse decode/prefill backends and the NSA
+    # attention backend; chunked prefill size is the factor times GPUs per engine), the peer to
+    # peer seed-via-transfer-engine flag when mode is p2p, then either the dummy load format
+    # (skip-validation) or a multithread loader config when there are at least 4 nodes or NSA,
+    # misc model flags, actor node and per-node GPU counts, an update buffer size in bytes
+    # (peer to peer uses bucket GB; broadcast prefers the config's broadcast GB; an explicit
+    # buffer-size environment variable overrides all), the weight-equality check unless
+    # skipping, and the transfer mode.
+    # (9) Head or single node: submit with a shell string that first loads model args, then
+    # submits a Ray job to the local dashboard with the runtime env, running the repo's train
+    # entry with model args plus quoted train args; the exit code is ignored. For multi-node the
+    # head then writes a completion marker file named for the mode into the log dir (default
+    # a signals dir) so workers can exit. Workers poll for that file every 10 seconds, then exit.
+    # KNOWN ISSUE: the dummy load format argument is one list element containing both the flag
+    # and its value, but every element is shell-quoted before joining, so the engine would
+    # receive a single token containing a space instead of a flag and a value.
+    # KNOWN ISSUE: the marker file is never removed, so a stale marker from an earlier run makes
+    # workers exit immediately; the job's failure status is ignored by both head and workers.
     """Launch training with P2P or broadcast weight transfer."""
     if model_name not in RUN_CONFIGS:
         print(f"ERROR: Unknown model '{model_name}'.")
@@ -1061,6 +1180,10 @@ def cmd_run(
 
 
 def build_model_args_command(cfg: RunConfig) -> str:
+    # [FUNCTION DOC] HELPER: Build a shell snippet that runs the repo's model-args utility script
+    # for the config's model type, with the model-args environment variables set as a prefix,
+    # captures its single output line into a shell variable (exiting the shell on failure), and
+    # splits it on whitespace into a shell array named for model args. Returns the snippet text.
     """A shell snippet leaving MODEL_ARGS set; the knobs must reach it, not only ray's runtime env."""
     prefix = "".join(f"{name}={shlex.quote(value)} " for name, value in build_model_args_env(cfg).items())
     return (
@@ -1071,6 +1194,9 @@ def build_model_args_command(cfg: RunConfig) -> str:
 
 
 def build_model_args_env(cfg: RunConfig) -> dict[str, str]:
+    # [FUNCTION DOC] HELPER: Return the environment variables the model definitions read: empty
+    # when the config has no rotary base override, otherwise a one-entry mapping from the rotary
+    # base variable name to the base as a string.
     """The MODEL_ARGS_* knobs the model definitions read, as declared by the profile."""
     if cfg.rotary_base is None:
         return {}
@@ -1083,6 +1209,12 @@ def build_model_args_env(cfg: RunConfig) -> dict[str, str]:
 
 
 def main():
+    # [FUNCTION DOC] Command line dispatcher over the process arguments. With no subcommand it
+    # prints usage and exits 1. The list subcommand prints the models. The prepare subcommand
+    # parses a model name, a download-only switch and a checkpoint dir option, then calls the
+    # prepare implementation. The run subcommand parses a model name, a mode choice (p2p default,
+    # or broadcast), a node rank (default 0) and a head IP (default empty), then calls the run
+    # implementation. Any other subcommand prints an error and usage and exits 1.
     """Simple CLI dispatcher (no external dependencies)."""
     if len(sys.argv) < 2:
         print("Usage: python run.py <prepare|run|list> [args...]")

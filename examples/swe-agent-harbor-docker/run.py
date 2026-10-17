@@ -1,3 +1,9 @@
+# [MODULE DOC] Launcher for colocated (synchronous) agentic GRPO training of GLM-4.7-Flash on
+# SWE-style tasks, with rollouts produced by an external Harbor agent server through a session
+# server and a custom rollout function that logs agent metrics. Command line program: cleanup
+# kills leftover processes, prepare (skippable) converts the HF checkpoint, execute builds the
+# arguments and submits the default train script. Agent, W&B and host IP defaults are read from
+# environment variables when the module is loaded.
 """SWE-Agent launcher (GLM-4.7-Flash): Miles <-> Harbor orchestration.
 
 Supports any task type (SWE-bench, Terminal-Bench, custom) via Harbor.
@@ -24,6 +30,14 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC] Command line options extending the shared train config: mode (normal, or
+    # debug_rollout_only), run id (generated at import), model type, GPUs per node (8), Megatron
+    # path; paths (skip-prepare switch, base dir for converted checkpoints, model name, HF
+    # checkpoint, reference load path, save dir, prompt data file); training sizes (max sequence
+    # 65536, 3000 rollouts, 4 prompts x 8 samples, global batch 32, save interval 100, optional
+    # trace dump dir, off when empty); agent settings (server URL defaulting from environment with
+    # an older alias, model name, Harbor tasks dir, session server external host, host IP
+    # override); Weights and Biases and Prometheus settings.
     mode: Literal["normal", "debug_rollout_only"] = "normal"
     run_id: str = command_utils.create_run_id()
     megatron_model_type: str = "glm4.7-flash"
@@ -72,6 +86,12 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
 
 def cleanup():
+    # [FUNCTION DOC] Kill stale processes whose command line contains sglang, the train script
+    # name or the Megatron trainer name, excluding this process and its parent, via a shell
+    # pipeline per name (failures ignored), then sleep 5 seconds. Prints start and end messages.
+    # KNOWN ISSUE: unlike the sibling launchers, the search pattern is not protected with the
+    # bracket trick, so the shell command line running the search itself can match the pattern
+    # (this process and its parent are excluded, but not that intermediate shell).
     """Kill old Ray jobs and stale processes to free GPU resources."""
     my_pid = os.getpid()
     ppid = os.getppid()
@@ -88,6 +108,9 @@ def cleanup():
 
 
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Convert the HF checkpoint to the distributed format on one node's GPUs, with
+    # output placed in the base dir. The backend decides whether conversion is skipped when the
+    # output exists. No return.
     """Convert HF checkpoint to torch_dist format if not already done."""
     U = args.create_backend()
     U.convert_checkpoint(
@@ -101,6 +124,24 @@ def prepare(args: ScriptArgs):
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Build the training arguments and submit the job. Checkpoint: HF, reference,
+    # save dir and interval. Rollout: prompt data with metadata key, shuffle, sizes from options,
+    # temperature 0.8, response length 8192, max sequence length, global batch, balancing. Perf:
+    # tensor 4 with sequence parallel, expert 8, pipeline and context 1, full uniform recompute,
+    # dynamic batch of 16384 tokens per GPU, optimizer CPU offload and precision-aware optimizer.
+    # GRPO with low variance KL loss (coefficient 0.01), clip 0.2/0.28. Adam 1e-6 constant.
+    # Sglang: one GPU per engine, memory fraction 0.7, GLM tool-call and reasoning parsers, router
+    # port 31000. Agent: agentic generate function, SWE agent function, reward function and the
+    # metrics-logging rollout function class from the sibling modules, a filter dropping aborted
+    # samples, GLM tokenization model, session server on port 30000 with 32 workers, optional
+    # external host. Misc: no dropout, fp32 gradient reduction and softmax, flash attention,
+    # colocated, actor nodes equal to the total node count, rollout GPUs equal to GPUs per node.
+    # Optional: debug rollout-only switch, trace dumping, W&B (only if a key is set) and
+    # Prometheus flags. Job environment: python path with Megatron, this directory and the repo
+    # root; agent server URL, model name and Harbor tasks dir; optional host IP.
+    # KNOWN ISSUE: the rollout GPU count flag is passed as one node's GPUs even though colocated
+    # mode runs rollout on the same GPUs as all actor nodes; for more than one node it does not
+    # equal the actor world size and appears to be redundant (or wrong) under colocation.
     U = args.create_backend()
     ckpt_args = (
         f"--hf-checkpoint {args.hf_checkpoint} "
@@ -261,6 +302,8 @@ def execute(args: ScriptArgs):
 
 @command_utils.dataclass_cli
 def main(args: ScriptArgs):
+    # [FUNCTION DOC] Command line entry: clean up stale processes, run prepare unless skipped,
+    # then execute.
     cleanup()
     if not args.skip_prepare:
         prepare(args)

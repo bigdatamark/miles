@@ -1,3 +1,10 @@
+# [MODULE DOC] Launcher with two subcommands for running a Tinker-compatible gateway backed by
+# Qwen3-30B-A3B with multiple LoRA adapters on one node: prepare downloads the model, serve
+# starts the long-running gateway job (the serve script of the repo rather than a training
+# script) on disjoint GPU sets for training and for sampling. The gateway idles until clients
+# connect; each client gets one of a fixed pool of adapter slots. Options come from a dataclass
+# of the shared train config via the command line wrapper. There is also an empty callback so the
+# command line app always has subcommands.
 """Prepare Qwen3-30B-A3B and serve the Tinker gateway on separate training and sampling GPUs."""
 
 from dataclasses import dataclass, field
@@ -11,6 +18,13 @@ app = typer.Typer()
 
 @dataclass
 class ScriptArgs(U.ExecuteTrainConfig):
+    # [CLASS DOC] Options extending the shared train config. Run id (generated per instance),
+    # optional HF checkpoint path and checkpoint save dir (filled in after construction), Megatron
+    # model type and path, model dir; GPUs per node 8 split into 4 actor and 4 rollout GPUs;
+    # tensor parallel 2 and expert parallel 4 for training; LoRA settings (maximum rank 32,
+    # alpha 64, number of adapter slots 4, target module list as a comma separated string);
+    # gateway port 10613; GPUs per rollout engine 2; sglang static memory fraction 0.7; extra
+    # raw arguments.
     run_id: str = field(default_factory=U.create_run_id)
 
     hf_checkpoint: str | None = None
@@ -38,6 +52,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
     extra_args: str = ""
 
     def __post_init__(self):
+        # [FUNCTION DOC] Fill defaults after construction: the save dir becomes a checkpoints
+        # folder under the output dir if unset, and the HF checkpoint becomes the Qwen3-30B-A3B
+        # folder under the model dir if unset.
         if self.save_dir is None:
             self.save_dir = f"{self.output_dir}/checkpoints"
         if self.hf_checkpoint is None:
@@ -47,6 +64,10 @@ class ScriptArgs(U.ExecuteTrainConfig):
 @app.command()
 @U.dataclass_cli
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Subcommand: create the model dir and download the Qwen3-30B-A3B HF
+    # checkpoint into a folder of that name under it. No return.
+    # KNOWN ISSUE: the download target and repository are fixed, ignoring the HF checkpoint and
+    # model type options, so a non-default checkpoint option is never downloaded.
     """Download the Qwen3-30B-A3B checkpoint. Run once per node before serving."""
     backend = args.create_backend()
     backend.exec_command_cpu(f"mkdir -p {args.model_dir}")
@@ -56,6 +77,16 @@ def prepare(args: ScriptArgs):
 @app.command()
 @U.dataclass_cli
 def serve(args: ScriptArgs):
+    # [FUNCTION DOC] Subcommand: print a summary line, build the argument string and start the
+    # gateway job. Arguments: checkpoint (HF path, bridge mode for Megatron-to-HF conversion);
+    # LoRA (rank, alpha, dropout 0, no fused gradient accumulation, number of adapter slots,
+    # quoted target modules); gateway (port, checkpoint root of the save dir plus run id);
+    # optimizer Adam with a placeholder learning rate (real values come with each optimizer
+    # step request); parallelism (tensor and expert sizes, sequence parallel, dynamic batch of
+    # 8192 tokens per GPU); sglang (GPUs per engine, memory fraction, triton LoRA backend);
+    # topology (one actor node with the actor GPUs, rollout GPUs); no dropout, fp32 gradient
+    # all-reduce and softmax, flash attention; extra args. Submits the repo's serve script (not a
+    # train script) with a job lifetime tied to the launcher. No return.
     """Serve the Tinker gateway (idles until clients connect)."""
     print(
         f"[run] tinker gateway: {args.actor_num_gpus} train + {args.rollout_num_gpus} rollout GPUs, "
@@ -116,6 +147,8 @@ def serve(args: ScriptArgs):
 
 @app.callback()
 def _callback() -> None:
+    # [FUNCTION DOC] HELPER: Intentionally empty command group callback, present only so the app
+    # keeps subcommand names (prepare and serve) instead of collapsing a single command.
     pass
 
 

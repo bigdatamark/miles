@@ -1,3 +1,12 @@
+# [MODULE DOC] Launcher for multi-turn tool-use (code interpreter) GRPO training of Qwen3-4B on
+# DAPO math, colocated on one or more nodes, with GPU count per node chosen from the detected
+# or given hardware. Rollouts use the repo's multi-turn generate function with the tool specs,
+# tool execution function and reward function from the sibling tool sandbox module, a Qwen 2.5
+# style tool call parser and a configurable turn limit. The starting model is either a
+# supervised-fine-tuned checkpoint (default, which also needs a larger rotary base) or the base
+# model. Command line program; prepare downloads data and the model and converts the checkpoint;
+# execute submits the job. Weights and Biases settings use a hard-coded project and group and
+# the API key from the environment. Many paths are hard-coded under the root dir.
 import os
 from dataclasses import dataclass, field
 from typing import Literal
@@ -12,6 +21,13 @@ WANDB_GROUP = "sft-multi-turn-batch-32"
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC] Command line options extending the shared train config: mode (normal, or
+    # debug_minimal: short responses, frequent saves, no eval), run id (generated per instance),
+    # hardware (auto-detect, H100, GB200 or GB300), GPUs per node (default from hardware),
+    # whether to start from the SFT model (default true), checkpoint save path, prompt data path,
+    # maximum tool-use turns (16), GPUs per rollout engine (2) and extra arguments. Two fields
+    # (HF checkpoint and reference load paths) are not user options; they are derived after
+    # construction.
     mode: Literal["normal", "debug_minimal"] = "normal"
     run_id: str = field(default_factory=command_utils.create_run_id)
     hardware: Literal["auto", "H100", "GB200", "GB300"] = "auto"
@@ -28,6 +44,11 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     ref_load: str = field(init=False)
 
     def __post_init__(self):
+        # [FUNCTION DOC] Resolve derived settings: replace the hardware option with the resolved
+        # hardware kind (detecting it when auto), default the GPUs per node to the standard count
+        # for that hardware if not given (a given zero would also be replaced), and set the HF
+        # checkpoint and reference load (converted checkpoint) paths either to the SFT model
+        # folders under a font-info dir or to the base Qwen3-4B folders under the models dir.
         self.hardware = command_utils.resolve_hardware(self)
         self.num_gpus_per_node = self.num_gpus_per_node or command_utils.NUM_GPUS_OF_HARDWARE[self.hardware]
         if self.use_sft_model:
@@ -39,6 +60,10 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
 
 def _get_wandb_args() -> str:
+    # [FUNCTION DOC] HELPER: Build the Weights and Biases flags with the module's fixed project
+    # and group names and the API key read from the environment.
+    # KNOWN ISSUE: if the key variable is unset the literal text for none is interpolated into
+    # the key flag instead of omitting wandb, and this bypasses the shared default wandb helper.
     WANDB_API_KEY = os.environ.get("WANDB_API_KEY")
     return (
         "--use-wandb "
@@ -49,6 +74,13 @@ def _get_wandb_args() -> str:
 
 
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Stage inputs under fixed root-dir paths: create folders and download the
+    # DAPO math and AIME 2024 datasets. With the SFT model option, download the SFT model into the
+    # derived HF checkpoint path and convert it to a distributed checkpoint under the font-info
+    # dir (Qwen3-4B Megatron type, per-node GPU count). Otherwise download the base Qwen3-4B into
+    # the models dir and convert it there. No return.
+    # KNOWN ISSUE: dataset locations are fixed and not tied to the prompt data option, so a
+    # custom prompt data path is never downloaded.
     U = args.create_backend()
     U.exec_command_cpu("mkdir -p /root/dapo-math-17k /root/aime-2024")
     U.exec_command_cpu("hf download --repo-type dataset zhuzilin/dapo-math-17k --local-dir /root/dapo-math-17k")
@@ -76,6 +108,20 @@ def prepare(args: ScriptArgs):
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Build the training arguments and submit the job (Megatron model type fixed
+    # to the Qwen3-4B type). Checkpoint: derived HF and reference paths, save path, save interval
+    # (2 in debug mode else 1000) and, for the SFT model, a rotary base of 5000000. Custom: the
+    # multi-turn generate function, tool specs and execution function from the sandbox module,
+    # the Qwen 2.5 tool-call parser, the max turn count and multi-turn logging. Rollout: prompt
+    # data with chat template and shuffle, the sandbox reward function, 3000 rollouts of 32
+    # prompts x 8 samples, response length 100 in debug mode else 8192, temperature 1, global
+    # batch 256, balanced. Eval (not in debug mode): every 20 rollouts on AIME, 16 samples,
+    # response length 16384, top-p 1. GRPO with zero KL coefficient and clip 0.2/0.28; Adam 1e-6
+    # constant; sglang with the configured GPUs per engine and memory fraction 0.7; perf: tensor
+    # parallel 2 with sequence parallel, full recompute, dynamic batch of 9216 tokens per GPU.
+    # Misc: node count from the base config, GPUs per node, colocated, no dropout, fp32 reductions,
+    # flash attention and pass-rate logging. Submits with Megatron and the repo at fixed paths on
+    # the python path.
     U = args.create_backend()
     megatron_model_type = "qwen3-4B"
 
@@ -201,6 +247,7 @@ def execute(args: ScriptArgs):
 
 @command_utils.dataclass_cli
 def main(args: ScriptArgs):
+    # [FUNCTION DOC] Command line entry: run prepare then execute.
     prepare(args)
     execute(args)
 

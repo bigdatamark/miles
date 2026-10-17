@@ -1,3 +1,10 @@
+# [MODULE DOC] Launcher for the synthetic random-async stress test of Qwen3.5-35B-A3B on three
+# 8-GPU nodes: two nodes for training (context parallel 8, expert parallel 8, FP8 blockwise) and
+# rollout GPUs served by a prefill/decode disaggregated sglang layout described by a YAML file
+# next to this script (one prefill one decode engine group). The rollout function is the random
+# one from this directory, so no dataset is needed; weights are loaded from a FP8 HF checkpoint
+# and the learning rate is zero. Command line program; prepare stages the BF16 and FP8 models
+# and the converted checkpoint (skippable); execute submits the async training job.
 import os
 from dataclasses import dataclass
 from typing import Literal
@@ -9,6 +16,12 @@ from miles.utils.external_utils import command_utils
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC] Command line options extending the shared train config: mode (normal, or
+    # debug_minimal with max response length 100), run id (generated at import), model name and
+    # Megatron type, GPUs per node (8), actor node count (2), total rollout GPUs (8), number of
+    # rollouts (4), model and Megatron directories, pause generation mode (in place default or
+    # retract), weight transfer mode (broadcast default, packed broadcast or p2p), a switch to
+    # skip the prepare step and free-form extra arguments.
     mode: Literal["normal", "debug_minimal"] = "normal"
     run_id: str = command_utils.create_run_id()
     model_name: str = "Qwen3.5-35B-A3B"
@@ -26,6 +39,11 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
 
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Stage models: create the model dir; download the BF16 HF model unless either
+    # a converted checkpoint already marked as release exists or the HF directory exists; download
+    # the FP8 variant unless its directory exists; then convert the BF16 HF checkpoint to a
+    # distributed checkpoint with one process per GPU. Shell conditionals make the downloads
+    # idempotent. No return.
     U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.model_dir}")
     U.exec_command_cpu(
@@ -48,6 +66,26 @@ def prepare(args: ScriptArgs):
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Build the training arguments and submit the async training job.
+    # Raises a value error for in-place pause with p2p transfer. Uses the engine layout YAML in
+    # this script's directory. Argument groups: checkpoints (HF checkpoint is the FP8 variant,
+    # reference load is the converted BF16 checkpoint, load path under the run folder of the
+    # output dir); rollout (the random rollout function, no global dataset, rollout count from
+    # options, 32 prompts x 16 samples, max response 8192 or 100 in debug mode, global batch
+    # 512, data balancing, pause mode); perf (context parallel 8, expert parallel 8, full uniform
+    # recompute, dynamic batch of 8000 tokens per GPU, log-prob chunk 1024, flex DeepEP token
+    # dispatcher, Transformer Engine FP8 e4m3 blockwise); runtime (manual router prefill/decode
+    # policies, min-load assignment, expandable-segments allocator env for training); GRPO
+    # (zero-coefficient low variance KL loss, clip 0.2/0.28, importance sampling correction);
+    # Adam with learning rate and weight decay zero; sglang (4 GPUs per engine, the YAML config,
+    # memory fraction 0.85, FA3 attention, data-parallel attention 4, expert parallel 4, DP LM
+    # head, DeepEP all-to-all, context length 80000, metrics on, server concurrency 384, plus
+    # the p2p seed flag when p2p); misc (flash attention, transfer mode, actor node count and
+    # GPUs, rollout GPU count). The job environment disables the flashinfer version check, pins
+    # the random rollout limits (max context 60000, concurrency 64 per GPU), enables forced
+    # prefill DP rank query with a 900 second disaggregation wait, and extends the python path
+    # with Megatron and this directory so the rollout module is importable.
+    # Note the 3 node total comes from 2 actor nodes plus the 8 rollout GPUs.
     U = args.create_backend()
     if args.pause_generation_mode == "in_place" and args.update_weight_transfer_mode == "p2p":
         raise ValueError(
@@ -189,6 +227,7 @@ def execute(args: ScriptArgs):
 
 @command_utils.dataclass_cli
 def main(args: ScriptArgs):
+    # [FUNCTION DOC] Command line entry: run prepare unless the skip switch is set, then execute.
     if not args.skip_prepare:
         prepare(args)
     execute(args)

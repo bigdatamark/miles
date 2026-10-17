@@ -1,3 +1,11 @@
+# [MODULE DOC] Launcher for disaggregated, fully asynchronous agentic GRPO training of
+# GLM-4.7-Flash on SWE-style tasks: the first group of nodes trains, the remaining nodes serve
+# inference engines (one engine per node), and rollouts are produced by an external Harbor agent
+# server through a session server. Command line program: cleanup kills leftover processes,
+# prepare (skippable) converts the HF checkpoint on up to a capped number of nodes, execute
+# derives the topology from the node counts and submits the async train script. The file name
+# contains hyphens, so it is run directly, not imported. Defaults for agent settings, W&B and
+# the host IP are read from environment variables when the module is loaded.
 """GLM-4.7-Flash fully-async agentic training with SWE-bench data.
 
 Disaggregated fully-async variant for agentic tasks: training and rollout run
@@ -43,6 +51,22 @@ MAX_CONVERT_GPUS = 92
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC] Command line options extending the shared train config (which supplies the total
+    # node count). Groups: mode (normal, or debug_rollout_only that skips training), run id
+    # (generated at import), model type, GPUs per node (8), Megatron path; paths (skip-prepare
+    # switch, model name, HF checkpoint, converted reference checkpoint, save dir, trace dump dir
+    # where empty means a traces folder under the save dir and the word disabled turns dumping
+    # off, prompt data file); length limits (max sequence 16384, response 8192) and save interval
+    # (5); batch sizing (3000 rollouts, 32 prompts x 4 samples, global batch 32, oversampling batch
+    # 64); rollout FP8 switch (declared but never used) and the first health-check wait (1800 s);
+    # agent settings (server URL, model name, Harbor tasks dir, session server external host, host
+    # IP override; the first, second, third and fifth default from environment variables at import);
+    # disaggregation (training node count 1, pause generation mode in place or retract, weight
+    # transfer mode broadcast, packed broadcast or p2p, fp32 gradient accumulation switch,
+    # tokens per GPU, optimizer CPU offload and precision-aware optimizer switches); Weights and
+    # Biases (key, project, team, run name, random-suffix switch) and Prometheus (switch, port,
+    # run name) settings.
+    # KNOWN ISSUE: the rollout FP8 option is never read, so setting it has no effect.
     mode: Literal["normal", "debug_rollout_only"] = "normal"
     run_id: str = command_utils.create_run_id()
     megatron_model_type: str = "glm4.7-flash"
@@ -106,6 +130,12 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
 
 def cleanup():
+    # [FUNCTION DOC] Kill stale processes whose command line matches sglang, the train script, the
+    # async train script or the Megatron trainer name, excluding this process and its parent, using
+    # a shell pipeline per name (failures ignored), then sleep 5 seconds. The first character of
+    # each name is wrapped in a bracket class so the search pattern does not match the shell
+    # command line that carries it. Prints start and end messages. Side effect: sends terminate
+    # signals to other processes.
     """Kill old Ray jobs and stale processes to free GPU resources."""
     my_pid = os.getpid()
     ppid = os.getppid()
@@ -126,6 +156,10 @@ def cleanup():
 
 
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Convert the HF checkpoint to the distributed format with a multi-node
+    # conversion job. The node count is the smaller of the cluster node count and the cap of 92
+    # GPUs divided (integer) by GPUs per node, so conversion does not take the whole cluster. The
+    # output goes to the parent folder of the reference load path. No return.
     """Convert HF checkpoint to torch_dist format."""
     U = args.create_backend()
     max_convert_nodes = MAX_CONVERT_GPUS // args.num_gpus_per_node
@@ -143,6 +177,35 @@ def prepare(args: ScriptArgs):
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Derive the topology, build the training arguments and submit the async job.
+    # Raises a value error for in-place pause with p2p transfer. Topology: rollout nodes are total
+    # nodes minus training nodes and must be positive (assertion); training GPUs and rollout GPUs
+    # follow from GPUs per node; tensor parallel is fixed at 4 (it must divide the model's 20
+    # attention heads) and pipeline at 1, training GPUs must be divisible by their product
+    # (assertion), data parallel is the quotient, and expert parallel is the largest number
+    # dividing both the 64 experts and the data parallel size. Each rollout node hosts one sglang
+    # engine spanning its GPUs, with attention tensor parallel 4 and attention data parallel the
+    # remainder (the world must be divisible by 4), expert parallel and tensor parallel equal to the
+    # engine size, dense MoE tensor parallel 1, DP LM head, max running requests = engine size x
+    # 256 / 4, chunked prefill = engine size x 256, decode CUDA graph batch 256, the GLM tool-call
+    # and reasoning parsers, router port 31000, and the p2p seed flag when p2p transfer is used.
+    # Other argument groups: checkpoint (HF, reference, save dir and interval); rollout (fully
+    # async, prompt data with metadata key, shuffle, sizes from options, temperature 0.8, lengths,
+    # a dynamic sampling filter that drops aborted samples, global batch, balancing, pause mode;
+    # no eval); perf (sequence parallel, full uniform recompute, dynamic batch, optional CPU
+    # offload and precision-aware optimizer); GRPO with KL loss coefficient 0.01 (low variance),
+    # clip 0.2/0.28; Adam 1e-6; agent (agentic generate function, the SWE agent function and the
+    # reward function from the sibling modules, GLM tokenization model, session server on port
+    # 30000 with 32 workers, optional external host); misc (no dropout, flash attention, transfer
+    # mode, 2 GiB weight update buffer, training node count, GPU counts, rollout GPUs, bf16
+    # gradient reduction, fault tolerance, health check wait, optional fp32 gradient accumulation,
+    # trace dumping unless disabled); optional debug rollout-only switch; optional W&B and
+    # Prometheus flags (W&B only if a key is set). Job environment: python path with Megatron, this
+    # directory and the repo root; NVLS switch from an environment variable (default off); a
+    # tensor-parallel memory imbalance check; agent server URL, model name and Harbor tasks dir;
+    # optional host IP. Submitted with the async train script.
+    # Note: unlike the colocated launcher in this directory, no custom rollout function is set, so
+    # the agent metrics aggregation class from the sibling module is not used here.
     U = args.create_backend()
     if args.pause_generation_mode == "in_place" and args.update_weight_transfer_mode == "p2p":
         raise ValueError(
@@ -380,6 +443,8 @@ def execute(args: ScriptArgs):
 
 @command_utils.dataclass_cli
 def main(args: ScriptArgs):
+    # [FUNCTION DOC] Command line entry: clean up stale processes, run prepare unless skipped,
+    # then execute.
     cleanup()
     if not args.skip_prepare:
         prepare(args)

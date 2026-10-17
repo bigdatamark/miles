@@ -1,3 +1,10 @@
+# [MODULE DOC] Custom reward functions (asynchronous callables taking run args and a sample)
+# for the self-distillation example, plugged in with the custom reward model path flag. Both
+# return a float. Correctness accepts a boxed final answer graded by the verl-style grader, or
+# the DAPO answer-line form graded by the DAPO scorer (whose result mapping must report a truthy
+# accuracy field); either is enough. Grader exceptions are swallowed and treated as not matching.
+# A sample with no label is never correct. The pure on-policy distillation variant scores only
+# evaluation samples, which are recognized by a metadata entry set via the eval config.
 """Reward functions for the Qwen3.5-35B-A3B self-distillation example.
 
 Two reward functions are provided:
@@ -33,11 +40,17 @@ from miles.rollout.rm_hub.math_utils import grade_answer_verl
 
 
 def _is_eval_sample(sample) -> bool:
+    # [FUNCTION DOC] HELPER: True if the sample's metadata is a mapping whose reward-mode entry
+    # equals the eval math marker; false for missing or non-mapping metadata.
     md = sample.metadata if isinstance(getattr(sample, "metadata", None), dict) else {}
     return md.get("opd_reward_mode") == "eval_math"
 
 
 def _is_correct(sample) -> bool:
+    # [FUNCTION DOC] HELPER: Whether the sample's response (empty string if none) answers the
+    # sample's label correctly. False if the label is none. First tries the verl boxed-answer
+    # grader; if it is truthy, true. Then tries the DAPO scorer and accepts if it returns a mapping
+    # with a truthy accuracy entry. Exceptions in either grader are ignored. Otherwise false.
     response, label = sample.response or "", sample.label
     if label is None:
         return False
@@ -58,11 +71,16 @@ def _is_correct(sample) -> bool:
 
 
 async def reward_func(args, sample, **kwargs):
+    # [FUNCTION DOC] Reward 1.0 if the sample is correct under either answer format, else 0.0.
+    # The args and extra keyword arguments are ignored.
     """Format-agnostic correctness (1.0 / 0.0). Phase-1 task reward + eval scorer."""
     return 1.0 if _is_correct(sample) else 0.0
 
 
 async def reward_func_pure_opd(args, sample, **kwargs):
+    # [FUNCTION DOC] For samples tagged as eval samples, return the same 1.0 or 0.0 correctness
+    # reward; for all other (training) samples return the constant 0.0. Args and extra keyword
+    # arguments are ignored.
     """Pure-OPD reward: accuracy for eval samples, constant 0.0 for training.
 
     Training reward is constant so the GRPO task advantage vanishes and the only

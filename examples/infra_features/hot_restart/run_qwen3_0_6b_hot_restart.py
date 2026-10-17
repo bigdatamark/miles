@@ -1,3 +1,8 @@
+# [MODULE DOC] Launcher for a small Qwen3-0.6B GRPO run used to exercise hot restart: it saves a
+# checkpoint every few rollouts and loads from the same directory, so re-running the same run
+# id resumes from the latest save. Command line program; prepare stages the model, GSM8K data
+# and converted checkpoint; execute submits the job. Reward model is a deterministic random
+# type (a test reward, not a real grader).
 from dataclasses import dataclass
 
 import typer
@@ -7,6 +12,10 @@ from miles.utils.external_utils import command_utils
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC] Command line options extending the shared train config: model name and Megatron
+    # type, number of rollouts (20), save interval in rollouts (2), actor GPU count (4), number
+    # of rollout engines (2), GPUs per engine (1), data/model/Megatron directories and free-form
+    # extra arguments. Run id and output dir come from the base config.
     model_name: str = "Qwen3-0.6B"
     megatron_model_type: str = "qwen3-0.6B"
     num_rollout: int = 20
@@ -21,14 +30,21 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
     @property
     def num_gpus_per_node(self) -> int:
+        # [FUNCTION DOC] Total GPUs needed on the node: actor GPUs plus engines times GPUs per
+        # engine (non-colocated layout). Returns an integer.
         return self.actor_num_gpus + self.num_engines * self.gpus_per_engine
 
     @property
     def checkpoint_dir(self) -> str:
+        # [FUNCTION DOC] Directory used both to save and load training checkpoints: the output
+        # dir, then the run id, then a checkpoints folder. Returns a string path.
         return f"{self.output_dir}/{self.run_id}/checkpoints"
 
 
 def prepare(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] Stage inputs: create directories, download the HF model and the GSM8K
+    # dataset, and convert the HF checkpoint to a distributed Megatron checkpoint using one
+    # process per actor GPU (not per node GPU). No return.
     U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.model_dir} {args.data_dir}")
     U.exec_command_cpu(f"hf download Qwen/{args.model_name} --local-dir {args.model_dir}/{args.model_name}")
@@ -44,6 +60,8 @@ def prepare(args: ScriptArgs) -> None:
 
 
 def execute(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] Submit the training job with the argument string from the builder, using the
+    # derived node GPU count. Uses the default train script (synchronous). No return.
     args.create_backend().execute_train(
         train_args=build_train_args(args),
         num_gpus_per_node=args.num_gpus_per_node,
@@ -53,6 +71,16 @@ def execute(args: ScriptArgs) -> None:
 
 
 def build_train_args(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] Compose the training argument string and return it. Checkpoint group: HF
+    # model, reference load from the converted checkpoint, and save plus load both pointing at
+    # the same checkpoint dir with the save interval (this is what enables resume). Rollout
+    # group: GSM8K parquet with messages key, chat template, shuffle, deterministic random
+    # reward, max response 200, temperature 0.8, 32 prompts x 8 samples per rollout, rollout
+    # count and rollout GPU/engine sizing from the options. Optimizer: Adam lr 1e-6 constant,
+    # weight decay 0.1, betas 0.9/0.98, fp32 gradient all-reduce. Misc: no dropout, flash
+    # attention, context parallel 2, one actor node, dynamic batch with 32768 tokens per GPU,
+    # GRPO with clip 0.2, global batch 256. Appends default wandb args, the run id as wandb run
+    # id, and the free-form extra args. Parts are joined by single spaces.
     ckpt_args = (
         f"--hf-checkpoint {args.model_dir}/{args.model_name} "
         f"--ref-load {args.model_dir}/{args.model_name}_torch_dist "
@@ -115,6 +143,7 @@ def build_train_args(args: ScriptArgs) -> str:
 
 @command_utils.dataclass_cli
 def main(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] Command line entry: run prepare then execute with the parsed options.
     prepare(args)
     execute(args)
 

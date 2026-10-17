@@ -1,3 +1,14 @@
+# [PACKAGE DOC] Public entry of the FSDP (fully sharded data parallel, FSDP2 style) training
+# backend. Exports the Ray training actor class and the argument loader for this backend, via a
+# guarded import: if the availability flag were false, both names would instead be replaced by a
+# function that raises an import error with installation guidance when called (the flag is
+# currently a constant true, see below). Also records two availability flags (memory saver and
+# FSDP) as module constants.
+# Side effect at import: sets the ROOT logger level to warning, which silences info and debug
+# logging of every logger in the process that relies on inheritance.
+# KNOWN ISSUE: both guarded blocks only assign a constant, so they can never raise an import
+# error; the imports they were meant to test are missing, making the warnings and the fallback
+# branch dead code, and the memory saver flag is never read.
 import logging
 
 
@@ -19,6 +30,9 @@ if _FSDP_AVAILABLE:
 else:
 
     def _raise_import_error(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Stand-in for the unavailable FSDP backend entry points; accepts
+        # any arguments and always raises an import error explaining that FSDP2 support is needed
+        # and where to read about installing it. Currently unreachable (see package note).
         raise ImportError(
             "FSDP backend is not available. "
             "Please ensure PyTorch with FSDP2 support is installed. "

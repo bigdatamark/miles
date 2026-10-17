@@ -1,3 +1,13 @@
+# [MODULE DOC] Checkpoint save and load for the FSDP backend using torch distributed checkpoint
+# (every rank writes/reads its shard). Layout under the save root: a tracker file holding the
+# latest step number, and per-step folders named iter plus a seven-digit zero-padded step number,
+# each containing separate model, optimizer and lr_scheduler distributed-checkpoint folders, an
+# rng file (rank 0's torch and CUDA random states) and a metadata JSON file. The step number is
+# the finished rollout id plus one. Three small state-holder classes adapt model, optimizer and
+# scheduler to the distributed checkpoint protocol; the actor object is used duck-typed (its args,
+# model, optimizer, scheduler and step counters). Loading is split in two: load restores tensors
+# and returns a payload; finalize_load (called after the rest of init) applies random state and
+# counters.
 from __future__ import annotations
 
 import json
@@ -18,50 +28,70 @@ logger = logging.getLogger(__name__)
 
 
 class ModelState(Stateful):
+    # [CLASS DOC] Adapter exposing only a model's weights to the distributed checkpoint protocol.
     """Wrapper for model state only."""
 
     def __init__(self, model):
+        # [FUNCTION DOC] Keep a reference to the model.
         self.model = model
 
     def state_dict(self):
+        # [FUNCTION DOC] Return a mapping with one key holding the model state dict obtained from
+        # the distributed state dict API (sharded values), with no optimizers involved.
         model_state_dict, _ = get_state_dict(self.model, optimizers=[])
         return {"model": model_state_dict}
 
     def load_state_dict(self, state_dict):
+        # [FUNCTION DOC] Load the model entry of the mapping into the model in place via the
+        # distributed state dict API (no optimizer state).
         set_state_dict(self.model, optimizers=[], model_state_dict=state_dict["model"], optim_state_dict=None)
 
 
 class OptimizerState(Stateful):
+    # [CLASS DOC] Adapter exposing only an optimizer's state (keyed consistently with the model's
+    # parameter names) to the distributed checkpoint protocol.
     """Wrapper for optimizer state only."""
 
     def __init__(self, model, optimizer):
+        # [FUNCTION DOC] Keep references to the model (needed to map parameter names) and optimizer.
         self.model = model
         self.optimizer = optimizer
 
     def state_dict(self):
+        # [FUNCTION DOC] Return a mapping with one key holding the optimizer state dict from the
+        # distributed state dict API, ignoring the model part.
         _, optimizer_state_dict = get_state_dict(self.model, optimizers=self.optimizer)
         return {"optim": optimizer_state_dict}
 
     def load_state_dict(self, state_dict):
+        # [FUNCTION DOC] Load the optimizer entry of the mapping into the optimizer in place (no
+        # model weights).
         set_state_dict(
             self.model, optimizers=self.optimizer, model_state_dict=None, optim_state_dict=state_dict["optim"]
         )
 
 
 class LRSchedulerState(Stateful):
+    # [CLASS DOC] Adapter exposing a learning rate scheduler's state to the distributed
+    # checkpoint protocol.
     """Wrapper for LR scheduler state only."""
 
     def __init__(self, lr_scheduler):
+        # [FUNCTION DOC] Keep a reference to the scheduler.
         self.lr_scheduler = lr_scheduler
 
     def state_dict(self):
+        # [FUNCTION DOC] Return a mapping with one key holding the scheduler's own state dict.
         return {"lr_scheduler": self.lr_scheduler.state_dict()}
 
     def load_state_dict(self, state_dict):
+        # [FUNCTION DOC] Restore the scheduler from the mapping's scheduler entry.
         self.lr_scheduler.load_state_dict(state_dict["lr_scheduler"])
 
 
 def _read_checkpoint_metadata(path: Path) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Read a JSON metadata file into a mapping; returns an empty mapping if
+    # the file is missing or is not valid JSON (the latter logs a warning).
     if not path.exists():
         return {}
     try:
@@ -72,12 +102,29 @@ def _read_checkpoint_metadata(path: Path) -> dict[str, Any]:
 
 
 def _write_checkpoint_metadata(path: Path, metadata: dict[str, Any]) -> None:
+    # [FUNCTION DOC] HELPER: Atomically write the mapping as indented, key-sorted JSON: write to a
+    # sibling temporary file (original name plus a temp suffix) and then rename it over the target.
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     tmp_path.write_text(json.dumps(metadata, indent=2, sort_keys=True))
     tmp_path.replace(path)
 
 
 def load(actor: Any) -> dict[str, Any] | None:
+    # [FUNCTION DOC] Restore weights (and, when available, optimizer and scheduler state) in place
+    # on the actor, then return a payload for the finalize step, or none if nothing was loaded.
+    # Steps: the load root comes from the args' load option (none if unset; a missing directory is
+    # skipped with a log). The step is the args' checkpoint step option if set, else the integer in
+    # the root's tracker file (skip if missing). The step folder is iter plus the zero-padded
+    # seven-digit step; if its model folder is missing, skip. Model weights are loaded with the
+    # distributed checkpoint API; ANY exception there is logged as an error and the function
+    # returns none. Optimizer state is loaded unless the no-load-optim arg is set or the actor has no
+    # optimizer, and only if its folder exists (failures are only warnings). Scheduler state is
+    # loaded if the actor has a scheduler and its folder exists (failures warn). Random state is read
+    # to CPU from the rng file if present. Metadata comes from the metadata JSON (empty if missing
+    # or invalid). Returns a mapping with the random state (or none), metadata and the step number
+    # under the iteration name.
+    # KNOWN ISSUE: a failure to load model weights is swallowed (logged only), so training would
+    # continue silently from the freshly initialized weights instead of failing the run.
     """Load checkpoint from disk.
 
     Loads model weights and optionally optimizer state from separate directories.
@@ -162,6 +209,17 @@ def load(actor: Any) -> dict[str, Any] | None:
 
 
 def finalize_load(actor: Any, checkpoint_payload: dict[str, Any] | None) -> None:
+    # [FUNCTION DOC] Apply the non-tensor part of a loaded checkpoint, then synchronize. With no
+    # payload, just a barrier across ranks. Otherwise: unless the no-load-rng arg is set, restore
+    # the CPU random state and, if CUDA is available, the random state of all CUDA devices (only the
+    # keys present). If metadata exists: restore the global and micro step counters (keeping
+    # current values if absent) and set the args' start rollout id to the recorded next rollout id
+    # when present. If there is no metadata but a step number exists: set the start rollout id to
+    # the step number only if it is currently unset. Finally synchronize CUDA and barrier.
+    # Note: every rank restores the same random state because only rank 0 saved one.
+    # KNOWN ISSUE: the actor sets the start rollout id to 0 before loading, so the no-metadata
+    # branch (which only fills an unset value) never takes effect and resume without a metadata
+    # file restarts from rollout 0.
     if checkpoint_payload is None:
         dist.barrier()
         return
@@ -190,6 +248,15 @@ def finalize_load(actor: Any, checkpoint_payload: dict[str, Any] | None) -> None
 
 
 def save(actor: Any, iteration: int) -> None:
+    # [FUNCTION DOC] Collectively save a checkpoint after the given (zero-based) rollout; all
+    # ranks must call it. The step number is iteration plus one and the folder is the save root's
+    # iter plus zero-padded step. Steps: synchronize CUDA; rank 0 creates the step, model,
+    # optimizer and scheduler folders; barrier; save model weights (distributed save); unless the
+    # no-save-optim arg is set, save optimizer state if the actor has a non-none optimizer and
+    # scheduler state if it has a non-none scheduler; rank 0 then writes the random states (CPU and
+    # all CUDA devices) and an atomically written metadata file (step, rollout id, next rollout id,
+    # global and micro step, world size, timestamp) and finally overwrites the tracker file in the
+    # save root with the step number (not atomically); final barrier. Logs the location from rank 0.
     """Save checkpoint to disk.
 
     Saves model weights and optimizer state to separate directories.

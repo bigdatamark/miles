@@ -1,3 +1,8 @@
+# [MODULE DOC] Launcher for fully async GRPO of Qwen3.5-4B with asynchronous checkpoint eval on a
+# single 8-GPU node. Command line program with a choice of eval backend: a Ray-managed eval
+# engine fleet, or the external sglang eval function launched on the spare GPU. Flow: prepare
+# downloads the model plus the training dataset and the AIME 2024 eval dataset and converts the
+# checkpoint; execute builds and submits the training command with the async train script.
 """Fully-async Qwen3.5-4B with async checkpoint eval on one 8-GPU node.
 
 Both eval backends implement the same trainer contract (CheckpointEvalFn): the
@@ -24,6 +29,10 @@ from miles.utils.external_utils import command_utils
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC] Command line options extending the shared train config: eval backend (fleet
+    # default, or external), run id (generated at import), model name, Megatron model type, GPUs
+    # per node (8), data/model/Megatron directories and free-form extra arguments appended to
+    # the training command.
     eval_backend: Literal["fleet", "external"] = "fleet"
     run_id: str = command_utils.create_run_id()
     model_name: str = "Qwen3.5-4B"
@@ -36,6 +45,9 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
 
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Stage inputs: create directories, download the HF model, download the
+    # dapo-math-17k training data and the aime-2024 eval data, and convert the HF checkpoint to
+    # a distributed Megatron checkpoint using one process per GPU on the node. No return.
     U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.model_dir} {args.data_dir}")
     U.exec_command_cpu(f"hf download Qwen/{args.model_name} --local-dir {args.model_dir}/{args.model_name}")
@@ -52,6 +64,19 @@ def prepare(args: ScriptArgs):
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Build the training argument string and submit the async training job.
+    # GPU split: 4 actor GPUs (tensor parallel 2), rollout GPUs equal to node GPUs minus 5, and
+    # one eval GPU; the remaining GPU count sums to the node. Checkpoint args load and save
+    # under the run folder in the output dir, saving every 20 steps. Rollout is fully async
+    # with in-place pause (the comment explains retract can deadlock cache flush under load).
+    # Eval args (shared by both backends) evaluate every 5 rollouts on AIME with 8 samples per
+    # prompt, max response 16384, top-p 1, stage HF snapshots under shared memory and keep the
+    # latest 2. Fleet backend adds one dedicated eval GPU with one GPU per engine; external
+    # backend sets the eval function path to the external sglang class and passes the last GPU
+    # index to it through an environment variable of the job. GRPO and optimizer settings match
+    # the sibling 30B launcher (low variance KL with zero coefficient, clip 0.2/0.28, importance
+    # sampling correction, Adam lr 1e-6); rollout engines use one GPU each with memory fraction
+    # 0.7. Submits with the async train script and Megatron on the python path.
     U = args.create_backend()
     ckpt_args = (
         f"--hf-checkpoint {args.model_dir}/{args.model_name} "
@@ -178,6 +203,7 @@ def execute(args: ScriptArgs):
 
 @command_utils.dataclass_cli
 def main(args: ScriptArgs):
+    # [FUNCTION DOC] Command line entry: run prepare then execute with the parsed options.
     prepare(args)
     execute(args)
 

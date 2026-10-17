@@ -1,3 +1,12 @@
+# [MODULE DOC] Launcher for LoRA agentic GRPO training of the very large GLM-5.2 mixture of
+# experts model, colocated across several 8-GPU nodes, with rollouts from an external Harbor
+# agent server (Terminal-Bench style tasks). The trainer (bf16, LoRA adapters only) and the
+# rollout engines (FP8 checkpoint, described by a generated engine config file) share the same
+# GPUs; training parallelism is derived from the node count; the module docstring below explains
+# the DSA attention backend trade-off. Command line program with a cleanup step and then
+# execute; there is no checkpoint preparation step. Requires Ray to be already running on every
+# node (see the docstring). Agent, W&B and host IP defaults are read from environment variables
+# when the module is loaded.
 """GLM-5.2 744B-A40B **LoRA** agentic launcher: Terminal-Bench-2 style tasks on Daytona sandboxes.
 
 Combines two paths that previously did not meet:
@@ -54,6 +63,19 @@ _DEFAULT_TARGET_MODULES = "o_proj,q_a_proj,kv_a_proj_with_mqa,q_b_proj,kv_b_proj
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC] Command line options extending the shared train config (which supplies the node
+    # count). Groups: mode (normal or debug_rollout_only), run id, model type, GPUs per node,
+    # Megatron path; paths (bf16 HF checkpoint, FP8 rollout checkpoint, shared save dir that also
+    # holds the generated engine config, trace dir, prompt data); sequence budget (max sequence
+    # length 65536 caps a whole session, response length 8192 caps one turn, and a separate
+    # serving context window 65536 that is intentionally independent of the former); training
+    # (200 rollouts, 4 prompts x 8 samples, global batch 32, save interval 10, learning rate as
+    # text 3e-5); LoRA (rank 16, alpha 32, dropout 0, target module list limited to attention and
+    # MLA projections, base-weight CPU backup on, expert outer-LoRA sharing off); GLM-5.2
+    # specifics (DSA attention backend tilelang by default or megatron; routing replay on);
+    # rollout engine (GPUs per FP8 engine 16, static memory fraction 0.85, disk dir for offloading
+    # the paused trainer, LoRA kernel backend triton); agent settings; Weights and Biases and
+    # Prometheus (port 9091) settings.
     mode: Literal["normal", "debug_rollout_only"] = "normal"
     run_id: str = command_utils.create_run_id()
     megatron_model_type: str = "glm5.2-744B-A40B_lora"
@@ -142,6 +164,11 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
 
 def cleanup():
+    # [FUNCTION DOC] Kill stale processes whose command line contains sglang, the train script or
+    # the Megatron trainer name (this process and its parent excluded), using a bracket trick on
+    # the first character so the search pattern does not match its own shell; failures ignored;
+    # then sleep 5 seconds. Prints start and end messages. Side effect: terminates other processes
+    # on this node only (not other nodes).
     """Kill old Ray jobs and stale processes to free GPU resources."""
     my_pid = os.getpid()
     ppid = os.getppid()
@@ -162,6 +189,13 @@ def cleanup():
 
 
 def _parallel_args(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: Training parallelism and memory flags as one string. Tensor parallel
+    # equals GPUs per node, expert parallel equals the world size (nodes times GPUs), expert
+    # tensor, pipeline and context parallel are 1, sequence parallel on. The query layout is thd
+    # for the tilelang backend and bshd for the megatron backend; microbatch size is 1 either way;
+    # full uniform recompute (one layer) is added only for the thd layout, because the shared DSA
+    # top-k state is not carried in bshd. Optimizer CPU offload with overlap and the
+    # precision-aware optimizer are always on.
     """TP = num_gpus_per_node (intra-node, so the TP all-reduce keeps to NVLink),
     EP = the whole world, ETP 1. Megatron requires EP * ETP == TP * DP, which holds
     for any node count with PP = CP = 1.
@@ -197,6 +231,15 @@ def _parallel_args(args: ScriptArgs) -> str:
 
 
 def _sglang_args(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: Rollout engine flags as one string. Engine size is the smaller of the
+    # configured GPUs per FP8 engine and the world size. Flags: GPUs per engine, static memory
+    # fraction, expert parallel equal to the engine size (data-parallel attention deliberately off,
+    # see the inline comment), NSA attention backend with flashmla decode (kv) and prefill (sparse)
+    # backends, page size 64, FP8 e4m3 KV cache, serving context length, decode CUDA graph max
+    # batch and max running requests both 64, chunked prefill size min(8192, 2048 x engine size),
+    # watchdog 3600 seconds, triton MoE runner with shared-expert fusion disabled, max LoRA rank
+    # equal to the configured rank, LoRA backend, GLM tool-call and reasoning parsers, router port
+    # 31001.
     world_size = args.num_nodes * args.num_gpus_per_node
     engine = min(args.fp8_rollout_gpus_per_engine, world_size)
     # Keep the running batch inside a captured graph; the graph only has to cover
@@ -231,6 +274,10 @@ def _sglang_args(args: ScriptArgs) -> str:
 
 
 def _write_sglang_fp8_config(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: Write a YAML engine config into the save dir (creating the dir) and
+    # return its path. It declares one model named default served from the FP8 checkpoint with
+    # weight updates enabled and a single regular server group whose GPU count is the whole world
+    # (nodes x GPUs per node), which sglang splits into engines. Side effect: overwrites the file.
     """Serve the fp8 ckpt while the trainer stays bf16. update_weights stays on so the
     per-step LoRA sync reaches the engine; the bf16 base sync is already skipped under
     colocate + cpu backup."""
@@ -252,6 +299,25 @@ def _write_sglang_fp8_config(args: ScriptArgs) -> str:
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Build all training arguments and submit the job (default train script).
+    # Checkpoint: HF model, bridge conversion mode, DSA backend, save dir and interval; no
+    # reference load, since with LoRA the reference is the base model with adapters off. LoRA:
+    # rank, alpha, dropout, quoted target modules, no fused gradient accumulation, optional
+    # expert outer-LoRA sharing and base CPU backup. Rollout: prompt data with metadata key,
+    # shuffle, sizes, temperature 0.8, response and sequence limits, global batch, balancing.
+    # GRPO: zero KL, entropy coefficients, clip 0.2/0.28 (KL loss itself not switched on). Adam
+    # with the configured learning rate. Optional routing replay. Agent: agentic generate
+    # function, SWE agent function, reward function and metrics rollout class, aborted-sample
+    # filter, GLM tokenization model, session server on port 30001 with 32 workers, optional
+    # external host. Misc: no dropout, flash attention, fp32 reductions, per-token loss, colocated,
+    # actor nodes and GPUs, trainer offload to disk in 256 MB chunks, trace dumping with dashboard
+    # unless the dir is the word disabled (default under the save dir), training entropy
+    # observation, and the flag that disables Megatron's non-finite gradient check so miles' own
+    # guard skips bad steps (see the inline comment for why). Optional debug rollout-only, W&B (if
+    # a key is set) and Prometheus flags. Engine flags plus the generated engine config path.
+    # Job environment: python path, agent settings, indexer rope style and NSA MLA switches for
+    # GLM-5, and a CUDA allocator config using garbage collection threshold and max split size
+    # (not expandable segments, see inline comment); optional host IP.
     U = args.create_backend()
     ckpt_args = (
         f"--hf-checkpoint {args.hf_checkpoint} "
@@ -437,6 +503,7 @@ def execute(args: ScriptArgs):
 
 @command_utils.dataclass_cli
 def main(args: ScriptArgs):
+    # [FUNCTION DOC] Command line entry: clean up stale processes on this node, then execute.
     cleanup()
     execute(args)
 

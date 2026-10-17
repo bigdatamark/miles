@@ -1,3 +1,10 @@
+# [MODULE DOC] Plug-ins for the SWE-agent example: a custom reward function that reads the reward
+# the agent environment already computed (stored in each sample's metadata under the reward key,
+# default 0), helpers that aggregate per-sample agent statistics (turns, tool calls, timings and
+# time ratios) into batch-level logged metrics, and a rollout function class that appends those
+# metrics to the output of a normal inference rollout. Agents that omit a metric are skipped
+# rather than counted as zero. The launcher scripts refer to this module by name for the reward
+# function and the rollout function class.
 """
 SWE-Agent: reward, metrics, and rollout class.
 
@@ -30,6 +37,9 @@ logger = logging.getLogger(__name__)
 
 
 async def reward_func(args, samples: Sample | list[Sample], **kwargs) -> float | list[float]:
+    # [FUNCTION DOC] Custom reward function. Given one sample returns its metadata reward value
+    # (0.0 if absent); given a list returns the list of such values in order. Args and extra
+    # keyword arguments are ignored. Raises if a sample has no metadata mapping.
     """Reward is pre-computed by the agent environment during generate().
 
     Handles both single-sample calls (from ``async_rm``) and batched calls
@@ -44,6 +54,8 @@ async def reward_func(args, samples: Sample | list[Sample], **kwargs) -> float |
 
 
 def _collect_values(all_metrics: list[dict], key: str) -> list[float]:
+    # [FUNCTION DOC] HELPER: From a list of per-sample metric mappings, collect the values under
+    # the key, skipping mappings where it is absent or none (zeros are kept). Returns a list.
     """Values agents reported for ``key``; agents that omit it are skipped.
 
     Defaulting to 0 would log a fake measurement and drag the batch mean down.
@@ -53,6 +65,9 @@ def _collect_values(all_metrics: list[dict], key: str) -> list[float]:
 
 
 def _agg_mean(metrics: dict, all_metrics: list[dict], keys: list[str], prefix: str = "agent/", suffix: str = "_mean"):
+    # [FUNCTION DOC] HELPER: For each key, compute the mean of the reported values and store it in
+    # the metrics mapping (mutated in place) under the prefix, key and suffix joined together;
+    # keys nobody reported are left out. No return.
     for key in keys:
         values = _collect_values(all_metrics, key)
         if values:
@@ -60,6 +75,14 @@ def _agg_mean(metrics: dict, all_metrics: list[dict], keys: list[str], prefix: s
 
 
 def aggregate_agent_metrics(samples: list[Sample]) -> dict:
+    # [FUNCTION DOC] Aggregate the agent metrics mappings found in sample metadata (samples
+    # without metadata or with an empty metrics mapping are skipped) into one flat mapping with
+    # keys under the agent prefix. Returns an empty mapping if no sample has metrics. Outputs: mean
+    # and sum of turns and of tool calls; means (with a mean suffix) of model query time sum,
+    # environment execution time sum, eval time and agent run time; means without a suffix of time
+    # per turn, average model query time, average environment time, and the model, environment
+    # and eval time ratios; and mean, max and min of total time. Only keys reported by at least
+    # one sample appear.
     """Aggregate agent metrics across samples for logging."""
     all_metrics = [
         s.metadata.get("agent_metrics", {})
@@ -94,9 +117,16 @@ def aggregate_agent_metrics(samples: list[Sample]) -> dict:
 
 
 class RolloutFn(InferenceRolloutFn):
+    # [CLASS DOC] Inference rollout function that behaves exactly like its parent for generation
+    # and only post-processes training output to add agent metrics. Selected in launchers through
+    # the rollout function path flag.
     """Rollout function with agent metrics aggregation."""
 
     async def _call_train(self, input: RolloutFnTrainInput) -> RolloutFnTrainOutput:
+        # [FUNCTION DOC] Run the parent's training rollout, flatten its samples (the output may
+        # hold groups as lists or single samples) and aggregate their agent metrics. If any metrics
+        # result, merge them into the output's metrics mapping (creating one if absent, overwriting
+        # same-named keys) and log them at info level with the rollout id. Returns the output.
         output = await super()._call_train(input)
 
         all_samples = []

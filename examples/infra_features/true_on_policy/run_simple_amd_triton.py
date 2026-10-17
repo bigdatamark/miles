@@ -1,3 +1,12 @@
+# [MODULE DOC] AMD-compatible variant of the true-on-policy script: trains Qwen3-0.6B on GSM8K
+# with the FSDP backend colocated, but uses the Triton attention path on both sides instead of
+# FA3. The inference side uses the sglang Triton attention backend and the training side uses a
+# bridge that calls the same Triton extend-attention forward kernel (with a PyTorch backward for
+# gradients), so the forward pass is bitwise identical in both stages. At import it puts the
+# repository root (three directories above this file) first on the module search path. Configured
+# by environment variables read at import: model name (only Qwen3-0.6B allowed), mode (normal,
+# debug_minimal, debug_one_sample) and GPU count (default 1). Run directly: prepare then execute.
+# Same mode semantics as the CUDA variant of this script.
 import os
 import sys
 
@@ -18,6 +27,8 @@ NUM_GPUS = int(os.environ.get("MILES_SCRIPT_NUM_GPUS", "1"))
 
 
 def prepare():
+    # [FUNCTION DOC] Create the models and datasets dirs under the root dir, download the Qwen
+    # model and the GSM8K dataset via the default backend. No return.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -25,6 +36,16 @@ def prepare():
 
 
 def execute():
+    # [FUNCTION DOC] Build the training arguments and submit with no Megatron model type (FSDP).
+    # Rollout, eval, GRPO, optimizer, FSDP bucket and misc settings are identical to the CUDA
+    # variant (mode-dependent sizes; eval only in normal mode), with a fixed sglang static memory
+    # fraction of 0.4 and no dynamic batch option. CI: only the CI test flag (the metric checker
+    # is commented out). True on policy: deterministic inference with the FSDP RL target, Triton
+    # attention for sglang and for the trainer, deterministic and true-on-policy modes. The job
+    # environment pins the NCCL algorithm to tree all-reduce, forwards (when set in the current
+    # environment) the Python path, CUDA/HIP/ROCR device visibility variables, Ray no-set
+    # visibility switches and the hipBLASLt switch, and enables the sglang dumper and debug print
+    # only in one-sample mode.
     U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME} "
 

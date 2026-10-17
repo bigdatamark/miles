@@ -1,3 +1,13 @@
+# [MODULE DOC] Launcher for a split deployment of a small Qwen3-0.6B GRPO run: instead of one
+# job, the run is installed as several separate deployments (one trainer, one inference
+# deployment per engine, and one primary deployment that coordinates them). Each launch command
+# installs exactly one part, chosen by the deploy-component option inherited from the shared
+# train config (plus a deploy instance id for inference parts, named by engine index), and all
+# parts must be given the same run id, namespace and run uuid so that the address book can
+# compute consistent in-cluster addresses. Every command also runs the prepare step and then
+# submits through the backend. Role-specific arguments are appended to a common argument string:
+# the shared object store arguments for all roles, the inference controller address for
+# inference parts, and the trainer controller addresses plus expected cell count for the primary.
 from dataclasses import dataclass
 
 import typer
@@ -13,6 +23,10 @@ from miles.utils.workers.types import DeployComponent
 
 @dataclass
 class ScriptArgs(command_utils.ExecuteTrainConfig):
+    # [CLASS DOC] Command line options extending the shared train config (which supplies the
+    # deploy component, deploy instance id, namespace, run id and run uuid): model name and
+    # Megatron type, number of rollouts (3), actor GPU count (4), number of inference engines
+    # (2), GPUs per engine (1), data/model/Megatron directories and free-form extra arguments.
     model_name: str = "Qwen3-0.6B"
     megatron_model_type: str = "qwen3-0.6B"
     num_rollout: int = 3
@@ -26,10 +40,14 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
 
     @property
     def num_gpus_per_node(self) -> int:
+        # [FUNCTION DOC] Total GPUs of the whole run: actor GPUs plus engines times GPUs per engine.
         return self.actor_num_gpus + self.num_engines * self.gpus_per_engine
 
 
 def prepare(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] Stage inputs: create directories, download the HF model and the GSM8K
+    # dataset, and convert the HF checkpoint to a distributed Megatron checkpoint using one
+    # process per actor GPU. Runs on every part's launch command. No return.
     U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.model_dir} {args.data_dir}")
     U.exec_command_cpu(f"hf download Qwen/{args.model_name} --local-dir {args.model_dir}/{args.model_name}")
@@ -45,6 +63,15 @@ def prepare(args: ScriptArgs) -> None:
 
 
 def build_deployment_train_args(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] Build the full argument string for the part selected by the deploy component.
+    # Builds the run's address book from the config (assertion errors if namespace or run uuid are
+    # missing) and the shared object store arguments. Trainer part: common arguments sized for the
+    # rollout GPUs of the whole run, plus the shared arguments. Inference part: common arguments
+    # sized for one engine's GPUs, plus shared arguments and the inference controller address.
+    # Primary part: whole-run sizing, shared arguments, the trainer controller address for the
+    # default trainer id (no instance id) and the expected cell count equal to the number of
+    # engines. Any other component raises an assertion error that lists the parts to launch, one
+    # command at a time. Returns the string.
     address_book = RunAddressBook.of_config(args)
     shared = address_book.shared_object_store_args()
     whole_run_rollout_num_gpus = args.num_engines * args.gpus_per_engine
@@ -76,6 +103,10 @@ def build_deployment_train_args(args: ScriptArgs) -> str:
 
 
 def compute_deployment_identities(args: ScriptArgs) -> list[tuple[DeployComponent, str | None]]:
+    # [FUNCTION DOC] List the parts that make up the run as pairs of component and instance id:
+    # the trainer (no id), one inference part per engine with ids numbered from zero prefixed by
+    # a letter, and the primary (no id), in that order. Used for error messages and for tooling
+    # that launches the parts.
     return [
         (DeployComponent.TRAINER, None),
         *[(DeployComponent.INFERENCE, f"e{index}") for index in range(args.num_engines)],
@@ -84,6 +115,15 @@ def compute_deployment_identities(args: ScriptArgs) -> list[tuple[DeployComponen
 
 
 def build_train_args(args: ScriptArgs, *, rollout_num_gpus: int) -> str:
+    # [FUNCTION DOC] Common training argument string shared by all parts; only the rollout GPU
+    # count varies by part. Checkpoint: HF model and reference load from the converted checkpoint
+    # (no save or load of training state). Rollout: GSM8K parquet, messages key, chat template,
+    # shuffle, deterministic random reward, response length 200, temperature 0.8, 32 prompts x 8
+    # samples, rollout count from options, the given rollout GPU count and GPUs per engine.
+    # Optimizer: Adam 1e-6 constant, weight decay 0.1, betas 0.9/0.98, fp32 gradient all-reduce.
+    # Misc: no dropout, flash attention, context parallel 2, one actor node with the actor GPU
+    # count, global batch 256, dynamic batch with 32768 tokens per GPU, GRPO with clip 0.2.
+    # Then default wandb args and the free-form extra args. Parts joined by single spaces.
     ckpt_args = (
         f"--hf-checkpoint {args.model_dir}/{args.model_name} "
         f"--ref-load {args.model_dir}/{args.model_name}_torch_dist "
@@ -141,6 +181,8 @@ def build_train_args(args: ScriptArgs, *, rollout_num_gpus: int) -> str:
 
 
 def launch_train(train_args: str, args: ScriptArgs) -> None:
+    # [FUNCTION DOC] Submit the given argument string through the backend with the whole-run
+    # GPU count and model type; default train script. No return.
     args.create_backend().execute_train(
         train_args=train_args,
         num_gpus_per_node=args.num_gpus_per_node,
@@ -151,6 +193,8 @@ def launch_train(train_args: str, args: ScriptArgs) -> None:
 
 @command_utils.dataclass_cli
 def main(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] Command line entry: build the part's arguments first (so a bad component
+    # fails before any download), then prepare the inputs, then launch the training submission.
     train_args = build_deployment_train_args(args)
     prepare(args)
     launch_train(train_args, args)

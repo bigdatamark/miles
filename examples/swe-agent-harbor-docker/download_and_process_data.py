@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Command line tool that turns a task dataset into the JSON-lines training format
+# of this repository: one record per task with a prompt string and a metadata mapping. Input is
+# either a local JSON-lines file (an existing path ending in the jsonl extension) or a HuggingFace
+# dataset name; a HuggingFace dataset is first exported to a temporary JSON-lines file (deleted
+# afterwards even on failure) and then converted by the same function. The metadata is a copy of
+# the whole original record plus the agent name and split labels, so downstream task-directory
+# preparation can use any original field. The prompt is read from a configurable key, falling
+# back (in order) to the problem statement, instruction and prompt keys when that is empty.
+# Options: required input and output; split (default train, used for loading and recorded in
+# metadata); optional record limit; agent name (default mini-swe-agent); prompt key (default
+# problem_statement); append switch (otherwise the output file is overwritten). Requires the
+# datasets library at import time.
 """Download and convert datasets to Miles format for SWE-agent training.
 
 Supports any task type — SWE-bench, Terminal-Bench, custom datasets, etc.
@@ -47,6 +59,13 @@ def convert_to_miles_format(
     prompt_key: str = "problem_statement",
     append: bool = False,
 ) -> int:
+    # [FUNCTION DOC] Stream records from the input JSON-lines file to the output file (opened for
+    # append or overwrite) and return the number written. Reading stops once the limit (if not
+    # none) is reached; a limit of zero therefore writes nothing. Each input line is parsed as a
+    # JSON object (a blank or invalid line raises a decoding error). Output record: a prompt text
+    # (value of the prompt key, else the first non-empty of the fallback keys, else empty string)
+    # and a metadata mapping holding a shallow copy of the input record with the agent name and
+    # split added (overriding same-named input fields). Prints a summary line.
     """Convert JSONL to Miles format.
 
     Returns the number of records written.
@@ -84,6 +103,11 @@ def convert_to_miles_format(
 
 
 def main():
+    # [FUNCTION DOC] Command line entry (options in the module doc). Local jsonl input is
+    # converted directly. Otherwise loads the named HuggingFace dataset split, truncates it to the
+    # limit when the limit is truthy (note: a limit of zero means no limit here, unlike in the
+    # conversion function), writes it to a temporary JSON-lines file, converts that to the output
+    # and removes the temporary file in a finally block. Prints progress and a final done line.
     parser = argparse.ArgumentParser(
         description="Download dataset and convert to Miles format",
     )

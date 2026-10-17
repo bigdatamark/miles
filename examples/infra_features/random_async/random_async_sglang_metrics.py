@@ -1,3 +1,12 @@
+# [MODULE DOC] Background reporter that periodically scrapes the SGLang router's engine metrics
+# endpoint (text in the OpenMetrics format), converts selected series into a small set of stable
+# aggregate numbers, merges in client-side request statistics recorded by the rollout code, and
+# logs everything to the active Weights and Biases run under a fixed key prefix.
+# Two parts: (1) a thread-safe module-level accumulator of per-request statistics (a window that
+# is emptied each scrape, plus cumulative totals) fed by the record function; (2) a reporter
+# class with its own daemon thread. The scrape interval is read from an environment variable at
+# import (default 30 seconds). Errors while scraping are logged at most once per 5 minutes and
+# never stop the loop; a missing wandb run is such an error.
 """Example-local SGLang metrics scraper for random_async.
 
 Miles can forward raw SGLang OpenMetrics to W&B, but this helper logs a small
@@ -45,6 +54,8 @@ _AGENT_CUMULATIVE: dict[str, float] = {
 
 @dataclass(frozen=True)
 class MetricSample:
+    # [CLASS DOC] HELPER: Immutable record of one parsed metric line: the metric name (colons
+    # replaced by underscores), its label mapping from name to unescaped value, and the numeric value.
     name: str
     labels: dict[str, str]
     value: float
@@ -58,6 +69,10 @@ def record_agent_request(
     perfect_cacheable_tokens: int,
     request_time: float,
 ) -> None:
+    # [FUNCTION DOC] Called by the rollout after each engine request. Under the module lock, adds
+    # the output, prompt, cached and ideal-cacheable token counts and the request duration to the
+    # current window sums, raises the window's max request time if exceeded, and increments the
+    # window request count. Keyword-only arguments; no return.
     with _AGENT_METRICS_LOCK:
         _AGENT_WINDOW["output_tokens"] += output_tokens
         _AGENT_WINDOW["prompt_tokens"] += prompt_tokens
@@ -69,6 +84,13 @@ def record_agent_request(
 
 
 def _pop_agent_metrics() -> dict[str, float]:
+    # [FUNCTION DOC] HELPER: Atomically copy and zero the request window. Returns an empty mapping
+    # if no requests were recorded. Otherwise adds the window sums to the cumulative totals and
+    # returns four client-side metrics: ideal cacheable tokens divided by prompt tokens (perfect
+    # cache hit rate), actual cached tokens divided by ideal cacheable tokens (each ratio is 0
+    # when its denominator is 0), average request time and max request time.
+    # KNOWN ISSUE: the cumulative totals are updated here (outside the lock) but nothing ever
+    # reads or reports them.
     with _AGENT_METRICS_LOCK:
         window = dict(_AGENT_WINDOW)
         for key in _AGENT_WINDOW:
@@ -100,6 +122,9 @@ def _pop_agent_metrics() -> dict[str, float]:
 
 
 def _parse_labels(raw: str | None) -> dict[str, str]:
+    # [FUNCTION DOC] HELPER: Parse the inside of a label brace group (name equals quoted value,
+    # comma separated) into a mapping; quoted values may contain escaped characters, which are
+    # decoded through a unicode-escape pass. Empty or missing input gives an empty mapping.
     if not raw:
         return {}
     return {
@@ -108,6 +133,11 @@ def _parse_labels(raw: str | None) -> dict[str, str]:
 
 
 def parse_openmetrics(text: str) -> list[MetricSample]:
+    # [FUNCTION DOC] Parse OpenMetrics or Prometheus text into metric samples. Each line is
+    # stripped; blank lines and comment lines (starting with a hash) and lines not matching the
+    # pattern of name, optional labels and a numeric value are silently skipped (so lines with
+    # timestamps or non-numeric values like NaN are dropped). Names have colons replaced by
+    # underscores. Returns samples in input order.
     samples: list[MetricSample] = []
     for line in text.splitlines():
         line = line.strip()
@@ -127,12 +157,18 @@ def parse_openmetrics(text: str) -> list[MetricSample]:
 
 
 def _matches_engine_type(labels: dict[str, str], engine_type: str | None) -> bool:
+    # [FUNCTION DOC] HELPER: True when no engine type filter is given, else whether the sample's
+    # engine type label equals it. Raises a key error if the filter is given but the sample has
+    # no engine type label.
     if engine_type is None:
         return True
     return labels["engine_type"] == engine_type
 
 
 def _sum(samples: list[MetricSample], name: str, *, engine_type: str | None = None, mode: str | None = None) -> float:
+    # [FUNCTION DOC] HELPER: Sum the values of all samples with the given name, optionally
+    # restricted to an engine type label and/or a mode label (a sample lacking the mode label
+    # never matches when a mode is given). Returns 0 if none match.
     total = 0.0
     for sample in samples:
         if sample.name != name:
@@ -146,6 +182,8 @@ def _sum(samples: list[MetricSample], name: str, *, engine_type: str | None = No
 
 
 def _has(samples: list[MetricSample], name: str, *, engine_type: str | None = None, mode: str | None = None) -> bool:
+    # [FUNCTION DOC] HELPER: Whether any sample has the given name and passes the same optional
+    # engine type and mode filters as the sum helper.
     return any(
         sample.name == name
         and _matches_engine_type(sample.labels, engine_type)
@@ -155,6 +193,8 @@ def _has(samples: list[MetricSample], name: str, *, engine_type: str | None = No
 
 
 def _avg(samples: list[MetricSample], name: str, *, engine_type: str | None = None) -> float | None:
+    # [FUNCTION DOC] HELPER: Arithmetic mean of the values of samples with the given name
+    # (optionally filtered by engine type); returns none if there are none.
     values = [
         sample.value for sample in samples if sample.name == name and _matches_engine_type(sample.labels, engine_type)
     ]
@@ -164,7 +204,16 @@ def _avg(samples: list[MetricSample], name: str, *, engine_type: str | None = No
 
 
 class SGLangMetricsReporter:
+    # [CLASS DOC] Periodic scraper and logger. State: router base URL without trailing slash,
+    # prefill and decode GPU counts (each at least 1, used to normalize per-GPU rates), a stop
+    # event, the thread, an exposed failure attribute, the previous cumulative token counters and
+    # timestamp (for rate computation) and the time of the last logged scrape failure.
+    # KNOWN ISSUE: the failure attribute is never assigned by this class (scrape errors are only
+    # logged), so the rollout worker's check of it can never fire.
+
     def __init__(self, router_url: str, prefill_num_gpus: int, decode_num_gpus: int):
+        # [FUNCTION DOC] Store the URL (trailing slash stripped), clamp both GPU counts to at
+        # least 1 and initialize empty rate-tracking state. Does not start the thread.
         self.router_url = router_url.rstrip("/")
         self.prefill_num_gpus = max(1, prefill_num_gpus)
         self.decode_num_gpus = max(1, decode_num_gpus)
@@ -176,6 +225,7 @@ class SGLangMetricsReporter:
         self._last_failure_log_time = 0.0
 
     def start(self) -> None:
+        # [FUNCTION DOC] Start the daemon scrape thread unless one is already alive; logs at info.
         if self._thread is not None and self._thread.is_alive():
             return
         self._thread = threading.Thread(target=self._run, name="random-async-sglang-metrics", daemon=True)
@@ -183,11 +233,18 @@ class SGLangMetricsReporter:
         logger.info("Started random_async SGLang metrics reporter for %s", self.router_url)
 
     def stop(self) -> None:
+        # [FUNCTION DOC] Signal the thread to stop and wait up to 5 seconds for it to finish.
         self._stop_event.set()
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=5)
 
     def _run(self) -> None:
+        # [FUNCTION DOC] HELPER: Thread body. Until stopped: fetch the router's engine metrics
+        # endpoint with a 10 second timeout (an error status raises), parse the text, build the
+        # engine metrics from it using the scrape start time as the clock, merge in the client-side
+        # request metrics, and log the merged mapping to wandb if non-empty. Any exception is
+        # swallowed; a warning with traceback is logged at most once per 300 seconds. Then waits
+        # the interval minus elapsed time, but never less than 1 second, or until stop.
         session = requests.Session()
         while not self._stop_event.is_set():
             start = time.time()
@@ -209,6 +266,20 @@ class SGLangMetricsReporter:
             self._stop_event.wait(max(1.0, METRICS_INTERVAL_SECONDS - elapsed))
 
     def _build_metrics(self, samples: list[MetricSample], now: float) -> dict[str, float]:
+        # [FUNCTION DOC] HELPER: Turn parsed samples into a mapping of prefixed metric keys to
+        # floats; mutates the stored previous counters and timestamp. Only metrics whose source
+        # series are present are emitted. Emitted: (a) decode generation throughput summed over
+        # decode engines divided by decode GPUs; (b) mean prefill cache hit rate; (c) for each of
+        # prefill and decode engine types, token usage, queued requests and running requests, each
+        # summed across engines; (d) a fixed list of router-wide series (prefill/decode queue
+        # lengths, KV transfer speed, latency, bootstrap, alloc, total size, retracted requests,
+        # bootstrap/transfer failures and prefill retries), each summed across all series;
+        # (e) token rates: the cumulative realtime token counters for decode, prefill compute and
+        # prefill cache modes are compared with the previous scrape; the delta over elapsed time
+        # (at least one microsecond) gives tokens per second, skipped for a mode with no previous
+        # value or a negative delta (counter reset); decode rate is per decode GPU, prefill
+        # compute, prefill cache and their total (only if positive) are per prefill GPU. The first
+        # call only records baselines. Always records the current counters and time.
         metrics: dict[str, float] = {}
 
         if _has(samples, "sglang_gen_throughput", engine_type="decode"):
@@ -285,6 +356,8 @@ class SGLangMetricsReporter:
         return metrics
 
     def _log_to_wandb(self, metrics: dict[str, float]) -> None:
+        # [FUNCTION DOC] HELPER: Import wandb lazily and log the mapping to the active run.
+        # Raises a runtime error if no run is active.
         import wandb
 
         if wandb.run is None:
