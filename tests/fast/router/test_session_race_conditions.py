@@ -1,3 +1,11 @@
+# [MODULE DOC] End-to-end stress tests of the session server's concurrency contract (split locking
+# with a closing flag), driven with real HTTP requests from thread pools against a session server in
+# front of a mock SGLang backend whose chat replies are patched to include token log-probabilities in
+# the session-server format. Tests cover overlapping same-session requests, parallel different
+# sessions, per-session serial turns under global parallelism, deleting a session mid-request,
+# requests during or after a delete, concurrent double delete, queued chats then delete, and rapid
+# create/chat/delete cycles. Uses local ports from 31000 and the Qwen3-0.6B tokenizer; timing-based
+# (sleeps and latency) so thresholds are loose.
 """E2E session stress tests.
 
 Contract under test (with split-lock / session.closing):
@@ -37,9 +45,17 @@ HF_CHECKPOINT = "Qwen/Qwen3-0.6B"
 
 
 def _patch_mock_chat_response():
+    # [FUNCTION DOC] HELPER: Returns an (unstarted) patch context for the mock backend's chat
+    # completion computation, replacing it with a version that calls the original and then adds to the
+    # first choice a meta info mapping holding the output token log-probabilities as pairs of
+    # (log-probability, token id), ids derived from the logprob entries' token strings via the mock's
+    # tokenizer, and the completion token count. Must be entered as a context manager to take effect.
     original_chat_response = MockSGLangServer._compute_chat_completions_response
 
     def patched_chat_response(self, payload: dict) -> dict:
+        # [FUNCTION DOC] HELPER: The replacement computation described above. Requires the original
+        # response to have a first choice with logprob content entries (key error otherwise).
+        # Returns the augmented response.
         response = original_chat_response(self, payload)
         # Session server expects output_token_logprobs as (logprob, token_id).
         choice = response["choices"][0]
@@ -58,6 +74,12 @@ def _patch_mock_chat_response():
 
 @contextmanager
 def _router_env(process_fn, *, latency: float = 0.0):
+    # [FUNCTION DOC] HELPER: Context manager. With the chat response patch active, starts a mock
+    # backend (model name the Qwen3-0.6B checkpoint, the given reply function and latency in
+    # seconds), builds a session server config for it (no chat template override, no speculative
+    # decoding, retract pause mode), serves the server on a free port from 31000 on a background
+    # thread, and yields a namespace of the server URL, the backend and the server thread. The
+    # server thread is stopped on exit.
     with _patch_mock_chat_response():
         with with_mock_server(model_name=HF_CHECKPOINT, process_fn=process_fn, latency=latency) as backend:
             config = make_session_server_config(
@@ -81,12 +103,16 @@ def _router_env(process_fn, *, latency: float = 0.0):
 
 
 def _create_session(url: str) -> str:
+    # [FUNCTION DOC] HELPER: Posts to the sessions path (5 s timeout), asserts status 200, and
+    # returns the new session id.
     response = requests.post(f"{url}/sessions", timeout=5.0)
     assert response.status_code == 200
     return response.json()["session_id"]
 
 
 def _chat(url: str, session_id: str, payload: dict, timeout: float = 20.0) -> requests.Response:
+    # [FUNCTION DOC] HELPER: Posts the JSON payload to the session's chat completions path with the
+    # given timeout (default 20 s) and returns the raw response without checking the status.
     return requests.post(
         f"{url}/sessions/{session_id}/v1/chat/completions",
         json=payload,
@@ -95,7 +121,14 @@ def _chat(url: str, session_id: str, payload: dict, timeout: float = 20.0) -> re
 
 
 class TestSessionConcurrencyContracts:
+    # [CLASS DOC] Tests of how requests to the same or different sessions overlap or serialize.
     def test_same_session_concurrent_requests_reach_backend(self):
+        # [FUNCTION DOC] With backend latency 0.2 s, a warm-up chat creates one assistant checkpoint.
+        # Then four identical retry requests (history, the assistant reply, and a system message) are
+        # sent concurrently from four threads after resetting backend stats. Asserts all four return
+        # 200 (no server errors), the backend logged four requests, and its maximum observed
+        # concurrency is at least 1 (overlap at the backend is allowed because the proxy phase holds no
+        # lock).
         """With the split-lock, same-session requests CAN overlap at the backend.
 
         Phase 2 (proxy) runs without the lock, so concurrent requests are not
@@ -105,6 +138,8 @@ class TestSessionConcurrencyContracts:
         """
 
         def process_fn(prompt: str) -> ProcessResult:
+            # [FUNCTION DOC] HELPER: Mock backend reply function: always the text "concurrent-ok" with
+            # finish reason stop.
             return ProcessResult(text="concurrent-ok", finish_reason="stop")
 
         with _router_env(process_fn, latency=0.2) as env:
@@ -136,7 +171,11 @@ class TestSessionConcurrencyContracts:
             assert env.backend.max_concurrent >= 1
 
     def test_different_sessions_can_run_in_parallel(self):
+        # [FUNCTION DOC] With latency 0.2 s, six sessions are created and one chat per session is
+        # submitted concurrently from six threads. Asserts all return 200, the backend logged six
+        # requests, and at least three were in flight at once.
         def process_fn(prompt: str) -> ProcessResult:
+            # [FUNCTION DOC] HELPER: Mock backend reply function: always "parallel-ok", finish stop.
             return ProcessResult(text="parallel-ok", finish_reason="stop")
 
         with _router_env(process_fn, latency=0.2) as env:
@@ -160,16 +199,26 @@ class TestSessionConcurrencyContracts:
             assert env.backend.max_concurrent >= 3
 
     def test_e2e_pressure_serial_per_session_parallel_globally(self):
+        # [FUNCTION DOC] Eight sessions each run three sequential turns in their own worker thread
+        # (latency 0.08 s). A worker sends the first user message, then for each later turn resends the
+        # history plus the previous assistant reply and a system continue message, asserting 200 each
+        # time; it returns true. Asserts all workers returned true, the backend logged 24 requests, and
+        # at least four were in flight at once.
         num_sessions = 8
         turns_per_session = 3
 
         def process_fn(prompt: str) -> ProcessResult:
+            # [FUNCTION DOC] HELPER: Mock backend reply function: always "turn-ok", finish stop.
             return ProcessResult(text="turn-ok", finish_reason="stop")
 
         with _router_env(process_fn, latency=0.08) as env:
             session_ids = [_create_session(env.url) for _ in range(num_sessions)]
 
             def run_session_worker(session_id: str, idx: int) -> bool:
+                # [FUNCTION DOC] HELPER: Runs the turn loop for one session as described by the
+                # enclosing test: asserts status 200 on every turn; between turns, extends the message
+                # history with the assistant reply and a system message naming the session and turn.
+                # Returns true.
                 messages: list[dict] = [{"role": "user", "content": f"session-{idx}-turn-0"}]
                 for turn in range(turns_per_session):
                     resp = _chat(env.url, session_id, {"messages": messages}, timeout=30.0)
@@ -193,6 +242,10 @@ class TestSessionConcurrencyContracts:
             assert env.backend.max_concurrent >= 4
 
     def test_delete_can_proceed_while_chat_is_mid_proxy(self):
+        # [FUNCTION DOC] With latency 0.35 s, one chat is submitted in a thread; the test polls (up to
+        # 5 s every 10 ms) until the backend logged it, failing otherwise, then deletes the session.
+        # Asserts the chat returns 200, the delete 204, and a later chat to the deleted session returns
+        # 404.
         """With split-lock, delete can acquire the lock while chat is in Phase 2.
 
         The inflight chat's Phase 3 sees session.closing=True and skips
@@ -200,6 +253,7 @@ class TestSessionConcurrencyContracts:
         """
 
         def process_fn(prompt: str) -> ProcessResult:
+            # [FUNCTION DOC] HELPER: Mock backend reply function: always "slow-turn", finish stop.
             return ProcessResult(text="slow-turn", finish_reason="stop")
 
         with _router_env(process_fn, latency=0.35) as env:
@@ -230,9 +284,14 @@ class TestSessionConcurrencyContracts:
 
 
 class TestClosingRaceConditions:
+    # [CLASS DOC] Tests of races around deleting a session (the closing flag).
     """Tests for race conditions around session.closing flag."""
 
     def test_chat_during_delete_returns_404(self):
+        # [FUNCTION DOC] With latency 0.5 s: chat A starts and the test waits (up to 5 s; unlike
+        # other tests it does not fail on timeout) for it to reach the backend; a delete is submitted
+        # and, after 50 ms, chat B is sent in the foreground. Asserts chat B returns 404 (session
+        # closing), then chat A returns 200 and the delete returns 204.
         """Chat requests arriving after delete sets closing=True get 404.
 
         Timeline:
@@ -243,6 +302,7 @@ class TestClosingRaceConditions:
         """
 
         def process_fn(prompt: str) -> ProcessResult:
+            # [FUNCTION DOC] HELPER: Mock backend reply function: always "slow", finish stop.
             return ProcessResult(text="slow", finish_reason="stop")
 
         with _router_env(process_fn, latency=0.5) as env:
@@ -281,6 +341,10 @@ class TestClosingRaceConditions:
             assert delete_resp.status_code == 204
 
     def test_double_delete_second_returns_404(self):
+        # [FUNCTION DOC] With latency 0.3 s: a chat holds the session; after it reaches the backend
+        # (waits up to 5 s without failing on timeout), two deletes are fired 20 ms apart. Asserts the
+        # chat returns 200 and the two delete status codes sorted are [204, 404] (one succeeds, the
+        # other sees the closing flag).
         """Concurrent delete on the same session: second delete gets 404.
 
         With session.closing flag, the first delete sets closing=True.
@@ -288,6 +352,7 @@ class TestClosingRaceConditions:
         """
 
         def process_fn(prompt: str) -> ProcessResult:
+            # [FUNCTION DOC] HELPER: Mock backend reply function: always "ok", finish stop.
             return ProcessResult(text="ok", finish_reason="stop")
 
         with _router_env(process_fn, latency=0.3) as env:
@@ -328,9 +393,12 @@ class TestClosingRaceConditions:
             assert codes == [204, 404], f"Expected [204, 404], got {codes}"
 
     def test_chat_after_delete_returns_404(self):
+        # [FUNCTION DOC] After deleting a fresh session (204), both a chat request and a GET of the
+        # session return 404.
         """Chat request after session is fully deleted returns 404."""
 
         def process_fn(prompt: str) -> ProcessResult:
+            # [FUNCTION DOC] HELPER: Mock backend reply function: always "ok", finish stop.
             return ProcessResult(text="ok", finish_reason="stop")
 
         with _router_env(process_fn) as env:
@@ -350,6 +418,10 @@ class TestClosingRaceConditions:
             assert get_resp.status_code == 404
 
     def test_multiple_chats_queued_then_delete(self):
+        # [FUNCTION DOC] With latency 0.3 s, three identical chats are fired concurrently; once the
+        # backend has logged one (up to 5 s wait, no failure on timeout) the session is deleted.
+        # Asserts the delete returns 204, every chat returned 200 or 404 (never a server error), and
+        # at least one returned 200.
         """Multiple chat requests queued behind session.lock, then delete.
 
         After delete marks closing=True, queued chats that acquire the lock
@@ -357,6 +429,7 @@ class TestClosingRaceConditions:
         """
 
         def process_fn(prompt: str) -> ProcessResult:
+            # [FUNCTION DOC] HELPER: Mock backend reply function: always "queued-ok", finish stop.
             return ProcessResult(text="queued-ok", finish_reason="stop")
 
         with _router_env(process_fn, latency=0.3) as env:
@@ -394,17 +467,22 @@ class TestClosingRaceConditions:
             assert 200 in status_codes, f"Expected at least one 200, got {status_codes}"
 
     def test_rapid_create_chat_delete_cycles(self):
+        # [FUNCTION DOC] Runs 20 lifecycle cycles on an 8-thread pool (no backend latency) and asserts
+        # all return true (each cycle's own assertions passed).
         """Rapidly create, chat, and delete sessions to stress the lifecycle.
 
         Ensures no deadlocks or crashes from rapid session lifecycle operations.
         """
 
         def process_fn(prompt: str) -> ProcessResult:
+            # [FUNCTION DOC] HELPER: Mock backend reply function: always "cycle-ok", finish stop.
             return ProcessResult(text="cycle-ok", finish_reason="stop")
 
         with _router_env(process_fn) as env:
 
             def lifecycle_cycle(idx: int) -> bool:
+                # [FUNCTION DOC] HELPER: Creates a session, sends one chat (asserts 200), deletes the
+                # session (asserts 204), then asserts a GET of it returns 404. Returns true.
                 session_id = _create_session(env.url)
                 payload = {"messages": [{"role": "user", "content": f"cycle-{idx}"}]}
                 chat_resp = _chat(env.url, session_id, payload, timeout=10.0)

@@ -1,3 +1,11 @@
+# [MODULE DOC] HELPER: Shared helpers for session-server pretokenized end-to-end tests. Provides a
+# scripted fake chat-completion backend (served by a real HTTP server on a background thread) that
+# replays predetermined assistant turns while rendering prompts with a real chat template, a function
+# that starts a session server pointed at such a backend and returns a handle with its URL, a
+# teardown function, a function to fetch a session payload over HTTP, and helpers that compare a
+# session's accumulated token ids against a locally rendered chat template and pick out forbidden
+# mismatch kinds. Side effects: opens local network ports (searching from 31000 for the session
+# server and 32000 for the backend), starts threads, loads tokenizers.
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -26,11 +34,18 @@ FORBIDDEN_MISMATCH_TYPES: frozenset[str] = frozenset(
 
 @dataclass(frozen=True)
 class ScriptedBackendTurn:
+    # [CLASS DOC] HELPER: Immutable record of one scripted backend turn: the assistant message
+    # returned to the client in the completion response, and the message used to render the
+    # expected response text (it may differ from the returned message, for example in how tool
+    # calls are shaped for the chat template).
     response_message: dict[str, Any]
     render_message: dict[str, Any]
 
 
 def load_test_tokenizer(hf_checkpoint: str, chat_template_path: str | None):
+    # [FUNCTION DOC] HELPER: Loads the tokenizer for the checkpoint, optionally overriding the chat
+    # template from the given file path, always allowing remote code. Returns the tokenizer; may read
+    # from disk or download from the model hub.
     return load_tokenizer(
         hf_checkpoint,
         chat_template_path=chat_template_path,
@@ -45,6 +60,13 @@ def make_router_env(
     chat_template_path: str | None,
     tito_model: str,
 ):
+    # [FUNCTION DOC] HELPER: Builds a session server configuration pointing at the backend's URL,
+    # with the given checkpoint, chat template path and token-in-token-out model name; version 2 of
+    # the session server, no routing replay, no speculative decoding, retract pause mode, the
+    # drop-same-prompt-retries sample picker and the default postprocessor. Creates a session server
+    # from it, finds a free port starting at 31000, and starts the server's application on a
+    # background thread bound to the loopback address. Returns a namespace with the server base URL,
+    # the backend and the server thread handle. The backend is expected to be started by the caller.
     config = make_session_server_config(
         backend_url=backend.url,
         hf_checkpoint=hf_checkpoint,
@@ -71,11 +93,16 @@ def make_router_env(
 
 
 def teardown_router_env(env) -> None:
+    # [FUNCTION DOC] HELPER: Stops the session server thread, then the backend, of an environment
+    # made by the router environment builder.
     env.server.stop()
     env.backend.stop()
 
 
 def fetch_session_payload(base_url: str, session_id: str) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Issues an HTTP GET to the sessions path for the session id under the
+    # base URL with a 5 second timeout, raises on a non-success status, and returns the decoded JSON
+    # body as a mapping.
     response = requests.get(f"{base_url}/sessions/{session_id}", timeout=5.0)
     response.raise_for_status()
     return response.json()
@@ -89,6 +116,11 @@ def compute_local_session_mismatch(
     accumulated_token_ids: list[int],
     tools: list[dict[str, Any]] | None,
 ) -> list[dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Recomputes, locally, what the session's accumulated token ids should be.
+    # Builds the token-in-token-out tokenizer for the model name and its comparator, renders the
+    # messages (with the tools, without a generation prompt) into token ids with the chat template,
+    # compares those expected ids against the accumulated ids, and returns each mismatch converted to
+    # a plain mapping (empty list when identical).
     comparator = get_tito_tokenizer(
         tokenizer,
         tokenizer_type=tito_model,
@@ -104,11 +136,24 @@ def compute_local_session_mismatch(
 
 
 def forbidden_mismatches(mismatch: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Filters the mismatch mappings to those whose type is one of the
+    # forbidden kinds (special token count, special token type, non-assistant text), preserving
+    # order. A mismatch without a type is never forbidden.
     return [m for m in mismatch if m.get("type") in FORBIDDEN_MISMATCH_TYPES]
 
 
 class ScriptedChatBackend:
+    # [CLASS DOC] HELPER: Fake chat-completion backend served over HTTP from a background thread.
+    # It exposes a health endpoint and a chat completions endpoint. The Nth completion request
+    # (counting from 0) is answered with the Nth scripted turn: the response text is derived by
+    # rendering the request messages with and without the scripted assistant message through the
+    # real chat template, and its token ids and fake log-probabilities are included in the response.
+    # More requests than scripted turns fail an assertion inside the handler. All requests are
+    # logged for later inspection.
     def __init__(self, tokenizer, scripted_turns: list[ScriptedBackendTurn]):
+        # [FUNCTION DOC] HELPER: Stores the tokenizer and scripted turns, zeroes the call counter,
+        # empties the request log, picks the loopback host and a free port starting at 32000, creates
+        # the web application and the background server (not started), and registers the routes.
         self.tokenizer = tokenizer
         self._scripted_turns = scripted_turns
         self._call_count = 0
@@ -121,25 +166,45 @@ class ScriptedChatBackend:
 
     @property
     def url(self) -> str:
+        # [FUNCTION DOC] HELPER: Property: the backend's base HTTP URL (host and port).
         return f"http://{self.host}:{self.port}"
 
     def start(self):
+        # [FUNCTION DOC] HELPER: Starts the background HTTP server thread.
         self._server.start()
 
     def stop(self):
+        # [FUNCTION DOC] HELPER: Stops the background HTTP server thread.
         self._server.stop()
 
     def reset_stats(self):
+        # [FUNCTION DOC] HELPER: Clears the request log and resets the call counter to zero, so the
+        # scripted turns replay from the first.
         self.request_log.clear()
         self._call_count = 0
 
     def _setup_routes(self):
+        # [FUNCTION DOC] HELPER: Registers the two endpoints on the application (see the class
+        # description). Each handler is defined inline as a nested function.
         @self.app.get("/health")
         async def health():
+            # [FUNCTION DOC] HELPER: Returns a JSON body with status "ok".
             return JSONResponse(content={"status": "ok"})
 
         @self.app.post("/v1/chat/completions")
         async def chat_completions(request: Request):
+            # [FUNCTION DOC] HELPER: Handles one completion request. Steps: parse the JSON body and
+            # append it to the request log; take the next scripted turn (assertion failure "unexpected
+            # extra request" if none left) and advance the counter; render the prompt text of the
+            # request messages (with tools, generation prompt added); render the text of the messages
+            # plus the turn's render message (no generation prompt) and assert it extends the prompt
+            # text; the response text is the extension, and the output token ids are its encoding
+            # without special tokens added; the prompt token ids are the request's explicit input ids
+            # when present, otherwise the tokenized prompt rendering. Returns a chat completion JSON
+            # with id scripted-N, the turn's response message, the prompt token ids, a finish reason
+            # of tool calls when the response message has tool calls and stop otherwise, the
+            # completion token count, and output token log-probabilities of minus index over 128
+            # paired with each token id.
             payload = await request.json()
             self.request_log.append(payload)
 

@@ -1,3 +1,17 @@
+# [MODULE DOC] Tests of the version 2 session server's samples operation, which builds one training
+# Sample per tree leaf from a tree of committed turns. Drives the version 2 session core in-process
+# with a real tokenizer (Qwen3-0.6B) and tree nodes fabricated directly in the registry (the
+# backend fails the test if it is ever called). Constants: 3 layers, top-k 2. A module-level config
+# uses version 2, the drop-rolled-back-leaves sample picker and the default postprocessor. Covers
+# golden merged assembly, speculative-decoding info and session rollout metrics, truncation, metadata
+# equality with the get-session reply, additional-R3 (per-leaf materialization, gaps give 422),
+# empty-reply reasons, the broken-chain 422 lane, tree data-plane behavior (rolled-back leaves
+# trimmed, abandoned deep branches kept with shared-prefix loss masked once, picker warnings, forests,
+# resent roots, checkpoint-count ordering), the hook layer (custom pickers and postprocessors,
+# contract enforcement mapping to 422), metadata layering (agent cannot override server-owned keys),
+# turn-args isolation, and the HTTP route order and 404 mapping.
+# KNOWN ISSUE: the comment above the agent metadata constant mentions a max-trim-tokens plant, but
+# the constant actually plants the accumulated token ids key.
 """Samples-op tests: golden assembled Samples plus the op-level error/route contracts.
 
 Drives `SessionCoreV2.collect_samples` in-process against a real tokenizer (the
@@ -59,13 +73,21 @@ _ARGS = make_session_server_config(
 
 
 class _UnusedBackend:
+    # [CLASS DOC] HELPER: Backend stub whose proxy always fails the test.
     """collect_samples never proxies; any backend call is a test bug."""
 
     async def do_proxy(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Always raises an assertion error saying sample collection must not
+        # touch the proxy backend.
         raise AssertionError("collect_samples must not touch the proxy backend")
 
 
 def _build_core(config=None, use_addition_r3: bool = False) -> SessionCoreV2:
+    # [FUNCTION DOC] HELPER: Builds a version 2 session core without the route setup: loads the
+    # tokenizer named by the config (default the module-level config), builds the token-in-token-out
+    # tokenizer with the config's template kwargs, a version 2 session registry around both, and a
+    # version 2 core over the unused backend, registry and config using the instance id and the
+    # additional-R3 flag. May download or read model files.
     # Mirrors setup_session_routes (sessions.py): tokenizer + registry + core.
     config = _ARGS if config is None else config
     tokenizer = load_tokenizer(
@@ -82,16 +104,20 @@ def _build_core(config=None, use_addition_r3: bool = False) -> SessionCoreV2:
 
 @pytest.fixture(scope="module")
 def core():
+    # [FUNCTION DOC] HELPER: Module-scoped fixture: a default version 2 core.
     return _build_core()
 
 
 @pytest.fixture(scope="module")
 def addition_core():
+    # [FUNCTION DOC] HELPER: Module-scoped fixture: a core with additional R3 enabled.
     return _build_core(use_addition_r3=True)
 
 
 @pytest.fixture(scope="module")
 def same_prompt_core():
+    # [FUNCTION DOC] HELPER: Module-scoped fixture: a core whose sample picker is the one that drops
+    # a leaf only when a later sibling re-sent its exact prompt.
     return _build_core(
         _ARGS.model_copy(
             update={"session_sample_picker_path": "miles.rollout.session.v2.picker_hub.drop_same_prompt_retries"}
@@ -101,6 +127,8 @@ def same_prompt_core():
 
 @pytest.fixture(scope="module")
 def spec_core():
+    # [FUNCTION DOC] HELPER: Module-scoped fixture: a core whose config has the EAGLE speculative
+    # decoding algorithm.
     return _build_core(_ARGS.model_copy(update={"sglang_speculative_algorithm": "EAGLE"}))
 
 
@@ -108,11 +136,17 @@ def spec_core():
 
 
 def _r3_b64(num_tokens: int, seed: int) -> str:
+    # [FUNCTION DOC] HELPER: Builds a routed-experts payload: consecutive 32-bit integers from the
+    # seed, count tokens times layers times top-k, raw bytes encoded in base64 text.
     arr = np.arange(seed, seed + num_tokens * NUM_LAYERS * TOPK, dtype=np.int32)
     return pybase64.b64encode(arr.tobytes()).decode("ascii")
 
 
 def _two_turn_records():
+    # [FUNCTION DOC] HELPER: Builds two session records. Turn 1: prompt [1, 2, 3], output [10, 11],
+    # log-probs [-0.125, -0.25], 0 cached of 3 prompt tokens, weight version "w1", full R3 for 4
+    # tokens seeded 0. Turn 2: prompt [1, 2, 3, 10, 11, 20, 21], output [30, 31], log-probs
+    # [-0.5, -1.0], 5 cached of 7 prompt tokens, weight version "w2", full R3 for 8 tokens seeded 100.
     # R3 buffer length per record = (len(prompt) + len(output) - 1) * layers * topk.
     return [
         _make_record(
@@ -140,6 +174,9 @@ _ACCUMULATED = [1, 2, 3, 10, 11, 20, 21, 30, 31]
 
 
 def _input_sample() -> Sample:
+    # [FUNCTION DOC] HELPER: Builds the driver-side input sample: group 4, index 9, one-message prompt
+    # "hi", label "lbl", reward 2.5, metadata with task and shared_key "from-input", routing key
+    # "routing-sid", training metadata (loss ppo) and a generate function path.
     return Sample(
         group_index=4,
         index=9,
@@ -160,6 +197,12 @@ _AGENT_METADATA = {"shared_key": "from-agent", "agent_only": 1, "accumulated_tok
 
 
 async def _make_session(core, records, accumulated) -> str:
+    # [FUNCTION DOC] HELPER: Creates a session through the core and builds a linear chain of tree
+    # nodes in its registry state, one per record in order, each the child of the previous (the first
+    # a root). Nodes have no delta messages, a zero completion span, the record's timestamp as commit
+    # time, an empty response id and finish reason. Only the last node holds token ids (a copy of the
+    # accumulated ids) and only when accumulated is not none; earlier nodes hold an empty list.
+    # Returns the session id.
     response = await core.create_session()
     sid = json.loads(response.body)["session_id"]
     state = core.registry.sessions[sid]
@@ -180,11 +223,16 @@ async def _make_session(core, records, accumulated) -> str:
 
 
 async def _collect_via_op(core, sid, *, max_seq_len=None, agent_metadata=None):
+    # [FUNCTION DOC] HELPER: Calls the core's sample collection with an optional maximum sequence
+    # length and optional agent metadata; returns (status code, raw body bytes).
     response = await core.collect_samples(sid, max_seq_len=max_seq_len, agent_metadata=agent_metadata)
     return response.status_code, response.body
 
 
 def _new_pipeline(payload, input_sample):
+    # [FUNCTION DOC] HELPER: Decodes the payload onto the input sample using the version 2 computed
+    # field set and returns (samples, reply). No driver-side metadata application (the server
+    # already applied it).
     """What the driver does with the reply: decode only — per-sample metadata
     and rewards arrive already applied by the server-side post-process."""
     reply = decode_samples_and_merge_input_sample(payload, input_sample, fields=COMPUTED_FIELDS_V2)
@@ -195,10 +243,21 @@ def _new_pipeline(payload, input_sample):
 
 
 def _expected_r3(seed: int, num_tokens: int):
+    # [FUNCTION DOC] HELPER: Expected R3 array: consecutive 32-bit integers from the seed, shaped
+    # (tokens, layers, top-k).
     return np.arange(seed, seed + num_tokens * NUM_LAYERS * TOPK, dtype=np.int32).reshape(num_tokens, NUM_LAYERS, TOPK)
 
 
 async def test_assembled_samples_golden_merged(core):
+    # [FUNCTION DOC] Collects the two-turn chain with agent metadata and expects exactly one merged
+    # sample: tokens equal accumulated ids; response text the concatenated decodings of the three
+    # response spans; response length 6; loss mask [1, 1, 0, 0, 1, 1]; log-probs [-0.125, -0.25, 0, 0,
+    # -0.5, -1.0]; completed; weight version spans "w1" (3 to 5) and "w2" (7 to 9); R3 of the last
+    # turn; prefix cache info 5 of 10; the input sample's prompt, label, reward, routing key and
+    # training metadata kept; metadata task kept, shared key from the agent, agent-only key kept, and
+    # accumulated ids equal to the real ones (the agent's planted value is overridden by the server
+    # because server keys are applied last). The reply's session metadata holds the agent mapping
+    # under the agent key.
     """Turns merge into one trajectory Sample; the env tokens between turns
     get zero loss/logprob; the last turn's R3 is kept."""
     sid = await _make_session(core, _two_turn_records(), _ACCUMULATED)
@@ -237,6 +296,9 @@ async def test_assembled_samples_golden_merged(core):
 
 
 async def test_spec_info_crosses_samples_wire(spec_core):
+    # [FUNCTION DOC] A single record with 7 output tokens whose meta info has speculative stats (3
+    # correct drafts, 5 proposed, 2 verify rounds), collected through a speculative-decoding core:
+    # the sample's speculative info dictionary has those values plus completion tokens 7.
     output_token_ids = [10, 11, 12, 13, 14, 15, 16]
     record = _make_record(prompt_token_ids=[1, 2, 3], output_token_ids=output_token_ids)
     record.response["choices"][0]["meta_info"].update(
@@ -257,6 +319,9 @@ async def test_spec_info_crosses_samples_wire(spec_core):
 
 
 async def test_session_rollout_metrics_are_absent_when_spec_is_disabled(core):
+    # [FUNCTION DOC] A record carrying speculative stats collected on a core without speculative
+    # decoding: the sample's speculative info is the empty default, and the session metadata has no
+    # session rollout metrics entry.
     record = _single_turn_record(
         [1, 2, 3],
         [10, 11],
@@ -273,6 +338,9 @@ async def test_session_rollout_metrics_are_absent_when_spec_is_disabled(core):
 
 
 async def test_truncation_golden(core):
+    # [FUNCTION DOC] With maximum sequence length 8 there is a single merged sample, truncated
+    # status, first 8 accumulated tokens, loss mask [1, 1, 0, 0, 1], log-probs trimmed to five
+    # entries, and R3 trimmed by one row.
     """max_seq_len=8 strips one output token off the second turn (a turn-level
     budget applied before merge): the merged sample ends TRUNCATED at 8 tokens
     with its per-token fields (including R3) trimmed in lockstep."""
@@ -290,6 +358,8 @@ async def test_truncation_golden(core):
 
 
 async def test_session_metadata_matches_get_session(core):
+    # [FUNCTION DOC] The reply's session metadata equals the get-session reply's metadata (status 200)
+    # and contains the accumulated token ids.
     """The samples reply and the records GET must expose the same metadata dict
     (both are built by the extracted _session_metadata helper)."""
     sid = await _make_session(core, _two_turn_records(), _ACCUMULATED)
@@ -306,6 +376,8 @@ async def test_session_metadata_matches_get_session(core):
 
 
 def _r3_slice_b64(seed: int, start_row: int, end_row: int) -> str:
+    # [FUNCTION DOC] HELPER: Base64 payload of the integer stream rows from start (inclusive) to end
+    # (exclusive); each row has layers times top-k consecutive values; the stream starts at the seed.
     """Rows [start_row, end_row) of the arange stream `_r3_b64(seed=...)`
     encodes in full, so addition patches rebuild exactly `_expected_r3`."""
     arr = np.arange(seed + start_row * NUM_LAYERS * TOPK, seed + end_row * NUM_LAYERS * TOPK, dtype=np.int32)
@@ -313,6 +385,9 @@ def _r3_slice_b64(seed: int, start_row: int, end_row: int) -> str:
 
 
 def _two_turn_addition_records(turn2_start_len: int = 4):
+    # [FUNCTION DOC] HELPER: Two-turn records with additional-R3 payloads: turn 1 carries rows 0 to 4
+    # with start length 0; turn 2 carries rows from the given start (default 4) to 8 with that start
+    # length. A start other than 4 creates an overlap or gap.
     # The _two_turn_records trajectory with addition-R3 payloads: each record
     # carries only rows [start, len(prompt)+len(output)-1) plus the request
     # offset that produced them (turn 1: rows [0,4); turn 2: rows [4,8)).
@@ -335,6 +410,9 @@ def _two_turn_addition_records(turn2_start_len: int = 4):
 
 
 async def test_addition_assembled_sample_matches_full_reference(addition_core):
+    # [FUNCTION DOC] With additional R3 patches along one path, collection returns 200 and one sample
+    # with the accumulated tokens, loss mask [1, 1, 0, 0, 1, 1], completed status and an R3 array of
+    # 32-bit integers equal to the full tensor.
     """Addition patches along one path rebuild byte-for-byte the tensor the
     full-R3 fixture assembles for the same tokens (test_assembled_samples_golden_merged)."""
     sid = await _make_session(addition_core, _two_turn_addition_records(), _ACCUMULATED)
@@ -351,12 +429,21 @@ async def test_addition_assembled_sample_matches_full_reference(addition_core):
 
 
 async def test_addition_branched_tree_materializes_each_leaf():
+    # [FUNCTION DOC] Builds a core with a keep-all picker (registered temporarily under a test name)
+    # and additional R3. The tree has a root (prompt [1, 2, 3], output [10, 11], R3 rows for 4
+    # tokens) and two sibling leaves attached at the root's 5-token snapshot with start length 4,
+    # each with its own 2 patch rows and one output token. Collection returns 200 with two samples,
+    # one per leaf, whose tokens equal the leaves' token ids and whose R3 is the root rows
+    # concatenated with the leaf's own rows.
     """Each leaf materializes its root patch plus its own suffix patch."""
     shared = _expected_r3(0, 4)
     leaf_a_rows = _expected_r3(1000, 2)
     leaf_b_rows = _expected_r3(2000, 2)
 
     def _addition_record(prompt_ids, output_ids, start_len, rows):
+        # [FUNCTION DOC] HELPER: Builds a record with the prompt and output ids, log-probs of -0.1 per
+        # output token, the rows array encoded as base64 raw bytes (made contiguous first) and the
+        # given start length.
         return _make_record(
             prompt_token_ids=list(prompt_ids),
             output_token_ids=list(output_ids),
@@ -402,6 +489,8 @@ async def test_addition_branched_tree_materializes_each_leaf():
 
 
 async def test_addition_gap_returns_422(addition_core):
+    # [FUNCTION DOC] Turn 2's patch starts at row 5 although turn 1 kept only 4 rows: collection
+    # returns 422 with a body mentioning additional R3, and the core's health check still returns 200.
     # Turn 2 starts at row 5 while turn 1 retained only 4 rows: the per-leaf
     # assembler rejects the gap as a 422 instead of producing a corrupt tensor.
     sid = await _make_session(addition_core, _two_turn_addition_records(turn2_start_len=5), _ACCUMULATED)
@@ -417,6 +506,8 @@ async def test_addition_gap_returns_422(addition_core):
 
 
 async def test_no_records_reply(core):
+    # [FUNCTION DOC] A session with no records returns 200 and a reply with no samples, empty reason
+    # "no_records", and no session rollout metrics entry in its metadata.
     sid = await _make_session(core, [], None)
     status, payload = await _collect_via_op(core, sid)
     assert status == 200
@@ -426,6 +517,8 @@ async def test_no_records_reply(core):
 
 
 async def test_all_truncated_reply(core):
+    # [FUNCTION DOC] With maximum sequence length 2, every turn is dropped: 200 with no samples and
+    # empty reason "all_truncated".
     # max_seq_len=2 < the first turn's prompt+1: truncate_samples_by_total_tokens
     # drops every turn -> empty samples with the all_truncated reason; the old
     # pipeline returns [] on the same fixture (today's ABORTED path).
@@ -441,6 +534,8 @@ async def test_all_truncated_reply(core):
 
 
 async def test_broken_chain_returns_422_and_server_survives(core):
+    # [FUNCTION DOC] Accumulated ids with one extra token (99) no record produced give 422 with a body
+    # mentioning the cursor, and the health check still returns 200.
     # The accumulated sequence carries one token the records never produced ->
     # the cursor consistency assert fires -> 422 with the assertion text, and
     # the server keeps serving (the failure never escapes as an unhandled 500).
@@ -457,6 +552,10 @@ async def test_broken_chain_returns_422_and_server_survives(core):
 
 
 def _single_turn_record(prompt_ids, output_ids, weight_version="w1", spec_info=None):
+    # [FUNCTION DOC] HELPER: Builds one record with the prompt and output ids, log-probs of -0.1 per
+    # output token, 0 cached tokens, the prompt length as prompt tokens, the given weight version
+    # (default "w1") and full R3 for prompt plus output minus one tokens seeded 0. If a speculative
+    # stats mapping is given, merges it into the first choice's meta info. Returns the record.
     record = _make_record(
         prompt_token_ids=list(prompt_ids),
         output_token_ids=list(output_ids),
@@ -472,6 +571,10 @@ def _single_turn_record(prompt_ids, output_ids, weight_version="w1", spec_info=N
 
 
 def _fabricate_node(state, parent, record, token_ids, *, completion_span, response_id="", committed_at=None):
+    # [FUNCTION DOC] HELPER: Adds a tree node under the parent (none for a root) with no delta
+    # messages, a copy of the token ids, the completion span, the response id (default empty), the
+    # record, finish reason stop, and commit time equal to the given value or, by default, the current
+    # node count as a float (so later nodes commit later). Returns the node.
     return state.tree.create_node(
         parent,
         delta_messages=[],
@@ -485,12 +588,17 @@ def _fabricate_node(state, parent, record, token_ids, *, completion_span, respon
 
 
 async def _fresh_state(core):
+    # [FUNCTION DOC] HELPER: Creates a session through the core and returns (session id, the
+    # registry's state object for it).
     response = await core.create_session()
     sid = json.loads(response.body)["session_id"]
     return sid, core.registry.sessions[sid]
 
 
 async def test_rolled_back_leaf_is_trimmed(core):
+    # [FUNCTION DOC] A root with two childless sibling leaves (an abandoned attempt, then the
+    # superseding request): collection returns 200 with exactly one sample, the later leaf with tokens
+    # [1, 2, 3, 10, 11, 21, 31].
     """A childless leaf with a later sibling is trimmed whatever it re-sent: one sample out."""
     sid, state = await _fresh_state(core)
     root = _fabricate_node(
@@ -520,6 +628,12 @@ async def test_rolled_back_leaf_is_trimmed(core):
 
 @pytest.mark.parametrize("trajectory_reward", [1.0, 0.0])
 async def test_deep_abandoned_branch_survives_and_masks_shared_prefix(core, trajectory_reward):
+    # [FUNCTION DOC] Parametrized over trajectory reward 1.0 and 0.0. Tree: a root, a deep early
+    # branch (two further nodes, leaf response id "early") and a shallow late leaf attached to the
+    # root (response id "late"). Collection with agent metadata {reward} returns two samples (early,
+    # late) with their leaves' tokens. The early leaf's loss mask starts [1, 1] (it owns the shared
+    # root completion), the late leaf's starts [0, 0] and ends 1 (its own completion trains). Both
+    # samples' reward and metadata reward equal the trajectory reward.
     """A deep abandoned branch is data (subagent shape): two samples, and the
     shared root completion trains exactly once (earliest leaf owns it)."""
     sid, state = await _fresh_state(core)
@@ -565,6 +679,13 @@ async def test_deep_abandoned_branch_survives_and_masks_shared_prefix(core, traj
 
 
 async def test_session_rollout_metrics_count_every_tree_node_once(spec_core):
+    # [FUNCTION DOC] With speculative decoding, builds a root (9/10 drafts, 2 verifies), an extra
+    # rolled-back sibling (100/100, 1 verify), an early branch of two nodes whose leaf has 0/10 and
+    # 1 verify, and a late leaf with 0/10 and 1 verify. Returns two samples (early, late); each
+    # sample's speculative info counts only its own path, deduplicating the shared root: correct 9,
+    # proposed 20, verifies 3, completion tokens 3 (both samples). The session rollout metrics entry
+    # counts every tree node exactly once, including the trimmed rolled-back one: correct 109,
+    # proposed 130, verifies 5, completion tokens 5, tagged with the session id.
     sid, state = await _fresh_state(spec_core)
     root = _fabricate_node(
         state,
@@ -655,6 +776,11 @@ async def test_session_rollout_metrics_count_every_tree_node_once(spec_core):
 
 
 async def test_session_rollout_metrics_include_node_excluded_by_max_seq_len(spec_core):
+    # [FUNCTION DOC] Two records with speculative stats (1/2, 1 verify; 3/5, 1 verify) and a maximum
+    # sequence length of 5 (the second turn is dropped). The single sample has the first turn's 5
+    # tokens, completed status and speculative info for the first turn only (1, 2, 1, completion
+    # tokens 2), while the session rollout metrics still include both turns (4, 7, 2, completion
+    # tokens 4).
     records = _two_turn_records()
     records[0].response["choices"][0]["meta_info"].update(
         {"spec_num_correct_drafts": 1, "spec_num_proposed_drafts": 2, "spec_verify_ct": 1}
@@ -686,6 +812,10 @@ async def test_session_rollout_metrics_include_node_excluded_by_max_seq_len(spec
 
 
 async def test_picker_warns_and_trims_longer_superseded_leaf(core, caplog):
+    # [FUNCTION DOC] A root with an abandoned leaf that is longer (3 output tokens) than its later
+    # replacement (1 token). With warnings captured from the picker's logger, collection returns 200
+    # with one sample, the replacement, and the log mentions that the leaf is longer than every later
+    # sibling's deepest leaf and that the picker continues by sequence number.
     """A longer superseded leaf warns, then temporal order still trims it."""
     sid, state = await _fresh_state(core)
     root = _fabricate_node(
@@ -717,6 +847,9 @@ async def test_picker_warns_and_trims_longer_superseded_leaf(core, caplog):
 
 
 async def test_picker_warns_on_wall_clock_rollback_and_trims_by_seq(core, caplog):
+    # [FUNCTION DOC] Two sibling leaves where the later-created one has an earlier commit time (5.0
+    # versus 10.0). Collection returns one sample, the later-created replacement; the log warns of a
+    # wall-clock rollback and continuing by sequence, and does not contain the longer-leaf warning.
     """A later `seq` with an earlier wall clock warns without changing the trim."""
     sid, state = await _fresh_state(core)
     root = _fabricate_node(
@@ -751,6 +884,10 @@ async def test_picker_warns_on_wall_clock_rollback_and_trims_by_seq(core, caplog
 
 
 async def test_two_roots_yield_two_samples(core):
+    # [FUNCTION DOC] Two unrelated roots (a main chain of 5 tokens and a sub chain of 4 tokens) give
+    # two samples: the sub chain first, then the main chain (ordered by checkpoint count then
+    # recency). The reply's tree metadata has two nodes with no parents, leaves listed in the order
+    # main then sub by node id, and both samples' rewards are none.
     """Zero-overlap branches (subagent forest) each assemble independently."""
     sid, state = await _fresh_state(core)
     main = _fabricate_node(
@@ -772,6 +909,10 @@ async def test_two_roots_yield_two_samples(core):
 
 @pytest.mark.parametrize("core_name", ["core", "same_prompt_core"])
 async def test_resent_first_turn_root_is_trimmed(core_name, request):
+    # [FUNCTION DOC] Parametrized over the default core and the same-prompt-picker core (fetched by
+    # name from the fixture request). A first-turn root is followed by a second root with the same
+    # prompt, which has a child leaf. Collection returns one sample, the child leaf of the second
+    # root, so the abandoned first root is trimmed under both pickers.
     """A re-sent first turn opens a root with the same prompt; both pickers trim the abandoned root."""
     core = request.getfixturevalue(core_name)
     sid, state = await _fresh_state(core)
@@ -796,6 +937,11 @@ async def test_resent_first_turn_root_is_trimmed(core_name, request):
 async def test_same_prompt_picker_trims_only_identical_resends(
     same_prompt_core, resent_env_token, expected_leaf_names
 ):
+    # [FUNCTION DOC] Parametrized: an earlier leaf (environment token 20) and a later leaf under the
+    # same root. When the later leaf re-sent the identical prompt (token 20) only the later leaf
+    # survives; with a different request (token 21) both survive and the expected order is later
+    # then earlier. Collection returns samples whose tokens equal the expected leaves' tokens in
+    # that order.
     """The default picker supersedes a leaf only when the later sibling re-sent its exact prompt."""
     sid, state = await _fresh_state(same_prompt_core)
     root = _fabricate_node(
@@ -825,6 +971,11 @@ async def test_same_prompt_picker_trims_only_identical_resends(
 
 
 async def test_picker_orders_by_checkpoint_count_then_latest_commit(core):
+    # [FUNCTION DOC] Builds a deep two-checkpoint chain (4 tokens) and two single-checkpoint roots (a
+    # longer, earlier one of 8 tokens and a shorter, later one of 7 tokens). Asserts the structure
+    # (path lengths 2, 1, 1; token lengths increasing deep, late, early) and that the returned
+    # samples' leaf node ids are ordered deep, shallow-late, shallow-early (inferred from the
+    # assertions: more checkpoints first, then the newest commit first).
     sid, state = await _fresh_state(core)
     root = _fabricate_node(state, None, _single_turn_record([1], [10]), [1, 10], completion_span=(1, 2))
     deep = _fabricate_node(
@@ -866,35 +1017,50 @@ async def test_picker_orders_by_checkpoint_count_then_latest_commit(core):
 
 
 def _keep_all_picker(leaf_samples, session_metadata):
+    # [FUNCTION DOC] HELPER: Custom picker that keeps every leaf sample: returns a new list copy of
+    # the input in the same order; metadata is unused.
     return list(leaf_samples)
 
 
 def _reverse_picker(leaf_samples, session_metadata):
+    # [FUNCTION DOC] HELPER: Custom picker returning all leaf samples in reversed order.
     return list(reversed(leaf_samples))
 
 
 def _replace_session_rollout_metrics(leaf_samples, session_metadata):
+    # [FUNCTION DOC] HELPER: Custom hook that overwrites the session rollout metrics entry of the
+    # session metadata mapping (in place) with a planted value, and returns the samples unchanged.
     session_metadata[SESSION_ROLLOUT_METRICS_KEY] = {"agent": "plant"}
     return leaf_samples
 
 
 def _duplicate_picker(leaf_samples, session_metadata):
+    # [FUNCTION DOC] HELPER: Contract-violating picker that returns the first sample twice.
     return [leaf_samples[0], leaf_samples[0]]
 
 
 def _exploding_picker(leaf_samples, session_metadata):
+    # [FUNCTION DOC] HELPER: Picker that always raises a runtime error saying "policy bug".
     raise RuntimeError("policy bug")
 
 
 def _impure_picker(leaf_samples, session_metadata):
+    # [FUNCTION DOC] HELPER: Contract-violating picker that returns a deep copy of the first sample
+    # (not one of the originals, so the result is not a subset of the input).
     return [deepcopy(leaf_samples[0])]
 
 
 async def _exploding_async_picker(leaf_samples, session_metadata):
+    # [FUNCTION DOC] HELPER: An asynchronous picker (which must be rejected at load time; it never
+    # runs). KNOWN ISSUE: the name says exploding, but the body just returns the samples unchanged.
     return leaf_samples
 
 
 def _build_core_with_hooks(use_addition_r3: bool = False, **hook_args) -> SessionCoreV2:
+    # [FUNCTION DOC] HELPER: Builds a new version 2 core from the module config overridden with the
+    # keyword hook settings (for example picker or postprocessor paths, speculative algorithm),
+    # re-validated through the config factory; otherwise as the main core builder. Hook loading from
+    # the function registry happens as part of core construction, so an invalid hook raises here.
     args = make_session_server_config(**{**_ARGS.model_dump(), **hook_args})
     tokenizer = load_tokenizer(args.hf_checkpoint, chat_template_path=args.chat_template_path, trust_remote_code=True)
     tito_tokenizer = get_tito_tokenizer(
@@ -907,6 +1073,9 @@ def _build_core_with_hooks(use_addition_r3: bool = False, **hook_args) -> Sessio
 
 
 async def _rolled_back_session(core):
+    # [FUNCTION DOC] HELPER: Creates a fresh session with a root (prompt [1, 2, 3], output [10, 11])
+    # and two sibling childless leaves (environment tokens 20 and 21, outputs 30 and 31), the second
+    # superseding the first. Returns the session id.
     sid, state = await _fresh_state(core)
     root = _fabricate_node(
         state, None, _single_turn_record([1, 2, 3], [10, 11]), [1, 2, 3, 10, 11], completion_span=(3, 5)
@@ -929,6 +1098,10 @@ async def _rolled_back_session(core):
 
 
 async def test_custom_picker_keeps_abandoned_leaf(core):
+    # [FUNCTION DOC] With the keep-all picker on a rolled-back session, collection returns 200 with
+    # two samples, the abandoned leaf (tokens ending 20, 30) and the replacement (ending 21, 31). The
+    # abandoned (earlier) leaf owns the shared root completion (loss mask starts [1, 1]); the
+    # replacement masks it ([0, 0]). The test's own core fixture argument is unused.
     """A tree-RL style picker keeps everything: the rolled-back leaf
     becomes a second sample instead of being trimmed."""
     with function_registry.temporary("test_hooks.keep_all", _keep_all_picker):
@@ -947,6 +1120,10 @@ async def test_custom_picker_keeps_abandoned_leaf(core):
 
 
 async def test_custom_picker_reorder_keeps_earliest_leaf_as_owner(core):
+    # [FUNCTION DOC] With a picker that reverses the leaf order, the returned order is replacement
+    # then abandoned, yet the earliest-created leaf (abandoned) still owns the shared root completion:
+    # replacement's loss mask starts [0, 0] and abandoned's starts [1, 1]. The core fixture argument
+    # is unused.
     with function_registry.temporary("test_hooks.reverse", _reverse_picker):
         hooked = _build_core_with_hooks(session_sample_picker_path="test_hooks.reverse")
         sid = await _rolled_back_session(hooked)
@@ -959,6 +1136,10 @@ async def test_custom_picker_reorder_keeps_earliest_leaf_as_owner(core):
 
 
 async def test_custom_postprocessor_cannot_replace_session_rollout_metrics():
+    # [FUNCTION DOC] A speculative-decoding core is configured with a postprocessor hook that
+    # overwrites the session rollout metrics entry with a planted value. Collection still returns 200
+    # and the reply's entry is the server's own (session id and an empty speculative info
+    # dictionary), so the hook's replacement is ignored.
     with function_registry.temporary("test_hooks.replace_metrics", _replace_session_rollout_metrics):
         hooked = _build_core_with_hooks(
             sglang_speculative_algorithm="EAGLE",
@@ -976,6 +1157,9 @@ async def test_custom_postprocessor_cannot_replace_session_rollout_metrics():
 
 
 async def test_hook_exception_maps_to_422_with_identity(core):
+    # [FUNCTION DOC] A picker that raises a runtime error makes collection return 422 whose body names
+    # the picker's registered name and the error text "policy bug". The core fixture argument is
+    # unused.
     with function_registry.temporary("test_hooks.exploding", _exploding_picker):
         hooked = _build_core_with_hooks(session_sample_picker_path="test_hooks.exploding")
         sid = await _rolled_back_session(hooked)
@@ -986,6 +1170,8 @@ async def test_hook_exception_maps_to_422_with_identity(core):
 
 
 async def test_impure_picker_maps_to_422(core):
+    # [FUNCTION DOC] A picker returning a copy instead of the original sample objects makes
+    # collection return 422 with a body mentioning "subset". The core fixture argument is unused.
     with function_registry.temporary("test_hooks.impure", _impure_picker):
         hooked = _build_core_with_hooks(session_sample_picker_path="test_hooks.impure")
         sid = await _rolled_back_session(hooked)
@@ -995,6 +1181,8 @@ async def test_impure_picker_maps_to_422(core):
 
 
 async def test_duplicate_picker_maps_to_422(core):
+    # [FUNCTION DOC] A picker returning the same sample twice makes collection return 422 with a body
+    # mentioning "duplicates". The core fixture argument is unused.
     with function_registry.temporary("test_hooks.duplicate", _duplicate_picker):
         hooked = _build_core_with_hooks(session_sample_picker_path="test_hooks.duplicate")
         sid = await _rolled_back_session(hooked)
@@ -1004,11 +1192,16 @@ async def test_duplicate_picker_maps_to_422(core):
 
 
 def _exploding_postprocessor(picked_samples, session_metadata):
+    # [FUNCTION DOC] HELPER: Postprocessor hook that always raises a runtime error "postprocess bug".
     raise RuntimeError("postprocess bug")
 
 
 class TestConfiguredPostprocessor:
+    # [CLASS DOC] Tests of a configured postprocessor hook.
     async def test_configured_postprocessor_failure_maps_to_422_with_identity(self):
+        # [FUNCTION DOC] With the exploding postprocessor registered temporarily and configured,
+        # collection on a rolled-back session returns 422 and the body names the postprocessor's
+        # registered name and the error text "postprocess bug".
         """A configured postprocessor is loaded and invoked, and its failure is a 422 naming that postprocessor."""
         with function_registry.temporary("test_hooks.exploding_postprocessor", _exploding_postprocessor):
             hooked = _build_core_with_hooks(session_sample_postprocessor_path="test_hooks.exploding_postprocessor")
@@ -1023,7 +1216,12 @@ class TestConfiguredPostprocessor:
 
 
 async def test_agent_cannot_fill_missing_server_metadata(core, monkeypatch):
+    # [FUNCTION DOC] The registry's mismatch computation is patched to raise a tokenization error.
+    # Collection with agent metadata that plants a mismatch list still returns 200, and the sample's
+    # metadata has no mismatch entry (the agent cannot supply a server-owned key the server failed to
+    # compute).
     def fail_mismatch(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Always raises a tokenization error "test mismatch failure".
         raise TokenizationError("test mismatch failure")
 
     monkeypatch.setattr(core.registry, "compute_mismatch", fail_mismatch)
@@ -1037,6 +1235,11 @@ async def test_agent_cannot_fill_missing_server_metadata(core, monkeypatch):
 
 @pytest.mark.parametrize("turn_args", [{}, {"temperature": 0.7, "chat_template_kwargs": {"enable_thinking": False}}])
 async def test_agent_cannot_override_turn_args(core, turn_args):
+    # [FUNCTION DOC] Parametrized over empty turn args and a mapping with temperature and template
+    # kwargs. The leaf's recorded turn args are set to a copy, then collection runs with agent
+    # metadata planting different turn args plus an agent-only key. The sample metadata's turn args
+    # equal the recorded ones, the agent-only key is kept, the reply's session metadata agent entry
+    # equals the full agent metadata, and the leaf's stored turn args are unchanged.
     sid = await _make_session(core, _two_turn_records(), _ACCUMULATED)
     leaf = core.registry.sessions[sid].tree.leaves()[0]
     leaf.turn_args = deepcopy(turn_args)
@@ -1056,6 +1259,8 @@ async def test_agent_cannot_override_turn_args(core, turn_args):
 
 
 def test_async_hook_rejected_at_load():
+    # [FUNCTION DOC] Building a core with a configured picker that is an asynchronous function raises
+    # a value error mentioning async.
     with function_registry.temporary("test_hooks.async_picker", _exploding_async_picker):
         with pytest.raises(ValueError, match="async"):
             _build_core_with_hooks(session_sample_picker_path="test_hooks.async_picker")
@@ -1066,6 +1271,8 @@ def test_async_hook_rejected_at_load():
 
 @pytest.fixture(scope="module")
 def app_client():
+    # [FUNCTION DOC] HELPER: Module-scoped fixture: builds a web app, installs the real session routes
+    # with the unused backend and the module config, and yields a test client (closed at teardown).
     app = FastAPI()
     setup_session_routes(app, _UnusedBackend(), _ARGS)
     with TestClient(app) as client:
@@ -1073,12 +1280,17 @@ def app_client():
 
 
 def test_missing_session_returns_404(app_client):
+    # [FUNCTION DOC] Posting to the samples path of a random unknown session returns 404 with an error
+    # message containing "not found".
     response = app_client.post(f"/sessions/{uuid.uuid4().hex}/samples", content=b'{"max_seq_len":null}')
     assert response.status_code == 404
     assert "not found" in response.json()["error"]
 
 
 def test_samples_route_registered_before_catch_all_proxy(app_client):
+    # [FUNCTION DOC] For a fresh session, the samples path returns 200 with an octet-stream content
+    # type and a decodable reply with empty reason "no_records", proving the samples route precedes
+    # the catch-all proxy route.
     # The catch-all session_proxy would forward the request to the inference
     # backend (_UnusedBackend raises); the samples route must win instead and
     # answer with a decodable empty reply for a fresh session.
@@ -1092,7 +1304,14 @@ def test_samples_route_registered_before_catch_all_proxy(app_client):
 
 @pytest.mark.asyncio
 async def test_hooks_cannot_mutate_committed_turn_args():
+    # [FUNCTION DOC] Registers a picker that appends marker strings into nested turn args in the
+    # session metadata, the tree nodes of the metadata and each sample's metadata. On a rolled-back
+    # session whose nodes were given turn args with a nested list, collection returns 200 and every
+    # node's stored turn args are equal to their pre-collection deep copies (hooks only saw copies).
     def mutate_metadata(samples, metadata):
+        # [FUNCTION DOC] HELPER: Picker that appends marker strings to the nested template-kwargs
+        # lists of the metadata's turn args, of every metadata tree node, and of every sample's
+        # metadata turn args (mutating them in place), then returns the samples.
         metadata["turn_args"]["chat_template_kwargs"]["nested"].append("session-hook")
         for node in metadata["tree"]["nodes"]:
             node["turn_args"]["chat_template_kwargs"]["nested"].append("tree-hook")
@@ -1114,6 +1333,11 @@ async def test_hooks_cannot_mutate_committed_turn_args():
 
 @pytest.mark.asyncio
 async def test_metadata_omits_payloads_without_changing_stored_turn_args(core):
+    # [FUNCTION DOC] Gives each node of a rolled-back session turn args that include input ids and
+    # messages. The get-session metadata then shows turn args without those two payload keys (session
+    # level equals the last node's, tree level equals each node's expected), the samples reply's
+    # session metadata equals that metadata, every sample's metadata turn args equal its leaf node's
+    # expected args, and the stored turn args are unchanged afterwards.
     sid = await _rolled_back_session(core)
     nodes = core.registry.sessions[sid].tree.nodes
     expected = []

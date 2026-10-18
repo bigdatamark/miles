@@ -1,3 +1,9 @@
+# [MODULE DOC] End-to-end smoke tests of the session server with each bundled fixed chat template
+# (seven model configurations: names, checkpoints, bundled template paths and token-in-token-out
+# model names are listed in a module-level tuple). For each, a scripted backend replays a long chain
+# trajectory through a real session server and the test checks the session's accumulated token ids
+# against a locally computed template rendering. Needs network or cached model access for the
+# tokenizers (a config whose tokenizer cannot be loaded is skipped) and opens local ports.
 """Representative session-layer smoke tests for miles-maintained fixed templates.
 
 These tests intentionally stay narrow:
@@ -33,6 +39,9 @@ from miles.utils.test_utils.mock_trajectories import LongChainTrajectory, build_
 
 @dataclass(frozen=True)
 class FixedTemplateSmokeConfig:
+    # [CLASS DOC] HELPER: Immutable description of one smoke case: a display name, the Hugging Face
+    # checkpoint to load the tokenizer from, the path to the bundled fixed chat template, and the
+    # token-in-token-out tokenizer type name.
     name: str
     hf_checkpoint: str
     chat_template_path: str
@@ -86,6 +95,8 @@ FIXED_TEMPLATE_SMOKE_CONFIGS: tuple[FixedTemplateSmokeConfig, ...] = (
 
 
 def _get_followup_messages_after_assistant(full_messages: list[dict], assistant_idx: int) -> list[dict]:
+    # [FUNCTION DOC] HELPER: Returns the messages that follow the assistant message at the given index,
+    # up to but excluding the next assistant message (or the end), in order.
     followup = []
     i = assistant_idx + 1
     while i < len(full_messages) and full_messages[i]["role"] != "assistant":
@@ -95,6 +106,10 @@ def _get_followup_messages_after_assistant(full_messages: list[dict], assistant_
 
 
 def _remap_followup_messages(followup_msgs: list[dict], response_tool_calls: list[dict]) -> list[dict]:
+    # [FUNCTION DOC] HELPER: Copies each follow-up message; the Nth tool message (in order) gets its
+    # tool call id replaced by the id of the Nth tool call the backend actually returned, if that call
+    # exists (extra tool messages keep their original id). Non-tool messages are copied unchanged.
+    # Returns the new list; inputs are not mutated.
     remapped = []
     tool_idx = 0
     for msg in followup_msgs:
@@ -109,6 +124,21 @@ def _remap_followup_messages(followup_msgs: list[dict], response_tool_calls: lis
 
 @pytest.mark.parametrize("config", FIXED_TEMPLATE_SMOKE_CONFIGS, ids=[c.name for c in FIXED_TEMPLATE_SMOKE_CONFIGS])
 def test_bundled_fixed_template_session_smoke(config: FixedTemplateSmokeConfig):
+    # [FUNCTION DOC] Parametrized over the seven fixed-template configs. Asserts the config has a
+    # bundled template path; loads the tokenizer (skipping the case on a value or OS error). Builds a
+    # long chain trajectory, scripts one backend turn per trajectory turn (the returned message gets
+    # empty-string content when missing; the render message is the original), starts the backend and
+    # a session server for the config. Creates a session; then for each turn sends the accumulated
+    # messages (the first turn's request messages for turn 0) with the trajectory tools to the
+    # session chat endpoint, asserting 200 and one choice, and for later turns that the backend
+    # received explicit input ids. After each turn, fetches the session payload and asserts: the tree
+    # has turn-number-plus-one nodes; the server's recorded mismatch list equals the locally
+    # computed mismatch of the accumulated token ids against a fresh rendering of messages plus the
+    # assistant reply; and no forbidden mismatch types occur. Then the assistant reply and the
+    # trajectory's follow-up messages (tool results remapped to the returned tool call ids) are
+    # appended for the next turn. Finally the records count equals the turn count, and all records
+    # have status 200 and the chat completions path. The router environment is torn down in a final
+    # cleanup step.
     assert config.chat_template_path is not None, f"{config.name} should resolve to a bundled fixed template"
 
     try:

@@ -1,3 +1,12 @@
+# [MODULE DOC] Tests of per-session policy at creation for the session server: the evaluation flag
+# (selects whether the engine is asked for routed experts / indexer top-k / sampling mask, the
+# training default being yes), sampling defaults (temperature, top-p, top-k) registered at creation
+# and applied only to omitted request fields, training-session temperature mismatch rejection,
+# strict validation of the creation body, and independence of concurrent sessions. The server app is
+# served in-process through an ASGI transport against a fake backend that renders the chat template
+# with a real tokenizer (Qwen3-0.6B) and replies with the fixed assistant message and its token
+# log-probabilities; every test is asyncio and runs for both session server versions (v1 and v2,
+# via parametrized fixtures).
 import asyncio
 import json
 from types import SimpleNamespace
@@ -28,15 +37,29 @@ TOOL = {"role": "tool", "content": "result", "tool_call_id": "call_1"}
 
 @pytest.fixture(scope="module")
 def tokenizer():
+    # [FUNCTION DOC] HELPER: Module-scoped fixture: loads the Qwen3-0.6B tokenizer once (remote code
+    # trusted; may read from disk or download).
     return load_tokenizer("Qwen/Qwen3-0.6B", trust_remote_code=True)
 
 
 class _Backend:
+    # [CLASS DOC] HELPER: Fake proxy backend for the session server. Records each forwarded request
+    # payload and answers with a canned chat completion.
     def __init__(self, tokenizer):
+        # [FUNCTION DOC] HELPER: Stores the tokenizer and an empty list of received request payloads.
         self.tokenizer = tokenizer
         self.requests = []
 
     async def do_proxy(self, request, path, *, body, headers):
+        # [FUNCTION DOC] HELPER: Decodes the JSON body and appends it to the received list; yields to
+        # the event loop once. Renders the prompt from the payload messages (generation prompt added,
+        # no tokenization, thinking disabled) and the completed text with the fixed assistant message
+        # appended, asserts the latter extends the former, and encodes the difference (no special
+        # tokens) as output token ids. Returns a proxy result mapping with the original request body,
+        # a JSON-encoded response body (id "response-N" by request count, one choice holding the
+        # assistant message, finish reason stop, completion token count and output token log-probs of
+        # -0.1 per token), status 200 and a JSON content type header. The request, path and headers
+        # arguments are unused.
         payload = json.loads(body)
         self.requests.append(payload)
         await asyncio.sleep(0)
@@ -68,6 +91,14 @@ class _Backend:
 
 
 async def _serve_env(tokenizer, monkeypatch, version, *, use_sampling_support_replay=False):
+    # [FUNCTION DOC] HELPER: Async generator that yields one environment. Patches the sessions module
+    # so loading a tokenizer returns the given one. Builds a session server config for the Qwen3-0.6B
+    # checkpoint (thinking disabled, the given session server version, routing replay and indexer
+    # replay on, optionally sampling-support replay, the drop-same-prompt-retries picker and default
+    # postprocessor), creates a web app, installs the session routes against the fake backend with
+    # additional routing replay enabled, and serves the app to an HTTP client over an in-process ASGI
+    # transport. Yields a namespace of the client, the backend and the version; the client is closed
+    # on exit.
     monkeypatch.setattr(sessions, "load_tokenizer", lambda *args, **kwargs: tokenizer)
     backend = _Backend(tokenizer)
     config = make_session_server_config(
@@ -88,12 +119,17 @@ async def _serve_env(tokenizer, monkeypatch, version, *, use_sampling_support_re
 
 @pytest_asyncio.fixture(params=[True, "v2"], ids=["v1", "v2"])
 async def env(request, tokenizer, monkeypatch):
+    # [FUNCTION DOC] HELPER: Async fixture parametrized over session server versions (ids v1 and
+    # v2); delegates to the environment generator without sampling-support replay and re-yields its
+    # value.
     async for value in _serve_env(tokenizer, monkeypatch, request.param):
         yield value
 
 
 @pytest_asyncio.fixture(params=[True, "v2"], ids=["v1", "v2"])
 async def replay_env(request, tokenizer, monkeypatch):
+    # [FUNCTION DOC] HELPER: Same as the main environment fixture but with sampling-support replay
+    # enabled (the engine is asked for a sampling mask for training sessions).
     async for value in _serve_env(
         tokenizer,
         monkeypatch,
@@ -104,6 +140,8 @@ async def replay_env(request, tokenizer, monkeypatch):
 
 
 async def _create(env, body=b""):
+    # [FUNCTION DOC] HELPER: Posts the raw body (default empty) to the sessions path, asserts status
+    # 200 and that the JSON body has exactly one key, session_id, and returns the session id.
     response = await env.client.post("/sessions", content=body)
     assert response.status_code == 200, response.text
     assert set(response.json()) == {"session_id"}
@@ -111,6 +149,8 @@ async def _create(env, body=b""):
 
 
 async def _chat(env, sid, messages, **kwargs):
+    # [FUNCTION DOC] HELPER: Posts a chat completions request with the messages and any extra JSON
+    # fields to the session, asserts status 200 and returns the response.
     response = await env.client.post(f"/sessions/{sid}/v1/chat/completions", json={"messages": messages, **kwargs})
     assert response.status_code == 200, response.text
     return response
@@ -118,6 +158,11 @@ async def _chat(env, sid, messages, **kwargs):
 
 @pytest.mark.parametrize("body", [b"", b"{}", b'{"evaluation": false}', b'{"evaluation": true}'])
 async def test_creation_selects_policy_and_defaults_to_training(env, body):
+    # [FUNCTION DOC] Parametrized over creation bodies: empty, empty object, evaluation false,
+    # evaluation true. After one chat request, the forwarded payload's routed-experts and indexer
+    # top-k flags are true for training (anything but evaluation true) and false for evaluation. For
+    # evaluation the sampling-mask flag is false and no routed-experts start length is sent; for
+    # training no sampling-mask flag is sent and the routed-experts start length is 0.
     sid = await _create(env, body)
     await _chat(env, sid, [USER])
     wire = env.backend.requests[-1]
@@ -151,7 +196,14 @@ async def test_creation_selects_policy_and_defaults_to_training(env, body):
     ],
 )
 async def test_invalid_creation_is_rejected_before_allocation(env, body, monkeypatch):
+    # [FUNCTION DOC] Parametrized over invalid bodies: malformed JSON; non-object JSON (array, null);
+    # evaluation as null, 0, 1 or a string; a misspelled or unknown key; non-numeric temperature
+    # string; top-p as a list; top-k as a non-integral float or a boolean. Session creation in both
+    # registries is patched to raise an assertion error if reached. Posting the body returns status
+    # 400 and the backend receives no request.
     def unexpected_allocation(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Raises an assertion error saying invalid creation must not allocate a
+        # session.
         raise AssertionError("invalid creation must not allocate a session")
 
     monkeypatch.setattr(sessions.SessionRegistry, "create_session", unexpected_allocation)
@@ -162,6 +214,14 @@ async def test_invalid_creation_is_rejected_before_allocation(env, body, monkeyp
 
 
 async def test_eval_policy_survives_continuation_and_retry_and_collects_without_replay(env):
+    # [FUNCTION DOC] Creates an evaluation session and sends three turns (first turn at temperature
+    # 0.0; a continuation with tool result at 0.7; a retry with different tool content at 1.2), each
+    # with top-p 0.8, top-k -1 and the client trying to force all replay flags on and a routed-experts
+    # start length of 999. In every forwarded payload: all three replay flags are false (client
+    # overrides ignored), no start length is sent, temperature/top-p/top-k pass through, log-probs and
+    # meta info are requested and no-stop-trim is false. The session's samples endpoint returns 200;
+    # decoding the reply (with the computed field set for the version) yields samples, none holding
+    # routed experts or indexer top-k. Deleting the session returns 204.
     sid = await _create(env, b'{"evaluation": true}')
     turns = [([USER], 0.0), ([USER, ASSISTANT, TOOL], 0.7), ([USER, ASSISTANT, {**TOOL, "content": "retry"}], 1.2)]
     for messages, temperature in turns:
@@ -194,6 +254,9 @@ async def test_eval_policy_survives_continuation_and_retry_and_collects_without_
 
 
 async def test_concurrent_train_and_eval_do_not_share_policy(env):
+    # [FUNCTION DOC] Concurrently creates a training and an evaluation session and sends one chat in
+    # each concurrently: the forwarded routed-experts flags (and indexer top-k flags) sorted are
+    # [false, true], so each session kept its own policy.
     train, evaluation = await asyncio.gather(_create(env), _create(env, b'{"evaluation": true}'))
     await asyncio.gather(_chat(env, train, [USER]), _chat(env, evaluation, [USER]))
     assert sorted(request["return_routed_experts"] for request in env.backend.requests) == [False, True]
@@ -205,6 +268,12 @@ SAMPLING = {"temperature": 0.6, "top_p": 0.9, "top_k": 20}
 
 @pytest.mark.parametrize("evaluation", [False, True])
 async def test_creation_sampling_defaults_fill_only_omitted_fields(replay_env, evaluation):
+    # [FUNCTION DOC] Parametrized over evaluation false/true. Creates a session with sampling
+    # defaults (temperature 0.6, top-p 0.9, top-k 20). The first chat omits sampling fields and gets
+    # all three defaults; the second chat sends a temperature (0.1 for evaluation, otherwise equal to
+    # the default), top-p null and top-k 10, and the forwarded payload has the defaults except for the
+    # explicit temperature and top-k (null top-p falls back to the default). The sampling-mask flag
+    # is on for training and off for evaluation in both.
     sid = await _create(replay_env, json.dumps({**SAMPLING, "evaluation": evaluation}).encode())
     await _chat(replay_env, sid, [USER])
     temperature = 0.1 if evaluation else SAMPLING["temperature"]
@@ -218,6 +287,12 @@ async def test_creation_sampling_defaults_fill_only_omitted_fields(replay_env, e
 
 @pytest.mark.parametrize("saved,requested", [(0.6, 0.1), (0.6, 0.0), (0.0, 0.6)])
 async def test_training_temperature_mismatch_is_rejected_before_forwarding(replay_env, saved, requested):
+    # [FUNCTION DOC] Parametrized over (registered, requested) temperature pairs (0.6 vs 0.1, 0.6 vs
+    # 0.0, 0.0 vs 0.6). For three turns (first, continuation, repeated continuation), a request with
+    # the mismatching temperature returns 400 with an error message stating the temperature does not
+    # match the training session temperature, and nothing is forwarded to the backend. Then the same
+    # turn with the registered temperature, top-p 0.5 and top-k 10 is forwarded with exactly those
+    # values and the sampling-mask flag on.
     sid = await _create(replay_env, json.dumps({**SAMPLING, "temperature": saved}).encode())
     turns = [[USER], [USER, ASSISTANT, TOOL], [USER, ASSISTANT, TOOL]]
     for messages in turns:
@@ -238,12 +313,16 @@ async def test_training_temperature_mismatch_is_rejected_before_forwarding(repla
 
 
 async def test_training_null_temperature_uses_registered_value(replay_env):
+    # [FUNCTION DOC] A chat with temperature explicitly null in a training session registered with
+    # temperature 0.6 is forwarded with temperature 0.6.
     sid = await _create(replay_env, json.dumps(SAMPLING).encode())
     await _chat(replay_env, sid, [USER], temperature=None)
     assert replay_env.backend.requests[-1]["temperature"] == SAMPLING["temperature"]
 
 
 async def test_creation_without_sampling_defaults_leaves_omitted_fields_unset(env):
+    # [FUNCTION DOC] A session created without sampling defaults forwards a chat with no temperature,
+    # top-p or top-k keys at all; a later chat that sets temperature 0.4 forwards 0.4.
     sid = await _create(env)
     await _chat(env, sid, [USER])
     assert not set(SAMPLING) & set(env.backend.requests[-1])
@@ -252,6 +331,8 @@ async def test_creation_without_sampling_defaults_leaves_omitted_fields_unset(en
 
 
 async def test_an_integer_temperature_is_accepted_as_a_float_default(env):
+    # [FUNCTION DOC] Creating with temperature 0 (integer) is accepted; the forwarded temperature
+    # equals 0 and no top-p is sent.
     sid = await _create(env, b'{"temperature": 0}')
     await _chat(env, sid, [USER])
     assert env.backend.requests[-1]["temperature"] == 0
@@ -259,6 +340,8 @@ async def test_an_integer_temperature_is_accepted_as_a_float_default(env):
 
 
 async def test_an_integral_float_top_k_is_stored_as_an_int(env):
+    # [FUNCTION DOC] Creating an evaluation session with top-k 40.0 (float) forwards top-k as the
+    # integer 40 (the type is checked to be int).
     """An eval dataset YAML can spell top_k as 40.0; the engine must still receive an integer."""
     sid = await _create(env, b'{"evaluation": true, "top_k": 40.0}')
     await _chat(env, sid, [USER])
@@ -267,6 +350,8 @@ async def test_an_integral_float_top_k_is_stored_as_an_int(env):
 
 
 async def test_concurrent_sessions_keep_their_own_sampling_defaults(env):
+    # [FUNCTION DOC] Two sessions created concurrently with temperatures 0.2 and 0.8 and chatted
+    # concurrently forward temperatures that sort to [0.2, 0.8].
     first, second = await asyncio.gather(_create(env, b'{"temperature": 0.2}'), _create(env, b'{"temperature": 0.8}'))
     await asyncio.gather(_chat(env, first, [USER]), _chat(env, second, [USER]))
     assert sorted(request["temperature"] for request in env.backend.requests) == [0.2, 0.8]
@@ -274,6 +359,9 @@ async def test_concurrent_sessions_keep_their_own_sampling_defaults(env):
 
 @pytest.mark.parametrize("field", ["input_ids", "logprob_start_len", "lora_path"])
 async def test_eval_retains_tito_control_validation(env, field):
+    # [FUNCTION DOC] Parametrized over client-supplied control fields input ids, logprob start length
+    # and LoRA path. In an evaluation session a chat that sets one of them to 1 is rejected with
+    # status 400 and nothing is forwarded.
     sid = await _create(env, b'{"evaluation": true}')
     response = await env.client.post(f"/sessions/{sid}/v1/chat/completions", json={"messages": [USER], field: 1})
     assert response.status_code == 400
@@ -281,6 +369,11 @@ async def test_eval_retains_tito_control_validation(env, field):
 
 
 async def test_eval_does_not_run_additional_r3_prefix_assertion():
+    # [FUNCTION DOC] A session core with additional routing replay enabled (no registry or tokenizer)
+    # is asked to add the routed-experts start length to a body whose routed-experts flag is false:
+    # the body is left without a start length even though the token ids are not a prefix of each
+    # other. With the flag true, the same inputs fail an assertion saying additional R3 requires
+    # (a prefix relationship).
     core = SessionCore(None, None, make_session_server_config(), use_addition_r3=True)
     body = {"return_routed_experts": False}
     core._maybe_request_addition_r3(body, [1, 2, 3, 4], [99])

@@ -1,3 +1,14 @@
+# [MODULE DOC] Integration tests for the Anthropic Messages route of the session server, which must
+# reuse the OpenAI chat session path end to end. A real session server (version 1 and version 2
+# variants via a module-scoped parametrized fixture) runs on a background thread in front of a mock
+# SGLang backend whose scripted replies depend on the prompt text (a tool-call reply when the prompt
+# asks to use the weather tool, a final answer when the prompt contains the tool result "sunny",
+# otherwise an echo). Tests cover: the unavailable-adapter error, the health capability flag, record
+# shape, thinking history handling, intermediate system messages, fake streaming events, parity with
+# equivalent OpenAI requests, error envelopes, fixed feature policy rejections and their priority,
+# policy traversal boundaries, post-commit failures, the multi-turn tool flow under strict versus
+# loose matchers, the delete-during-request race, and the matcher gate itself. Opens local ports
+# starting at 31000 and loads a real tokenizer in one test.
 """Integration tests for ``POST /sessions/{session_id}/v1/messages``.
 
 The Anthropic route must reuse the OpenAI session path end to end: canonical
@@ -40,6 +51,10 @@ _TOOLS = [{"name": "get_weather", "description": "weather", "input_schema": {"ty
 
 
 def _process_fn(prompt: str) -> ProcessResult:
+    # [FUNCTION DOC] HELPER: Mock backend reply policy keyed on the prompt text. If the prompt
+    # contains "sunny", returns the text "final-answer" with finish reason stop; else if it contains
+    # "use the weather tool", returns the scripted weather tool-call text; otherwise returns
+    # "anthropic-echo". All finish with stop.
     if "sunny" in prompt:
         return ProcessResult(text="final-answer", finish_reason="stop")
     if "use the weather tool" in prompt:
@@ -49,6 +64,13 @@ def _process_fn(prompt: str) -> ProcessResult:
 
 @contextmanager
 def _anthropic_env(extra_args: dict | None = None, *, latency: float = 0.0):
+    # [FUNCTION DOC] HELPER: Context manager. Starts a mock backend with the reply policy and the
+    # given latency (seconds), builds a session server config pointing at it (30 s timeout, Qwen3-0.6B
+    # checkpoint, template kwargs with thinking disabled, default token-in-token-out model, a random
+    # instance id, retract pause mode merged with and overridden by the extra args mapping), serves
+    # the server on a free port from 31000 on a background thread, and yields a namespace with the
+    # server URL and the backend. The server thread is stopped on exit; the backend is stopped by
+    # its own context manager.
     # The mock backend already emits choice.meta_info with
     # output_token_logprobs/completion_tokens in the session-server format.
     with with_mock_server(process_fn=_process_fn, latency=latency) as backend:
@@ -80,34 +102,50 @@ _V2_ARGS = {
 
 @pytest.fixture(scope="module", params=["v1", "v2"])
 def anthropic_env(request):
+    # [FUNCTION DOC] HELPER: Module-scoped fixture parametrized over session server versions "v1"
+    # and "v2". Starts the environment with the version 2 argument set for v2 (none for v1) and
+    # yields a namespace of the version name plus the environment's URL and backend.
     with _anthropic_env(_V2_ARGS if request.param == "v2" else None) as env:
         yield SimpleNamespace(version=request.param, **vars(env))
 
 
 @pytest.fixture(scope="module", params=["v1", "v2"])
 def anthropic_env_loose(request):
+    # [FUNCTION DOC] HELPER: Like the main environment fixture but with the session message matcher
+    # set to the loose tool-call matcher in addition (for both versions).
     extra = {"session_message_matcher": "loose_tool_call", **(_V2_ARGS if request.param == "v2" else {})}
     with _anthropic_env(extra) as env:
         yield SimpleNamespace(version=request.param, **vars(env))
 
 
 def _create_session(url: str) -> str:
+    # [FUNCTION DOC] HELPER: Posts to the sessions path of the server (5 s timeout) and returns the
+    # new session id from the JSON body.
     return requests.post(f"{url}/sessions", timeout=5.0).json()["session_id"]
 
 
 def _post_messages(url: str, session_id: str, payload: dict) -> requests.Response:
+    # [FUNCTION DOC] HELPER: Posts the JSON payload to the session's Anthropic messages path with a
+    # 30 s timeout and returns the raw response (no status check).
     return requests.post(f"{url}/sessions/{session_id}/v1/messages", json=payload, timeout=30.0)
 
 
 def _records(url: str, session_id: str) -> list[dict]:
+    # [FUNCTION DOC] HELPER: Fetches the session over HTTP (5 s timeout) and returns the list of
+    # records from its JSON body.
     return requests.get(f"{url}/sessions/{session_id}", timeout=5.0).json()["records"]
 
 
 def _payload(messages, **extra) -> dict:
+    # [FUNCTION DOC] HELPER: Builds an Anthropic messages request body with model "claude-test",
+    # max tokens 64, the given messages, and any extra top-level fields (which may override).
     return {"model": "claude-test", "max_tokens": 64, "messages": messages, **extra}
 
 
 def _parse_sse(body: str) -> list[tuple[str, dict]]:
+    # [FUNCTION DOC] HELPER: Parses a server-sent-events body: splits on blank lines, skips empty
+    # blocks, and for each block asserts it has exactly an event line (prefix "event: ") followed by
+    # a data line (prefix "data: "), returning a list of (event name, decoded JSON data) pairs.
     events = []
     for block in body.split("\n\n"):
         if not block.strip():
@@ -128,6 +166,13 @@ def _parse_sse(body: str) -> list[tuple[str, dict]]:
     ],
 )
 def test_sessions_module_imports_without_optional_sglang_anthropic_helpers(missing_module: str) -> None:
+    # [FUNCTION DOC] Parametrized over four SGLang anthropic modules (package, utils, serving,
+    # protocol). Runs a fresh interpreter subprocess that marks that module as unimportable, imports
+    # the adapter and sessions modules, and asserts: when utils (or the package) is missing the
+    # sessions module's utils reference is none; when serving (or the package) is missing the
+    # response converter and request converter references are none; when protocol (or the package)
+    # is missing the adapter reports itself unavailable. The test passes when the subprocess exits
+    # with code 0 (error output is the failure message).
     script = (
         "import sys\n"
         f"missing = {missing_module!r}\n"
@@ -147,7 +192,13 @@ def test_sessions_module_imports_without_optional_sglang_anthropic_helpers(missi
 
 
 class TestAnthropicRoute:
+    # [CLASS DOC] Tests of the Anthropic messages route, run against both session server versions
+    # through the parametrized environment fixture.
     def test_unavailable_sglang_adapter_returns_501_without_record(self, anthropic_env):
+        # [FUNCTION DOC] With the sessions module's anthropic utils reference patched to none, a
+        # messages request returns status 501 with an Anthropic error envelope (type api_error,
+        # message that the installed SGLang does not support the adapter), and the session has no
+        # records.
         session_id = _create_session(anthropic_env.url)
         with patch.object(sessions_module, "anthropic_utils", None):
             resp = _post_messages(anthropic_env.url, session_id, _payload([{"role": "user", "content": "hello"}]))
@@ -163,10 +214,19 @@ class TestAnthropicRoute:
         assert _records(anthropic_env.url, session_id) == []
 
     def test_health_reports_live_intermediate_system_capability(self, anthropic_env):
+        # [FUNCTION DOC] The server's health endpoint body has the intermediate-system-supported
+        # capability flag set to true.
         body = requests.get(f"{anthropic_env.url}/health", timeout=5.0).json()
         assert body["anthropic_intermediate_system_supported"] is True
 
     def test_non_stream_text_creates_canonical_openai_record(self, anthropic_env):
+        # [FUNCTION DOC] A non-streaming request with a system string and one user message returns
+        # 200 JSON: an assistant message whose model is the backend's "mock-model" (frozen behavior),
+        # content one text block "anthropic-echo", stop reason end_turn, and positive input and
+        # output token usage. The session snapshot has exactly one record whose response id equals
+        # the returned id (for v2 also the first tree node's response id), path is the OpenAI chat
+        # completions path, request messages are [system "sys", user "hello"], request input ids is a
+        # non-empty list, and the response object is a chat completion.
         session_id = _create_session(anthropic_env.url)
         resp = _post_messages(
             anthropic_env.url, session_id, _payload([{"role": "user", "content": "hello"}], system="sys")
@@ -197,6 +257,9 @@ class TestAnthropicRoute:
         assert record["response"]["object"] == "chat.completion"
 
     def test_assistant_thinking_history_becomes_canonical_reasoning_content(self, anthropic_env):
+        # [FUNCTION DOC] A request whose assistant history message has a thinking block ("ponder\n")
+        # and a text block ("hello") succeeds, and the stored request's assistant message has content
+        # "hello" and a reasoning content field "ponder\n".
         session_id = _create_session(anthropic_env.url)
         resp = _post_messages(
             anthropic_env.url,
@@ -234,6 +297,14 @@ class TestAnthropicRoute:
         ],
     )
     def test_assistant_thinking_strip_preserves_the_rest_of_the_message(self, remaining_block, expected_content):
+        # [FUNCTION DOC] No server needed. Parametrized: an assistant message with two thinking
+        # blocks ("first", "second") and either nothing else (expected content empty string) or a
+        # tool-use block (expected content unchecked, tool call preserved). The request is validated
+        # as an Anthropic request, the reasoning history is stripped, converted to an OpenAI chat
+        # request (merging inline system), dumped to JSON (excluding unset and none values, by
+        # alias), and the reasoning history is restored. The single assistant message must have
+        # reasoning content "first\nsecond", and either the expected empty content or the tool call
+        # named get_weather.
         content = [{"type": "thinking", "thinking": "first"}, {"type": "thinking", "thinking": "second"}]
         if remaining_block is not None:
             content.append(remaining_block)
@@ -252,9 +323,17 @@ class TestAnthropicRoute:
             assert assistant["tool_calls"][0]["function"]["name"] == "get_weather"
 
     def test_assistant_thinking_response_replays_as_the_same_canonical_history(self, anthropic_env, monkeypatch):
+        # [FUNCTION DOC] The backend's chat completion computation is wrapped so the reply carries
+        # reasoning content "ponder\n". The first request returns content whose first block is a
+        # thinking block with that text. The second request replays the first reply's content as the
+        # assistant history plus a new user message and succeeds. Two records exist; the stored
+        # response message of the first matches (under the strict matcher) the replayed assistant
+        # message of the second request, which has reasoning content "ponder\n".
         original = anthropic_env.backend._compute_chat_completions_response
 
         def with_reasoning(payload):
+            # [FUNCTION DOC] HELPER: Calls the original computation and sets the first choice's
+            # message reasoning content to "ponder\n"; returns the modified response.
             response = original(payload)
             response["choices"][0]["message"]["reasoning_content"] = "ponder\n"
             return response
@@ -290,6 +369,15 @@ class TestAnthropicRoute:
         assert replayed["reasoning_content"] == "ponder\n"
 
     def test_intermediate_system_stays_in_place(self, anthropic_env):
+        # [FUNCTION DOC] Turn 1 sends a user message with a leading system "initial policy". Turn 2
+        # replays the first reply and adds an intermediate system message "answer briefly" before a
+        # new user message, keeping the leading system. Asserts: the second record's request roles
+        # are system, user, assistant, system, user, with the two system messages being the leading
+        # and intermediate ones in order. The second request's input ids agree with the first
+        # request's input ids plus the first completion's token ids up to the length excluding the
+        # session's maximum trim tokens; the decoded remaining suffix (real tokenizer) contains the
+        # intermediate system text before the text "again". For v2 the tree nodes have parents none
+        # then 0.
         leading_system = "initial policy"
         intermediate_system = "answer briefly"
         session_id = _create_session(anthropic_env.url)
@@ -344,6 +432,13 @@ class TestAnthropicRoute:
             assert [node["parent"] for node in snapshot["metadata"]["tree"]["nodes"]] == [None, 0]
 
     def test_stream_returns_eager_fake_sse(self, anthropic_env):
+        # [FUNCTION DOC] A streaming request returns 200 with an event-stream content type whose
+        # events, in order, are message start, content block start, content block delta, content
+        # block stop, message delta and message stop (the whole reply is produced eagerly after the
+        # backend finishes). The start event's model is the request model "claude-test", with output
+        # tokens 0 and positive input tokens; the delta is a text delta "anthropic-echo"; the message
+        # delta has stop reason end_turn and positive output tokens. The single stored record's
+        # response id equals the start message id (for v2 also the first tree node's response id).
         session_id = _create_session(anthropic_env.url)
         resp = _post_messages(
             anthropic_env.url, session_id, _payload([{"role": "user", "content": "hello"}], stream=True)
@@ -375,6 +470,10 @@ class TestAnthropicRoute:
             assert message_start["id"] == snapshot["metadata"]["tree"]["nodes"][0]["response_id"]
 
     def test_parity_with_equivalent_openai_request(self, anthropic_env):
+        # [FUNCTION DOC] Sends an Anthropic request (system "sys", user "hello") in one session and
+        # the equivalent OpenAI chat request in another. Both succeed, and the first record of each
+        # has equal request messages, equal request input ids, and equal first-choice response
+        # messages.
         anthropic_session = _create_session(anthropic_env.url)
         openai_session = _create_session(anthropic_env.url)
 
@@ -403,6 +502,10 @@ class TestAnthropicRoute:
         )
 
     def test_parity_with_equivalent_openai_request_with_tools(self, anthropic_env):
+        # [FUNCTION DOC] Like the plain parity test but with one weather tool. The OpenAI request
+        # spells the tool with the description field before the name and no extra defaults (auto tool
+        # choice), which the chat template needs to render byte-identically. Asserts equal request
+        # messages, tools and input ids between the two sessions' first records.
         """Tool-bearing parity pins the canonical tools spelling: the chat
         template renders tools in dict key order, so byte-identical TITO
         input_ids require the OpenAI client to write the codec's field order
@@ -444,6 +547,10 @@ class TestAnthropicRoute:
         assert anthropic_record["request"]["input_ids"] == openai_record["request"]["input_ids"]
 
     def test_unexpected_core_exception_wears_anthropic_envelope(self, anthropic_env):
+        # [FUNCTION DOC] With the completion extraction function patched (in both version 1 and
+        # version 2 core modules, by attribute on pre-imported modules) to raise a runtime error, a
+        # messages request returns 500 with a JSON content type and the generic envelope (type
+        # error, api_error, message "Internal server error"), and no record is stored.
         """Unexpected (non-SessionError) processing failures keep the frozen
         wire behavior: a scrubbed generic Anthropic api_error envelope, not
         the framework's text/plain 500 page."""
@@ -462,6 +569,9 @@ class TestAnthropicRoute:
         assert _records(anthropic_env.url, session_id) == []
 
     def test_nan_sampling_param_maps_to_invalid_request_error(self, anthropic_env):
+        # [FUNCTION DOC] A raw JSON body with the non-standard NaN literal as temperature is posted
+        # with a JSON content type. The response is status 400 with error type
+        # invalid_request_error, and no record is stored.
         """json.loads admits the non-standard NaN literal and the wire models
         accept it, but ``_render_json`` (allow_nan=False) rejects it — that
         failure must stay a 400 request error, never a plain-text 500."""
@@ -481,6 +591,13 @@ class TestAnthropicRoute:
         assert _records(anthropic_env.url, session_id) == []
 
     def test_error_envelopes_and_no_record_on_validation_failure(self, anthropic_env):
+        # [FUNCTION DOC] Posting to a nonexistent session returns 404 with a not_found_error envelope
+        # whose message is "session not found: session_id=nonexistent". For a real session, two bad
+        # bodies (malformed JSON with an exact message about invalid JSON; a body missing max tokens
+        # whose message mentions max_tokens) each return 400 invalid_request_error. During those
+        # calls both cores' chat completion methods are patched with auto-specced mocks: they are
+        # never awaited, the backend request count is unchanged, and the session's records are
+        # unchanged.
         payload = _payload([{"role": "user", "content": "hello"}])
         resp = _post_messages(anthropic_env.url, "nonexistent", payload)
         assert resp.status_code == 404
@@ -526,6 +643,15 @@ class TestAnthropicRoute:
         assert _records(anthropic_env.url, session_id) == records
 
     def test_fixed_feature_policy_rejects_before_core(self, anthropic_env):
+        # [FUNCTION DOC] A table of unsupported-feature payloads, each with its exact error message:
+        # thinking enabled/disabled setting; output config; betas; server tools such as web search;
+        # thinking blocks in user, system, system-field and tool-result positions (allowed only in
+        # assistant history); redacted thinking; image blocks; tool reference and search result
+        # blocks; tool results flagged as errors; tool-reference blocks inside tool results; image
+        # blocks in the system field. Each is posted to a real session with both cores' chat
+        # completion methods mocked: every response is 400 with an invalid_request_error envelope of
+        # exactly that message, the mocks are never awaited, the backend saw no new requests, and the
+        # session records are unchanged.
         messages = [{"role": "user", "content": "q"}]
         cases = [
             (
@@ -658,6 +784,10 @@ class TestAnthropicRoute:
         assert _records(anthropic_env.url, session_id) == records
 
     def test_converter_exception_is_400_before_core(self, anthropic_env):
+        # [FUNCTION DOC] With the request converter in the sessions module patched to raise a runtime
+        # error "conversion boom" and the cores' chat completion methods mocked, a valid request
+        # returns 400 with an invalid_request_error envelope carrying that message; the mocks are
+        # never awaited, the backend saw no new requests and the records are unchanged.
         session_id = _create_session(anthropic_env.url)
         backend_requests = len(anthropic_env.backend.request_log)
         records = _records(anthropic_env.url, session_id)
@@ -682,6 +812,12 @@ class TestAnthropicRoute:
         assert _records(anthropic_env.url, session_id) == records
 
     def test_feature_priority_is_stable(self):
+        # [FUNCTION DOC] No server needed. Builds five payloads that each carry the offending
+        # features from one level downward in the priority order: thinking, output config, betas,
+        # server tool, system image block (all over a user message containing a tool reference). For
+        # each, the session sessions module's private feature validator raises a value error whose
+        # text is the message for the highest-priority feature present: thinking, then output config,
+        # betas, server tool, finally image blocks.
         messages = [
             {"role": "user", "content": [{"type": "tool_reference", "tool_name": "f"}]},
         ]
@@ -736,6 +872,15 @@ class TestAnthropicRoute:
             assert str(exc_info.value) == message
 
     def test_policy_traversal_boundaries_match_converter(self):
+        # [FUNCTION DOC] No server needed. Checks that the feature validator only inspects the
+        # content positions the SGLang converter actually uses. Case 1: a tool-result block placed in
+        # the system field holding an image block passes validation, and the converted request has
+        # only the user message. Case 2: an image block nested two levels deep inside tool results
+        # passes validation and is dropped by the converter (the tool message has content "depth1" and
+        # tool call id "outer", and no image URL appears in the dump). Case 3: image/thinking/search
+        # result type names appearing inside arbitrary JSON (a tool-use input, request metadata, a
+        # tool input schema) pass validation and are preserved verbatim: the converted tool call
+        # arguments decode to the original object and the tool parameters equal the original schema.
         system_nested = _payload(
             [{"role": "user", "content": "q"}],
             betas=[],
@@ -816,9 +961,14 @@ class TestAnthropicRoute:
         }
 
     def test_backend_failure_maps_to_anthropic_error_without_record(self, anthropic_env):
+        # [FUNCTION DOC] With the mock backend's generate-like request handler replaced so every call
+        # returns a 500 JSON response, a messages request returns 500 with an api_error envelope with
+        # message "Internal server error" (backend detail scrubbed), and no record is stored.
         session_id = _create_session(anthropic_env.url)
 
         async def reject(self, request, compute_fn):
+            # [FUNCTION DOC] HELPER: Replacement handler; ignores its inputs and returns a JSON
+            # response with an error entry "mock backend failure" and status 500.
             return JSONResponse(content={"error": "mock backend failure"}, status_code=500)
 
         with patch.object(MockSGLangServer, "_handle_generate_like_request", new=reject):
@@ -830,6 +980,9 @@ class TestAnthropicRoute:
         assert _records(anthropic_env.url, session_id) == []
 
     def test_post_commit_conversion_failure_returns_500_and_keeps_record(self, anthropic_env):
+        # [FUNCTION DOC] With the response converter patched to raise after the core committed, a
+        # request returns 500 with the generic api_error envelope, yet the record stays stored
+        # (accepted first-version boundary): one record exists.
         session_id = _create_session(anthropic_env.url)
         with patch.object(sessions_module, "convert_response", side_effect=RuntimeError("boom")):
             resp = _post_messages(anthropic_env.url, session_id, _payload([{"role": "user", "content": "hello"}]))
@@ -839,6 +992,9 @@ class TestAnthropicRoute:
         assert len(_records(anthropic_env.url, session_id)) == 1
 
     def test_sse_build_failure_returns_json_500_not_partial_stream(self, anthropic_env):
+        # [FUNCTION DOC] With the fake streaming event builder patched to raise, a streaming request
+        # returns a JSON (not event-stream) 500 whose error type is api_error; the record stays
+        # stored (same post-commit boundary as the non-streaming case).
         session_id = _create_session(anthropic_env.url)
         with patch.object(
             sessions_module.anthropic_utils, "to_anthropic_fake_sse_events", side_effect=RuntimeError("boom")
@@ -854,6 +1010,9 @@ class TestAnthropicRoute:
 
 
 def _tool_turn1(url: str, session_id: str) -> dict:
+    # [FUNCTION DOC] HELPER: Sends the tool-eliciting first turn (user asks to use the weather tool,
+    # weather tool declared), asserts status 200, stop reason tool_use, and a tool-use block named
+    # get_weather with input city Paris and unit C. Returns that block.
     """Run the tool-eliciting first turn; returns the tool_use block."""
     turn1 = _post_messages(
         url, session_id, _payload([{"role": "user", "content": "please use the weather tool"}], tools=_TOOLS)
@@ -867,6 +1026,10 @@ def _tool_turn1(url: str, session_id: str) -> dict:
 
 
 def _tool_turn2_payload(tool_use: dict) -> dict:
+    # [FUNCTION DOC] HELPER: Builds the second-turn request: the original user message, an assistant
+    # message holding the tool-use block with its input keys in reversed order (so the re-serialized
+    # arguments differ in spelling), and a user message with a tool result "sunny" for the tool-use
+    # id; the weather tool is declared. Returns the payload.
     """Replay with the tool_use input keys REVERSED: json.dumps preserves the
     object's key order, so the re-serialized arguments spelling differs from
     the stored one — accepted only by ``loose_tool_call``."""
@@ -882,7 +1045,13 @@ def _tool_turn2_payload(tool_use: dict) -> dict:
 
 
 class TestAnthropicToolFlow:
+    # [CLASS DOC] End-to-end tool-calling flow tests across two turns.
     def test_multi_turn_tool_flow_reuses_stored_prefix(self, anthropic_env_loose):
+        # [FUNCTION DOC] Under the loose tool-call matcher, turn 1 elicits a tool call and turn 2
+        # replays it with reversed input key order and the tool result. Turn 2 returns 200 with
+        # content one text block "final-answer". Two records exist; the second request's input ids
+        # start with the first request's input ids (stored prefix reused); the replayed assistant
+        # message has a tool call named get_weather whose arguments decode to city Paris and unit C.
         url = anthropic_env_loose.url
         session_id = _create_session(url)
         tool_use = _tool_turn1(url, session_id)
@@ -905,6 +1074,12 @@ class TestAnthropicToolFlow:
         }
 
     def test_strict_matcher_rejects_respelled_tool_arguments(self, anthropic_env):
+        # [FUNCTION DOC] Skipped for version 2 (it branches into a new lineage instead of rolling
+        # back). For version 1 under the default strict matcher: turn 1 elicits a tool call; turn 2
+        # replays it with reversed input key order and succeeds with 200, but the re-serialized
+        # arguments differ from the stored message, so the session rolls back to empty, discarding
+        # turn 1's record. Exactly one record remains with request roles user, assistant, tool, and
+        # its input ids do not start with turn 1's input ids (re-rendered from scratch).
         """Design matcher gate, end to end: under the default ``strict``
         matcher the re-serialized tool arguments diverge from the stored
         assistant message, so v1 rolls back to the empty checkpoint —
@@ -928,7 +1103,15 @@ class TestAnthropicToolFlow:
 
 
 class TestAnthropicCloseRace:
+    # [CLASS DOC] Tests of closing a session while a request is being served.
     def test_delete_during_inflight_chat_skips_update_gracefully(self):
+        # [FUNCTION DOC] Starts a dedicated server with a 0.35 s backend latency. In a thread pool a
+        # messages request is submitted; the test polls (up to 5 s, every 10 ms) until the backend has
+        # logged the request (failing with an assertion error otherwise), then deletes the session.
+        # Asserts: delete returns 204; the in-flight request still returns 200 with a message-typed
+        # body whose content is one text block "anthropic-echo" (the commit is skipped because the
+        # session was closing, but the client gets a well-formed reply); a later request to the same
+        # session returns 404 with a not_found_error.
         """Split-lock close race through the Anthropic route: DELETE lands
         while the chat is mid-proxy; Phase 3 sees closing=True and skips the
         commit, but the client still gets a well-formed Anthropic response —
@@ -963,11 +1146,17 @@ class TestAnthropicCloseRace:
 
 
 class TestMatcherGate:
+    # [CLASS DOC] Unit tests (no server) of the strict and loose message matchers applied to tool
+    # call arguments re-serialized from an object by the Anthropic-to-OpenAI conversion.
     """Design matcher gate: object → string re-serialization may change tool
     argument spelling; ``strict`` must reject it, ``loose_tool_call`` must
     accept it, so tool launch profiles default to ``loose_tool_call``."""
 
     def _replayed_assistant(self, arguments_object: dict) -> dict:
+        # [FUNCTION DOC] HELPER: Builds an Anthropic request with a user message and an assistant
+        # message holding one tool-use block (id call1, name f, the given input object), converts it
+        # to an OpenAI chat request (merging inline system) and returns the last message of the dump
+        # (excluding none values, by alias), i.e. the replayed assistant message.
         request = AnthropicMessagesRequest.model_validate(
             _payload(
                 [
@@ -983,6 +1172,10 @@ class TestMatcherGate:
         return openai_request.model_dump(mode="json", exclude_none=True, by_alias=True)["messages"][-1]
 
     def test_strict_rejects_and_loose_accepts_respelled_arguments(self):
+        # [FUNCTION DOC] A stored assistant tool call with compact arguments '{"a":1}' is compared
+        # with the replayed message whose arguments are the standard-library spelling '{"a": 1}':
+        # the strict matcher returns false and the loose tool-call matcher (resolved by name) returns
+        # true.
         stored = {
             "role": "assistant",
             "content": "",
@@ -997,6 +1190,8 @@ class TestMatcherGate:
         assert loose(stored, replayed) is True
 
     def test_strict_accepts_identical_spelling(self):
+        # [FUNCTION DOC] When the stored arguments already use the standard-library spelling '{"a":
+        # 1}', the strict matcher accepts the replayed message (returns true).
         stored = {
             "role": "assistant",
             "content": "",
