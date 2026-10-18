@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Tests of the rollout debug data module. Covers saving and loading debug rollout dumps (path
+# template with a rollout id placeholder, policy-keyed file names, trajectory and dashboard sidecar
+# files, metadata, evaluation flattening, parent directory creation), load-time subsampling, and the
+# CI rollout-data injection utility (should-inject predicate, load, and the match check between
+# generated and injected samples). Uses the shared conftest helpers for args and samples and temporary
+# directories for all files.
 from __future__ import annotations
 
 from pathlib import Path
@@ -17,8 +24,13 @@ from miles.ray.rollout.debug_data import (
 
 
 class TestRoundTrip:
+    # [CLASS DOC] Checks the save and load behavior of debug rollout dumps: file naming, placeholder
+    # validation, metadata handling, evaluation flattening and no-op behavior when unset.
     @pytest.mark.parametrize("field", ["{rollout_id:0>4}", "{rollout_id!s:0>4}"])
     def test_formatted_rollout_ids_are_saved(self, tmp_path: Path, field: str) -> None:
+        # [FUNCTION DOC] Parametrized over two placeholder forms (zero-pad to width four, and the same
+        # with a string conversion). Saves one sample for rollout 7 with the placeholder embedded in
+        # the path template and asserts a file named with the zero-padded id 0007 exists.
         """Valid format specifications and conversions keep working in debug dump paths."""
         args = make_args(save_debug_rollout_data=str(tmp_path / f"r_{field}.pt"))
 
@@ -27,6 +39,9 @@ class TestRoundTrip:
         assert (tmp_path / "r_0007.pt").exists()
 
     def test_an_escaped_rollout_id_is_not_a_substitution(self, tmp_path: Path) -> None:
+        # [FUNCTION DOC] A template whose rollout id placeholder is written with doubled braces is a
+        # literal, not a substitution; saving must raise an assertion error mentioning the missing
+        # placeholder.
         """Escaped braces cannot provide unique rollout filenames."""
         args = make_args(save_debug_rollout_data=str(tmp_path / "r_{{rollout_id}}.pt"))
 
@@ -34,6 +49,9 @@ class TestRoundTrip:
             save_debug_rollout_data(args, [make_sample()], rollout_id=7, evaluation=False)
 
     def test_train_path_round_trip(self, tmp_path: Path):
+        # [FUNCTION DOC] Saves two groups of three samples as rollout 7 (not evaluation) and asserts the
+        # file for rollout 7 exists. Loading it returns the same number of samples and empty metadata,
+        # and each loaded sample matches the original in index and response length, pairwise.
         path_template = str(tmp_path / "rollout_{rollout_id}.pt")
         args_save = make_args(save_debug_rollout_data=path_template)
         args_load = make_args(load_debug_rollout_data=path_template)
@@ -50,6 +68,8 @@ class TestRoundTrip:
             assert got.response_length == orig.response_length
 
     def test_a_policy_keyed_dump_does_not_collide_with_another_policy(self, tmp_path: Path):
+        # [FUNCTION DOC] Saves rollout 7 twice with trainer model ids solver and verifier; asserts two
+        # separate files exist with the policy key inserted before the rollout id in the file name.
         """Multi-policy runs count rollouts per policy, so unkeyed dumps would overwrite each other."""
         args = make_args(save_debug_rollout_data=str(tmp_path / "rollout_{rollout_id}.pt"))
 
@@ -60,6 +80,10 @@ class TestRoundTrip:
         assert (tmp_path / "rollout_verifier_7.pt").exists()
 
     def test_policy_key_is_applied_to_every_debug_artifact(self, tmp_path: Path):
+        # [FUNCTION DOC] Configures both a rollout data template and a trajectory template in separate
+        # subdirectories and saves rollout 7 for two policies, each sample carrying chat messages in
+        # its metadata. Asserts the policy-keyed trajectory files and the policy-keyed dashboard column
+        # files (in a dashboard columns directory at the temporary root) exist for both policies.
         """Policy keys keep trajectory and dashboard sidecars distinct for the same rollout."""
         args = make_args(
             save_debug_rollout_data=str(tmp_path / "rollout_data" / "rollout_{rollout_id}.pt"),
@@ -81,6 +105,8 @@ class TestRoundTrip:
         assert (tmp_path / "dashboard_columns" / "rollout_verifier_7.parquet").exists()
 
     def test_metadata_round_trip(self, tmp_path: Path):
+        # [FUNCTION DOC] Saves rollout 3 with a metadata mapping (dynamic global batch size 24) and
+        # asserts load returns an equal mapping.
         """Metadata passed to save comes back verbatim from load."""
         path_template = str(tmp_path / "rollout_{rollout_id}.pt")
         args_save = make_args(save_debug_rollout_data=path_template)
@@ -95,6 +121,9 @@ class TestRoundTrip:
         assert metadata == original_metadata
 
     def test_load_file_without_metadata_key_returns_empty_metadata(self, tmp_path: Path):
+        # [FUNCTION DOC] Writes a legacy dump directly (a mapping with only rollout id and a list of
+        # one sample as a dictionary, no metadata key) and asserts load returns that one sample and an
+        # empty metadata mapping.
         """Files recorded before metadata support load with metadata defaulting to {}."""
         path = tmp_path / "rollout_5.pt"
         torch.save(dict(rollout_id=5, samples=[make_sample().to_dict()]), path)
@@ -105,6 +134,10 @@ class TestRoundTrip:
         assert metadata == {}
 
     def test_evaluation_path_round_trip_flattens_dataset_dict(self, tmp_path: Path):
+        # [FUNCTION DOC] Saves an evaluation payload (a mapping from dataset name to a mapping holding
+        # a samples list; three samples for one dataset, two for another) for rollout 4. Asserts the
+        # file name carries an eval prefix on the id, then loads by the prefixed id and asserts five
+        # samples come back, indices match the union, and order follows dataset insertion order.
         """eval-mode save flattens dict-of-{name: {samples: [...]}} into one list.
 
         The loader doesn't know about eval mode — it just reads the flat list.
@@ -130,6 +163,8 @@ class TestRoundTrip:
         assert [s.response for s in loaded] == ["a0", "a1", "a2", "b0", "b1"]
 
     def test_save_creates_parent_dirs(self, tmp_path: Path):
+        # [FUNCTION DOC] Saves into a template under two not-yet-existing nested directories and
+        # asserts the directories and the rollout 0 file were created.
         nested = tmp_path / "nested" / "deeper"
         path_template = str(nested / "r_{rollout_id}.pt")
         args = make_args(save_debug_rollout_data=path_template)
@@ -137,6 +172,8 @@ class TestRoundTrip:
         assert nested.exists() and (nested / "r_0.pt").exists()
 
     def test_save_does_nothing_when_template_is_none(self, monkeypatch):
+        # [FUNCTION DOC] Replaces the torch save function with a recorder, calls save with the save
+        # template unset, and asserts the recorder was never called (no I/O at all).
         """When ``save_debug_rollout_data`` is unset, the function must short-circuit
         before touching torch.save (so no I/O happens regardless of cwd / data shape)."""
         args = make_args(save_debug_rollout_data=None)
@@ -146,6 +183,8 @@ class TestRoundTrip:
         assert called == []
 
     def test_a_rollout_dump_template_without_the_rollout_id_is_refused(self, tmp_path: Path):
+        # [FUNCTION DOC] A literal rollout dump path with no rollout id placeholder must make save
+        # raise an assertion error saying the template must contain the placeholder.
         """A literal dump path would let every rollout overwrite the preceding rollout."""
         args = make_args(save_debug_rollout_data=str(tmp_path / "rollout.pt"))
 
@@ -153,6 +192,9 @@ class TestRoundTrip:
             save_debug_rollout_data(args, [make_sample()], rollout_id=0, evaluation=False)
 
     def test_a_trajectory_template_without_the_rollout_id_is_refused(self, tmp_path: Path):
+        # [FUNCTION DOC] A literal trajectory path with no rollout id placeholder must make the
+        # trajectory save function raise the same placeholder assertion error, for a sample carrying
+        # chat messages in its metadata.
         """A literal trajectory path would let every rollout overwrite the preceding trajectory."""
         args = make_args(save_debug_trajectory_data=str(tmp_path / "trajectory.jsonl"))
         sample = make_sample(metadata={"messages": [{"role": "user", "content": "question"}]})
@@ -165,9 +207,16 @@ class TestRoundTrip:
 
 
 class TestSubsample:
+    # [CLASS DOC] Checks the load-time subsample ratio that keeps only a head and a tail slice of the
+    # saved samples.
     @pytest.fixture
     def saved_path_factory(self, tmp_path: Path):
+        # [FUNCTION DOC] HELPER: Fixture. Returns a function that saves a given number of samples
+        # (index i, response r followed by i) as rollout 0 under a template in the temporary
+        # directory, and returns that template string.
         def _save(n_samples: int) -> str:
+            # [FUNCTION DOC] HELPER: Performs the save described by the fixture and returns the path
+            # template.
             path_template = str(tmp_path / "r_{rollout_id}.pt")
             args = make_args(save_debug_rollout_data=path_template)
             samples = [make_sample(index=i, response="r" + str(i)) for i in range(n_samples)]
@@ -177,12 +226,17 @@ class TestSubsample:
         return _save
 
     def test_ratio_one_returns_full_data(self, saved_path_factory):
+        # [FUNCTION DOC] Saves ten samples and loads with subsample ratio 1.0; asserts all ten return.
         template = saved_path_factory(10)
         args = make_args(load_debug_rollout_data=template, load_debug_rollout_data_subsample=1.0)
         loaded, _metadata = load_debug_rollout_data(args, rollout_id=0)
         assert len(loaded) == 10
 
     def test_ratio_half_takes_first_and_last_chunks(self, saved_path_factory):
+        # [FUNCTION DOC] Saves ten samples and loads with ratio 0.5. The rough size is five; the head
+        # keeps floor of half of it (two) and the tail keeps three because the negated rough size is
+        # floor-divided (rounding toward negative infinity). Asserts five samples with indices 0, 1, 7,
+        # 8, 9, i.e. the head/tail split is asymmetric for an odd rough size.
         """``data[: rough // 2] + data[-rough // 2 :]`` with rough = int(N * ratio).
 
         For 10 rows, ratio=0.5: ``rough = 5``, ``rough // 2 = 2``, ``-5 // 2 = -3``
@@ -199,6 +253,9 @@ class TestSubsample:
 
 
 def _save_recording(tmp_path: Path, rollout_id: int, *, metadata: dict | None = None) -> str:
+    # [FUNCTION DOC] HELPER: Saves one rollout dump holding a single sample whose index equals the
+    # rollout id (optionally with metadata) under a rollout id template in the temporary directory, as
+    # a debug-save run would, and returns that template string.
     """Record one rollout file in --save-debug-rollout-data format; return the template."""
     template = str(tmp_path / "rollout_{rollout_id}.pt")
     args = make_args(save_debug_rollout_data=template)
@@ -209,13 +266,17 @@ def _save_recording(tmp_path: Path, rollout_id: int, *, metadata: dict | None = 
 
 
 class TestShouldInjectRolloutData:
+    # [CLASS DOC] Checks the predicate deciding whether a rollout id is replaced by injected data.
     def test_false_when_injection_not_configured(self):
+        # [FUNCTION DOC] With default args (no injection path) the predicate returns false for rollout 0.
         """Without --ci-inject-rollout-data-path, no rollout is injected."""
         args = make_args()
         assert RolloutDataInjectionUtil.should_inject(args, rollout_id=0) is False
 
     @pytest.mark.parametrize(("rollout_id", "expected"), [(2, False), (3, True), (4, True)])
     def test_injects_only_at_or_after_start_rollout_id(self, rollout_id: int, expected: bool):
+        # [FUNCTION DOC] Parametrized over rollout ids 2, 3 and 4 with an injection path set and a start
+        # rollout id of 3; expects false for 2 and true for 3 and 4.
         """Rollouts before the start id keep their generated data; later ones are injected."""
         args = make_args(
             ci_inject_rollout_data_path="/recorded/{rollout_id}.pt",
@@ -225,7 +286,11 @@ class TestShouldInjectRolloutData:
 
 
 class TestLoadInjectedRolloutData:
+    # [CLASS DOC] Checks loading of injected rollout data from recorded debug dumps.
     def test_round_trip_returns_samples_and_metadata(self, tmp_path: Path):
+        # [FUNCTION DOC] Records rollout 3 with metadata, configures injection from that template with
+        # start id 3, loads rollout 3, and asserts the sample indices are [3] and the metadata equals
+        # what was recorded.
         """Injection loads samples and metadata from a --save-debug-rollout-data recording."""
         template = _save_recording(tmp_path, 3, metadata={"dynamic_global_batch_size": 16})
         args = make_args(ci_inject_rollout_data_path=template, ci_inject_rollout_data_start_rollout_id=3)
@@ -236,6 +301,8 @@ class TestLoadInjectedRolloutData:
         assert metadata == {"dynamic_global_batch_size": 16}
 
     def test_missing_recording_fails_loudly(self, tmp_path: Path):
+        # [FUNCTION DOC] Loading rollout 7 from a template with no recorded file must raise an
+        # assertion error whose message contains the resolved file name for rollout 7.
         """A missing recorded file raises with the resolved path instead of training on wrong data."""
         template = str(tmp_path / "rollout_{rollout_id}.pt")
         args = make_args(ci_inject_rollout_data_path=template, ci_inject_rollout_data_start_rollout_id=3)
@@ -245,13 +312,21 @@ class TestLoadInjectedRolloutData:
 
 
 def _make_paired_sample(prompt_tokens: list[int], response_tokens: list[int]):
+    # [FUNCTION DOC] HELPER: Builds a sample whose tokens are the prompt tokens followed by the
+    # response tokens and whose response length is the number of response tokens.
     return make_sample(tokens=prompt_tokens + response_tokens, response_length=len(response_tokens))
 
 
 class TestAssertInjectedRolloutDataMatchesGenerated:
+    # [CLASS DOC] Checks the assertion comparing freshly generated samples with injected recorded
+    # samples. Pairing is by position; prompt tokens and sample count must match exactly, while response
+    # tokens only need to match at or above a ratio threshold (default 0.9, configurable through args).
+    # The class attribute holds a shared three-token prompt.
     _PROMPT: list[int] = [101, 102, 103]
 
     def test_identical_data_passes(self):
+        # [FUNCTION DOC] Four generated and four injected samples with identical prompts and twenty
+        # identical response tokens each; the check must not raise.
         """Bitwise-identical generated and injected data trivially passes the match check."""
         samples = [_make_paired_sample(self._PROMPT, list(range(20))) for _ in range(4)]
         paired = [_make_paired_sample(self._PROMPT, list(range(20))) for _ in range(4)]
@@ -261,6 +336,9 @@ class TestAssertInjectedRolloutDataMatchesGenerated:
         )
 
     def test_few_flipped_tokens_pass(self):
+        # [FUNCTION DOC] Four sample pairs where the injected response differs from the generated one
+        # in only the first of twenty tokens (95 percent match, above the default threshold); the check
+        # must not raise.
         """ulp-drift-level divergence (one flipped token per response) stays above the 0.9 threshold."""
         generated = [_make_paired_sample(self._PROMPT, list(range(20))) for _ in range(4)]
         injected = [_make_paired_sample(self._PROMPT, [999] + list(range(1, 20))) for _ in range(4)]
@@ -270,6 +348,8 @@ class TestAssertInjectedRolloutDataMatchesGenerated:
         )
 
     def test_threshold_comes_from_args(self):
+        # [FUNCTION DOC] One sample pair matching in only the first ten of twenty response tokens (50
+        # percent). With the minimum match ratio argument lowered to 0.4 the check must not raise.
         """A lower --ci-inject-rollout-data-min-match-ratio accepts what the default rejects."""
         generated = [_make_paired_sample(self._PROMPT, list(range(20)))]
         injected = [_make_paired_sample(self._PROMPT, list(range(10)) + [999] * 10)]
@@ -282,6 +362,8 @@ class TestAssertInjectedRolloutDataMatchesGenerated:
         )
 
     def test_mostly_diverged_responses_fail(self):
+        # [FUNCTION DOC] Four sample pairs matching at only 50 percent with default args; expects an
+        # assertion error mentioning that generated responses must match the injected recording.
         """Responses matching at only 50% (wrong engine weights) fail the threshold loudly."""
         generated = [_make_paired_sample(self._PROMPT, list(range(20))) for _ in range(4)]
         injected = [_make_paired_sample(self._PROMPT, list(range(10)) + [999] * 10) for _ in range(4)]
@@ -292,6 +374,8 @@ class TestAssertInjectedRolloutDataMatchesGenerated:
             )
 
     def test_length_divergence_counts_as_mismatch(self):
+        # [FUNCTION DOC] Generated response of twenty tokens versus an injected one of ten tokens that
+        # equals the shared prefix; the match ratio is 0.5 so the same assertion error is expected.
         """A response twice as long as the recording scores 0.5 even if the shared prefix matches."""
         generated = [_make_paired_sample(self._PROMPT, list(range(20)))]
         injected = [_make_paired_sample(self._PROMPT, list(range(10)))]
@@ -302,6 +386,8 @@ class TestAssertInjectedRolloutDataMatchesGenerated:
             )
 
     def test_prompt_mismatch_fails_as_wiring_error(self):
+        # [FUNCTION DOC] Identical responses but different prompt tokens; expects an assertion error
+        # about a prompt tokens mismatch, since that means broken pairing rather than numeric drift.
         """Differing prompt tokens mean broken pairing, not drift — hard fail regardless of responses."""
         generated = [_make_paired_sample([101, 102, 103], list(range(20)))]
         injected = [_make_paired_sample([201, 202, 203], list(range(20)))]
@@ -312,6 +398,8 @@ class TestAssertInjectedRolloutDataMatchesGenerated:
             )
 
     def test_sample_count_mismatch_fails(self):
+        # [FUNCTION DOC] Three generated samples versus two injected ones; expects an assertion error
+        # about a sample count mismatch, raised before any token comparison.
         """Different sample counts cannot be paired and fail before any token comparison."""
         generated = [_make_paired_sample(self._PROMPT, list(range(20))) for _ in range(3)]
         injected = [_make_paired_sample(self._PROMPT, list(range(20))) for _ in range(2)]
