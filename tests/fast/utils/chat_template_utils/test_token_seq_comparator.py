@@ -1,3 +1,13 @@
+# [MODULE DOC] Tests for TokenSeqComparator (miles.utils.chat_template_utils.token_seq_comparator),
+# the checker used to verify TITO merges: it splits two token id sequences into alternating
+# special-token segments and content segments, then reports mismatches typed as special token count,
+# special token type, assistant text (benign) or non-assistant text (suspicious). Tests run against
+# real Hugging Face tokenizers for Qwen3-4B and GLM-4.7-Flash (downloaded), built once per model in a
+# module-level cache together with a comparator configured with the model's assistant start string.
+# Covered: segmentation, identical and empty inputs, structural mismatches, content mismatch
+# classification per model template, trimming of trailing stop tokens (constructor default unioned
+# with the per-call set), and a GLM boundary-token swap regression. See the docstring below for
+# the intended structure.
 """Tests for TokenSeqComparator: segmentation, comparison, and mismatch classification.
 
 ## Background
@@ -82,6 +92,10 @@ from miles.utils.processing_utils import load_tokenizer
 
 @dataclass(frozen=True)
 class ModelConfig:
+    # [CLASS DOC] HELPER: Immutable per-model test configuration: Hugging Face model id, the
+    # assistant start string used to classify assistant content, and a tuple of known special token
+    # strings used to build realistic sequences (index 0 and 1 are used as ordinary delimiters, the
+    # last one as the end-of-text token).
     model_id: str
     assistant_start_str: str
     known_special_tokens: tuple[str, ...]
@@ -110,9 +124,12 @@ class TokenizerEnv:
     comparator: TokenSeqComparator
 
     def encode(self, text: str) -> list[int]:
+        # [FUNCTION DOC] HELPER: Encode text to token ids without adding special tokens.
         return self.tokenizer.encode(text, add_special_tokens=False)
 
     def token_id(self, token_text: str) -> int:
+        # [FUNCTION DOC] HELPER: Return the vocabulary id of the given token string (the unknown
+        # id if absent).
         return self.tokenizer.convert_tokens_to_ids(token_text)
 
 
@@ -120,6 +137,10 @@ _ENV_CACHE: dict[str, TokenizerEnv] = {}
 
 
 def _build_env(cfg: ModelConfig) -> TokenizerEnv:
+    # [FUNCTION DOC] HELPER: Return the cached environment for the model id, creating it on first
+    # use: loads the tokenizer (remote code trusted, may download), builds a comparator with the
+    # config's assistant start string and no trim ids, and stores the bundle in the cache keyed by
+    # model id.
     if cfg.model_id in _ENV_CACHE:
         return _ENV_CACHE[cfg.model_id]
     tok = load_tokenizer(cfg.model_id, trust_remote_code=True)
@@ -131,17 +152,21 @@ def _build_env(cfg: ModelConfig) -> TokenizerEnv:
 
 @pytest.fixture(params=list(_CONFIGS.keys()))
 def env(request) -> TokenizerEnv:
+    # [FUNCTION DOC] HELPER: Fixture parametrized over both model configs; returns the cached
+    # environment for the current model.
     """Parametrized: runs the test once per model (Qwen3, GLM47)."""
     return _build_env(_CONFIGS[request.param])
 
 
 @pytest.fixture
 def qwen3_env() -> TokenizerEnv:
+    # [FUNCTION DOC] HELPER: Fixture returning the cached Qwen3-4B environment.
     return _build_env(_CONFIGS["qwen3_4b"])
 
 
 @pytest.fixture
 def glm47_env() -> TokenizerEnv:
+    # [FUNCTION DOC] HELPER: Fixture returning the cached GLM-4.7-Flash environment.
     return _build_env(_CONFIGS["glm47_flash"])
 
 
@@ -159,10 +184,13 @@ def glm47_env() -> TokenizerEnv:
 
 
 class TestSegmentation:
+    # [CLASS DOC] Tests of splitting a flat id list into special and content segments.
     def test_empty(self, env: TokenizerEnv):
+        # [FUNCTION DOC] An empty id list yields an empty segment list.
         assert env.comparator.segment_by_special_tokens([]) == []
 
     def test_plain_text_single_segment(self, env: TokenizerEnv):
+        # [FUNCTION DOC] Plain text ids give exactly one non-special segment holding all ids.
         """No special tokens → one content segment containing all IDs."""
         ids = env.encode("The quick brown fox.")
         segs = env.comparator.segment_by_special_tokens(ids)
@@ -171,6 +199,8 @@ class TestSegmentation:
         assert segs[0].token_ids == ids
 
     def test_special_tokens_create_boundaries(self, env: TokenizerEnv):
+        # [FUNCTION DOC] A first special token, text, then a second special token give three
+        # segments: special, content, special (with the exact ids).
         """<sp1> text <sp2> → [special, content, special]."""
         sp1 = env.token_id(env.config.known_special_tokens[0])
         sp2 = env.token_id(env.config.known_special_tokens[1])
@@ -182,6 +212,7 @@ class TestSegmentation:
         assert segs[2] == Segment(token_ids=[sp2], is_special=True)
 
     def test_consecutive_specials_each_get_own_segment(self, env: TokenizerEnv):
+        # [FUNCTION DOC] Three adjacent special tokens give three segments, each special and one id long.
         """Adjacent special tokens are NOT merged — each gets its own segment."""
         sp_ids = [env.token_id(t) for t in env.config.known_special_tokens[:3]]
         segs = env.comparator.segment_by_special_tokens(sp_ids)
@@ -195,12 +226,15 @@ class TestSegmentation:
 
 
 class TestCompareIdentical:
+    # [CLASS DOC] Baseline tests: identical inputs produce no mismatches.
     def test_identical(self, env: TokenizerEnv):
+        # [FUNCTION DOC] A sequence compared with itself (special, text, special) yields no mismatches.
         sp = env.token_id(env.config.known_special_tokens[0])
         ids = [sp] + env.encode("Hello world") + [sp]
         assert env.comparator.compare_sequences(ids, ids) == []
 
     def test_both_empty(self, env: TokenizerEnv):
+        # [FUNCTION DOC] Two empty sequences yield no mismatches.
         assert env.comparator.compare_sequences([], []) == []
 
 
@@ -214,7 +248,10 @@ class TestCompareIdentical:
 
 
 class TestStructuralMismatch:
+    # [CLASS DOC] Tests of mismatches in segment structure.
     def test_different_segment_count(self, env: TokenizerEnv):
+        # [FUNCTION DOC] Expected has special, text, special; actual lacks the trailing special.
+        # Asserts exactly one mismatch of the special-token-count type.
         """Missing a special token → different segment count → SPECIAL_TOKEN_COUNT."""
         sp1 = env.token_id(env.config.known_special_tokens[0])
         sp2 = env.token_id(env.config.known_special_tokens[1])
@@ -226,6 +263,8 @@ class TestStructuralMismatch:
         assert result[0].type == MismatchType.SPECIAL_TOKEN_COUNT
 
     def test_special_id_swap(self, env: TokenizerEnv):
+        # [FUNCTION DOC] Same structure but the first special token differs; asserts some mismatch
+        # has the special-token-type kind at segment index 0.
         """Same segment structure, but a special token is swapped → SPECIAL_TOKEN_TYPE."""
         sp_a = env.token_id(env.config.known_special_tokens[0])
         sp_b = env.token_id(env.config.known_special_tokens[1])
@@ -260,7 +299,12 @@ class TestStructuralMismatch:
 
 
 class TestContentMismatch:
+    # [CLASS DOC] Tests of classifying differing content between special tokens as assistant or
+    # non-assistant text, depending on the model's assistant start pattern.
     def test_non_assistant_content_diff(self, env: TokenizerEnv):
+        # [FUNCTION DOC] Content wrapped by the second known special token (neither model's assistant
+        # start) differs ("Hello world" versus "Goodbye world"); asserts exactly one mismatch of the
+        # non-assistant-text type.
         """Content between non-assistant specials → NON_ASSISTANT_TEXT."""
         # Use index 1 (im_end for Qwen3, user for GLM) — neither is the
         # assistant-start token, so content after it is non-assistant.
@@ -274,6 +318,8 @@ class TestContentMismatch:
     # -- Qwen3: <|im_start|> + "assistant\n..." vs "user\n..." --
 
     def test_qwen3_assistant_content_diff(self, qwen3_env: TokenizerEnv):
+        # [FUNCTION DOC] Qwen3: differing text after the message-start token and "assistant" yields
+        # exactly one assistant-text mismatch.
         """Qwen3: content after <|im_start|>assistant → ASSISTANT_TEXT."""
         env = qwen3_env
         im_start = env.token_id("<|im_start|>")
@@ -285,6 +331,8 @@ class TestContentMismatch:
         assert result[0].type == MismatchType.ASSISTANT_TEXT
 
     def test_qwen3_user_content_diff(self, qwen3_env: TokenizerEnv):
+        # [FUNCTION DOC] Qwen3: differing text after the message-start token and "user" yields
+        # exactly one non-assistant-text mismatch.
         """Qwen3: content after <|im_start|>user → NON_ASSISTANT_TEXT."""
         env = qwen3_env
         im_start = env.token_id("<|im_start|>")
@@ -298,6 +346,8 @@ class TestContentMismatch:
     # -- GLM47: <|assistant|> + content vs <|user|> + content --
 
     def test_glm_assistant_content_diff(self, glm47_env: TokenizerEnv):
+        # [FUNCTION DOC] GLM: differing text after the assistant token (before the user token)
+        # yields exactly one assistant-text mismatch.
         """GLM: content after <|assistant|> → ASSISTANT_TEXT."""
         env = glm47_env
         asst = env.token_id("<|assistant|>")
@@ -309,6 +359,8 @@ class TestContentMismatch:
         assert result[0].type == MismatchType.ASSISTANT_TEXT
 
     def test_glm_user_content_diff(self, glm47_env: TokenizerEnv):
+        # [FUNCTION DOC] GLM: differing text after the user token (before the assistant token)
+        # yields exactly one non-assistant-text mismatch.
         """GLM: content after <|user|> → NON_ASSISTANT_TEXT."""
         env = glm47_env
         user = env.token_id("<|user|>")
@@ -322,6 +374,8 @@ class TestContentMismatch:
     # -- Both types in one sequence --
 
     def test_mixed_assistant_and_non_assistant(self, qwen3_env: TokenizerEnv):
+        # [FUNCTION DOC] Qwen3: a user turn and an assistant turn both differ; the set of mismatch
+        # types contains both non-assistant-text and assistant-text.
         """A multi-turn sequence can produce both mismatch types simultaneously."""
         env = qwen3_env
         im_start = env.token_id("<|im_start|>")
@@ -351,12 +405,18 @@ class TestContentMismatch:
 
 
 class TestTrimTrailing:
+    # [CLASS DOC] Tests of trimming trailing stop token ids from both sequences before comparison.
     def _make(self, env: TokenizerEnv, trim_ids: set[int]) -> TokenSeqComparator:
+        # [FUNCTION DOC] HELPER: Build a comparator over the environment's tokenizer and assistant
+        # start string with the given set of ids to trim by default.
         return TokenSeqComparator(
             env.tokenizer, assistant_start_str=env.config.assistant_start_str, trim_trailing_ids=trim_ids
         )
 
     def test_strips_trailing_before_comparison(self, env: TokenizerEnv):
+        # [FUNCTION DOC] Actual has two extra end-of-text tokens after the expected sequence. The
+        # default comparator reports at least one mismatch; a comparator trimming the end-of-text id
+        # reports none.
         """Extra trailing stop tokens are stripped so the comparison succeeds."""
         sp = env.token_id(env.config.known_special_tokens[0])
         eos = env.token_id(env.config.known_special_tokens[-1])
@@ -369,6 +429,10 @@ class TestTrimTrailing:
         assert self._make(env, {eos}).compare_sequences(expected, actual) == []
 
     def test_does_not_strip_middle(self, env: TokenizerEnv):
+        # [FUNCTION DOC] An end-of-text token in the middle of a sequence is not trimmed: comparing
+        # the sequence with itself under a trimming comparator yields no mismatches.
+        # KNOWN ISSUE: because both sides are identical the test would pass even if the middle token
+        # were stripped, so it does not really prove the middle is preserved.
         """Trim only affects the tail — same token in the middle is preserved."""
         sp = env.token_id(env.config.known_special_tokens[0])
         eos = env.token_id(env.config.known_special_tokens[-1])
@@ -379,6 +443,9 @@ class TestTrimTrailing:
         assert comp.compare_sequences(seq, seq) == []
 
     def test_call_time_union(self, env: TokenizerEnv):
+        # [FUNCTION DOC] Actual has two different extra trailing special tokens. A comparator
+        # initialized to trim only one still reports a mismatch; passing the other id at call time
+        # makes it trim both (union) and report none.
         """trim_trailing_ids at call time is unioned with init-time IDs.
 
         This lets TITOTokenizer set model defaults at construction while
@@ -412,7 +479,11 @@ class TestTrimTrailing:
 
 
 class TestGlm47BoundaryTokens:
+    # [CLASS DOC] GLM-specific regression test for swapped boundary tokens.
     def test_user_vs_observation_is_type_mismatch(self, glm47_env: TokenizerEnv):
+        # [FUNCTION DOC] Sequences differ only by the user token versus the observation token in the
+        # middle (assistant, text, boundary, text, assistant). Asserts exactly one mismatch, of the
+        # special-token-type kind, at segment index 2.
         """Swapping <|user|> for <|observation|> at the same position is a real error."""
         env = glm47_env
         user_id = env.token_id("<|user|>")

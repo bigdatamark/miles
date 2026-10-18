@@ -1,3 +1,13 @@
+# [MODULE DOC] Tests for the token-in-token-out (TITO) tokenizer family
+# (miles.utils.chat_template_utils.tito_tokenizer): per-family configuration, request argument
+# resolution (chat-template kwargs and tools merging over launch values and recorded turn
+# arguments), the merge of a pretokenized prefix with incrementally tokenized appended messages
+# (boundary fix-ups per family), incremental tokenization of appended messages, completion
+# post-processing hooks, append-only validation, and the factory. Tokenizers are real Hugging Face
+# tokenizers (downloaded, cached in a module-level cache keyed by model and fixed template path),
+# so most tests need network or model cache access; some use mock tokenizers. The module docstring
+# below describes the intended test classes. Trajectory-based tests derive split positions
+# automatically from message structure of the mock trajectories listed in a module-level list.
 """Tests for TITOTokenizer: merge_tokens boundary logic, incremental tokenization, and factory.
 
 ## Test structure
@@ -103,6 +113,10 @@ _TOK_CACHE: dict[tuple[str, str | None], AutoTokenizer] = {}
 
 
 def _get_tokenizer(model_id: str, tito_type: TITOTokenizerType | None = None) -> AutoTokenizer:
+    # [FUNCTION DOC] HELPER: Return a cached tokenizer for the model, optionally loaded with the
+    # fixed chat template file of a TITO family. The cache key is the pair of model id and resolved
+    # template path (none when no family given). On a miss, loads through the project's tokenizer
+    # loader with remote code trusted (may download). The cache is never cleared.
     chat_template_path = resolve_fixed_chat_template(tito_type)[0] if tito_type is not None else None
     cache_key = (model_id, chat_template_path)
     if cache_key not in _TOK_CACHE:
@@ -130,6 +144,9 @@ _TITO_MODELS: dict[str, tuple[str, type[TITOTokenizer], TITOTokenizerType]] = {
 
 @pytest.fixture(params=list(_TITO_MODELS.keys()))
 def tito(request) -> TITOTokenizer:
+    # [FUNCTION DOC] HELPER: Fixture parametrized over the models table (Qwen3-4B and GLM-4.7-Flash).
+    # Returns the family's TITO tokenizer class built on the cached tokenizer (with the family's
+    # fixed template) and chat template kwargs clear_thinking false.
     model_id, cls, tito_type = _TITO_MODELS[request.param]
     return cls(
         _get_tokenizer(model_id, tito_type),
@@ -139,6 +156,8 @@ def tito(request) -> TITOTokenizer:
 
 @pytest.fixture
 def qwen3_tito() -> Qwen3TITOTokenizer:
+    # [FUNCTION DOC] HELPER: Fixture returning a Qwen3 TITO tokenizer over the Qwen3-4B tokenizer
+    # with the Qwen3 fixed template and clear_thinking false.
     return Qwen3TITOTokenizer(
         _get_tokenizer("Qwen/Qwen3-4B", TITOTokenizerType.QWEN3),
         chat_template_kwargs={"clear_thinking": False},
@@ -147,6 +166,8 @@ def qwen3_tito() -> Qwen3TITOTokenizer:
 
 @pytest.fixture
 def glm47_tito() -> GLM47TITOTokenizer:
+    # [FUNCTION DOC] HELPER: Fixture returning a GLM 4.7 TITO tokenizer over the GLM-4.7-Flash
+    # tokenizer with clear_thinking false.
     return GLM47TITOTokenizer(
         _get_tokenizer("zai-org/GLM-4.7-Flash", TITOTokenizerType.GLM47),
         chat_template_kwargs={"clear_thinking": False},
@@ -155,6 +176,8 @@ def glm47_tito() -> GLM47TITOTokenizer:
 
 @pytest.fixture
 def default_tito() -> TITOTokenizer:
+    # [FUNCTION DOC] HELPER: Fixture returning the base TITO tokenizer (no family boundary logic)
+    # over the plain Qwen3-4B tokenizer.
     return TITOTokenizer(_get_tokenizer("Qwen/Qwen3-4B"))
 
 
@@ -172,6 +195,9 @@ def default_tito() -> TITOTokenizer:
 
 
 def _find_tito_splits(traj_cls) -> list[int]:
+    # [FUNCTION DOC] HELPER: For a mock trajectory class return the indices i+1 at which message i
+    # is an assistant message with tool calls and message i+1 exists and has role tool or system
+    # (the index of the first appended message). Empty list if none.
     """Find TITO split positions from message structure.
 
     A valid split is at index ``i+1`` whenever ``messages[i]`` is an assistant
@@ -192,6 +218,9 @@ def _find_tito_splits(traj_cls) -> list[int]:
 
 
 def _split_at(traj_cls, pos: int):
+    # [FUNCTION DOC] HELPER: Split a trajectory at the position. Returns (old messages = those
+    # before pos, new messages = those before the next assistant message at or after pos, i.e. old
+    # plus the following non-assistant run, and the trajectory's tools).
     """Split trajectory at *pos* into ``(old_msgs, new_msgs, tools)``.
 
     ``old_msgs = messages[:pos]`` — the pretokenized prefix (ends with assistant turn).
@@ -228,19 +257,25 @@ _TRAJ_CASES = [
 
 
 class TestConfig:
+    # [CLASS DOC] Smoke checks of per-family configuration stored at construction.
     """Each subclass stores the correct model-specific configuration at init."""
 
     def test_qwen3(self, qwen3_tito: Qwen3TITOTokenizer):
+        # [FUNCTION DOC] The Qwen3 tokenizer's assistant start string is "<|im_start|>assistant" and
+        # its newline token id is among the trailing token ids.
         assert qwen3_tito._assistant_start_str == "<|im_start|>assistant"
         assert qwen3_tito._newline_id in qwen3_tito.trailing_token_ids
 
     def test_glm47(self, glm47_tito: GLM47TITOTokenizer):
+        # [FUNCTION DOC] The GLM 4.7 tokenizer's assistant start string is "<|assistant|>", the
+        # observation and user token ids are trailing ids, and the maximum trim tokens is 1.
         assert glm47_tito._assistant_start_str == "<|assistant|>"
         assert glm47_tito._observation_id in glm47_tito.trailing_token_ids
         assert glm47_tito._user_id in glm47_tito.trailing_token_ids
         assert glm47_tito.max_trim_tokens == 1
 
     def test_default(self, default_tito: TITOTokenizer):
+        # [FUNCTION DOC] The base tokenizer has no assistant start string and an empty trailing id set.
         assert default_tito._assistant_start_str is None
         assert default_tito.trailing_token_ids == frozenset()
 
@@ -264,6 +299,11 @@ class TestConfig:
         ],
     )
     def test_deepseek_v32_forwards_effective_thinking_mode(self, chat_template_kwargs, expected):
+        # [FUNCTION DOC] Parametrized over launch kwargs: default (thinking on), enable-thinking
+        # false, thinking false, enable-thinking taking precedence over thinking, explicit thinking
+        # mode taking precedence over thinking, explicit chat mode. Builds the V3.2 TITO tokenizer on
+        # a mock tokenizer (two token id lookups returning 1 and 2) and asserts the stored kwargs'
+        # thinking value equals the expected boolean.
         tokenizer = MagicMock()
         tokenizer.convert_tokens_to_ids.side_effect = [1, 2]
 
@@ -299,6 +339,15 @@ class TestConfig:
     def test_deepseek_request_aliases_override_startup_mode(
         self, tito_cls, startup_thinking, request_kwargs, expected
     ):
+        # [FUNCTION DOC] Parametrized over the V3.2 and V4 classes and ten (startup thinking,
+        # request kwargs, expected thinking) combinations covering the aliases thinking,
+        # enable-thinking and thinking mode, omitted aliases inheriting the startup value, explicit
+        # nulls replacing the base, and precedence rules (mode over toggles, enable-thinking over
+        # thinking, null toggle falling through). Builds the tokenizer with a startup
+        # enable-thinking value and a custom option, resolves request args for a request carrying the
+        # kwargs, and asserts: the result has kwargs with drop-thinking false, the expected thinking
+        # value and the custom option, and tools null; the tokenizer's own stored kwargs keep the
+        # startup values; and the request kwargs mapping is not mutated.
         tokenizer = MagicMock()
         tokenizer.convert_tokens_to_ids.return_value = 1
         startup_tito = tito_cls(
@@ -320,17 +369,24 @@ class TestConfig:
         assert request_kwargs == original_kwargs
 
     def test_comparator_inherits_trailing_ids(self, qwen3_tito: Qwen3TITOTokenizer):
+        # [FUNCTION DOC] The comparator created by the tokenizer has a trim set of trailing ids
+        # equal to the tokenizer's trailing token ids.
         """create_comparator propagates trailing_token_ids to the comparator's trim set."""
         comp = qwen3_tito.create_comparator()
         assert comp._trim_trailing_ids == set(qwen3_tito.trailing_token_ids)
 
 
 class TestResolveRequestArgs:
+    # [CLASS DOC] Tests of resolve_request_args: how a request's chat-template kwargs and tools are
+    # combined with the launch kwargs and with arguments recorded for earlier turns of a session.
+    # Class constants: launch kwargs (enable-thinking false), a weather tool and another tool.
     LAUNCH = {"enable_thinking": False}
     TOOLS = [{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}]
     OTHER_TOOLS = [{"type": "function", "function": {"name": "get_time"}}]
 
     def test_new_root_merges_request_kwargs_over_the_launch_and_takes_the_request_tools(self):
+        # [FUNCTION DOC] With no recorded turn, request kwargs (enable-thinking true) override the
+        # launch value and the request tools are taken as given.
         launch = TITOTokenizer(MagicMock(), chat_template_kwargs=self.LAUNCH)
 
         args = launch.resolve_request_args(
@@ -340,6 +396,8 @@ class TestResolveRequestArgs:
         assert args == {"chat_template_kwargs": {"enable_thinking": True}, "tools": self.TOOLS}
 
     def test_request_without_kwargs_or_tools_renders_like_the_launch(self):
+        # [FUNCTION DOC] A request without kwargs or tools resolves to the launch kwargs and null
+        # tools (other request fields are kept); null kwargs and an empty tools list behave the same.
         launch = TITOTokenizer(MagicMock(), chat_template_kwargs=self.LAUNCH)
         assert launch.resolve_request_args({"messages": []}, turn_args=None) == {
             "messages": [],
@@ -352,6 +410,9 @@ class TestResolveRequestArgs:
         }
 
     def test_continued_turn_inherits_omitted_kwargs_and_request_overrides_history(self):
+        # [FUNCTION DOC] With recorded turn args holding kwargs: an omitting request inherits them
+        # (tools null); a request repeating them gives the same; a request with a different value
+        # overrides; and the recorded mapping is never mutated.
         launch = TITOTokenizer(MagicMock(), chat_template_kwargs=self.LAUNCH)
         recorded = {"chat_template_kwargs": {"enable_thinking": True}}
 
@@ -364,6 +425,9 @@ class TestResolveRequestArgs:
         assert recorded == {"chat_template_kwargs": {"enable_thinking": True}}
 
     def test_empty_history_keeps_defaults_but_does_not_allow_new_tools(self):
+        # [FUNCTION DOC] With an empty recorded mapping the launch kwargs and null tools are kept;
+        # tools supplied with no recorded turn at all are accepted; tools supplied against an empty
+        # (but present) recorded mapping raise a value error saying tools changed.
         launch = TITOTokenizer(MagicMock(), chat_template_kwargs=self.LAUNCH)
         assert launch.resolve_request_args({}, turn_args={}) == {"chat_template_kwargs": self.LAUNCH, "tools": None}
         assert launch.resolve_request_args({"tools": self.TOOLS}, turn_args=None)["tools"] == self.TOOLS
@@ -371,6 +435,9 @@ class TestResolveRequestArgs:
             launch.resolve_request_args({"tools": self.TOOLS}, turn_args={})
 
     def test_continued_turn_tools_inherit_pass_or_are_refused(self):
+        # [FUNCTION DOC] Recorded tools are inherited by an omitting request; the same tools in the
+        # bare-function spelling are accepted (kept as given); different tools, or tools against a
+        # recorded turn that had none, raise a value error "tools changed on a continued turn".
         launch = TITOTokenizer(MagicMock())
         recorded = {"tools": self.TOOLS}
 
@@ -386,8 +453,16 @@ class TestResolveRequestArgs:
             launch.resolve_request_args({"tools": self.TOOLS}, turn_args={})  # the turn had none
 
     def test_a_family_may_allow_tools_to_change_mid_session(self):
+        # [FUNCTION DOC] Defines a local tokenizer subclass whose tools hook takes the request's
+        # tools if present, else the recorded tools, and sets a deep copy on the resolved args. With
+        # different request and recorded tools, asserts the resolved tools are the request's (no
+        # refusal), with empty kwargs.
         class _ToolsAtTheTailTITOTokenizer(TITOTokenizer):
+            # [CLASS DOC] HELPER: Test-only subclass allowing tools to change between turns.
             def resolve_tools(self, request_args, *, request_source, turn_args):
+                # [FUNCTION DOC] HELPER: Pick the tools from the request source, else from the
+                # recorded turn args; if any, store a deep copy in the resolved request args.
+                # Mutates request_args; returns nothing.
                 tools = request_source.get("tools") or (turn_args or {}).get("tools")
                 if tools:
                     request_args["tools"] = deepcopy(tools)
@@ -397,6 +472,8 @@ class TestResolveRequestArgs:
         assert args == {"chat_template_kwargs": {}, "tools": self.OTHER_TOOLS}
 
     def test_family_constants_override_requested_values(self, qwen3_tito: Qwen3TITOTokenizer):
+        # [FUNCTION DOC] Qwen3's family constant clear_thinking false is merged with a request's
+        # other kwargs, and wins over a request value of clear_thinking true.
         args = qwen3_tito.resolve_request_args({"chat_template_kwargs": {"enable_thinking": True}}, turn_args=None)
         assert args == {"chat_template_kwargs": {"clear_thinking": False, "enable_thinking": True}, "tools": None}
         assert qwen3_tito.resolve_request_args({"chat_template_kwargs": {"clear_thinking": True}}, turn_args=None) == {
@@ -406,6 +483,11 @@ class TestResolveRequestArgs:
 
     @pytest.mark.parametrize("tito_cls", [DeepSeekV32TITOTokenizer, DeepSeekV4TITOTokenizer])
     def test_deepseek_thinking_rule_uses_resolved_kwargs(self, tito_cls):
+        # [FUNCTION DOC] Parametrized over V3.2 and V4 classes. Calls the thinking resolution hook
+        # on request args whose kwargs hold thinking mode "thinking" and a custom option, with a
+        # request source and recorded turn args that say thinking is off. Asserts the hook rewrites
+        # the args' kwargs to thinking true (from the resolved mode) plus the custom option, leaving
+        # other fields (temperature) intact; the aliases and mode key are removed.
         tokenizer = MagicMock()
         tokenizer.convert_tokens_to_ids.return_value = 1
         model = tito_cls(tokenizer, chat_template_kwargs={"thinking": False})
@@ -427,6 +509,10 @@ class TestResolveRequestArgs:
 
     @pytest.mark.parametrize("tito_cls", [DeepSeekV32TITOTokenizer, DeepSeekV4TITOTokenizer])
     def test_deepseek_recorded_mode_overrides_request_aliases(self, tito_cls):
+        # [FUNCTION DOC] Parametrized over V3.2 and V4 classes. Launch has enable-thinking false, so
+        # stored kwargs are drop-thinking false and thinking false. A first request with thinking
+        # true records thinking true; on later turns requests with enable-thinking true or thinking
+        # mode "chat" resolve to exactly the recorded args (recorded mode wins over aliases).
         tokenizer = MagicMock()
         tokenizer.convert_tokens_to_ids.return_value = 1
         launch = tito_cls(tokenizer, chat_template_kwargs={"enable_thinking": False})
@@ -442,6 +528,8 @@ class TestResolveRequestArgs:
         )
 
     def test_returns_the_same_full_request_without_inheriting_sampling_fields(self):
+        # [FUNCTION DOC] Resolving with recorded args that include sampling fields and a model key;
+        # asserts the returned object is the very request mapping passed in (mutated in place).
         launch = TITOTokenizer(MagicMock())
         turn_args = {"temperature": 0.2, "seed": 42, "chat_template_kwargs": {"enable_thinking": True}}
         request_args = {"temperature": 0.8, "model": "m"}
@@ -456,6 +544,11 @@ class TestResolveRequestArgs:
         assert turn_args["temperature"] == 0.2
 
     def test_inherited_nested_values_are_owned_by_the_working_request(self):
+        # [FUNCTION DOC] Launch kwargs hold a nested options mapping with a list. Resolving with no
+        # recorded turn and mutating the nested list of the result must leave the launch kwargs
+        # untouched; then resolving with recorded args (nested kwargs and tools) and mutating the
+        # result's nested kwargs and tool name must leave the recorded args untouched (values are
+        # deep-copied into the working request).
         launch = TITOTokenizer(MagicMock(), chat_template_kwargs={"options": {"labels": ["launch"]}})
         request_args = launch.resolve_request_args({}, turn_args=None)
         request_args["chat_template_kwargs"]["options"]["labels"].append("request")
@@ -469,13 +562,25 @@ class TestResolveRequestArgs:
         assert turn_args["tools"][0]["function"]["name"] == "get_weather"
 
     def test_appended_rules_receive_original_sources_and_can_change_full_request(self):
+        # [FUNCTION DOC] Defines a local subclass that appends one custom rule to the base rule
+        # list. The rule runs only when the request has a temperature; it asserts the original request
+        # source still has its own kwargs and tools, and that the working args already contain the
+        # request kwargs merged with the launch ones; it then sets temperature 0.25, a tool choice of
+        # "auto", renames the working tool and overwrites a kwarg. The test resolves a request and
+        # asserts the very same request object is returned with those changes, the launch mapping is
+        # unchanged, and the base tokenizer has 4 rules while the subclass has 5.
         class Model(TITOTokenizer):
+            # [CLASS DOC] HELPER: Test-only subclass appending a custom request-argument rule.
             def request_arg_rules(self):
+                # [FUNCTION DOC] HELPER: Return the parent's rule list with the custom rule appended.
                 rules = super().request_arg_rules()
                 rules.append(self.resolve_custom_args)
                 return rules
 
             def resolve_custom_args(self, request_args, *, request_source, turn_args):
+                # [FUNCTION DOC] HELPER: Custom rule: does nothing when the original request has no
+                # temperature; otherwise performs the assertions and mutations described by the
+                # enclosing test on the working request args. Returns nothing.
                 if "temperature" not in request_source:
                     return
                 assert request_source["chat_template_kwargs"] == {"choice": "request"}
@@ -524,6 +629,17 @@ class TestResolveRequestArgs:
     def test_model_rules_keep_fields_that_affect_the_reused_prefix(
         self, tito_cls, key, recorded_value, requested_value, recorded_present
     ):
+        # [FUNCTION DOC] Parametrized over many families and a template kwarg that affects the
+        # already rendered prefix (vision id switch, thinking switch, reasoning effort, low effort,
+        # Kimi tool declaration, bos token, context messages, and so on) with a recorded value and a
+        # different requested value, and whether the recorded turn has the key at all. Builds the
+        # tokenizer on a mock tokenizer with the requested value as launch kwarg, builds recorded
+        # turn args from the launch kwargs with the key removed or set to the recorded value, resolves
+        # a request that asks for the other value plus a custom option. Asserts: the very request
+        # object is returned; when recorded, the result keeps the recorded value (and for the context
+        # key the result is a deep copy, which the test mutates); when not recorded, the key is
+        # absent; the custom option passes through; the recorded turn args are unchanged; and the
+        # tokenizer's own kwargs equal the launch kwargs copy.
         tokenizer = MagicMock()
         tokenizer.encode.return_value = [1]
         tokenizer.convert_tokens_to_ids.return_value = 1
@@ -568,6 +684,13 @@ class TestResolveRequestArgs:
     def test_model_rules_preserve_rendered_prefix_when_request_changes_a_locked_field(
         self, tito_cls, key, old_value, new_value, content
     ):
+        # [FUNCTION DOC] Parametrized over Inkling reasoning effort, Qwen 3.8-small thinking switch
+        # and effort, and Qwen 3.5 vision ids (with image content). Resolves a first request
+        # recording the old value, then a request asking for the new value on the continued turn.
+        # Renders a one-message conversation with the family's fixed template using (a) the recorded
+        # args, (b) the old args with the key changed, and (c) the newly resolved args. Asserts that
+        # (b) differs from (a) (the field really matters) and that (c) equals (a) (the locked value
+        # kept the rendered prefix stable).
         tokenizer = MagicMock()
         tokenizer.encode.return_value = [1]
         tokenizer.convert_tokens_to_ids.return_value = 1
@@ -601,6 +724,10 @@ class TestResolveRequestArgs:
         ],
     )
     def test_qwen38_new_root_selects_effort(self, launch_kwargs, request_kwargs, expected_effort):
+        # [FUNCTION DOC] Parametrized over launch/request reasoning effort combinations. With no
+        # recorded turn, the Qwen 3.8-small tokenizer resolves kwargs to preserve-thinking true (the
+        # family constant beats a request value of false) plus a reasoning effort equal to the
+        # request's value, else the launch value, else absent when neither is given.
         tokenizer = MagicMock()
         tokenizer.encode.return_value = [1]
         model = Qwen38SmallTITOTokenizer(tokenizer, chat_template_kwargs=launch_kwargs)
@@ -614,6 +741,11 @@ class TestResolveRequestArgs:
 
     @pytest.mark.parametrize("turn_args", [None, {}, {"chat_template_kwargs": {"reasoning_effort": "low"}}])
     def test_qwen38_effort_follows_history(self, turn_args):
+        # [FUNCTION DOC] Parametrized over recorded turn args: none, empty mapping, and one recording
+        # effort "low". Launch effort is xhigh and the request asks for medium. Asserts the very
+        # request object is returned and the resolved effort is: the request's medium for a new root
+        # (no turn), absent for an empty recorded mapping, the recorded low for a recorded effort; and
+        # the recorded args are unchanged.
         tokenizer = MagicMock()
         tokenizer.encode.return_value = [1]
         tokenizer.convert_tokens_to_ids.return_value = 1
@@ -633,6 +765,9 @@ class TestResolveRequestArgs:
         assert turn_args == original_turn
 
     def test_qwen38_omitted_effort_uses_template_default(self):
+        # [FUNCTION DOC] With nothing specified, the resolved template args have no reasoning effort.
+        # Renders a hello message with generation prompt using the fixed template with those args and
+        # asserts it equals the render with effort explicitly xhigh (the template default is xhigh).
         tokenizer = MagicMock()
         tokenizer.encode.return_value = [1]
         model = Qwen38SmallTITOTokenizer(tokenizer)
@@ -648,7 +783,10 @@ class TestResolveRequestArgs:
 
 
 class TestCompletionPostprocess:
+    # [CLASS DOC] Tests of the completion post-processing hook.
     def test_default_returns_upstream_message_unchanged(self):
+        # [FUNCTION DOC] The base tokenizer's hook returns the very assistant message object it was
+        # given and leaves the choice dictionary (message, finish reason, meta info) unchanged.
         tito = TITOTokenizer(MagicMock())
         assistant_message = {"role": "assistant", "content": "upstream"}
         choice = {
@@ -672,8 +810,15 @@ class TestCompletionPostprocess:
 
 
 class TestInklingComparatorBoundaries:
+    # [CLASS DOC] Tests of the sequence comparator created by the Inkling TITO tokenizer, using a
+    # mock tokenizer with four message-role special tokens (ids 200000 to 200003).
     @staticmethod
     def _build_comparator():
+        # [FUNCTION DOC] HELPER: Build a mock tokenizer whose token lookup returns the role marker
+        # ids (user, model, system, tool) and raises a key error for others, whose encode maps each
+        # character to its code point, and whose decode maps role ids back to marker text and other
+        # ids to characters. Creates the Inkling tokenizer's comparator from it and returns
+        # (marker-to-id mapping, mock tokenizer, comparator).
         token_ids = {
             "<|message_user|>": 200000,
             "<|message_model|>": 200001,
@@ -691,12 +836,16 @@ class TestInklingComparatorBoundaries:
         return token_ids, tokenizer, comparator
 
     def test_uses_exact_message_role_boundaries(self):
+        # [FUNCTION DOC] The comparator's special id set equals the four role marker ids.
         token_ids, _, comparator = self._build_comparator()
 
         assert comparator._special_ids == set(token_ids.values())
 
     @pytest.mark.parametrize("appended_role", ["user", "system", "tool"])
     def test_appended_non_assistant_content_is_not_assistant_text(self, appended_role):
+        # [FUNCTION DOC] Parametrized over appended roles user, system, tool. Two sequences share a
+        # model-role prefix "assistant" and then a role marker plus differing text ("expected" versus
+        # "changed"). Asserts comparing yields exactly one mismatch of the non-assistant-text type.
         token_ids, tokenizer, comparator = self._build_comparator()
         assistant = [token_ids["<|message_model|>"]] + tokenizer.encode("assistant")
         role_token = token_ids[f"<|message_{appended_role}|>"]
@@ -708,6 +857,8 @@ class TestInklingComparatorBoundaries:
         assert [mismatch.type for mismatch in mismatches] == [MismatchType.NON_ASSISTANT_TEXT]
 
     def test_assistant_content_remains_soft_mismatch(self):
+        # [FUNCTION DOC] Two sequences after a model-role marker with different text; asserts
+        # exactly one mismatch of the assistant-text type.
         token_ids, tokenizer, comparator = self._build_comparator()
         assistant_role = [token_ids["<|message_model|>"]]
         expected = assistant_role + tokenizer.encode("expected")
@@ -719,12 +870,19 @@ class TestInklingComparatorBoundaries:
 
 
 class TestInklingFixedTemplate:
+    # [CLASS DOC] Tests of the Inkling fixed chat template's rendering of assistant turns.
     @staticmethod
     def _render(messages):
+        # [FUNCTION DOC] HELPER: Read the Inkling fixed template file and render the messages with
+        # it without a generation prompt. Returns the string.
         template = (TEMPLATE_DIR / "inkling_fixed.jinja").read_text()
         return apply_chat_template_from_str(template, messages, add_generation_prompt=False)
 
     def test_tool_call_only_turn_skips_empty_text_block(self):
+        # [FUNCTION DOC] An assistant turn with empty content, reasoning "check" and one tool call
+        # renders no empty text block; it renders a thinking message followed by a model message
+        # addressed to the tool name holding compact JSON of the call (name and args) and then the
+        # end-of-sampling marker.
         messages = [
             {"role": "user", "content": "weather?"},
             {
@@ -751,6 +909,8 @@ class TestInklingFixedTemplate:
         ) in rendered
 
     def test_empty_assistant_turn_skips_bare_terminator(self):
+        # [FUNCTION DOC] A completely empty assistant turn renders neither a model message marker
+        # nor the end-of-sampling marker.
         rendered = self._render(
             [
                 {"role": "user", "content": "hello"},
@@ -762,6 +922,8 @@ class TestInklingFixedTemplate:
         assert "<|content_model_end_sampling|>" not in rendered
 
     def test_nonempty_reasoning_and_final_text_are_preserved(self):
+        # [FUNCTION DOC] An assistant turn with reasoning "think" and content "done" renders a
+        # thinking message, then a text message, then the end-of-sampling marker, in that order.
         rendered = self._render(
             [
                 {"role": "user", "content": "hello"},
@@ -780,6 +942,11 @@ class TestInklingFixedTemplate:
         ) in rendered
 
     def test_ordered_blocks_preserve_thinking_tool_call_and_text_order(self):
+        # [FUNCTION DOC] An assistant turn carrying both flattened fields and ordered content blocks
+        # (thinking, empty text, tool call with recipient and raw JSON text, thinking, text). The
+        # render must follow the ordered blocks exactly (including the empty text block and the raw
+        # JSON text verbatim), ignore the flattened text and reasoning, and contain exactly one
+        # tool-json marker.
         raw_json = '{ "args": {"command": "pwd"}, "name": "bash_command" }'
         rendered = self._render(
             [
@@ -825,6 +992,8 @@ class TestInklingFixedTemplate:
         assert rendered.count("<|content_invoke_tool_json|>") == 1
 
     def test_empty_ordered_block_sequence_keeps_sampling_terminator(self):
+        # [FUNCTION DOC] An assistant turn with empty content and an empty list of ordered blocks
+        # renders ending with the end-of-sampling marker.
         rendered = self._render(
             [
                 {"role": "user", "content": "hello"},
@@ -846,14 +1015,21 @@ class TestDeepSeekV32IncrementalAppend:
     real-history render suffix for both tool and user appends."""
 
     class _CharTokenizer:
+        # [CLASS DOC] HELPER: Minimal fake tokenizer for the V3.2 incremental tests: name-or-path
+        # attribute, character-code encoder, and a lookup of just the user and assistant markers.
         def __init__(self, name_or_path: str):
+            # [FUNCTION DOC] HELPER: Store the name-or-path string.
             self.name_or_path = name_or_path
 
         def encode(self, text, add_special_tokens=False):
+            # [FUNCTION DOC] HELPER: Return the code point of each character; asserts special
+            # tokens were not requested.
             assert add_special_tokens is False
             return [ord(c) for c in text]
 
         def convert_tokens_to_ids(self, token):
+            # [FUNCTION DOC] HELPER: Map the user marker to 1 and the assistant marker to 2; any
+            # other token raises a key error.
             return {"<｜User｜>": 1, "<｜Assistant｜>": 2}[token]
 
     @pytest.mark.parametrize(
@@ -871,6 +1047,13 @@ class TestDeepSeekV32IncrementalAppend:
         ids=["user", "tool", "assistant_then_user", "consecutive_assistants_then_user"],
     )
     def test_incremental_equals_real_history_suffix(self, tmp_path, appended):
+        # [FUNCTION DOC] Parametrized over four appended message shapes (user, tool, injected
+        # assistant then user, two injected assistants then user). Writes a deepseek_v32 config in the
+        # temp directory, builds the V3.2 TITO tokenizer (drop-thinking false) over the character
+        # tokenizer, and uses a history of a user question and an assistant tool call with reasoning.
+        # Computes the incremental tokens for the appended messages, renders the old history without
+        # a generation prompt and the new history with one, and asserts the new text starts with the
+        # old text and the incremental ids equal the character ids of the new text's remaining suffix.
         (tmp_path / "config.json").write_text(json.dumps({"model_type": "deepseek_v32"}), encoding="utf-8")
         tokenizer = self._CharTokenizer(str(tmp_path))
         tito = DeepSeekV32TITOTokenizer(
@@ -908,11 +1091,17 @@ _BND_OLD, _BND_NEW, _BND_TOOLS = _split_at(SingleToolTrajectory, 3)
 
 
 class TestMergeTokensBoundary:
+    # [CLASS DOC] Tests of the prefix manipulation done by merge_tokens, using the single-tool
+    # trajectory split at position 3 (module-level old messages, new messages and tools) and
+    # synthetic prefix token ids such as 100 and 200 followed by a boundary token.
     """merge_tokens correctly manipulates the prefix before concatenating incremental tokens."""
 
     # -- Qwen3: insert \n after <|im_end|> --
 
     def test_qwen3_inserts_newline_after_im_end(self, qwen3_tito: Qwen3TITOTokenizer):
+        # [FUNCTION DOC] For a prefix ending with the Qwen3 end-of-message token, asserts the merge
+        # result is the prefix, then the newline token, then the incrementally tokenized appended
+        # messages.
         """Model stops at <|im_end|> without trailing \\n; merge_tokens inserts it."""
         incremental = qwen3_tito.tokenize_additional_messages(
             _BND_OLD, _BND_NEW, template_args=qwen3_tito.default_template_args(_BND_TOOLS)
@@ -926,6 +1115,8 @@ class TestMergeTokensBoundary:
         assert result == [100, 200, im_end, nl] + incremental
 
     def test_qwen3_no_newline_otherwise(self, qwen3_tito: Qwen3TITOTokenizer):
+        # [FUNCTION DOC] For a prefix ending with an ordinary token, asserts the merge result is just
+        # prefix plus incremental tokens.
         """No insertion when prefix does not end with <|im_end|>."""
         incremental = qwen3_tito.tokenize_additional_messages(
             _BND_OLD, _BND_NEW, template_args=qwen3_tito.default_template_args(_BND_TOOLS)
@@ -938,6 +1129,8 @@ class TestMergeTokensBoundary:
     # -- GLM47: strip ambiguous boundary tokens --
 
     def test_glm47_strips_observation(self, glm47_tito: GLM47TITOTokenizer):
+        # [FUNCTION DOC] A prefix ending with the GLM observation token has that last token removed
+        # before appending incremental tokens.
         """Model emits <|observation|> as stop token; merge_tokens strips the duplicate."""
         incremental = glm47_tito.tokenize_additional_messages(
             _BND_OLD, _BND_NEW, template_args=glm47_tito.default_template_args(_BND_TOOLS)
@@ -951,6 +1144,8 @@ class TestMergeTokensBoundary:
         assert result == [100, 200] + incremental
 
     def test_glm47_strips_user(self, glm47_tito: GLM47TITOTokenizer):
+        # [FUNCTION DOC] A prefix ending with the GLM user token has that last token removed before
+        # appending incremental tokens.
         """<|user|> is also an ambiguous boundary — stripped the same way."""
         incremental = glm47_tito.tokenize_additional_messages(
             _BND_OLD, _BND_NEW, template_args=glm47_tito.default_template_args(_BND_TOOLS)
@@ -964,6 +1159,7 @@ class TestMergeTokensBoundary:
         assert result == [100, 200] + incremental
 
     def test_glm47_no_strip_otherwise(self, glm47_tito: GLM47TITOTokenizer):
+        # [FUNCTION DOC] A prefix ending with an ordinary token is kept whole before the incremental tokens.
         """Non-boundary trailing token is preserved."""
         incremental = glm47_tito.tokenize_additional_messages(
             _BND_OLD, _BND_NEW, template_args=glm47_tito.default_template_args(_BND_TOOLS)
@@ -976,6 +1172,7 @@ class TestMergeTokensBoundary:
     # -- Default: no boundary handling --
 
     def test_default_concatenates(self, default_tito: TITOTokenizer):
+        # [FUNCTION DOC] The base tokenizer's merge is plain concatenation of prefix and incremental tokens.
         """Base class does plain concatenation without any prefix modification."""
         incremental = default_tito.tokenize_additional_messages(
             _BND_OLD, _BND_NEW, template_args=default_tito.default_template_args(_BND_TOOLS)
@@ -988,6 +1185,7 @@ class TestMergeTokensBoundary:
     # -- Edge case --
 
     def test_empty_prefix(self, qwen3_tito: Qwen3TITOTokenizer):
+        # [FUNCTION DOC] With an empty prefix the Qwen3 merge result equals just the incremental tokens.
         """Empty prefix → no boundary handling, result is just incremental."""
         incremental = qwen3_tito.tokenize_additional_messages(
             _BND_OLD, _BND_NEW, template_args=qwen3_tito.default_template_args(_BND_TOOLS)
@@ -1011,10 +1209,15 @@ class TestMergeTokensBoundary:
 
 
 class TestTokenizeAdditional:
+    # [CLASS DOC] Tests of tokenize_additional_messages (incremental tokens of the appended
+    # suffix, computed through a synthetic prefix) and its append-only validation.
     """tokenize_additional_messages produces valid incremental tokens."""
 
     @pytest.mark.parametrize("traj_cls, pos", _TRAJ_CASES)
     def test_produces_nonempty_incremental(self, tito: TITOTokenizer, traj_cls, pos):
+        # [FUNCTION DOC] Parametrized over every trajectory split position and every model tokenizer
+        # fixture: splits the trajectory, tokenizes the appended messages with default template args
+        # for its tools, and asserts the incremental token list is non-empty.
         """Every valid TITO split yields non-empty incremental tokens.
 
         This is the primary scalability test — it runs every trajectory's
@@ -1029,6 +1232,14 @@ class TestTokenizeAdditional:
     def test_complete_appendix_reaches_renderer_and_its_error_propagates(
         self, qwen3_tito: Qwen3TITOTokenizer, monkeypatch
     ):
+        # [FUNCTION DOC] Old messages are the first three of the single-tool trajectory; the appended
+        # suffix is its fourth message, a user message and another tool message. Replaces the
+        # tokenizer's private rendered-suffix tokenizer with a recording fake that raises a value
+        # error "invalid tool ordering" when the appended roles are tool, user, tool (else returns
+        # [1]). Asserts: the value error propagates; the fake was called exactly once with a base of
+        # a system and an assistant message whose tool calls equal the old last message's, the whole
+        # appended list as one block, the same template args, and the generation prompt flag true.
+        # The nested fake is called with base messages, appended messages, template args and the flag.
         old_msgs = list(SingleToolTrajectory.MESSAGES[:3])
         appended = [
             SingleToolTrajectory.MESSAGES[3],
@@ -1038,6 +1249,9 @@ class TestTokenizeAdditional:
         calls = []
 
         def reject_invalid_order(base_messages, appended_messages, *, template_args=None, add_generation_prompt=False):
+            # [FUNCTION DOC] HELPER: Fake suffix tokenizer. Records its four arguments as a tuple in
+            # the enclosing list; raises a value error "invalid tool ordering" if the appended roles
+            # are exactly tool, user, tool; otherwise returns the one-element list [1].
             calls.append((base_messages, appended_messages, template_args, add_generation_prompt))
             if [message["role"] for message in appended_messages] == ["tool", "user", "tool"]:
                 raise ValueError("invalid tool ordering")
@@ -1061,6 +1275,10 @@ class TestTokenizeAdditional:
         assert add_generation_prompt is True
 
     def test_generation_prompt_is_appended_once_for_full_suffix(self, qwen3_tito: Qwen3TITOTokenizer):
+        # [FUNCTION DOC] Appends a tool result and a user message to the thinking single-tool
+        # trajectory. Decodes the incremental tokens and asserts the assistant start string occurs
+        # exactly once and the decoded text ends with the decoded tokens of the full new conversation
+        # rendered with a generation prompt and no appended block (so the prompt is added once).
         old_msgs = list(SingleToolThinkingTrajectory.MESSAGES[:3])
         new_msgs = old_msgs + [
             SingleToolThinkingTrajectory.MESSAGES[3],
@@ -1082,6 +1300,9 @@ class TestTokenizeAdditional:
         )
 
     def test_dummy_assistant_preserves_parallel_tool_calls(self):
+        # [FUNCTION DOC] Builds the dummy assistant from the stored assistant message of the
+        # multi-tool single-turn trajectory; asserts empty content, reasoning content of a single
+        # space, tool calls equal to the stored ones, and tool call ids call_1 and call_2 in order.
         stored_assistant = MultiToolSingleTurnTrajectory.MESSAGES[2]
         dummy_assistant = _build_dummy_assistant(stored_assistant)
 
@@ -1099,6 +1320,11 @@ class TestTokenizeAdditional:
         ],
     )
     def test_qwen3_merge_preserves_non_assistant_structure(self, qwen3_tito: Qwen3TITOTokenizer, traj_cls, pos):
+        # [FUNCTION DOC] Parametrized over the single-tool, tool-plus-system and intermediate-system
+        # trajectories at position 3. Tokenizes the old messages with the tokenizer's template (no
+        # generation prompt), merges with the appended messages, tokenizes the full new messages with
+        # a generation prompt as the expected sequence, compares expected and merged with the
+        # comparator and asserts every mismatch is of the assistant-text type.
         """Merged tokens may differ in assistant text, but not in tool/system structure."""
         old_msgs, new_msgs, tools = _split_at(traj_cls, pos)
         pretokenized = apply_chat_template(
@@ -1124,6 +1350,8 @@ class TestTokenizeAdditional:
     # -- Append-only validation (assert_messages_append_only_with_allowed_role is called internally) --
 
     def test_rejects_prefix_mutation(self, qwen3_tito: Qwen3TITOTokenizer):
+        # [FUNCTION DOC] Changes the first old message's content in the new list and asserts that
+        # tokenizing the additional messages raises a value error mentioning a mismatch.
         """Modifying an existing message in new_messages raises ValueError."""
         old_msgs, new_msgs, _ = _split_at(SingleToolTrajectory, 3)
         mutated_old = [{"role": "user", "content": "CHANGED"}] + list(old_msgs[1:])
@@ -1132,15 +1360,21 @@ class TestTokenizeAdditional:
             qwen3_tito.tokenize_additional_messages(old_msgs, mutated_new)
 
     def test_rejects_fewer_messages(self, qwen3_tito: Qwen3TITOTokenizer):
+        # [FUNCTION DOC] A new list shorter than the old one raises a value error mentioning "fewer".
         """new_messages shorter than old_messages raises ValueError."""
         old_msgs = SingleToolTrajectory.MESSAGES[:3]
         with pytest.raises(ValueError, match="fewer"):
             qwen3_tito.tokenize_additional_messages(old_msgs, old_msgs[:1])
 
     def test_restricted_template_rejects_unsupported_role(self, qwen3_tito: Qwen3TITOTokenizer):
+        # [FUNCTION DOC] Defines a Qwen3 subclass whose fixed template only allows appended tool
+        # messages, builds it on the fixture's tokenizer, and asserts that appending an assistant
+        # message raises a value error mentioning the role.
         """A template with an explicit narrow capability rejects other roles."""
 
         class _ToolOnlyQwen3TITOTokenizer(Qwen3TITOTokenizer):
+            # [CLASS DOC] HELPER: Test-only Qwen3 variant whose registered fixed template (same file
+            # and kwargs as the parent) permits only the tool role to be appended.
             FIXED_TEMPLATE = FixedTemplate(
                 template=Qwen3TITOTokenizer.FIXED_TEMPLATE.template,
                 extra_kwargs=dict(Qwen3TITOTokenizer.FIXED_TEMPLATE.extra_kwargs),
@@ -1163,6 +1397,7 @@ class TestTokenizeAdditional:
 
 
 class TestFactory:
+    # [CLASS DOC] Tests of the get_tito_tokenizer factory.
     """get_tito_tokenizer creates the correct subclass from string or enum type."""
 
     @pytest.mark.parametrize(
@@ -1179,10 +1414,15 @@ class TestFactory:
         ],
     )
     def test_creates_correct_type(self, type_str, model_id, cls):
+        # [FUNCTION DOC] Parametrized over string type names ("qwen3", "qwen35", "qwen36",
+        # "qwen38small", "qwen4exp", "qwennext", "glm47", "default"); the factory returns an instance of
+        # the expected class (qwen4exp maps to the Qwen 3.8-small class).
         tito = get_tito_tokenizer(_get_tokenizer(model_id), tokenizer_type=type_str)
         assert isinstance(tito, cls)
 
     def test_enum_input(self):
+        # [FUNCTION DOC] Passing the Qwen3 enum member gives a Qwen3 tokenizer whose allowed append
+        # roles equal the full role set.
         """Enum values work the same as string values."""
         tito = get_tito_tokenizer(_get_tokenizer("Qwen/Qwen3-4B"), tokenizer_type=TITOTokenizerType.QWEN3)
         assert isinstance(tito, Qwen3TITOTokenizer)
@@ -1199,6 +1439,8 @@ class TestFactory:
         ],
     )
     def test_qwen_variant_inherits_qwen3_boundary_logic(self, type_str, cls):
+        # [FUNCTION DOC] Parametrized over Qwen 3.5, 3.6, 3.8-small, qwen4exp and Qwen-Next type names;
+        # the factory result is an instance of the named class and also of the Qwen3 class.
         """Qwen3.5 / Qwen3-Next reuse Qwen3's boundary handling via inheritance.
         The named subclass owns its FixedTemplate contract, while token-level
         merge behavior remains identical to Qwen3."""
@@ -1207,15 +1449,19 @@ class TestFactory:
         assert isinstance(tito, Qwen3TITOTokenizer)
 
     def test_invalid_type_raises(self):
+        # [FUNCTION DOC] An unknown type name raises a value error.
         with pytest.raises(ValueError):
             get_tito_tokenizer(_get_tokenizer("Qwen/Qwen3-4B"), tokenizer_type="nonexistent")
 
     def test_none_tokenizer_raises(self):
+        # [FUNCTION DOC] A null tokenizer raises a value error saying it must not be none.
         with pytest.raises(ValueError, match="must not be None"):
             get_tito_tokenizer(None)
 
 
 class TestParserBinding:
+    # [CLASS DOC] Tests of per-family reasoning-parser and tool-call-parser bindings and of
+    # resolve_reasoning_and_tool_call_parser, which checks user-supplied parser names against them.
     """Each TITO subclass binds sglang ``--reasoning-parser`` and
     ``--tool-call-parser`` values; ``resolve_reasoning_and_tool_call_parser``
     enforces user-supplied values agree with the bindings (or returns the
@@ -1245,11 +1491,16 @@ class TestParserBinding:
         ],
     )
     def test_subclass_binding(self, tito_model, expected_reasoning, expected_tool_call):
+        # [FUNCTION DOC] Parametrized over families and their expected reasoning parser and tool
+        # call parser names (some families have none). Looks up the family's class and asserts both
+        # class attributes equal the expected values.
         cls = TITOTokenizerType.get_tokenizer_class(tito_model)
         assert cls.reasoning_parser == expected_reasoning
         assert cls.tool_call_parser == expected_tool_call
 
     def test_resolve_returns_binding_when_user_omits(self):
+        # [FUNCTION DOC] With no user values, resolution returns each family's bound pair (Qwen,
+        # GLM, DeepSeek V4 families) and returns (none, none) for the default family.
         from miles.utils.chat_template_utils import resolve_reasoning_and_tool_call_parser
 
         assert resolve_reasoning_and_tool_call_parser(TITOTokenizerType.QWEN3) == ("qwen3", "qwen25")
@@ -1264,6 +1515,8 @@ class TestParserBinding:
         assert resolve_reasoning_and_tool_call_parser(TITOTokenizerType.DEFAULT) == (None, None)
 
     def test_resolve_accepts_matching_user_value(self):
+        # [FUNCTION DOC] User values equal to the binding are accepted (family given as string or
+        # enum) and returned.
         from miles.utils.chat_template_utils import resolve_reasoning_and_tool_call_parser
 
         assert resolve_reasoning_and_tool_call_parser("qwen3", "qwen3", "qwen25") == ("qwen3", "qwen25")
@@ -1273,18 +1526,24 @@ class TestParserBinding:
         )
 
     def test_resolve_raises_on_reasoning_mismatch(self):
+        # [FUNCTION DOC] A user reasoning parser "glm45" for the Qwen3 family raises a value error
+        # whose message says the reasoning parser option disagrees.
         from miles.utils.chat_template_utils import resolve_reasoning_and_tool_call_parser
 
         with pytest.raises(ValueError, match="--reasoning-parser='glm45' disagrees"):
             resolve_reasoning_and_tool_call_parser(TITOTokenizerType.QWEN3, user_reasoning_parser="glm45")
 
     def test_resolve_raises_on_tool_call_mismatch(self):
+        # [FUNCTION DOC] A user tool call parser "glm47" for the Qwen3 family raises a value error
+        # whose message says the tool call parser option disagrees.
         from miles.utils.chat_template_utils import resolve_reasoning_and_tool_call_parser
 
         with pytest.raises(ValueError, match="--tool-call-parser='glm47' disagrees"):
             resolve_reasoning_and_tool_call_parser(TITOTokenizerType.QWEN3, user_tool_call_parser="glm47")
 
     def test_resolve_accepts_user_value_when_family_unbound(self):
+        # [FUNCTION DOC] For the default family (no bindings), user-provided parser names are
+        # returned unchanged.
         # DEFAULT family has no binding for either parser; user-provided wins
         # (for families that haven't been wired up to a sglang parser yet).
         from miles.utils.chat_template_utils import resolve_reasoning_and_tool_call_parser
@@ -1294,6 +1553,8 @@ class TestParserBinding:
         ) == ("custom_reasoning", "custom_tool_call")
 
     def test_resolve_partial_user_input(self):
+        # [FUNCTION DOC] Supplying only one parser name: the other is filled in independently from the
+        # family binding (reasoning only for Qwen3, tool call only for GLM 4.7).
         # User can pass only one of the two; the other auto-resolves from
         # the family binding independently.
         from miles.utils.chat_template_utils import resolve_reasoning_and_tool_call_parser

@@ -1,3 +1,9 @@
+# [MODULE DOC] Tests for helpers of the run-and-compare command
+# (miles.utils.debug_utils.run_megatron.cli.commands.run_and_compare): running a baseline and a
+# target configuration through run_impl (mocked) with per-run output directories, optional routing
+# replay wiring (baseline dumps the replay, target loads it, baseline must be single-rank), logprob
+# output directories, and extra per-side arguments; and appending extra arguments to a dictionary
+# of common run fields.
 import dataclasses
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -13,6 +19,9 @@ from miles.utils.debug_utils.run_megatron.cli.parallel_utils import ParallelConf
 
 
 def _make_common_fields(**overrides: object) -> dict[str, object]:
+    # [FUNCTION DOC] HELPER: Build the dictionary form of common run arguments (model type
+    # "deepseek_v3", checkpoint "/fake/hf", other fields default) via the dataclass-to-dictionary
+    # conversion, then apply the keyword overrides. Returns a new dictionary on every call.
     base = CommonRunArgs(
         model_type="deepseek_v3",
         hf_checkpoint=Path("/fake/hf"),
@@ -23,8 +32,12 @@ def _make_common_fields(**overrides: object) -> dict[str, object]:
 
 
 class TestRunAndCompare:
+    # [CLASS DOC] Tests of the baseline/target runner with the run implementation mocked; the
+    # recorded calls' first positional argument is the run arguments object.
     @patch("miles.utils.debug_utils.run_megatron.cli.commands.run_and_compare.run_impl")
     def test_calls_run_twice(self, mock_run: MagicMock) -> None:
+        # [FUNCTION DOC] Running baseline (tp 1) and target (tp 2) with no replay results in exactly
+        # two calls of the run implementation.
         _run_baseline_and_target(
             baseline_config=ParallelConfig(tp=1),
             target_config=ParallelConfig(tp=2),
@@ -41,6 +54,9 @@ class TestRunAndCompare:
 
     @patch("miles.utils.debug_utils.run_megatron.cli.commands.run_and_compare.run_impl")
     def test_output_dir_uses_dir_name(self, mock_run: MagicMock) -> None:
+        # [FUNCTION DOC] Output paths are built from a base directory plus each parallel config's
+        # directory name; asserts the first call's output directory contains the baseline's name and
+        # the second call's contains the target's name (baseline run first).
         baseline_config = ParallelConfig(tp=1)
         target_config = ParallelConfig(tp=2)
 
@@ -65,6 +81,8 @@ class TestRunAndCompare:
 
     @patch("miles.utils.debug_utils.run_megatron.cli.commands.run_and_compare.run_impl")
     def test_replay_baseline_nproc1_required(self, mock_run: MagicMock) -> None:
+        # [FUNCTION DOC] With a replay directory and a baseline of tensor parallel 2, a value error
+        # mentioning "single-rank baseline" is raised.
         with pytest.raises(ValueError, match="single-rank baseline"):
             _run_baseline_and_target(
                 baseline_config=ParallelConfig(tp=2),
@@ -81,6 +99,8 @@ class TestRunAndCompare:
 
     @patch("miles.utils.debug_utils.run_megatron.cli.commands.run_and_compare.run_impl")
     def test_replay_paths_passed_correctly(self, mock_run: MagicMock) -> None:
+        # [FUNCTION DOC] With a replay directory and a single-rank baseline, the baseline run gets a
+        # routing replay dump path and no load path, and the target run gets a load path and no dump path.
         _run_baseline_and_target(
             baseline_config=ParallelConfig(tp=1),
             target_config=ParallelConfig(tp=2),
@@ -104,6 +124,8 @@ class TestRunAndCompare:
 
     @patch("miles.utils.debug_utils.run_megatron.cli.commands.run_and_compare.run_impl")
     def test_logprob_dirs_wired_when_provided(self, mock_run: MagicMock) -> None:
+        # [FUNCTION DOC] Logprob directories passed for baseline and target end up as the logprob
+        # output of the first and second run respectively.
         _run_baseline_and_target(
             baseline_config=ParallelConfig(tp=1),
             target_config=ParallelConfig(tp=2),
@@ -125,6 +147,8 @@ class TestRunAndCompare:
 
     @patch("miles.utils.debug_utils.run_megatron.cli.commands.run_and_compare.run_impl")
     def test_extra_args_appended_to_baseline_and_target(self, mock_run: MagicMock) -> None:
+        # [FUNCTION DOC] Per-side extra arguments "--baseline-flag" and "--target-flag" appear in the
+        # extra arguments of the baseline and target runs respectively.
         _run_baseline_and_target(
             baseline_config=ParallelConfig(tp=1),
             target_config=ParallelConfig(tp=2),
@@ -146,7 +170,9 @@ class TestRunAndCompare:
 
 
 class TestAppendExtraArgs:
+    # [CLASS DOC] Tests of the helper that appends extra arguments text to the common fields.
     def test_appends_extra_to_existing_extra_args(self) -> None:
+        # [FUNCTION DOC] Existing extra arguments "--foo" plus "--bar" give "--foo --bar".
         result = _append_extra_args(
             _make_common_fields(extra_args="--foo"),
             "--bar",
@@ -154,6 +180,10 @@ class TestAppendExtraArgs:
         assert result["extra_args"] == "--foo --bar"
 
     def test_empty_extra_preserves_original(self) -> None:
+        # [FUNCTION DOC] Appending an empty string to fields with extra arguments "--foo" leaves the
+        # result equal to freshly built fields with the same value.
+        # KNOWN ISSUE: the identity comparison against a freshly built dictionary is always false
+        # (a new dictionary is created each call), so only the equality half of the assertion matters.
         result = _append_extra_args(
             _make_common_fields(extra_args="--foo"),
             "",
@@ -161,6 +191,8 @@ class TestAppendExtraArgs:
         assert result is _make_common_fields(extra_args="--foo") or result == _make_common_fields(extra_args="--foo")
 
     def test_empty_both_returns_original(self) -> None:
+        # [FUNCTION DOC] With empty existing extra arguments and an empty addition, the very same
+        # dictionary object is returned (no copy).
         common = _make_common_fields(extra_args="")
         result = _append_extra_args(common, "")
         assert result is common

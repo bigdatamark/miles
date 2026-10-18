@@ -1,3 +1,15 @@
+# [MODULE DOC] Alignment tests between miles' apply_chat_template and SGLang's chat serving
+# pipeline, plus dataset routing and message-matching checks. Reference helpers build a minimal
+# SGLang serving-chat object (created without running its initializer, with mocked tokenizer and
+# template managers and the attributes the message processing reads) and return its prompt token
+# ids for plain Jinja models, for DeepSeek V3.2 and for DeepSeek V4 encoder paths. Tests compare
+# those ids with the ids produced by miles for a per-model table (model id, thinking support, fixed
+# template family or none, allowed append roles) across mock trajectories and thinking variants;
+# verify JSON-string versus dictionary tool arguments, no-tools prompts, input immutability, data
+# path routing versus the raw tokenizer, dataset prompt rendering with tools, DeepSeek V3.2 / V4
+# TITO prompt alignment (skipped when the local cluster-storage checkpoints are absent), and the
+# strict message matcher's treatment of wire index and id fields. Tokenizers are downloaded and
+# cached in a module-level cache. Network or model cache access is required.
 """Test that apply_chat_template aligns with SGLang's _apply_jinja_template.
 
 The reference function ``sglang_prompt_ids`` calls
@@ -56,6 +68,14 @@ from miles.utils.test_utils.mock_trajectories import (
 
 
 def _make_serving(tokenizer) -> OpenAIServingChat:
+    # [FUNCTION DOC] HELPER: Create a bare SGLang serving-chat object (skipping its initializer)
+    # and set only the state its message processing reads: mocked tokenizer manager exposing the
+    # given tokenizer; mocked template manager with no named template and "string" content format;
+    # DeepSeek V3.2 encoding off, no chat encoding spec, not gpt-oss, not gemma4, no tool call or
+    # reasoning parser, no V4 reasoning profile, empty default chat-template kwargs, a flag telling
+    # whether the tokenizer auto-adds special tokens (encoding the empty string yields tokens), the
+    # result of the object's own prompt-text round-trip probe, and an empty ordered template cache.
+    # Returns it. Mirrors attributes added by specific SGLang versions.
     """Create a minimal ``OpenAIServingChat`` that can run ``_process_messages``."""
     serving = object.__new__(OpenAIServingChat)
     serving.tokenizer_manager = MagicMock()
@@ -91,6 +111,10 @@ def sglang_prompt_ids(
     tools: list[dict] | None = None,
     **kwargs,
 ) -> list[int]:
+    # [FUNCTION DOC] HELPER: Reference prompt ids. Builds a chat completion request from deep
+    # copies of the messages (and tools when non-empty; extra keyword arguments become the request's
+    # chat-template kwargs, model name "test"), runs the minimal serving object's message processing
+    # in text-only mode and returns the resulting prompt token id list.
     """Get prompt_ids by calling SGLang's ``_process_messages`` directly."""
     request_data: dict = {"messages": copy.deepcopy(messages), "model": "test"}
     if tools:
@@ -110,6 +134,9 @@ def sglang_dsv32_prompt_ids(
     tools: list[dict] | None = None,
     **kwargs,
 ) -> list[int]:
+    # [FUNCTION DOC] HELPER: Same as the plain reference helper but forces the serving object's
+    # chat encoding spec to "dsv32", the reasoning parser to "deepseek-v3" and the tool call parser
+    # to "deepseekv32" before processing, so the DeepSeek V3.2 encoder is used. Returns prompt ids.
     """Get prompt_ids through sglang's DeepSeek V3.2 encoding path.
 
     sglang selects the V3.2 encoder in ``_apply_jinja_template`` when
@@ -139,6 +166,10 @@ def sglang_dsv4_prompt_ids(
     tools: list[dict] | None = None,
     **kwargs,
 ) -> list[int]:
+    # [FUNCTION DOC] HELPER: Same as the plain reference helper but forces the chat encoding spec
+    # to "dsv4", reasoning parser "deepseek-v4", tool call parser "deepseekv4", and sets the V4
+    # reasoning effort profile resolved for the local DeepSeek V4 model path constant (read lazily
+    # at call time from the module-level path). Returns prompt ids.
     """Get DeepSeek-V4 prompt_ids through SGLang's DSv4 encoder path."""
     request_data: dict = {"messages": copy.deepcopy(messages), "model": "test"}
     if tools:
@@ -170,24 +201,33 @@ _DEEPSEEK_V32_MODEL = "/cluster-storage/models/deepseek-ai/DeepSeek-V3.2"
 
 
 def _get_tokenizer(model_id: str) -> AutoTokenizer:
+    # [FUNCTION DOC] HELPER: Return a tokenizer for the model id from the module-level cache,
+    # loading it on first use through the project's tokenizer loader with remote code trusted
+    # (may download). The cache is never cleared.
     if model_id not in _TOK_CACHE:
         _TOK_CACHE[model_id] = load_tokenizer(model_id, trust_remote_code=True)
     return _TOK_CACHE[model_id]
 
 
 def _get_deepseek_v32_tokenizer() -> AutoTokenizer:
+    # [FUNCTION DOC] HELPER: Skip the calling test if the local DeepSeek V3.2 checkpoint directory
+    # does not exist; otherwise return its cached tokenizer.
     if not Path(_DEEPSEEK_V32_MODEL).exists():
         pytest.skip(f"DeepSeek V3.2 tokenizer not found: {_DEEPSEEK_V32_MODEL}")
     return _get_tokenizer(_DEEPSEEK_V32_MODEL)
 
 
 def _get_deepseek_v4_tokenizer() -> AutoTokenizer:
+    # [FUNCTION DOC] HELPER: Skip the calling test if the local DeepSeek V4 Flash checkpoint
+    # directory does not exist; otherwise return its cached tokenizer.
     if not Path(_DEEPSEEK_V4_MODEL).exists():
         pytest.skip(f"DeepSeek V4 tokenizer not found: {_DEEPSEEK_V4_MODEL}")
     return _get_tokenizer(_DEEPSEEK_V4_MODEL)
 
 
 def _load_fixed_or_none(tito_model: TITOTokenizerType | None) -> str | None:
+    # [FUNCTION DOC] HELPER: Return the text of the family's bundled fixed chat template file, or
+    # none when the family is none or has no template file. Reads the file.
     """Return the bundled fixed chat-template content for *tito_model*, or ``None``."""
     if tito_model is None:
         return None
@@ -225,6 +265,12 @@ _MODELS: list[tuple[str, bool, TITOTokenizerType | None, frozenset[str]]] = [
 
 
 def _build_align_params():
+    # [FUNCTION DOC] HELPER: Build parameters (model id, fixed family, case, thinking variant) for
+    # the alignment test. For each model, selects cases by allowed append roles (non-thinking
+    # trajectories only when the model has no thinking), crosses with both thinking variants (or
+    # off only), and skips trajectories ending in a plain assistant message (SimpleNoTool,
+    # SingleToolThinking, MultiRoleSequence) because SGLang treats those as continue-final-message
+    # and drops the trailing assistant header. Ids are the short model name plus the case id.
     # Thinking templates: every selected trajectory × {enable_thinking=True, False}.
     # Non-thinking templates: only non-thinking trajectories, no enable_thinking kwarg.
     params = []
@@ -254,6 +300,8 @@ def _build_align_params():
 
 
 def _per_model_params():
+    # [FUNCTION DOC] HELPER: One parameter per table model: (model id, fixed family or none) with
+    # the short model name as id.
     return [pytest.param(model_id, fixed_tito, id=model_id.split("/")[-1]) for model_id, _, fixed_tito, _ in _MODELS]
 
 
@@ -263,6 +311,9 @@ def _per_model_params():
 
 
 def _assert_aligned(tokenizer, case: CaseSpec, kwargs: dict, chat_template: str | None):
+    # [FUNCTION DOC] HELPER: Compute the SGLang reference prompt ids and the miles tokenized
+    # apply-chat-template ids for the case's messages and tools with the same template kwargs (and
+    # an override chat template when given), and assert they are equal lists.
     # ``kwargs`` are template kwargs (e.g. ``enable_thinking``, ``clear_thinking``)
     # — both ``sglang_prompt_ids`` (via ``chat_template_kwargs``) and
     # ``apply_chat_template`` (via ``**template_kwargs``) route them into jinja.
@@ -281,16 +332,23 @@ def _assert_aligned(tokenizer, case: CaseSpec, kwargs: dict, chat_template: str 
 
 
 class TestAlignWithSGLang:
+    # [CLASS DOC] Alignment of miles' apply-chat-template with the SGLang reference for the
+    # per-model table.
     """apply_chat_template must produce identical prompt_ids to SGLang's pipeline."""
 
     @pytest.mark.parametrize("model_id, fixed_tito, case, kwargs", _build_align_params())
     def test_align(self, model_id, fixed_tito, case, kwargs):
+        # [FUNCTION DOC] Parametrized over the generated matrix. Loads the model tokenizer and the
+        # optional fixed template and asserts aligned prompt ids.
         tokenizer = _get_tokenizer(model_id)
         chat_template = _load_fixed_or_none(fixed_tito)
         _assert_aligned(tokenizer, case, kwargs, chat_template)
 
     @pytest.mark.parametrize("model_id, fixed_tito", _per_model_params())
     def test_json_string_arguments(self, model_id, fixed_tito):
+        # [FUNCTION DOC] Parametrized per model. Uses a weather conversation (assistant tool call
+        # whose arguments are a JSON string, then a tool result) with one tool definition, and
+        # asserts the miles ids equal the SGLang reference ids (with the fixed template if any).
         """JSON-string tool_call arguments should produce same IDs as dict arguments."""
         tokenizer = _get_tokenizer(model_id)
         chat_template = _load_fixed_or_none(fixed_tito)
@@ -325,6 +383,8 @@ class TestAlignWithSGLang:
 
     @pytest.mark.parametrize("model_id, fixed_tito", _per_model_params())
     def test_no_tools(self, model_id, fixed_tito):
+        # [FUNCTION DOC] Parametrized per model. A system plus user conversation without tools gives
+        # identical ids from miles and the SGLang reference.
         """Plain conversation without tools."""
         tokenizer = _get_tokenizer(model_id)
         chat_template = _load_fixed_or_none(fixed_tito)
@@ -339,6 +399,9 @@ class TestAlignWithSGLang:
 
     @pytest.mark.parametrize("model_id, fixed_tito", _per_model_params())
     def test_does_not_mutate_input(self, model_id, fixed_tito):
+        # [FUNCTION DOC] Parametrized per model (the fixed family parameter is unused). Applies the
+        # template to deep copies of the single-tool trajectory messages and tools and asserts both
+        # equal their snapshots afterwards.
         tokenizer = _get_tokenizer(model_id)
         messages = copy.deepcopy(SingleToolTrajectory.MESSAGES)
         tools = copy.deepcopy(SingleToolTrajectory.TOOLS)
@@ -350,6 +413,9 @@ class TestAlignWithSGLang:
 
     @pytest.mark.parametrize("model_id, fixed_tito", _per_model_params())
     def test_data_path_routing_matches_raw_tokenizer(self, model_id, fixed_tito):
+        # [FUNCTION DOC] Parametrized per model (the fixed family parameter is unused). For one user
+        # message without tools, asserts the rendered string (not tokenized, with generation prompt)
+        # from miles equals the tokenizer's own chat template output.
         """Dataset rendering routes non-DeepSeek models through
         ``apply_chat_template`` instead of the old raw ``tokenizer.apply_chat_template``.
         For the no-tools dataset case the rendered string must be byte-identical."""
@@ -361,6 +427,10 @@ class TestAlignWithSGLang:
 
 
 def _build_dataset(tmp_path, tokenizer, row, **dataset_kwargs):
+    # [FUNCTION DOC] HELPER: Write the row as one JSON line into a rows file in the given
+    # directory and construct the project's Dataset from it with the tokenizer, no processor, no
+    # extra options and chat template application enabled, plus any keyword options. Returns the
+    # dataset. Needs no GPU or Ray.
     """Instantiate ``Dataset`` from a one-row temp jsonl (CPU-only, no ray/GPU)."""
     import json as _json
     import os
@@ -374,12 +444,16 @@ def _build_dataset(tmp_path, tokenizer, row, **dataset_kwargs):
 
 
 class TestDatasetRouting:
+    # [CLASS DOC] Tests of dataset prompt rendering through the unified template wiring.
     """End-to-end check that ``miles.utils.data.Dataset`` renders prompts through
     the unified ``apply_chat_template`` wiring (tool_key parsing, per-sample
     rendering, ``Sample.prompt`` output)."""
 
     @pytest.mark.parametrize("model_id, fixed_tito", _per_model_params())
     def test_no_tool_prompt_byte_identical_to_raw(self, tmp_path, model_id, fixed_tito):
+        # [FUNCTION DOC] Parametrized per model (family unused). Builds a one-row dataset with a
+        # user message and asserts the first sample's prompt string equals the tokenizer's own
+        # chat template output with generation prompt.
         tokenizer = _get_tokenizer(model_id)
         messages = [{"role": "user", "content": "Hello, how are you?"}]
         dataset = _build_dataset(str(tmp_path), tokenizer, {"text": messages})
@@ -387,6 +461,9 @@ class TestDatasetRouting:
         assert dataset.samples[0].prompt == expected
 
     def test_tool_prompt_matches_sglang_ids(self, tmp_path):
+        # [FUNCTION DOC] Builds a one-row dataset for Qwen3-4B with a user message and a weather
+        # tool read from the tools column, and asserts that encoding the first sample's prompt
+        # string without special tokens equals the SGLang reference prompt ids.
         tokenizer = _get_tokenizer("Qwen/Qwen3-4B")
         messages = [{"role": "user", "content": "What's the weather in Paris?"}]
         tools = [
@@ -414,6 +491,8 @@ class TestDatasetRouting:
 
 
 class TestDeepSeekV32TITOAlignWithSGLang:
+    # [CLASS DOC] Alignment tests of the DeepSeek V3.2 TITO tokenizer with the SGLang V3.2 encoder;
+    # tests skip when the local checkpoint is missing. Holds a class-level weather tool list.
     """V3.2 TITO prompt tokenization must match sglang's dsv32 encoder.
 
     V3.2 ships no jinja chat_template; the ``DEEPSEEKV32`` TITO family rides
@@ -443,6 +522,10 @@ class TestDeepSeekV32TITOAlignWithSGLang:
 
     @pytest.mark.parametrize("thinking", [False, True], ids=["chat", "thinking"])
     def test_prompt_ids_match_sglang_dsv32_with_tools(self, thinking):
+        # [FUNCTION DOC] Parametrized chat/thinking. For a single user question with the weather
+        # tool, the SGLang reference ids (thinking request knob) equal the TITO tokenizer's ids
+        # (enable-thinking template kwarg, generation prompt, tokenized, default template args
+        # built from the tools).
         tokenizer = _get_deepseek_v32_tokenizer()
         messages = [{"role": "user", "content": "What is the weather in Paris?"}]
 
@@ -458,6 +541,8 @@ class TestDeepSeekV32TITOAlignWithSGLang:
         assert actual == expected
 
     def test_absent_enable_thinking_defaults_to_thinking(self):
+        # [FUNCTION DOC] With no enable-thinking kwarg in the TITO tokenizer, the ids equal the
+        # SGLang reference ids with thinking requested true (the encoder default).
         # With the translation now living in the encoder, an absent enable_thinking
         # renders in thinking mode (the encoder default), matching sglang thinking=True.
         tokenizer = _get_deepseek_v32_tokenizer()
@@ -476,6 +561,8 @@ class TestDeepSeekV32TITOAlignWithSGLang:
 
     @pytest.mark.parametrize("thinking", [False, True], ids=["chat", "thinking"])
     def test_prompt_ids_match_sglang_dsv32_with_tool_history(self, thinking):
+        # [FUNCTION DOC] Parametrized chat/thinking. A conversation with a user question, an
+        # assistant tool call and a tool result: SGLang reference ids equal the TITO tokenizer ids.
         tokenizer = _get_deepseek_v32_tokenizer()
         messages = [
             {"role": "user", "content": "Weather in Beijing?"},
@@ -511,10 +598,14 @@ class TestDeepSeekV32TITOAlignWithSGLang:
 
 
 class TestDeepSeekV4TITOAlignWithSGLang:
+    # [CLASS DOC] Alignment tests of the DeepSeek V4 TITO tokenizer with the SGLang V4 encoder;
+    # tests skip when the local checkpoint is missing.
     """DeepSeek V4 TITO prompt tokenization must match SGLang's DSv4 encoder."""
 
     @pytest.mark.parametrize("thinking", [False, True], ids=["chat", "thinking"])
     def test_prompt_ids_match_sglang_dsv4_with_tools(self, thinking):
+        # [FUNCTION DOC] Parametrized chat/thinking. A single user question with a no-parameter
+        # year tool: SGLang V4 reference ids equal the V4 TITO tokenizer ids.
         tokenizer = _get_deepseek_v4_tokenizer()
         messages = [{"role": "user", "content": "What is 1+1?"}]
         tools = [
@@ -542,6 +633,9 @@ class TestDeepSeekV4TITOAlignWithSGLang:
 
     @pytest.mark.parametrize("thinking", [False, True], ids=["chat", "thinking"])
     def test_prompt_ids_match_sglang_dsv4_with_tool_history(self, thinking):
+        # [FUNCTION DOC] Parametrized chat/thinking. A system message, user question, assistant
+        # tool call (arguments JSON text with non-ASCII kept) and tool result, with a weather tool:
+        # SGLang V4 reference ids equal the V4 TITO tokenizer ids.
         tokenizer = _get_deepseek_v4_tokenizer()
         tools = [
             {
@@ -591,6 +685,8 @@ class TestDeepSeekV4TITOAlignWithSGLang:
 
 
 class TestMessageMatches:
+    # [CLASS DOC] Tests of the strict message matcher against a stored SGLang wire-format
+    # assistant tool-call message (index 0, null reasoning) and a rebuilt replay message.
     """strict_message_matches compares template-relevant content, not wire idiosyncrasies."""
 
     STORED_SGLANG_WIRE = {
@@ -608,6 +704,10 @@ class TestMessageMatches:
     }
 
     def _rebuilt(self, **tool_call_overrides):
+        # [FUNCTION DOC] HELPER: Build the replayed assistant message: empty content and one tool
+        # call with id "call_abc", type function, weather function with Paris arguments, no index,
+        # then the keyword overrides merged over the call (an override can add an index or change
+        # the id).
         tool_call = {
             "id": "call_abc",
             "type": "function",
@@ -618,14 +718,19 @@ class TestMessageMatches:
 
     @pytest.mark.parametrize("index_value", [0, 7, None], ids=["int", "other-int", "null"])
     def test_stream_rebuilt_replay_matches_sglang_wire(self, index_value):
+        # [FUNCTION DOC] Parametrized over stored index 0, 7 and null; the strict matcher accepts
+        # the stored message against the rebuilt one (no index) regardless of the stored index.
         stored = copy.deepcopy(self.STORED_SGLANG_WIRE)
         stored["tool_calls"][0]["index"] = index_value
         assert strict_message_matches(stored, self._rebuilt())
 
     def test_null_index_matches_absent_index(self):
+        # [FUNCTION DOC] A rebuilt message with a null index matches the stored message.
         assert strict_message_matches(self.STORED_SGLANG_WIRE, self._rebuilt(index=None))
 
     def test_null_tool_call_id_does_not_match_absent_id(self):
+        # [FUNCTION DOC] Stored id null versus a rebuilt call with the id key removed: the strict
+        # matcher rejects (null id is not equal to absent id).
         stored = copy.deepcopy(self.STORED_SGLANG_WIRE)
         stored["tool_calls"][0]["id"] = None
         rebuilt = self._rebuilt()
@@ -633,15 +738,18 @@ class TestMessageMatches:
         assert not strict_message_matches(stored, rebuilt)
 
     def test_different_arguments_still_mismatch(self):
+        # [FUNCTION DOC] Rebuilt arguments naming Rome instead of Paris are rejected.
         rebuilt = self._rebuilt()
         rebuilt["tool_calls"][0]["function"] = {"name": "get_weather", "arguments": '{"city": "Rome"}'}
         assert not strict_message_matches(self.STORED_SGLANG_WIRE, rebuilt)
 
     def test_different_tool_call_id_still_mismatches(self):
+        # [FUNCTION DOC] A rebuilt call with a different id is rejected.
         rebuilt = self._rebuilt(id="call_zzz")
         assert not strict_message_matches(self.STORED_SGLANG_WIRE, rebuilt)
 
     def test_content_mismatch_still_detected(self):
+        # [FUNCTION DOC] A rebuilt message with non-empty different content is rejected.
         rebuilt = self._rebuilt()
         rebuilt["content"] = "different"
         assert not strict_message_matches(self.STORED_SGLANG_WIRE, rebuilt)

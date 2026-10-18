@@ -1,3 +1,15 @@
+# [MODULE DOC] Tests that rendering with a pretokenized prefix (token ids of the first N messages
+# supplied separately) yields the same token ids as the standard apply-chat-template path
+# (the append-only / prefix invariant), for many chat templates. A module-level table lists
+# templates (fixed templates resolved from the TITO families and HF-native templates downloaded at
+# import time, so importing needs network or cache access), each with: name, template text, whether it
+# supports thinking, the set of roles that may be appended, and extra template kwargs. Parameters
+# are generated as template x selected trajectory case x enable-thinking variant. Also contains
+# negative tests (original unfixed Qwen templates must show a prefix mismatch; cutting before the
+# last user turn of a multi-user-turn thinking trajectory must mismatch for templates that compress
+# older reasoning) and a matrix of injected system/assistant append shapes per TITO family.
+# KNOWN ISSUE: the table rows "qwen3_thinking_2507_fixed" and "qwen3_next_thinking_fixed" use the
+# identical template, role set and kwargs, so one is redundant.
 """
 Unit tests for the pretokenized chat completion path.
 
@@ -30,6 +42,9 @@ from miles.utils.test_utils.mock_trajectories import (
 
 
 def _load_fixed(tito_model: TITOTokenizerType) -> str:
+    # [FUNCTION DOC] HELPER: Resolve the fixed chat template of a TITO family and return its file
+    # text. Asserts that the family has a template file (a message names the family otherwise);
+    # kwargs from the resolution are discarded. Reads the file.
     path, _kwargs = resolve_fixed_chat_template(tito_model)
     assert path is not None, f"resolve_fixed_chat_template should resolve {tito_model.value}"
     with open(path) as f:
@@ -180,6 +195,12 @@ _ORIGINAL_TEMPLATES = {
 
 
 def _build_pretokenized_params():
+    # [FUNCTION DOC] HELPER: Build the pytest parameter list for the core test. For each table row,
+    # select trajectory cases filtered by the row's allowed append roles (and restricted to
+    # non-thinking trajectories when the template does not support thinking); thinking templates are
+    # crossed with both enable-thinking values, non-thinking ones with the off variant only. Each
+    # parameter is (template text, case, merged kwargs of the variant and the row's extra kwargs)
+    # with an id made of the row name and the formatted case id.
     # Thinking templates: every selected trajectory × {enable_thinking=True, False}.
     # Non-thinking templates: only non-thinking trajectories, no enable_thinking kwarg.
     params = []
@@ -204,6 +225,9 @@ def _build_pretokenized_params():
 
 @pytest.mark.parametrize("chat_template, case, kwargs", _build_pretokenized_params())
 def test_pretokenized(chat_template: str, case: CaseSpec, kwargs: dict):
+    # [FUNCTION DOC] Core parametrized test: runs the shared verification helper on a deep copy of
+    # the case's messages, pretokenizing the first N messages of the case, with the case's tools and
+    # the kwargs; the helper raises if the pretokenized path differs from the standard path.
     assert_pretokenized_equals_standard(
         chat_template=chat_template,
         messages=deepcopy(case.traj_cls.MESSAGES),
@@ -235,6 +259,9 @@ _MISMATCH_CASES = [
 
 @pytest.mark.parametrize("chat_template,trajectory_cls,pretokenize_n", _MISMATCH_CASES)
 def test_original_template_prefix_mismatch(chat_template, trajectory_cls, pretokenize_n):
+    # [FUNCTION DOC] Parametrized over original (unfixed) Qwen templates and trajectories, with
+    # the first 3 messages pretokenized. Asserts the simulation raises a value error whose message
+    # says "Prefix mismatch".
     """Original templates with loop.last cause prefix mismatch (our fix resolves this)."""
     with pytest.raises(ValueError, match="Prefix mismatch"):
         simulate_pretokenized_path(
@@ -256,6 +283,11 @@ _CROSS_USER_THINKING_N = last_user_index(MultiUserTurnThinkingTrajectory.MESSAGE
 
 
 def _unique_thinking_templates():
+    # [FUNCTION DOC] HELPER: Build parameters for the cross-user-turn negative test: the distinct
+    # template texts (by content) of table rows that support thinking, skipping rows whose name
+    # starts with the Qwen 3.8 prefix (they preserve reasoning by default) or the Kimi prefix
+    # (they compress at a different boundary). Each parameter carries the template text and the
+    # row name as id (first row wins for duplicate content).
     seen: set[str] = set()
     out = []
     for name, content, supports_thinking, _, _ in _TEMPLATES:
@@ -282,6 +314,9 @@ def _unique_thinking_templates():
 @pytest.mark.parametrize("chat_template", _unique_thinking_templates())
 @pytest.mark.parametrize("enable_thinking", [True, False], ids=["thinking_on", "thinking_off"])
 def test_cross_user_turn_thinking_prefix_mismatch(chat_template, enable_thinking):
+    # [FUNCTION DOC] Parametrized over the distinct thinking templates and thinking on/off.
+    # Pretokenizes the multi-user-turn thinking trajectory up to the last user index and asserts the
+    # simulation raises a value error saying "Prefix mismatch".
     """Thinking templates compress reasoning_content from earlier user turns, breaking prefix invariant."""
     with pytest.raises(ValueError, match="Prefix mismatch"):
         simulate_pretokenized_path(
@@ -337,6 +372,13 @@ _APPEND_SHAPES = {
 @pytest.mark.parametrize("shape", list(_APPEND_SHAPES), ids=list(_APPEND_SHAPES))
 @pytest.mark.parametrize("family, hf_model_id", _APPEND_ROLE_FAMILIES, ids=[f.value for f, _ in _APPEND_ROLE_FAMILIES])
 def test_appends_are_append_only_on_family_template(family, hf_model_id, shape):
+    # [FUNCTION DOC] Parametrized over TITO families (with an HF model id when the family has no
+    # fixed template file) and four append shapes (system, injected assistant, assistant then user,
+    # two assistants then user). Resolves the family's fixed template and kwargs (or downloads the
+    # HF template), renders a one-round history without generation prompt as the base, then:
+    # for the Qwen 3.5, 3.6, 3.8-small and Qwen4-exp families with the system shape, asserts the
+    # template raises a value error "System message must be at the beginning" and returns;
+    # otherwise renders history plus the shape and asserts the result starts with the base text.
     path, kwargs = resolve_fixed_chat_template(family)
     if path is not None:
         with open(path, encoding="utf-8") as f:

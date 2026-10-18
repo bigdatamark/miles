@@ -1,3 +1,8 @@
+# [MODULE DOC] Tests that the Qwen3-4B launch script (scripts/run_qwen3_4b) expands its true
+# on-policy switch into the full set of training arguments and environment variables. Each test
+# patches the command backend's train execution to capture the keyword arguments (train argument
+# string and extra environment variables) instead of launching anything, and patches the default
+# wandb-arguments helper to return an empty string. CPU only; no processes are started.
 from __future__ import annotations
 
 from scripts import run_qwen3_4b
@@ -7,9 +12,20 @@ from miles.utils.external_utils.command_utils.base_backend import BaseCommandBac
 
 
 def test_qwen3_script_true_on_policy_single_knob_expands_to_megatron_contract(monkeypatch):
+    # [FUNCTION DOC] Builds script arguments for H100, Qwen3-4B, true on-policy on, eval and KL loss
+    # off, and first asserts the legacy sglang target is unset and sequence parallel is already off
+    # on the constructed arguments. Runs the script's train execution and asserts the captured train
+    # arguments contain true on-policy mode, deterministic sglang inference, the sglang and
+    # Megatron contract flags with the Qwen3 dense name, the fa3 backend, recompute logprobs via
+    # prefill, the load path of the Qwen3-4B torch-dist checkpoint, the save path under the shared
+    # data directory for the run id, batch-invariant mode and no rope fusion; and do not contain
+    # the legacy target flag, use-sglang, or sequence parallel. The row-linear invariance and
+    # deterministic Megatron all-reduce variables must be absent from the extra environment.
     captured = {}
 
     def fake_execute_train(_self, **kwargs):
+        # [FUNCTION DOC] HELPER: Stand-in for the backend train execution; stores its keyword
+        # arguments into the enclosing test's capture mapping and returns nothing.
         captured.update(kwargs)
 
     monkeypatch.setattr(BaseCommandBackend, "execute_train", fake_execute_train)
@@ -50,9 +66,21 @@ def test_qwen3_script_true_on_policy_single_knob_expands_to_megatron_contract(mo
 
 
 def test_qwen3_script_true_on_policy_tp2_cp4_normal_topology_contract(monkeypatch):
+    # [FUNCTION DOC] Like the single-knob test but in normal mode with the script arguments then
+    # overridden to tensor parallel 2, context parallel 4, pipeline parallel 1, context-parallel
+    # communication type a2a and 8 rollout GPUs per engine (set after construction). Asserts the
+    # sglang target is unset and sequence parallel off before execution. After running the train
+    # execution, asserts the arguments carry those sizes, the a2a type, the load and save paths for
+    # the run id, the sglang contract flag, fa3, recompute via prefill, batch-invariant mode, no
+    # bias-swiglu fusion and no rope fusion, and lack the legacy target, use-sglang and sequence
+    # parallel flags. Asserts the environment has the NCCL algorithm Ring, nondeterministic
+    # algorithms disabled for the transformer library, cuBLAS workspace config :4096:8, and neither
+    # the row-linear invariance nor the deterministic Megatron all-reduce variable.
     captured = {}
 
     def fake_execute_train(_self, **kwargs):
+        # [FUNCTION DOC] HELPER: Stand-in for the backend train execution; stores its keyword
+        # arguments into the enclosing test's capture mapping and returns nothing.
         captured.update(kwargs)
 
     monkeypatch.setattr(BaseCommandBackend, "execute_train", fake_execute_train)
@@ -104,9 +132,15 @@ def test_qwen3_script_true_on_policy_tp2_cp4_normal_topology_contract(monkeypatc
 
 
 def test_qwen3_script_off_policy_does_not_emit_true_on_policy_contract(monkeypatch):
+    # [FUNCTION DOC] Builds script arguments with true on-policy off and runs the train execution.
+    # Asserts the captured train arguments contain none of: true on-policy mode, the sglang
+    # contract flag, the legacy target flag, the Megatron contract flag, recompute-logprobs-via-
+    # prefill, use-sglang; and the extra environment lacks the row-linear invariance variable.
     captured = {}
 
     def fake_execute_train(_self, **kwargs):
+        # [FUNCTION DOC] HELPER: Stand-in for the backend train execution; stores its keyword
+        # arguments into the enclosing test's capture mapping and returns nothing.
         captured.update(kwargs)
 
     monkeypatch.setattr(BaseCommandBackend, "execute_train", fake_execute_train)

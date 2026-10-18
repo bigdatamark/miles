@@ -1,3 +1,14 @@
+# [MODULE DOC] Contract tests for the session message matcher hub
+# (miles.utils.chat_template_utils.message_matcher_hub). A matcher decides whether a stored
+# message equals a replayed one. Three built-in policies are nested by strictness: strict (full
+# comparison with empty-value and wire-index normalization), loose tool call (additionally treats
+# tool call arguments as equal when they decode to equal JSON objects, with empty arguments
+# normalized, but still comparing ids, types, names, unknown fields, call count/order and
+# reasoning content) and role/content only (compares only role and content with empty-value
+# equivalence). Also tested: resolving matchers by alias or dotted path, the contract wrapper
+# (must return a real bool, exceptions wrapped), the append-only assertion using a configurable
+# matcher, compatibility re-exports, lazy import of the function registry, and absence of import
+# cycles (checked in subprocesses). Test helper functions build assistant messages with tool calls.
 """Contract tests for session message matching policies."""
 
 from __future__ import annotations
@@ -35,6 +46,11 @@ def _tool_call(
     call_extra: dict[str, Any] | None = None,
     function_extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Build one tool call dictionary with an id (default "call-A"), a type
+    # (default "function") and a function entry with the name (default "lookup"). The arguments
+    # entry is included only if arguments were supplied (a sentinel distinguishes missing from
+    # null). Extra function entries are merged in; an index is added only if supplied; extra
+    # call-level entries are merged last.
     function = {"name": name}
     if arguments is not _MISSING:
         function["arguments"] = arguments
@@ -57,6 +73,9 @@ def _assistant(
     reasoning_content: Any = _MISSING,
     **call_kwargs: Any,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Build an assistant message with the given content (default empty)
+    # and tool calls: the explicit list when given, otherwise a single tool call built from the
+    # arguments and the remaining keyword options. Reasoning content is added only when supplied.
     message: dict[str, Any] = {
         "role": "assistant",
         "content": content,
@@ -68,6 +87,8 @@ def _assistant(
 
 
 def test_strict_preserves_existing_empty_and_wire_index_normalization() -> None:
+    # [FUNCTION DOC] A stored message (tool call index 0, null reasoning) and a replayed one (index
+    # 91, no reasoning, different extra wire metadata) are equal under the strict matcher.
     stored = _assistant('{"city":"Paris"}', index=0, reasoning_content=None)
     replayed = _assistant('{"city":"Paris"}', index=91)
     stored["wire_metadata"] = {"source": "stored"}
@@ -86,6 +107,9 @@ def test_strict_preserves_existing_empty_and_wire_index_normalization() -> None:
     ],
 )
 def test_loose_tool_call_normalizes_empty_argument_objects(stored_arguments: Any, replayed_arguments: Any) -> None:
+    # [FUNCTION DOC] Parametrized over four pairs of empty-argument spellings (null versus empty
+    # string, empty string versus empty dict, empty dict versus "{}", "{}" versus "{ }"). Asserts
+    # the strict matcher rejects the pair while the loose matcher accepts it.
     stored = _assistant(stored_arguments)
     replayed = _assistant(replayed_arguments)
 
@@ -94,6 +118,9 @@ def test_loose_tool_call_normalizes_empty_argument_objects(stored_arguments: Any
 
 
 def test_loose_tool_call_normalizes_nested_json_objects_without_mutating_array_order() -> None:
+    # [FUNCTION DOC] Stored arguments are a JSON string with nested objects, an escaped non-ASCII
+    # character and number 1e0; replayed arguments are the equivalent dictionary with different key
+    # order, float 1.0 and the literal character. Strict rejects, loose accepts.
     stored = _assistant('{"outer":{"b":2,"a":[1,{"text":"\\u00e9"}]},"number":1e0}')
     replayed = _assistant(
         {
@@ -119,6 +146,9 @@ def test_loose_tool_call_normalizes_nested_json_objects_without_mutating_array_o
 def test_loose_tool_call_preserves_json_types_values_and_array_order(
     stored_arguments: Any, replayed_arguments: Any
 ) -> None:
+    # [FUNCTION DOC] Parametrized over argument pairs that differ semantically (boolean versus
+    # number, null versus string, array order, object versus array of pairs, different numbers).
+    # Strict and loose both reject, while the role/content-only matcher still accepts.
     stored = _assistant(stored_arguments)
     replayed = _assistant(replayed_arguments)
 
@@ -145,6 +175,10 @@ def test_loose_tool_call_preserves_json_types_values_and_array_order(
 def test_loose_tool_call_invalid_or_non_object_arguments_use_type_sensitive_raw_comparison(
     stored_arguments: Any, replayed_arguments: Any
 ) -> None:
+    # [FUNCTION DOC] Parametrized over argument pairs that are not normalizable JSON objects
+    # (whitespace only, invalid JSON, duplicate keys, NaN and infinities, top-level array or
+    # number, dictionaries with non-JSON values or non-string keys). Asserts the loose matcher
+    # rejects each pair (raw, type-sensitive comparison, no normalization).
     stored = _assistant(stored_arguments)
     replayed = _assistant(replayed_arguments)
 
@@ -152,6 +186,8 @@ def test_loose_tool_call_invalid_or_non_object_arguments_use_type_sensitive_raw_
 
 
 def test_loose_tool_call_preserves_large_finite_json_numbers() -> None:
+    # [FUNCTION DOC] Arguments with 1e999 and 10e998 (equal exact numbers beyond float range) are
+    # accepted as equal by the loose matcher.
     stored = _assistant('{"value":1e999}')
     replayed = _assistant('{"value":10e998}')
 
@@ -159,6 +195,8 @@ def test_loose_tool_call_preserves_large_finite_json_numbers() -> None:
 
 
 def test_loose_tool_call_rejects_decimal_from_python_dict() -> None:
+    # [FUNCTION DOC] A JSON string argument with number 1 versus a dictionary holding a decimal
+    # object 1 (not a JSON type): the loose matcher rejects.
     stored = _assistant('{"value":1}')
     replayed = _assistant({"value": Decimal("1")})
 
@@ -166,6 +204,9 @@ def test_loose_tool_call_rejects_decimal_from_python_dict() -> None:
 
 
 def test_loose_tool_call_deep_json_falls_back_without_raising() -> None:
+    # [FUNCTION DOC] Two argument strings nested 2000 array levels deep and differing only in
+    # whitespace. With the interpreter recursion limit temporarily lowered to 500 (always restored),
+    # asserts the loose matcher returns exactly false instead of raising a recursion error.
     stored_arguments = '{"x":' + "[" * 2000 + "0" + "]" * 2000 + "}"
     replayed_arguments = '{"x": ' + "[" * 2000 + "0" + "]" * 2000 + "}"
 
@@ -194,6 +235,8 @@ def test_loose_tool_call_deep_json_falls_back_without_raising() -> None:
 def test_loose_tool_call_does_not_equate_missing_arguments_with_empty_object(
     empty_arguments: Any,
 ) -> None:
+    # [FUNCTION DOC] Parametrized over four empty spellings; a tool call with no arguments entry
+    # at all never matches one with an empty spelling under the loose matcher.
     assert not loose_tool_call_message_matches(
         _assistant(_MISSING),
         _assistant(empty_arguments),
@@ -213,6 +256,10 @@ def test_loose_tool_call_does_not_equate_missing_arguments_with_empty_object(
 def test_loose_tool_call_still_compares_call_identity_and_unknown_fields(
     path: tuple[str, ...], replacement: Any
 ) -> None:
+    # [FUNCTION DOC] Parametrized over a field path in the replayed tool call (call id, call type,
+    # function name, unknown call-level field, unknown function-level field) and a replacement
+    # value. Starts from equivalent messages (JSON string versus dictionary arguments, same unknown
+    # fields), changes just that field in the replayed copy and asserts the loose matcher rejects.
     stored = _assistant(
         '{"x":1}',
         call_extra={"provider": "stored"},
@@ -233,6 +280,8 @@ def test_loose_tool_call_still_compares_call_identity_and_unknown_fields(
 
 
 def test_loose_tool_call_requires_unknown_fields_to_be_present() -> None:
+    # [FUNCTION DOC] Deleting the unknown call-level field from the replayed tool call makes the
+    # loose matcher reject.
     stored = _assistant('{"x":1}', call_extra={"provider": "same"})
     replayed = _assistant({"x": 1}, call_extra={"provider": "same"})
     del replayed["tool_calls"][0]["provider"]
@@ -241,6 +290,8 @@ def test_loose_tool_call_requires_unknown_fields_to_be_present() -> None:
 
 
 def test_loose_tool_call_preserves_tool_call_count_and_order() -> None:
+    # [FUNCTION DOC] Stored has two tool calls; a reordered replay and a replay with only the first
+    # call are both rejected by the loose matcher.
     stored = _assistant(
         calls=[
             _tool_call('{"x":1}', call_id="call-A", name="first"),
@@ -260,6 +311,8 @@ def test_loose_tool_call_preserves_tool_call_count_and_order() -> None:
 
 
 def test_loose_tool_call_does_not_relax_reasoning_content() -> None:
+    # [FUNCTION DOC] Stored has non-empty reasoning content, replay has none: loose rejects while
+    # role/content-only accepts.
     stored = _assistant('{"x":1}', reasoning_content="kept")
     replayed = _assistant({"x": 1})
 
@@ -268,6 +321,9 @@ def test_loose_tool_call_does_not_relax_reasoning_content() -> None:
 
 
 def _projected_message(field: str, value: Any) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Build a user message with content "same", then set the named field to
+    # the value, or remove the field entirely when the value is the missing sentinel. Note that for
+    # the role field the base role is user, so the result may lack a role.
     message: dict[str, Any] = {"role": "user", "content": "same"}
     if value is _MISSING:
         message.pop(field)
@@ -277,6 +333,8 @@ def _projected_message(field: str, value: Any) -> dict[str, Any]:
 
 
 def test_role_content_only_uses_the_existing_empty_value_class_for_each_projected_field() -> None:
+    # [FUNCTION DOC] For each of role and content, over all pairs of empty values (missing, null,
+    # empty string, empty list), the role/content-only matcher accepts.
     empty_values = (_MISSING, None, "", [])
     for field in ("role", "content"):
         for stored_value in empty_values:
@@ -301,6 +359,9 @@ def test_role_content_only_uses_the_existing_empty_value_class_for_each_projecte
 def test_role_content_only_does_not_add_other_normalization(
     field: str, stored_value: Any, replayed_value: Any
 ) -> None:
+    # [FUNCTION DOC] Parametrized over differing role or content values (different role, leading
+    # space, case, Unicode normalization form, JSON spacing, list order); the role/content-only
+    # matcher rejects each (no extra normalization).
     assert not role_content_only_message_matches(
         _projected_message(field, stored_value),
         _projected_message(field, replayed_value),
@@ -308,6 +369,10 @@ def test_role_content_only_does_not_add_other_normalization(
 
 
 def test_role_content_only_ignores_every_non_projected_field_even_when_tool_calls_are_malformed() -> None:
+    # [FUNCTION DOC] Two assistant messages with empty (null versus empty string) content but
+    # completely different values for every other field (reasoning, tool calls including a
+    # malformed string, names, ids, date, location, tools, response format, unknown); the
+    # role/content-only matcher accepts.
     stored = {
         "role": "assistant",
         "content": "",
@@ -339,6 +404,9 @@ def test_role_content_only_ignores_every_non_projected_field_even_when_tool_call
 
 
 def test_builtin_match_sets_are_monotonic() -> None:
+    # [FUNCTION DOC] Over all ordered pairs of a small message set (user messages, several
+    # assistant tool-call variants, a malformed one), asserts strict implies loose and loose implies
+    # role/content-only (match sets are nested).
     messages = [
         {"role": "user", "content": "same"},
         {"role": "user", "content": "different"},
@@ -358,6 +426,8 @@ def test_builtin_match_sets_are_monotonic() -> None:
 
 
 def test_matchers_do_not_mutate_either_input() -> None:
+    # [FUNCTION DOC] Runs all three matchers in both argument orders on messages with nested
+    # arguments and unknown fields, then asserts both messages equal their deep copies.
     stored = _assistant(
         {"nested": {"b": [2, 1], "a": True}},
         index=0,
@@ -392,30 +462,43 @@ def test_matchers_do_not_mutate_either_input() -> None:
     ],
 )
 def test_resolver_maps_builtin_aliases_by_identity(selector: str, expected: Any) -> None:
+    # [FUNCTION DOC] Parametrized over the three alias names; the resolved matcher (a wrapper) wraps
+    # exactly the corresponding built-in function object.
     assert resolve_session_message_matcher(selector).__wrapped__ is expected
 
 
 def test_resolver_loads_a_synchronous_dotted_path() -> None:
+    # [FUNCTION DOC] Resolving the dotted path of the standard equality operator function yields a
+    # wrapper around that very function.
     assert resolve_session_message_matcher("operator.eq").__wrapped__ is operator.eq
 
 
 class TestValidatedMessageMatcher:
+    # [CLASS DOC] Tests of the contract wrapper that validates custom matcher results.
     def test_passes_through_exact_bool_results(self):
+        # [FUNCTION DOC] Wrapped matchers returning true or false yield exactly those booleans.
         assert _validated(lambda stored, replayed: True)({}, {}) is True
         assert _validated(lambda stored, replayed: False)({}, {}) is False
 
     def test_wraps_matcher_exceptions(self):
+        # [FUNCTION DOC] A matcher that raises a runtime error makes the wrapper raise the matcher
+        # error type with a message saying the matcher raised an exception.
         def broken(stored, replayed):
+            # [FUNCTION DOC] HELPER: Matcher that always raises a runtime error "boom".
             raise RuntimeError("boom")
 
         with pytest.raises(SessionMessageMatcherError, match="raised an exception"):
             _validated(broken)({}, {})
 
     def test_rejects_truthy_non_bool_results(self):
+        # [FUNCTION DOC] A matcher returning the integer 1 makes the wrapper raise the matcher error
+        # saying it must return bool, got int.
         with pytest.raises(SessionMessageMatcherError, match="must return bool, got int"):
             _validated(lambda stored, replayed: 1)({}, {})
 
     def test_resolver_applies_the_contract_check_to_custom_paths(self):
+        # [FUNCTION DOC] Resolving the dotted path of the path-join function and calling it with two
+        # strings raises the matcher error saying it must return bool, got str.
         wrapped = resolve_session_message_matcher("os.path.join")
         with pytest.raises(SessionMessageMatcherError, match="must return bool, got str"):
             wrapped("a", "b")
@@ -423,6 +506,8 @@ class TestValidatedMessageMatcher:
 
 @pytest.mark.parametrize("selector", ["Strict", "LOOSE_TOOL_CALL", "role-content-only"])
 def test_builtin_aliases_are_exact_and_case_sensitive(selector: str) -> None:
+    # [FUNCTION DOC] Parametrized over wrongly cased or hyphenated aliases; resolving raises a
+    # value error whose message lists the three valid aliases.
     with pytest.raises(ValueError) as exc_info:
         resolve_session_message_matcher(selector)
 
@@ -442,11 +527,17 @@ def test_builtin_aliases_are_exact_and_case_sensitive(selector: str) -> None:
     ],
 )
 def test_resolver_wraps_invalid_custom_paths(selector: str) -> None:
+    # [FUNCTION DOC] Parametrized over a missing module, a missing attribute, a non-callable and an
+    # asynchronous callable; each raises a value error saying it failed to resolve the session
+    # message matcher option.
     with pytest.raises(ValueError, match="failed to resolve --session-message-matcher"):
         resolve_session_message_matcher(selector)
 
 
 def test_append_only_assert_defaults_to_strict_and_honors_the_configured_matcher() -> None:
+    # [FUNCTION DOC] Stored has one assistant message (JSON string arguments), replay has the same
+    # with dictionary arguments plus an allowed tool message. By default the append-only assertion
+    # raises a value error about a mismatch at index 0; with the loose matcher passed it succeeds.
     stored = [_assistant('{"city":"Paris"}')]
     replayed = [_assistant({"city": "Paris"}), {"role": "tool", "content": "ok"}]
 
@@ -459,6 +550,8 @@ def test_append_only_assert_defaults_to_strict_and_honors_the_configured_matcher
 
 
 def test_append_only_assert_still_validates_suffix_roles_under_a_loose_matcher() -> None:
+    # [FUNCTION DOC] With the loose matcher, an appended system message when only tool is allowed
+    # still raises a value error about the appended message at index 1.
     stored = [_assistant('{"city":"Paris"}')]
     replayed = [_assistant({"city": "Paris"}), {"role": "system", "content": "injected"}]
 
@@ -469,6 +562,9 @@ def test_append_only_assert_still_validates_suffix_roles_under_a_loose_matcher()
 
 
 def test_compatibility_exports_are_direct_aliases() -> None:
+    # [FUNCTION DOC] Asserts the strict matcher and the append-only assertion are the same objects
+    # when reached through the template module, the package and the hub; and that the package does
+    # not export the loose matcher, role/content-only matcher or the resolver.
     assert template.strict_message_matches is message_matcher_hub.strict_message_matches
     assert chat_template_utils.strict_message_matches is message_matcher_hub.strict_message_matches
     assert (
@@ -485,6 +581,10 @@ def test_compatibility_exports_are_direct_aliases() -> None:
 
 
 def test_hub_import_keeps_the_function_registry_lazy_until_a_custom_path_is_resolved() -> None:
+    # [FUNCTION DOC] Runs a fresh interpreter subprocess (120 second timeout, must exit
+    # successfully) that checks: the function registry module is not loaded initially nor after
+    # importing the hub nor after resolving the built-in strict alias; it is loaded after resolving a
+    # custom dotted path; and the broader misc utilities module stays unloaded.
     code = """
 import importlib
 import sys
@@ -511,6 +611,9 @@ assert "miles.utils.misc" not in sys.modules
     ],
 )
 def test_supported_import_orders_have_no_cycle(first_import: str) -> None:
+    # [FUNCTION DOC] Parametrized over four first-imported modules (hub, template, package, TITO
+    # tokenizer). In a fresh interpreter subprocess (120 second timeout) imports that module first
+    # and then all four; the subprocess must exit successfully (no import cycle error).
     modules = (
         "miles.utils.chat_template_utils.message_matcher_hub",
         "miles.utils.chat_template_utils.template",

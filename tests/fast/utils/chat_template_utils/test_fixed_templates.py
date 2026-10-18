@@ -1,3 +1,11 @@
+# [MODULE DOC] Tests for resolve_fixed_chat_template and the FixedTemplate registration of the
+# token-in-token-out (TITO) tokenizer families. A table maps each non-default tokenizer type to the
+# expected fixed template file name (or none when the native template is used) and the extra
+# template kwargs that keep rendering append-only (preserve/clear thinking switches and so on).
+# Checks: the table covers every family, resolution returns existing template files and kwargs,
+# defaults of FixedTemplate, rejection of unknown append roles, restricted role sets of some
+# families, string family names accepted, returned kwargs being copies, registered kwargs overriding
+# conflicting launch values, and tool-argument serialization of the Qwen 3.5 and 3.6 templates.
 """Unit tests for ``resolve_fixed_chat_template`` — one template per family.
 
 Each ``TITOTokenizer`` subclass registers a single ``FIXED_TEMPLATE``:
@@ -51,6 +59,8 @@ _EXPECTED_FIXED_TEMPLATES = {
 
 
 def test_every_non_default_family_is_covered():
+    # [FUNCTION DOC] Asserts the expectation table's keys equal the set of all tokenizer types
+    # except the default one, so a new family forces a new row.
     # New families must register a FIXED_TEMPLATE and take a row here.
     assert set(_EXPECTED_FIXED_TEMPLATES) == set(TITOTokenizerType) - {TITOTokenizerType.DEFAULT}
 
@@ -59,6 +69,10 @@ def test_every_non_default_family_is_covered():
     "tito_model", list(_EXPECTED_FIXED_TEMPLATES), ids=[t.value for t in _EXPECTED_FIXED_TEMPLATES]
 )
 def test_family_resolves_template_and_preserve_think_kwargs(tito_model):
+    # [FUNCTION DOC] Parametrized over every family in the table. Resolves the fixed template; if
+    # the table expects no template file asserts the path is none, otherwise asserts the path equals
+    # the template directory joined with the expected file name and that the file exists. Asserts the
+    # returned kwargs equal the expected kwargs exactly.
     # Every family pins its preserve-think kwargs unconditionally, so renders
     # stay append-only regardless of which roles the harness appends.
     expected_template, expected_kwargs = _EXPECTED_FIXED_TEMPLATES[tito_model]
@@ -72,10 +86,13 @@ def test_family_resolves_template_and_preserve_think_kwargs(tito_model):
 
 
 def test_default_family_uses_native_template():
+    # [FUNCTION DOC] The default family resolves to no template path and empty kwargs.
     assert resolve_fixed_chat_template(TITOTokenizerType.DEFAULT) == (None, {})
 
 
 def test_fixed_template_defaults_to_all_roles():
+    # [FUNCTION DOC] A default-constructed fixed template allows all append roles as an immutable
+    # set, and equals the base tokenizer class's registered fixed template.
     fixed = FixedTemplate()
     assert fixed.allowed_append_roles == ALL_APPEND_ROLES
     assert isinstance(fixed.allowed_append_roles, frozenset)
@@ -83,6 +100,8 @@ def test_fixed_template_defaults_to_all_roles():
 
 
 def test_fixed_template_rejects_unknown_role():
+    # [FUNCTION DOC] Constructing a fixed template whose allowed roles include "developer" raises a
+    # value error about unknown allowed append roles.
     with pytest.raises(ValueError, match="Unknown FixedTemplate allowed_append_roles"):
         FixedTemplate(allowed_append_roles=frozenset({"developer"}))
 
@@ -99,14 +118,20 @@ def test_fixed_template_rejects_unknown_role():
     ],
 )
 def test_restricted_fixed_template_excludes_mid_session_system(tokenizer_cls):
+    # [FUNCTION DOC] Parametrized over the DeepSeek V4, Qwen 3.5, 3.6, 3.8-small and MiniMax M2.5 and
+    # M2.7 tokenizer classes; asserts each allows exactly the tool, user and assistant append roles.
     assert tokenizer_cls.FIXED_TEMPLATE.allowed_append_roles == frozenset({"tool", "user", "assistant"})
 
 
 def test_string_tito_model_accepted():
+    # [FUNCTION DOC] Resolving with the string "qwen3" equals resolving with the Qwen3 enum member.
     assert resolve_fixed_chat_template("qwen3") == resolve_fixed_chat_template(TITOTokenizerType.QWEN3)
 
 
 def test_kwargs_are_copied_not_shared(monkeypatch):
+    # [FUNCTION DOC] Temporarily replaces the Qwen3 class registration with a template-less one
+    # carrying clear-thinking false, resolves it, mutates the returned kwargs, and asserts the
+    # registered extra kwargs are unchanged.
     # Mutating the returned kwargs must not leak into the registration.
     monkeypatch.setattr(
         Qwen3TITOTokenizer,
@@ -126,6 +151,10 @@ def test_kwargs_are_copied_not_shared(monkeypatch):
     ],
 )
 def test_registered_kwargs_override_conflicting_launch_values(tokenizer_cls, chat_template_kwargs):
+    # [FUNCTION DOC] Parametrized over Qwen3 with clear-thinking true and Qwen 3.8-small with
+    # preserve-thinking false. Builds the tokenizer wrapper around a mock tokenizer whose encode
+    # returns [1] and passes the conflicting kwargs; asserts the stored kwargs equal the class's
+    # registered extra kwargs (registration wins).
     tokenizer = MagicMock()
     tokenizer.encode.return_value = [1]
     tito = tokenizer_cls(tokenizer, chat_template_kwargs=chat_template_kwargs)
@@ -140,6 +169,12 @@ def test_registered_kwargs_override_conflicting_launch_values(tokenizer_cls, cha
     ],
 )
 def test_qwen35_and_qwen36_preserve_family_tool_argument_serialization(family, expected_boolean, expected_nothing):
+    # [FUNCTION DOC] Parametrized over Qwen 3.5 (boolean rendered "False", null rendered "None")
+    # and Qwen 3.6 ("false", "null"). Reads the resolved template file, renders a user message plus
+    # an assistant tool call with arguments of string, boolean, number, null, array and object
+    # types (no generation prompt, family kwargs applied), and asserts each parameter block: string
+    # as plain text, boolean and null per the family's spelling, number as 3, array as "[1, 2]" and
+    # object as compact JSON.
     template_path, kwargs = resolve_fixed_chat_template(family)
     assert template_path is not None
     with open(template_path, encoding="utf-8") as template_file:

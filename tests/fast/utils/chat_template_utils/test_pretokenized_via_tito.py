@@ -1,3 +1,10 @@
+# [MODULE DOC] Tests for the decode-roundtrip append-only verifiers
+# verify_append_only_via_tito_instance and run_all_checks_via_tito (miles.utils.test_utils
+# chat_template_verify): they must pass on registered TITO families, fail on the original unfixed
+# Qwen3 chat template, and fail on a test-local Qwen3 tokenizer variant whose merge omits the
+# newline fix-up. Registers as a CPU test in the stage-b-cpu suite (estimated 120 seconds). Needs
+# real Hugging Face tokenizers (downloaded) and, for one test, a local DeepSeek V4 checkpoint path
+# (skipped when absent).
 """Unit tests for ``verify_append_only_via_tito_instance`` /
 ``run_all_checks_via_tito``: PASS on registered TITO families, FAIL on the
 unfixed Qwen3 chat template, FAIL on a test-local ``_BuggyQwen3TITOTokenizer``
@@ -28,6 +35,10 @@ def _setup_tokenizer_with_registered_template(
     model_id: str,
     family: TITOTokenizerType,
 ):
+    # [FUNCTION DOC] HELPER: Load a fresh Hugging Face tokenizer for the model id (network or
+    # cache), resolve the family's fixed template and kwargs, and if a template file exists
+    # overwrite the tokenizer's chat template with its text. Returns (tokenizer, copy of the extra
+    # kwargs as a plain dictionary).
     """Mirror what production wiring does at startup.
 
     Loads tokenizer, resolves the family's ``FIXED_TEMPLATE`` (resolution is
@@ -65,6 +76,10 @@ _PASS_PARAMS = [
 
 @pytest.mark.parametrize("family,model_id", _PASS_PARAMS)
 def test_via_tito_pass_on_registered_families(family, model_id):
+    # [FUNCTION DOC] Parametrized over Qwen, GLM families and model ids. Sets up the tokenizer
+    # with the registered template, runs all via-TITO checks (thinking "on" only for GLM 5.3, "both"
+    # otherwise) with the extra template kwargs, and asserts there are no failed results; the
+    # assertion message lists up to five failures with case name and error.
     """Registered TITO families round-trip cleanly via decode-roundtrip."""
     tokenizer, extra_kwargs = _setup_tokenizer_with_registered_template(model_id, family)
     results = run_all_checks_via_tito(
@@ -90,6 +105,10 @@ _DEEPSEEK_V4_MODEL = "/cluster-storage/models/deepseek-ai/DeepSeek-V4-Flash"
 
 
 def test_via_tito_pass_on_deepseek_v4():
+    # [FUNCTION DOC] Skips unless the local DeepSeek V4 Flash checkpoint directory exists. Loads
+    # its tokenizer (remote code trusted), runs all via-TITO checks for the DeepSeek V4 family in
+    # both thinking modes with a copy of the family's kwargs, and asserts there are no failures
+    # (message lists up to five).
     """DSv4's encoder folds contiguous tool/user turns into one ``<｜User｜>``
     block and auto-appends the assistant opener after a user tail; the
     subclass's real-history diff + opener strip must round-trip on both
@@ -119,6 +138,8 @@ def test_via_tito_pass_on_deepseek_v4():
 
 
 def test_via_tito_fail_on_original_qwen3_template():
+    # [FUNCTION DOC] Loads the Qwen3-0.6B tokenizer and keeps its original chat template, runs all
+    # via-TITO checks for the Qwen3 family in both thinking modes, and asserts at least one result failed.
     """The original Qwen3 chat template uses ``loop.last`` and breaks append-only.
 
     Bypass ``resolve_fixed_chat_template`` entirely — keep the HF default
@@ -147,6 +168,8 @@ def test_via_tito_fail_on_original_qwen3_template():
 
 
 class _BuggyQwen3TITOTokenizer(Qwen3TITOTokenizer):
+    # [CLASS DOC] HELPER: Test-only Qwen3 TITO tokenizer whose token merge deliberately skips the
+    # newline insertion after a trailing end-of-message token, to prove the verifier detects it.
     """Test-only Qwen3 variant with the ``\\n`` boundary insertion deleted.
 
     Real ``Qwen3TITOTokenizer.merge_tokens`` appends ``self._newline_id`` after
@@ -157,12 +180,18 @@ class _BuggyQwen3TITOTokenizer(Qwen3TITOTokenizer):
     """
 
     def merge_tokens(self, old_messages, new_messages, pretokenized_token_ids, *, template_args=None):
+        # [FUNCTION DOC] HELPER: Tokenize the additional (new minus old) messages with the parent's
+        # helper and return the pretokenized ids followed by those incremental ids, with no newline
+        # boundary fix-up. Returns a new list; inputs are not mutated.
         incremental = self.tokenize_additional_messages(old_messages, new_messages, template_args=template_args)
         # Intentionally omit the `+\n` insertion — that's the bug we're catching.
         return list(pretokenized_token_ids) + incremental
 
 
 def test_via_tito_fail_on_buggy_qwen3_subclass():
+    # [FUNCTION DOC] Builds the buggy tokenizer over a Qwen3-0.6B tokenizer with the registered
+    # template and verifies the single-tool trajectory with the first 3 messages pretokenized.
+    # Asserts the result did not pass and its error message contains "Decode-roundtrip mismatch".
     """A buggy ``merge_tokens`` produces a junction-level diff that the verifier surfaces."""
     tokenizer, _ = _setup_tokenizer_with_registered_template("Qwen/Qwen3-0.6B", TITOTokenizerType.QWEN3)
     buggy = _BuggyQwen3TITOTokenizer(tokenizer)
