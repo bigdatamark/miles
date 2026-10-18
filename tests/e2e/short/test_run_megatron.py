@@ -1,3 +1,18 @@
+# [MODULE DOC] End-to-end test of the standalone Megatron runner debug tool: runs the tool's
+# run-and-compare command on a 5-layer slice of Qwen3-30B-A3B, executing a baseline parallel
+# layout (tensor parallel 1) and a target layout (tensor 2, pipeline 2, context 2, expert 1 with
+# first stage 3 layers and last stage 2 layers) on 8 GPUs, with batch-sequence-head-dim layout,
+# sequence length 128, batch size 1, math prompts, sequence parallel, flash attention, a source
+# patcher config (the replicated expert markers stripped from the template), a dumper filter
+# keeping non-layer tensors and layers below 3, a tensor diff threshold of 0.002 and a log-prob
+# threshold of 0.06. Interface: a typer app with commands run (prepare then run-and-compare) and
+# compare (re-run only the comparison on existing dumps by recomputing each layout's directory
+# name from its parallel arguments). When invoked with no arguments, as the CI harness does, it
+# defaults to the run command with the only configured mode. Module state: a temporary run
+# directory created at import time (never removed), the repository root prepended to the import
+# path at import time, model repo/name/type, 8 GPUs and 5 layers. Registered for CUDA 8-GPU H100
+# (est. 300 s) and ROCm 8-GPU MI350 nightly (est. 300 s). The packed token layout mode is disabled
+# in the config table with a todo (the standalone worker hard-codes the batch-sequence layout).
 # WARNING: Do NOT relax any assert logic in this file. All assertions must remain strict.
 # The comparator must report all-passed with zero failures — no exceptions.
 
@@ -26,6 +41,7 @@ from miles.utils.external_utils import command_utils
 
 
 def _backend():
+    # [FUNCTION DOC] HELPER: Creates and returns a fresh command backend from the default config.
     return command_utils.default_config().create_backend()
 
 
@@ -45,6 +61,10 @@ register_rocm_ci(est_time=300, suite="nightly-stage-c-8-gpu-mi350", labels=["sho
 
 @dataclasses.dataclass(frozen=True)
 class _ModeConfig:
+    # [CLASS DOC] HELPER: Immutable description of one comparison mode: the baseline layout's
+    # parallel argument text, the target layout's argument text, the data layout name (default
+    # "bshd", also used to pick the source patcher template), and extra Megatron arguments applied
+    # only to the target run (default empty).
     baseline_args: str
     target_args: str
     format: str = "bshd"
@@ -72,12 +92,20 @@ CONFIGS: dict[str, _ModeConfig] = {
 
 
 def _resolve_mode(mode: str) -> tuple[str, _ModeConfig]:
+    # [FUNCTION DOC] HELPER: Looks up the mode in the config table. Raises a typer bad-parameter
+    # error listing valid modes if unknown. Returns the mode name and its config.
     if mode not in CONFIGS:
         raise typer.BadParameter(f"Unknown mode {mode!r}, valid: {list(CONFIGS.keys())}")
     return mode, CONFIGS[mode]
 
 
 def _prepare(dump_dir: Path, config: _ModeConfig) -> Path:
+    # [FUNCTION DOC] HELPER: Creates the models directory, downloads the 5-layer model repository,
+    # converts it to a Megatron distributed checkpoint using the smaller of 8 and 5 GPUs (5), and
+    # force-removes the dump directory. Takes the source patcher YAML template for the config's data
+    # layout, deletes the text " ep:replicated" and " etp:replicated" from it (so expert-related
+    # replication markers are not applied), and writes it to a file in the temporary run directory.
+    # Returns that file's path. Side effects: shell commands, network, filesystem, GPU.
     """Download model, convert checkpoint, write source patcher config."""
     U = _backend()
     U.exec_command_cpu("mkdir -p /root/models")
@@ -101,6 +129,16 @@ def _prepare(dump_dir: Path, config: _ModeConfig) -> Path:
 def run(
     mode: Annotated[str, typer.Option(help="Config mode: " + ", ".join(CONFIGS.keys()))],
 ) -> None:
+    # [FUNCTION DOC] Command "run": resolves the mode (bad-parameter error if unknown), puts dumps
+    # in a "dumps" folder in the temporary run directory and prints the run directory, prepares
+    # (download, conversion, patcher file), clears proxy variables from the environment, and builds
+    # and executes a single GPU shell command invoking the runner module's run-and-compare
+    # subcommand with: model type, HF checkpoint, converted reference-load directory, output base
+    # directory, baseline and target argument texts in single quotes, sequence length 128, batch
+    # size 1, math prompt mode, sequence parallel, the patcher file, the dumper filter, diff
+    # threshold 0.002, log-prob threshold 0.06, an optional target-only extra-args option, and
+    # extra args selecting flash attention. Pass/fail comes from the exit status of the command.
+    # Argument texts are inserted into the command without escaping.
     """Full pipeline: prepare + run baseline + run target + compare."""
     _config_name, config = _resolve_mode(mode)
     dump_dir: Path = _RUN_DIR / "dumps"
@@ -142,6 +180,11 @@ def compare(
     mode: Annotated[str, typer.Option(help="Config mode: " + ", ".join(CONFIGS.keys()))],
     dump_dir: Annotated[str, typer.Option(help="Path to existing dump base directory")],
 ) -> None:
+    # [FUNCTION DOC] Command "compare": for an existing dump base directory and mode, computes the
+    # baseline and target directory names by parsing each layout's parallel arguments into a
+    # parallel config and asking it for its directory name, then runs (on the CPU backend) the
+    # runner module's compare subcommand on the "standalone" subdirectory of each. Raises a
+    # bad-parameter error for an unknown mode.
     """Re-run comparator on existing dumps (no training)."""
     _config_name, config = _resolve_mode(mode)
     base: Path = Path(dump_dir)

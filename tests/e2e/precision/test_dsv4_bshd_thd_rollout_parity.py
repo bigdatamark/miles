@@ -1,3 +1,17 @@
+# [MODULE DOC] End-to-end precision test: checks that training on a fixed set of rollout samples
+# gives equivalent results whether sequences are fed in batch-sequence-head-dim layout (one
+# sequence per micro-batch) or in packed token-head-dim layout (all samples packed in one
+# micro-batch), for a 4-layer FP8 DeepSeek-V4-Flash slice on 4 H200 GPUs through the DeepSeek V4
+# launcher script (its argument class, download/convert steps, train step and precision config are
+# imported). Flow: prepare the checkpoint once under a file lock; run a rollout-only job that
+# dumps 16 samples (8 prompts times 2 samples) using a custom deterministic reward, then validate
+# the dump; run two training jobs (bshd and thd) that each replay that dumped rollout and save the
+# gradient norm and dumped train data; finally compare per-token log probabilities and the
+# loss, PPO KL and grad norm metrics between the two layouts within tolerances. Registered for
+# CUDA 4-GPU H200 (est. 1100 s, Hopper only, labels precision and long). Module constants: model
+# name, GPU count, prompt and sample counts, rollout identifiers, the import path of the custom
+# reward, and log-prob tolerance thresholds (relative 0.2, absolute 0.9, mean absolute 0.1, 99th
+# percentile absolute 0.9, max absolute 1.5). Run as a script: calls main.
 import fcntl
 import math
 import os
@@ -47,7 +61,14 @@ async def deterministic_index_reward(
     samples: Sample | list[Sample],
     **_kwargs,
 ) -> float | list[float]:
+    # [FUNCTION DOC] Custom asynchronous reward function plugged into the rollout by import path.
+    # Gives a reward that depends only on the sample's global index, making rewards deterministic
+    # and distinct within a group: the index modulo samples per prompt, as a float. Accepts either
+    # one sample (returns one float) or a list of samples (returns a list of floats in order).
+    # Extra keyword arguments are ignored. Raises an assertion error if a sample has no index.
     def score(sample: Sample) -> float:
+        # [FUNCTION DOC] HELPER: Asserts the sample has an index and returns that index modulo the
+        # samples-per-prompt count from the enclosing arguments, as a float.
         assert sample.index is not None
         return float(sample.index % args.n_samples_per_prompt)
 
@@ -57,6 +78,9 @@ async def deterministic_index_reward(
 
 
 def _prepare_args() -> ScriptArgs:
+    # [FUNCTION DOC] HELPER: Builds the launcher argument object used only for the preparation
+    # phase: run id "prepare", the 4-layer model, the in-repo implementation, the GSM8K task, eval
+    # off, one node with 4 GPUs, H200 hardware, saving skipped and fault tolerance off.
     return ScriptArgs(
         run_id="prepare",
         model_name=_MODEL_NAME,
@@ -72,6 +96,12 @@ def _prepare_args() -> ScriptArgs:
 
 
 def _common_extra_args(*, te_precision_config_path: Path, micro_batch_size: int) -> str:
+    # [FUNCTION DOC] HELPER: Returns the extra command-line text shared by the rollout and train
+    # jobs: CI test mode with quantization error allowed in the weight check and the logprob
+    # checker disabled; experiment tracking disabled; one rollout of 8 prompts times 2 samples
+    # with global batch equal to the sample count (16) and the given micro-batch size; 256 max
+    # response tokens at temperature 0.7; rollout seed 42, global seed 1234; decode CUDA-graph
+    # max batch 4; and the path of the transformer-engine precision config file.
     return (
         "--ci-test "
         "--check-weight-update-allow-quant-error "
@@ -99,6 +129,12 @@ def _run_args(
     extra_args: str,
     debug_train: bool,
 ) -> ScriptArgs:
+    # [FUNCTION DOC] HELPER: Builds the launcher argument object for a rollout or train job with
+    # the given run id, debug data root directory, Hugging Face checkpoint path and extra argument
+    # text. Fixed settings: 4-layer model, in-repo implementation, GSM8K, eval off, 1 node with 4
+    # GPUs, H200, saving skipped, fault tolerance off, detail dumping on. When debug_train is true
+    # the job is told to replay the earlier rollout run id and rollout id from the debug root;
+    # otherwise those two replay settings are unset.
     return ScriptArgs(
         run_id=run_id,
         model_name=_MODEL_NAME,
@@ -120,6 +156,12 @@ def _run_args(
 
 
 def _prepare(args: ScriptArgs) -> str:
+    # [FUNCTION DOC] HELPER: Prepares the model once per host. Creates the model directory if
+    # needed, opens a per-model lock file inside it in append mode, takes an exclusive file lock
+    # (blocking, so concurrent runs serialize), and while holding it runs the launcher's download,
+    # single-process conversion and SPMD conversion steps in that order; the lock is released when
+    # the file closes. Returns the path of the converted model under the local model directory.
+    # Side effects: filesystem writes, network download, GPU conversion work.
     model_dir = Path(args.model_dir)
     model_dir.mkdir(parents=True, exist_ok=True)
     lock_path = model_dir / f".{args.model_name}.ci-prepare.lock"
@@ -133,6 +175,12 @@ def _prepare(args: ScriptArgs) -> str:
 
 
 def _assert_rollout_artifact(path: Path) -> None:
+    # [FUNCTION DOC] HELPER: Loads the dumped rollout file onto the CPU (full unpickling allowed)
+    # and validates it with assertions. Rollout id must be 0. Samples sorted by index must have
+    # indices 0 through 15 and group indices that repeat each prompt number twice in order. For
+    # each consecutive pair (one prompt): same group, rewards exactly 0.0 then 1.0 (from the
+    # deterministic reward), response lengths in 1 through 256, and the two responses (the last
+    # response-length tokens) must differ. Raises assertion errors on any violation.
     payload = torch.load(path, map_location="cpu", weights_only=False)
     assert payload["rollout_id"] == 0
     samples = sorted(payload["samples"], key=lambda sample: sample["index"])
@@ -151,6 +199,11 @@ def _assert_rollout_artifact(path: Path) -> None:
 
 
 def _run_rollout(*, debug_root: Path, hf_checkpoint: str, te_precision_config_path: Path) -> None:
+    # [FUNCTION DOC] HELPER: Runs the rollout-only job and checks its dump. Builds arguments with
+    # run id "rollout", the common extra arguments with micro-batch size equal to the sample count,
+    # plus the debug rollout-only flag, SGLang server concurrency 1 (for determinism), and the
+    # custom reward import path. Calls the launcher's train step, then asserts on the rollout data
+    # file at the debug root under the rollout run, dump details, rollout data, named by rollout id.
     args = _run_args(
         run_id=_ROLLOUT_RUN_ID,
         debug_root=debug_root,
@@ -178,6 +231,12 @@ def _run_train(
     hf_checkpoint: str,
     te_precision_config_path: Path,
 ) -> Path:
+    # [FUNCTION DOC] HELPER: Runs one training job replaying the dumped rollout in the given
+    # query-key-value layout (bshd or thd) and returns the directory holding its dumped details.
+    # Micro-batch size is 1 for bshd (one sequence per micro-batch, the reference) and the full
+    # sample count for thd (everything packed). Passes the layout flag and a path for saving the
+    # gradient norm under the debug root. After the job, loads the saved gradient norm as a float
+    # and asserts it is finite and positive. Returns the dump-details directory of that run id.
     grad_norm_path = debug_root / f"{qkv_format}_grad_norm.pt"
     # BSHD uses one sequence per microbatch as the reference; THD packs all samples.
     micro_batch_size = 1 if qkv_format == "bshd" else _NUM_SAMPLES
@@ -202,6 +261,10 @@ def _run_train(
 
 
 def _load_train_data_shard(directory: Path) -> dict:
+    # [FUNCTION DOC] HELPER: Loads the single dumped train-data file for rollout id 0 from the
+    # directory (files are written per data-parallel/context-parallel shard; this run has one of
+    # each). Asserts exactly one matching file, rollout id 0, and sample indices equal to 0
+    # through 15 in order. Returns the rollout data mapping from the payload.
     # Train data is dumped once per (dp, cp) shard; this run has dp=1, cp=1.
     dump_files = sorted(directory.glob(f"{_ROLLOUT_ID}_*.pt"))
     assert len(dump_files) == 1, [path.name for path in dump_files]
@@ -214,6 +277,13 @@ def _load_train_data_shard(directory: Path) -> dict:
 
 
 def _compare_train_log_probs(bshd_dir: Path, thd_dir: Path) -> None:
+    # [FUNCTION DOC] HELPER: Compares per-token training log probabilities between the two layouts
+    # using the dumped train data in the two directories. For every sample asserts equal response
+    # lengths and exactly equal tokens and loss masks, then asserts each side's log probs are
+    # one-dimensional, floating point, of length equal to the response length, and finite. All
+    # samples are concatenated as double precision, absolute differences computed, and the mean,
+    # 99th percentile and max printed. Asserts closeness within relative 0.2 and absolute 0.9,
+    # mean absolute difference at most 0.1, 99th percentile at most 0.9 and max at most 1.5.
     bshd = _load_train_data_shard(bshd_dir)
     thd = _load_train_data_shard(thd_dir)
     bshd_log_probs: list[torch.Tensor] = []
@@ -258,6 +328,11 @@ def _compare_train_log_probs(bshd_dir: Path, thd_dir: Path) -> None:
 
 
 def _compare(bshd_dump: Path, thd_dump: Path) -> None:
+    # [FUNCTION DOC] HELPER: Runs the full comparison between the two dump directories: first the
+    # per-token log-prob comparison on their train-data subdirectories, then the shared metric
+    # comparison helper (baseline is the bshd run) with relative tolerance 0.1 and absolute 0.03
+    # over metrics whose names start with train loss, train PPO KL, or train grad norm, excluding
+    # none. Raises assertion errors from either step.
     _compare_train_log_probs(
         bshd_dump / "train_data",
         thd_dump / "train_data",
@@ -273,6 +348,12 @@ def _compare(bshd_dump: Path, thd_dump: Path) -> None:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Orchestrates the whole test. Prepares the model (under the file lock), then
+    # removes proxy variables and the experiment-tracking API key from the environment. Creates a
+    # temporary debug directory under the system temp directory (never cleaned up) and writes the
+    # imported precision config text plus a newline to a YAML file there. Runs the rollout-only
+    # job, then the bshd training job, then the thd training job, and finally compares the two
+    # dumps. Side effects: environment mutation, filesystem writes, subprocess/GPU jobs.
     prepare_args = _prepare_args()
     hf_checkpoint = _prepare(prepare_args)
     for env_var in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "WANDB_API_KEY"):

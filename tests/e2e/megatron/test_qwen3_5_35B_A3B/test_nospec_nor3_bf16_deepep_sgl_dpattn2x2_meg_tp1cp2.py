@@ -1,3 +1,12 @@
+# [MODULE DOC] Single-case end-to-end test for Qwen3.5-35B-A3B on 4 colocated GPUs: no speculative
+# decoding, no MTP training, no rollout routing replay, BF16 rollout with DeepEP on both sides.
+# Megatron: tensor 1, context 2, expert 4 (default flex dispatcher), max tokens per GPU 4096
+# because the gated delta-net backward context-parallel kernel runs out of memory during autotune
+# at 8192. SGLang: one 4-GPU engine with data-parallel attention (data parallel 2), expert
+# parallel 4, DeepEP dispatching in BF16 (the automatic dtype would dispatch FP8). Weight check
+# uses the target-only selector and skips vision weights. Registered for CUDA 4-GPU H200 (est.
+# 1500 s, Hopper only) with five CI metric gates. Run as a script: strips proxy variables, then
+# prepare and execute.
 """Qwen3.5-35B-A3B without speculative decoding or R3: the BF16 DeepEP case.
 
 Megatron runs TP1 x CP2 with EP4 through flex (DeepEP). The rollout runs DP attention

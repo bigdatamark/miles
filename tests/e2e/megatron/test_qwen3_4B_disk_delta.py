@@ -1,3 +1,11 @@
+# [MODULE DOC] End-to-end test of the disk-delta weight update pipeline with Qwen3-4B, using the
+# asynchronous train script. Layout: 4 GPUs total, non-colocated; 2 actor GPUs (tensor parallel
+# 2 with sequence parallel) and 2 rollout GPUs as two single-GPU engines. The "shared" publish
+# directory and host-local checkpoint directory are plain local paths since it is a single node,
+# so the whole delta pipeline runs end to end: baseline pull and reload, then per sync a publish,
+# pull-weights apply, and reload. Registered for CUDA 4-GPU H200 (est. 400 s, labels megatron and
+# weight-update) and ROCm 4-GPU MI350 nightly (est. 500 s) with five CI metric gates. Run as a
+# script: prepare then execute (no proxy stripping).
 from tests.ci.ci_register import register_cuda_ci, register_rocm_ci
 from tests.ci.metric_history import register_ci_gate
 
@@ -27,6 +35,9 @@ register_ci_gate(metric_key="rollout/raw_reward")
 
 
 def prepare():
+    # [FUNCTION DOC] Creates model/dataset directories, downloads Qwen3-4B and the dapo-math-17k
+    # dataset, and converts the model to a Megatron distributed checkpoint on 4 GPUs. Side effects:
+    # shell commands, network, filesystem, GPU.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu("hf download Qwen/Qwen3-4B --local-dir /root/models/Qwen3-4B")
@@ -35,6 +46,13 @@ def prepare():
 
 
 def execute():
+    # [FUNCTION DOC] Builds the argument string and launches asynchronous training. Rollout: 2
+    # rollouts of 4 prompts times 2 samples, 100 response tokens, temperature 0.8, global batch 8,
+    # balanced data. Tensor parallel 2 with sequence parallel, full recompute, dynamic batching
+    # with 2048 tokens per GPU. GRPO with zero KL/entropy coefficients, plain Adam. SGLang: single
+    # GPU engines over half of the GPUs (2), mem fraction 0.8. Actor uses half of the GPUs. Weight
+    # update mode disk-delta with a 1 GiB buffer, a delta publish directory and a local
+    # checkpoint directory under the root home. Launches with 4 GPUs per node.
     U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/{MODEL_NAME}_torch_dist "
 

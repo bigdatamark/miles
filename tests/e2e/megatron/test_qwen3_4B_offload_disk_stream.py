@@ -1,3 +1,12 @@
+# [MODULE DOC] End-to-end test of streaming fp32 main params and Adam moments through NVMe files
+# bucket by bucket during each optimizer step, on top of disk offload, for Qwen3-4B on 4 colocated
+# GPUs (tensor parallel 2). After training, two post-run checks read Ray worker logs: disk offload
+# armed on every rank, and every rank both initialized main params through NVMe and logged
+# streaming steps. Registered for CUDA 4-GPU H200 (est. 600 s, label miles-plugin) and ROCm 4-GPU
+# MI350 (est. 600 s, labels miles-plugin and amd) with five CI metric gates. Run as a script:
+# prepare then execute.
+# KNOWN ISSUE: the ROCm registration uses a stage-c suite name without the nightly prefix that
+# sibling ROCm registrations use; this may be intentional (non-nightly ROCm run).
 """E2E test for --stream-optimizer-state-to-disk (on top of --offload-train-target=disk).
 
 Same colocate RL loop as test_qwen3_4B_offload_disk.py, but the fp32 main params and
@@ -43,6 +52,9 @@ register_ci_gate(metric_key="rollout/raw_reward")
 
 
 def prepare():
+    # [FUNCTION DOC] Creates model/dataset directories, downloads Qwen3-4B and the dapo-math-17k
+    # dataset, and converts the model to a Megatron distributed checkpoint on 4 GPUs. Side effects:
+    # shell commands, network, filesystem, GPU.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -51,6 +63,12 @@ def prepare():
 
 
 def _assert_offloaded_to_disk():
+    # [FUNCTION DOC] HELPER: Post-run check over Ray's latest-session worker logs. Collects the
+    # directory path printed after the text "reclaim armed for" in every line reporting that the
+    # train disk-offload reclaim was armed. The expected set is one directory per rank under the
+    # offload directory, named from cell index 0 and the rank index via the shared name-index
+    # formatter. Fails with an assertion error if no logs exist or the collected set differs from
+    # the expected set. Prints how many ranks armed offload.
     """Every rank must have armed disk offload under its own directory."""
     logs = glob.glob("/tmp/ray/session_latest/logs/worker-*")
     assert logs, "no Ray worker logs to check for the disk-offload path"
@@ -71,6 +89,13 @@ def _assert_offloaded_to_disk():
 
 
 def _assert_streamed():
+    # [FUNCTION DOC] HELPER: Post-run check over Ray's latest-session worker logs, reading each
+    # whole file. A log counts as initialized if it contains the NVMe main-param initialization
+    # marker, and as streamed if it contains the NVMe streaming-step marker. Fails with an
+    # assertion error if there are no logs, if the number of initialized logs differs from the GPU
+    # count (4), or if the number of streamed logs differs from the GPU count. Prints how many
+    # ranks streamed. The check counts distinct log files, so it assumes one training actor
+    # process per log file.
     """Every rank must have executed real streaming steps.
 
     The store logs one `NVMe streaming step: ...` line per optimizer step from each
@@ -101,6 +126,13 @@ def _assert_streamed():
 
 
 def execute():
+    # [FUNCTION DOC] Builds the argument string, runs training, then runs the disk-offload and
+    # streaming log assertions in that order. Rollout: 2 rollouts of 4 prompts times 2 samples,
+    # 256 response tokens, temperature 0.8, global batch 8. Tensor parallel 2, sequence parallel,
+    # full recompute, dynamic batching at 2048 tokens per GPU. GRPO with KL loss at zero
+    # coefficient; plain Adam. Offload flags: disk offload in 64 MB chunks plus streaming
+    # optimizer state to disk. One single-GPU SGLang engine per GPU with mem fraction 0.6;
+    # colocated. Launches with 4 GPUs.
     U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/{MODEL_NAME}_torch_dist "
 

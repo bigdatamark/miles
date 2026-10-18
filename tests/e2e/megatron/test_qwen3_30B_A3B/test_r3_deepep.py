@@ -1,3 +1,12 @@
+# [MODULE DOC] Single-case end-to-end test of rollout routing replay (R3) with DeepEP for
+# Qwen3-30B-A3B on 4 GPUs, colocated, BF16 rollout. It is the BF16 DeepEP control for the
+# baseline R3 topology (Megatron context 2, pipeline 1, tensor 2, expert 4; one 4-GPU SGLang
+# engine with expert parallel 4) so that a failure isolates DeepEP from FP8 rollout in the
+# disabled FP8 variant. SGLang max running requests is lowered to 256 because 512 over tensor
+# parallel 4 would sit exactly at the 128-token DeepEP low-latency cap. Registered for CUDA 4-GPU
+# H200 (est. 1400 s) with five CI metric gates (grad norm, PPO KL, train/rollout logprob absolute
+# difference, train/rollout KL, raw reward). Run as a script: strips proxy variables, then
+# prepare and execute.
 import os
 
 from tests.ci.ci_register import register_cuda_ci

@@ -1,3 +1,14 @@
+# [MODULE DOC] End-to-end pytest module (one H200) checking that session server v2 reproduces the
+# training payload of session server v1 bit for bit on agentic trajectories with same-prompt
+# retries, using Qwen3-8B at a pinned revision (path overridable by environment variable) with
+# fa3 attention, deterministic inference, radix cache disabled, qwen3 reasoning parser, qwen25
+# tool-call parser and static memory fraction 0.5. Sixteen input samples (indices and rollout ids
+# 0 through 15, the initial agent messages as prompt, reward 0.25, a small metadata mapping) are run
+# through both versions via shared helpers from the tests session-parity utilities, then compared
+# pairwise. Registered for CUDA 2-GPU H200 (est. 190 s, Hopper only), label sglang. Run as a
+# script: runs pytest on this file verbosely.
+# KNOWN ISSUE: registered for the 2-GPU stage although the server starts without tensor parallelism
+# and the fixture only requires one CUDA device.
 import os
 
 import pytest
@@ -22,6 +33,10 @@ _BATCH_SIZE = 16
 
 @pytest.fixture(scope="module")
 def sglang_server():
+    # [FUNCTION DOC] HELPER: Module-scoped pytest fixture. Asserts CUDA is available and the first
+    # GPU is an H200. Downloads the pinned model revision unless the path override is set. Starts an
+    # SGLang server with deterministic inference and the extra arguments described in the module
+    # doc, yields it, and always stops it at teardown.
     assert torch.cuda.is_available()
     assert "H200" in torch.cuda.get_device_name(0)
     if _MODEL_PATH_OVERRIDE is None:
@@ -49,6 +64,11 @@ def sglang_server():
 
 
 def test_qwen3_8b_h200_fa3_agentic_v2_same_prompt_retries_match_v1_training_payload_bitwise(sglang_server):
+    # [FUNCTION DOC] The test. Runs the agentic retry trajectories against the shared backend once
+    # with version 1 and once with version 2, each with freshly built input samples and the model
+    # path as checkpoint. Asserts both result lists have 16 entries; for each pair asserts the first
+    # sample's index and rollout id equal the position in both, then calls the shared parity
+    # assertion helper to compare the trajectories (bitwise training payload parity).
     v1_runs = run_agentic_retry_trajectories(
         backend_url=sglang_server.base_url,
         hf_checkpoint=_MODEL_PATH,
@@ -70,6 +90,9 @@ def test_qwen3_8b_h200_fa3_agentic_v2_same_prompt_retries_match_v1_training_payl
 
 
 def _build_input_samples() -> list[Sample]:
+    # [FUNCTION DOC] HELPER: Builds 16 samples whose index and rollout id equal their position,
+    # whose prompt is the shared initial agent message list, reward 0.25, and metadata marking the
+    # source as parity. Returns the list.
     return [
         Sample(
             index=index,

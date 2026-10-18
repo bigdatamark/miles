@@ -1,3 +1,12 @@
+# [MODULE DOC] End-to-end test of the peer-to-peer weight update mode for Qwen3-30B-A3B on 8
+# GPUs, non-colocated: a 6-GPU training actor pool (pipeline parallel 3, context parallel 2,
+# tensor 1, expert 2, so data parallel is 1) and a 2-GPU rollout pool with a single engine,
+# trained through the asynchronous train script. p2p weight update cannot be combined with
+# colocation, hence disjoint pools. The actor uses CPU optimizer offload because fp32 main
+# params and Adam moments do not fit with only a data/context shard of 2. The rollout engine
+# seeds weights through the transfer engine. Registered for CUDA 8-GPU H100 (est. 800 s) with
+# five CI metric gates. Module constants: model name/type, total GPUs 8, rollout GPUs 2, actor
+# GPUs 6. Run as a script: prepare then execute (no proxy stripping).
 from tests.ci.ci_register import register_cuda_ci
 from tests.ci.metric_history import register_ci_gate
 
@@ -24,6 +33,9 @@ register_ci_gate(metric_key="rollout/raw_reward")
 
 
 def prepare():
+    # [FUNCTION DOC] Creates model/dataset directories, downloads the Qwen3-30B-A3B Hugging Face
+    # model and the dapo-math-17k dataset, and converts the model to a Megatron distributed
+    # checkpoint using all 8 GPUs. Side effects: shell commands, network, filesystem, GPU.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -32,6 +44,15 @@ def prepare():
 
 
 def execute():
+    # [FUNCTION DOC] Builds the argument string and launches asynchronous training. Rollout: 2
+    # rollouts of 4 prompts times 2 samples, 100 response tokens, temperature 0.8, global batch 8,
+    # balanced data. Parallelism: pipeline 3, context 2, expert 2, sequence parallel, full
+    # recompute, dynamic batching with 2048 tokens per GPU. GRPO with zero KL/entropy
+    # coefficients and the actor forward-only pass skipped. Adam with CPU offload. SGLang: one
+    # engine of 2 GPUs, 2 rollout GPUs, mem fraction 0.7, remote-instance weight loader seeded via
+    # the transfer engine. Weight update: p2p mode with a 1 GiB buffer; alltoall token dispatcher.
+    # The launch sets an environment variable disabling the nvidia peer-memory module because the
+    # CI host lacks it (GPU memory is registered via dmabuf instead). Launches with 8 GPUs per node.
     U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/{MODEL_NAME}_torch_dist "
 

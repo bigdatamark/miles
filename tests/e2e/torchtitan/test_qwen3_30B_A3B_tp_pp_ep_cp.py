@@ -1,3 +1,15 @@
+# [MODULE DOC] Single-case end-to-end test of the torchtitan backend with Qwen3-30B-A3B on 8
+# colocated GPUs using every parallel axis at once: tensor 2, pipeline 2, context 2, expert 2 (the
+# fully-sharded data-parallel degree is therefore 1), with rollout routing replay on. It targets
+# axis interactions (context-parallel logits gather under a pipeline schedule, expert weights
+# partial on two axes at export, replay queues consumed per micro-batch across stages); the
+# train/rollout log-prob gap and reward curve are the things to inspect. Sequence length is 8192
+# rather than 16384 because optimizer state is whole on every rank and the context-parallel loss
+# gathers full-sequence logits, leaving no headroom at 16k on an H200. Max response 4096, 4
+# rollouts, memory fraction 0.55, triton MoE runner. Registered for CUDA 8-GPU H200 (est. 2700 s,
+# Hopper only), labels torchtitan and replay. Run as a script: prepare then execute.
+# KNOWN ISSUE: the CUDA estimate of 2700 s exceeds the 2400 s cap for registrations that are
+# neither nightly nor labeled long.
 from tests.ci.ci_register import register_cuda_ci
 from tests.e2e.torchtitan._common import CaseConfig, execute, prepare
 

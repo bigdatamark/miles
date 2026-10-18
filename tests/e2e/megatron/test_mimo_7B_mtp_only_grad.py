@@ -1,3 +1,14 @@
+# [MODULE DOC] End-to-end CI test for multi-token-prediction (MTP) training on the MiMo-7B-RL model
+# using Megatron with colocated SGLang rollout on 4 GPUs. The test only launches a short GRPO run
+# with MTP training enabled and the CI flag on; the actual assertion (only MTP parameters get
+# non-zero gradients) is performed inside the training code, which triggers an MTP gradient check
+# automatically when both the CI-test flag and the MTP-training flag are set. Registered for CUDA
+# (4-GPU H200 suite, est. 400 s, Hopper and Blackwell) and ROCm (4-GPU MI350 nightly, est. 600 s).
+# Functions: prepare() downloads and converts, execute() trains. Running as a script calls
+# prepare(), removes proxy variables from the environment, then execute().
+# KNOWN ISSUE: the first line of the file is a fixme marker comment with no explanation, which
+# suggests the test is known to be incomplete or unreliable. Also, the max response length of 128
+# tokens is described as truncating every output, but that is only an assumption about the model.
 # FIXME
 """End-to-end test for MTP-only gradient verification.
 
@@ -24,6 +35,10 @@ NUM_GPUS = 4
 
 
 def prepare():
+    # [FUNCTION DOC] Downloads the MiMo-7B-RL Hugging Face model and the dapo-math-17k dataset,
+    # then converts the model to a Megatron distributed checkpoint with one MTP layer, using 4
+    # GPUs and writing under the models directory. Side effects: shell commands, network
+    # downloads, filesystem writes, GPU use. Returns nothing.
     """Download model and convert checkpoint with MTP layers."""
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
@@ -41,6 +56,14 @@ def prepare():
 
 
 def execute():
+    # [FUNCTION DOC] Launches one rollout of GRPO training: 4 prompts times 2 samples, global batch
+    # 8, max response 128 tokens, temperature 0.8, tensor parallel 2 with sequence parallel,
+    # full recompute, dynamic batching at 4096 tokens per GPU, Adam, zero KL/entropy coefficients.
+    # SGLang runs one GPU per engine with EAGLE speculative decoding (2 steps, top-k 1, 3 draft
+    # tokens). MTP training uses one layer with loss scaling 0.2. The CI-test flag is set and
+    # the KL checker is disabled; colocated mode with parameter rematerialization from master
+    # weights. Passes the argument string to the backend's train launcher with 4 GPUs. Returns
+    # nothing; the in-training MTP gradient check supplies the assertion.
     """Run training with MTP enabled and very short output length to cause truncation."""
     U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/models/{MODEL_NAME}_torch_dist "

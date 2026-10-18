@@ -1,3 +1,11 @@
+# [MODULE DOC] Single-case end-to-end test: Qwen3-30B-A3B on 4 GPUs, colocated, FP8 rollout with
+# DeepEP, not bridge mode (Megatron distributed checkpoint is converted). Megatron side: tensor 2,
+# expert tensor 2, expert 2, no context or pipeline parallelism, so the DeepEP group has 4 ranks.
+# SGLang side: one engine over 4 GPUs with data-parallel attention (data parallel 4, expert
+# parallel 4); 512 running requests over 4 ranks gives 128 tokens per rank, the DeepEP
+# low-latency cap. Registered for CUDA 4-GPU H200 (est. 1500 s, Hopper and Blackwell) with five
+# CI metric gates (grad norm, PPO KL, train/rollout logprob absolute difference, train/rollout
+# KL, raw reward). Run as a script: strips proxy variables, then prepare and execute.
 import os
 
 from tests.ci.ci_register import register_cuda_ci

@@ -1,3 +1,11 @@
+# [MODULE DOC] Single-case end-to-end test: Qwen3-30B-A3B on 4 GPUs, colocated, with INT4 rollout
+# (fake quantization-aware training on the training side, an INT4-converted checkpoint for
+# SGLang). Megatron side: context parallel 2, pipeline 1, tensor 2, expert 4; SGLang side: four
+# single-GPU engines. The shared preparation step runs the HF-to-INT4 conversion and the shared
+# argument builder adds the INT4 environment and quantization-tolerant weight-update check.
+# Registered for CUDA 4-GPU H200 (est. 1700 s, Hopper and Blackwell) with five CI metric gates
+# (grad norm, PPO KL, train/rollout logprob absolute difference, train/rollout KL, raw reward).
+# Run as a script: strips proxy variables, then prepare and execute.
 import os
 
 from tests.ci.ci_register import register_cuda_ci

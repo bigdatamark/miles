@@ -1,3 +1,11 @@
+# [MODULE DOC] Single-case end-to-end test of the torchtitan backend with Qwen3-30B-A3B, rollout
+# routing replay and fully-asynchronous rollout on 8 GPUs: 4 training GPUs (expert parallel 4) plus
+# 4 rollout GPUs forming one engine, non-colocated, async train script, sequence length 8192, max
+# response 4096, 3 rollouts, memory fraction 0.8, triton MoE runner. It checks replay when the
+# rollout that recorded the routing is a weight version or more behind the trainer, and it loads
+# the disaggregated weight path continuously (expert parallelism makes each rank's export partial,
+# so the stream needs an owner broadcast). Registered for CUDA 8-GPU H200 (est. 2400 s, Hopper
+# only), labels torchtitan, fully-async and replay. Run as a script: prepare then execute.
 from tests.ci.ci_register import register_cuda_ci
 from tests.e2e.torchtitan._common import CaseConfig, execute, prepare
 

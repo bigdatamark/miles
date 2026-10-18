@@ -1,3 +1,11 @@
+# [MODULE DOC] Single-case end-to-end test for Qwen3.5-35B-A3B on 4 colocated GPUs using the
+# distributed Muon optimizer, with no speculative decoding, no MTP training, no routing replay,
+# BF16 rollout and no DeepEP. Megatron: tensor 2, pipeline 2, expert 2, no context parallelism,
+# alltoall token dispatcher (the only 4-GPU Qwen3.5 case with pipeline parallelism). SGLang: one
+# 4-GPU engine with data-parallel attention (data parallel 2) and expert parallel 4. Weight check
+# uses the target-only selector and skips vision weights. Registered for CUDA 4-GPU H200 (est.
+# 1500 s, Hopper and Blackwell) and ROCm 4-GPU MI350 nightly (est. 1300 s) with five CI metric
+# gates. Run as a script: strips proxy variables, then prepare and execute.
 """Qwen3.5-35B-A3B without speculative decoding or R3: the BF16 precision case with distributed Muon.
 
 The rollout runs DP attention (attention TP2 x DP2) with EP4 MoE and no DeepEP on either side.

@@ -1,3 +1,11 @@
+# [MODULE DOC] End-to-end test of the inline SGLang config with two model deployments sharing 4
+# colocated GPUs on Qwen2.5-0.5B (bridge mode): an "actor" entry (2 GPUs, weight updates on) and a
+# frozen "ref" entry (2 GPUs, weight updates off), both overlapping with the training actor and
+# therefore offloaded. The YAML is passed as a pseudo file. The test runs 2 short GRPO rollouts on
+# GSM8K and passes if the offload and onload cycle completes (see the existing docstring for the
+# behaviors covered). Registered nightly-only for CUDA 4-GPU H200 (est. 400 s) and for ROCm 4-GPU
+# MI350 nightly (est. 300 s). Run as a script: prepare, strip proxy variables, execute.
+# KNOWN ISSUE: the eval interval (20) exceeds the number of rollouts (2), so evaluation never runs.
 """E2E test: mixed offload with updatable + frozen models.
 
 Deploys two models via --sglang-config in colocate mode:
@@ -47,6 +55,9 @@ sglang:
 
 
 def prepare():
+    # [FUNCTION DOC] Creates model/dataset directories, downloads the Qwen2.5-0.5B-Instruct model
+    # and the GSM8K dataset. No checkpoint conversion (bridge mode). Side effects: shell commands,
+    # network, filesystem.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -54,6 +65,13 @@ def prepare():
 
 
 def execute():
+    # [FUNCTION DOC] Writes the two-deployment YAML config to a pseudo file and launches training
+    # with 4 GPUs. Rollout: GSM8K parquet, math reward, 2 rollouts of 8 prompts times 4 samples,
+    # 512 response tokens, temperature 0.8, global batch 32. Eval flags on GSM8K (interval 20,
+    # 512 tokens, top-k 1). All parallel sizes 1 with sequence parallel, dynamic batching at 4096
+    # tokens per GPU. GRPO with KL loss at zero coefficient and a lower clip only, Adam at 1e-6.
+    # SGLang: 1 GPU per engine, mem fraction 0.7, decode CUDA-graph max batch 32, config pseudo
+    # file. CI test flag; colocated; bridge conversion mode. Returns nothing.
     U = command_utils.default_config().create_backend()
     config_arg = command_utils.encode_pseudo_file(SGLANG_CONFIG_YAML)
 

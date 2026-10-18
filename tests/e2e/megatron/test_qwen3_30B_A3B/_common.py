@@ -1,3 +1,10 @@
+# [MODULE DOC] HELPER: Shared building blocks for the Qwen3-30B-A3B Megatron end-to-end tests in
+# this directory (one test file per case). Provides a case-configuration dataclass describing
+# topology and feature toggles, a prepare function (downloads and conversions), a function that
+# builds the full training argument string, and an execute function that launches training.
+# The argument builder is separate from execute so a CPU-only golden test can inspect the string.
+# Module-level state: the model name and Megatron model type, and a tight-host-memory flag read
+# from an environment variable (default on) that selects fp16 optimizer state for Adam.
 import os
 from dataclasses import dataclass, field
 from typing import Literal
@@ -12,6 +19,15 @@ TIGHT_HOST_MEMORY = bool(int(os.environ.get("MILES_TEST_TIGHT_HOST_MEMORY", "1")
 
 @dataclass
 class CaseConfig:
+    # [CLASS DOC] HELPER: Plain data holder describing one test case. Topology fields: GPUs per
+    # node, context/pipeline/tensor/expert parallel sizes, optional expert tensor parallel (default
+    # 1), rollout GPUs per engine, optional SGLang expert- and data-parallel sizes, data-parallel
+    # attention flag, SGLang max running requests (default 512). Feature toggles (all default off):
+    # DeepEP, FP8 rollout, INT4 rollout, bridge mode (direct HF load), rollout routing replay (R3),
+    # Mooncake object store. Other fields: max tokens per GPU (default 8192), colocate (default
+    # true), total rollout GPUs (required when not colocated), optional weight-update transfer mode,
+    # number of rollouts (default 2), fully-async flag, optimizer choice (adam or dist_muon), extra
+    # argument text appended verbatim, and extra environment variables for the launch.
     num_gpus_per_node: int
     cp_size: int
     pp_size: int
@@ -40,6 +56,13 @@ class CaseConfig:
     extra_env_vars: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self):
+        # [FUNCTION DOC] HELPER: Validation only; nothing is inferred or mutated. Raises a value
+        # error if: the optimizer is not one of the two supported names; fully-async is combined
+        # with colocation (the async trainer rejects colocation); GPUs per node is not divisible
+        # by context size times pipeline size; non-colocated without a rollout GPU count; or the
+        # rollout pool (GPUs per node if colocated, else rollout GPUs) is not divisible by GPUs
+        # per engine. If a weight-update transfer mode is given it must be broadcast or
+        # broadcast-packed, enforced with an assertion (assertion error, not value error).
         if self.optimizer not in ("adam", "dist_muon"):
             raise ValueError(f"unsupported optimizer: {self.optimizer}")
         # Validation only — topology values are passed explicitly, not inferred.
@@ -63,6 +86,13 @@ class CaseConfig:
 
 
 def prepare(case: CaseConfig, *, need_fp8: bool, need_int4: bool, all_bridge: bool) -> None:
+    # [FUNCTION DOC] Downloads and converts assets for a case. Creates model and dataset
+    # directories; downloads the BF16 Hugging Face model; if FP8 is needed, downloads the FP8
+    # model; if INT4 is needed, runs the direct HF-to-INT4 conversion tool on the GPU into a
+    # sibling INT4 directory; downloads the dapo-math-17k and aime-2024 datasets; and unless
+    # all_bridge is true, converts the model to a Megatron distributed checkpoint using the case's
+    # GPUs per node (bridge mode reads the HF checkpoint directly, so no conversion). Side
+    # effects: shell commands, network, filesystem, GPU. Returns nothing.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu("hf download Qwen/Qwen3-30B-A3B --local-dir /root/models/Qwen3-30B-A3B")
@@ -89,6 +119,29 @@ def prepare(case: CaseConfig, *, need_fp8: bool, need_int4: bool, all_bridge: bo
 
 
 def build_train_args(case: CaseConfig, *, wandb_file: str) -> str:
+    # [FUNCTION DOC] Assembles the single space-separated training argument string for a case;
+    # pure apart from reading environment variables and a call to the wandb-args helper (keyed on
+    # the given test file path). Raises a value error if INT4 and FP8 rollout are both set.
+    # Sections: checkpoint (HF checkpoint is the INT4, FP8 or BF16 dir; reference load is the HF
+    # dir in bridge mode else the Megatron distributed dir; INT4 adds the flag disabling gradient
+    # accumulation fusion because fake QAT weights are straight-through); rollout (dapo-math
+    # data, 8 prompts times 8 samples, 8192 response tokens, global batch 32, balanced data);
+    # eval (aime24 prompts, 16384 tokens, top-k 1; the eval interval of 20 is added only when the
+    # eval environment variable is set, otherwise the eval data flags remain without an
+    # interval); performance (parallel sizes from the case, full recompute, dynamic batching;
+    # when tight host memory is on and the optimizer is Adam, fp16 for first/second moments and
+    # main params); GRPO (GSPO estimator, KL loss omitted in bridge mode, TIS, and the routing
+    # replay flag: rollout-routing replay for R3 cases, plain routing replay otherwise);
+    # optimizer (Adam gets CPU offload and precision-aware optimizer; dist_muon gets chunked
+    # state offload of fraction 1.0 and 1024 MB chunks); SGLang (per-engine GPUs, mem fraction
+    # 0.7, metrics, DeepEP a2a backend plus deep_gemm runner for BF16 only, optional EP/DP
+    # sizes and DP attention); CI flags (CI test, plus allow-quant-error for FP8/INT4); misc
+    # (dropouts zero, fp32 grad allreduce and softmax, flash attention, colocate with
+    # rematerialization for Adam or explicit rollout GPU count, transfer mode, bridge mode,
+    # fully-async, Mooncake args, DeepEP flex dispatcher or alltoall). Returns the string with the
+    # case's extra args appended.
+    # KNOWN ISSUE: the default-off eval flags are always emitted even when evaluation is
+    # disabled, so only the interval flag is conditional.
     """Build the train_args string for `case`.
 
     Split out from `execute()` so the CPU-only golden test can inspect the
@@ -262,6 +315,11 @@ def build_train_args(case: CaseConfig, *, wandb_file: str) -> str:
 
 
 def execute(case: CaseConfig, *, wandb_file: str) -> None:
+    # [FUNCTION DOC] Launches training for a case. Builds the argument string, then builds the
+    # extra environment: for INT4 rollout sets the fake-QAT flag and group size 128, then merges
+    # the case's own extra variables (these win on conflict). Calls the backend train launcher
+    # with GPU count equal to GPUs per node plus rollout GPUs when not colocated, the model type,
+    # and the async train script when fully-async else the standard one. Returns nothing.
     U = command_utils.default_config().create_backend()
     train_args = build_train_args(case, wandb_file=wandb_file)
 

@@ -1,3 +1,12 @@
+# [MODULE DOC] Single-case end-to-end test: Qwen3-30B-A3B on 4 GPUs, colocated, bridge mode
+# (direct Hugging Face load) with FP8 rollout and DeepEP. Megatron side: tensor 2, pipeline 2,
+# expert 2, no context parallelism, so tensor, pipeline and expert parallelism are all above 1
+# on the bridge path; max tokens per GPU 2048 (limited by host memory). SGLang side: two engines
+# of 2 GPUs each with expert parallel 2, and 256 max running requests so decode stays at 128 tokens
+# per rank (the DeepEP low-latency cap). Registered for CUDA 4-GPU H200 (est. 1300 s, Hopper and
+# Blackwell) with five CI metric gates (grad norm, PPO KL, train/rollout logprob absolute
+# difference, train/rollout KL, raw reward). Run as a script: strips proxy variables, then
+# prepare and execute.
 import os
 
 from tests.ci.ci_register import register_cuda_ci

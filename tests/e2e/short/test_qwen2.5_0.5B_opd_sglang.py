@@ -1,3 +1,18 @@
+# [MODULE DOC] End-to-end test of on-policy distillation with an SGLang teacher server
+# (self-distillation: the teacher is the same Qwen2.5-0.5B-Instruct as the student) on 4 GPUs: 2
+# GPUs train (colocated with 2 single-GPU student rollout engines), 1 GPU hosts a separately
+# launched teacher SGLang server on loopback port 13141, and the fourth is unused. GPUs are taken
+# from the visible-devices environment variable (default 0 through 3): the first 2 for training,
+# the third for the teacher. The visible devices are narrowed to the training GPUs before the
+# cluster starts, and the teacher is launched from a hook just before the Ray job is submitted.
+# Distillation settings: sglang type, KL coefficient 1.0, top-2 log probs, only-student top-k
+# strategy, student-probability reward weighting, custom reward and post-process functions from the
+# on-policy distillation module posting to the teacher's generate route. The legacy v1 rollout
+# path is forced by an environment variable because the student-side top-k needs data only v1
+# produces. Registered nightly-only for CUDA 4-GPU H200 (est. 300 s) and ROCm 4-GPU MI350 nightly
+# (est. 300 s). Module state: a tight-device-memory flag (environment variable, default on) that
+# lowers the SGLang memory fraction from 0.7 to 0.6. Run as a script: prepare, strip proxy
+# variables, execute.
 import os
 import subprocess
 import time
@@ -24,6 +39,9 @@ TEACHER_PORT = 13141
 
 
 def prepare():
+    # [FUNCTION DOC] Creates model/dataset directories and downloads the Qwen2.5-0.5B-Instruct
+    # model and the GSM8K dataset. No checkpoint conversion (bridge mode). Side effects: shell
+    # commands, network, filesystem.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -31,6 +49,10 @@ def prepare():
 
 
 def _get_gpu_split():
+    # [FUNCTION DOC] HELPER: Reads the comma-separated visible-devices environment variable
+    # (default: indices 0 through 3). Raises an assertion error if fewer than 4 devices are listed.
+    # Returns a pair: the first 2 devices as the training list, and the third device alone as the
+    # teacher device (the fourth and later devices are unused).
     """Split available GPUs: first half for training, one from the rest for teacher."""
     all_gpus = os.environ.get("CUDA_VISIBLE_DEVICES", ",".join(str(i) for i in range(NUM_GPUS))).split(",")
     assert len(all_gpus) >= NUM_GPUS, f"Expected at least {NUM_GPUS} GPUs, got {len(all_gpus)}"
@@ -40,6 +62,14 @@ def _get_gpu_split():
 
 
 def _launch_teacher_server(teacher_gpu: str):
+    # [FUNCTION DOC] HELPER: Starts the teacher SGLang server subprocess pinned to the given device
+    # (a copy of the environment with visible devices set to it), serving the local model on all
+    # interfaces at the teacher port with tensor parallel 1 and mem fraction 0.6; output goes to a
+    # fixed log file under the temp directory (overwritten). Prints the pid and log path. Then polls
+    # up to 120 times, 5 seconds apart (plus up to 2 seconds per request): if the process has
+    # exited raises a runtime error naming the exit code and log; if the health-generate endpoint
+    # returns status 200 prints a ready message and returns the process; request errors are
+    # ignored. If never ready, kills the process and raises a runtime error. Returns the process.
     """Launch an sglang teacher server on the specified GPU."""
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = teacher_gpu
@@ -88,6 +118,18 @@ def _launch_teacher_server(teacher_gpu: str):
 
 
 def execute():
+    # [FUNCTION DOC] Runs the distillation job. Splits GPUs into training and teacher devices, then
+    # overwrites the process's visible-devices variable with the training devices (side effect: it
+    # stays narrowed for the rest of the process). Defines a hook that launches the teacher server
+    # and remembers its process. Builds arguments: rollout (GSM8K, math reward, 2 rollouts of 8
+    # prompts times 4 samples, 1024 tokens, temperature 0.8, global batch 32), eval flags with no
+    # interval, all parallel sizes 1, distillation settings and custom reward functions pointing at
+    # the teacher's generate URL (see the module doc), GRPO with KL loss at zero coefficient, Adam
+    # at 1e-6, SGLang one GPU per engine with metrics, CI test flag, 2 actor GPUs colocated, bridge
+    # mode. Launches training on the 2 training GPUs with the teacher hook run before the Ray job is
+    # submitted and the legacy rollout v1 environment variable. In a finally block always kills and
+    # reaps the teacher process if started and runs a shell command that force-kills every sglang
+    # process on the machine (ignoring its exit status). Returns nothing.
     U = command_utils.default_config().create_backend()
     train_gpus, teacher_gpu = _get_gpu_split()
     teacher_process = None
@@ -96,6 +138,9 @@ def execute():
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(train_gpus)
 
     def launch_teacher():
+        # [FUNCTION DOC] HELPER: Hook run before the Ray job is submitted. Starts the teacher server
+        # on the chosen device and stores its process in the enclosing function's variable so the
+        # cleanup block can kill it. May raise a runtime error if the server fails to start.
         nonlocal teacher_process
         teacher_process = _launch_teacher_server(teacher_gpu)
 

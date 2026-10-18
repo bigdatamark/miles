@@ -1,3 +1,14 @@
+# [MODULE DOC] End-to-end test of fully-asynchronous training with a dedicated evaluation engine
+# on Qwen2.5-0.5B-Instruct, 4 GPUs in total: 2 actor GPUs, 1 rollout GPU and 1 dedicated eval GPU,
+# non-colocated, bridge mode, async train script. Evaluation snapshots of the Hugging Face weights
+# are staged in a per-run temporary directory in shared memory (CI containers share host IPC, so
+# each run owns its directory); every eval point must report a weight version equal to its rollout
+# id (verified by the eval controller). Run: 4 rollouts of 8 prompts times 4 samples, eval every 2
+# rollouts on the GSM8K test split, keeping 2 snapshots; the CI checker expects the GSM8K eval
+# metric to be reported 3 times with threshold 0.4. Pause mode is in-place because the default
+# retract mode can deadlock cache flushing in fully-async under load. Registered for CUDA 4-GPU
+# H200 (est. 400 s) and ROCm 4-GPU MI350 nightly (est. 400 s). Run as a script: prepare, strip
+# proxy variables, create the snapshot directory, execute.
 import os
 from tempfile import TemporaryDirectory
 
@@ -16,6 +27,9 @@ NUM_GPUS = 4
 
 
 def prepare():
+    # [FUNCTION DOC] Creates model/dataset directories and downloads the Qwen2.5-0.5B-Instruct
+    # model and the GSM8K dataset. No checkpoint conversion (bridge mode). Side effects: shell
+    # commands, network, filesystem.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -23,6 +37,16 @@ def prepare():
 
 
 def execute(eval_hf_dir: str):
+    # [FUNCTION DOC] Builds the argument string and launches the asynchronous train script with 4
+    # GPUs, using the given directory for evaluation snapshots. Rollout: fully-async flag, GSM8K
+    # parquet, math reward, 4 rollouts of 8 prompts times 4 samples, 1024 tokens, temperature 0.8,
+    # global batch 32, in-place pause mode. Eval: interval 2, GSM8K test split, 1 sample, 1024
+    # tokens, top-k 1, one dedicated eval GPU with one engine, snapshot directory, keep 2 snapshots.
+    # All parallel sizes 1 with sequence parallel, dynamic batching at 9216 tokens per GPU. GRPO with
+    # KL loss at zero coefficient, Adam at 1e-6. SGLang: 1 GPU per engine, mem fraction 0.65, metrics.
+    # CI flags: CI test plus a metric checker on the GSM8K eval metric (threshold 0.4, 3 expected
+    # reports). Misc: 2 actor GPUs, 1 rollout GPU, bridge mode (needed for the Hugging Face
+    # reference load and snapshot export). Returns nothing.
     U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/models/{MODEL_NAME}/ "
 

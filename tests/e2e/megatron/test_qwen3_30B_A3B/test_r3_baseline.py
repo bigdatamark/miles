@@ -1,3 +1,11 @@
+# [MODULE DOC] Single-case end-to-end test of rollout routing replay (R3) for Qwen3-30B-A3B on 4
+# GPUs, colocated, BF16 rollout, no DeepEP: Megatron context parallel 2, pipeline 1, tensor 2,
+# expert 4; one 4-GPU SGLang engine. This is the topology reused by the DeepEP R3 variants.
+# Registered for CUDA 4-GPU H200 (est. 1200 s) and ROCm 4-GPU MI350 nightly (est. 1000 s), both
+# currently disabled, with five CI metric gates (grad norm, PPO KL, train/rollout logprob
+# absolute difference, train/rollout KL, raw reward). Run as a script: strips proxy variables,
+# then prepare and execute.
+# KNOWN ISSUE: both registrations are disabled with a reason that cites no issue or PR.
 import os
 
 from tests.ci.ci_register import register_cuda_ci, register_rocm_ci

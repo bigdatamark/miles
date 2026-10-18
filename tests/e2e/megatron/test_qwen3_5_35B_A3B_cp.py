@@ -1,3 +1,15 @@
+# [MODULE DOC] End-to-end test of context parallelism for Qwen3.5-35B-A3B on 8 colocated GPUs
+# (tensor 1, pipeline 1, expert parallel = 8 divided by context size, sequence parallel). One
+# training run is launched with a context-parallel size read from an environment variable
+# (default 2) when run as a script; two thin wrappers exist for sizes 2 and 4. The run uses
+# MTP training (one layer, loss scale 0.2), EAGLE speculative decoding with spec v2 (needs the
+# extra-buffer mamba radix cache strategy), one 8-GPU SGLang engine with expert parallel 8, Adam
+# with CPU offload, 2 rollouts of 8 prompts times 8 samples (8192 tokens), and AIME-2024 eval
+# flags without an interval. Registered for CUDA 8-GPU H100 (est. 900 s) but currently disabled as
+# flaky; there is no registered CI metric gate. Module constants: model name/type and 8 GPUs.
+# Run as a script: prepare, strip proxy variables, then run with the chosen context size.
+# KNOWN ISSUE: a fixme comment above the registration marks it as unfixed, and the disabled reason
+# cites no issue or PR. The two wrapper functions are not called from the script entry point.
 """E2E test for Qwen3.5-35B-A3B with Context Parallel (CP=2 and CP=4).
 
 Validates that GDN layers use real fla native CP (state passing) instead of
@@ -25,6 +37,9 @@ NUM_GPUS = 8
 
 
 def prepare():
+    # [FUNCTION DOC] Creates model/dataset directories, downloads the Qwen3.5-35B-A3B model and the
+    # dapo-math-17k and aime-2024 datasets, and converts the model to a Megatron distributed
+    # checkpoint on 8 GPUs. Side effects: shell commands, network, filesystem, GPU.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -34,6 +49,16 @@ def prepare():
 
 
 def _execute_with_cp(cp_size: int):
+    # [FUNCTION DOC] HELPER: Launches one training run with the given context-parallel size.
+    # Asserts (assertion error) that 8 GPUs divide evenly by the size; expert parallel size is the
+    # quotient. Argument groups: rollout (2 rollouts, 8 prompts times 8 samples, 8192 tokens,
+    # temperature 1, global batch 32, balanced); eval flags for AIME-2024 (no interval, so eval is
+    # not scheduled); performance (tensor 1, pipeline 1, full recompute, dynamic batching at 8192
+    # tokens per GPU); GRPO with zero-coefficient KL loss; Adam with CPU offload; SGLang (one
+    # 8-GPU engine, mem fraction 0.7, expert parallel 8, 512 max running requests, EAGLE with 2
+    # steps, top-k 1, 3 draft tokens, extra-buffer mamba radix cache); MTP training; CI test flag;
+    # colocate, flex token dispatcher, parameter rematerialization. Sets the spec v2 environment
+    # variable for the launch, which uses 8 GPUs.
     """Run a short training loop with the given context-parallel size."""
     U = command_utils.default_config().create_backend()
     assert NUM_GPUS % cp_size == 0
@@ -155,11 +180,13 @@ def _execute_with_cp(cp_size: int):
 
 
 def execute_cp2():
+    # [FUNCTION DOC] Runs the shared launcher with context-parallel size 2 (expert parallel 4).
     """Qwen3.5-35B-A3B with CP=2."""
     _execute_with_cp(cp_size=2)
 
 
 def execute_cp4():
+    # [FUNCTION DOC] Runs the shared launcher with context-parallel size 4 (expert parallel 2).
     """Qwen3.5-35B-A3B with CP=4."""
     _execute_with_cp(cp_size=4)
 

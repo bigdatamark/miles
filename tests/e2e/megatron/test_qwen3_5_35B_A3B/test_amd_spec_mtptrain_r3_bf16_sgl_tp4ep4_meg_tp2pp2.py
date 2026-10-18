@@ -1,3 +1,12 @@
+# [MODULE DOC] Single-case end-to-end test (ROCm, 4 MI350 GPUs, colocated) for Qwen3.5-35B-A3B
+# with MTP training on, EAGLE speculative decoding (spec v2) and rollout routing replay (R3), BF16
+# rollout, built on the shared case configuration. Megatron: tensor 2, pipeline 2, expert 2, no
+# context parallelism, using the alltoall token dispatcher. SGLang: one 4-GPU engine with expert
+# parallel 4 and shared-experts fusion disabled. The weight-equality check covers target and draft
+# (default selector) and skips vision weights. Registered for ROCm 4-GPU MI350 (est. 1600 s, labels
+# megatron, qwen35, amd) with five CI metric gates (grad norm, PPO KL, train/rollout logprob
+# absolute difference, train/rollout KL, raw reward). Run as a script: strips proxy variables, then
+# prepare and execute.
 """AMD 4-GPU Qwen3.5-35B-A3B case: 1 MTP layer + speculative-v2 + R3.
 
 MTP training is on with one draft layer, so the rollout MTP/draft weights are synced

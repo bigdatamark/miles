@@ -1,3 +1,12 @@
+# [MODULE DOC] Single-case end-to-end test of rollout routing replay (R3) with DeepEP and FP8
+# rollout for Qwen3-30B-A3B on 4 GPUs, colocated: Megatron context 2, pipeline 1, tensor 2, expert
+# 4; one 4-GPU SGLang engine with expert parallel 4. Registered for CUDA 4-GPU H200 (est. 1800 s)
+# but disabled; no CI metric gates are registered. Run as a script: strips proxy variables, then
+# prepare and execute.
+# KNOWN ISSUE: the registration is disabled because of a mismatch between FP8 rollout and BF16
+# training, and a fixme comment above it marks it as unfixed; the disabled reason cites no
+# issue or PR. Unlike sibling cases it registers no metric gates, and unlike the BF16 control it
+# does not lower the max running requests, which would put it at the DeepEP low-latency cap.
 import os
 
 from tests.ci.ci_register import register_cuda_ci

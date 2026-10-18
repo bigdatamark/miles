@@ -1,3 +1,13 @@
+# [MODULE DOC] End-to-end test of short GRPO training on Qwen2.5-0.5B-Instruct with GSM8K, 2
+# colocated GPUs, bridge mode, fault tolerance (health check every 5 s, 10 s timeout, no initial
+# wait). Besides serving as its own test, the module exposes a parameterized entrypoint (worker
+# communication backend, object store backend defaulting to Mooncake, and the calling test file used
+# for experiment-tracking names) that sibling tests for the Ray RPC communication backend with
+# Mooncake or Ray stores reuse. Model and data directories come from the shared test directory
+# helpers. Rollout: 2 rollouts of 8 prompts times 4 samples, oversampling 16, non-zero reward std
+# filter, 1024 tokens, global batch 32; eval flags use interval 20 (never reached in 2 rollouts).
+# Registered for CUDA 2-GPU H200 (est. 400 s) and ROCm 2-GPU MI350 nightly (est. 300 s), labels
+# short and mooncake. Run as a script: entrypoint with the Ray communication backend.
 import os
 
 from tests.ci.ci_register import register_cuda_ci, register_rocm_ci
@@ -25,6 +35,9 @@ def entrypoint(
     object_store_backend: ObjectStoreBackend = ObjectStoreBackend.MOONCAKE,
     test_file: str,
 ) -> None:
+    # [FUNCTION DOC] Full flow for a caller: prepare assets, remove proxy variables from the
+    # environment, then run the training with the given worker communication backend, object store
+    # backend and test file path (used to name the tracking run). Returns nothing.
     prepare()
     for proxy_var in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
         os.environ.pop(proxy_var, None)
@@ -32,6 +45,9 @@ def entrypoint(
 
 
 def prepare():
+    # [FUNCTION DOC] Creates the model and data directories (from the shared helpers), downloads
+    # Qwen2.5-0.5B-Instruct into the model directory and GSM8K into the data directory. Side
+    # effects: shell commands, network, filesystem.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu(f"mkdir -p {MODEL_DIR} {DATA_DIR}")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir {MODEL_DIR}/{MODEL_NAME}")
@@ -44,6 +60,15 @@ def execute(
     object_store_backend: ObjectStoreBackend = ObjectStoreBackend.MOONCAKE,
     test_file: str,
 ) -> None:
+    # [FUNCTION DOC] Builds the argument string and launches training with 2 GPUs, colocated.
+    # Keyword-only inputs: worker communication backend; object store backend (default Mooncake);
+    # test file path for tracking names. The communication argument is omitted for the Ray backend
+    # and otherwise names the backend's value. The object store arguments are the Ray backend flag
+    # for the Ray store, else the Mooncake argument helper's text; they are placed right after the
+    # checkpoint arguments, and the communication argument is last. Other settings: GRPO with KL
+    # loss at zero coefficient, Adam at 1e-6, all parallel sizes 1 with sequence parallel, dynamic
+    # batching at 9216 tokens per GPU, SGLang one GPU per engine with mem fraction 0.7 and metrics,
+    # CI test flag, fault tolerance flags, bridge mode. Returns nothing.
     U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint {MODEL_DIR}/{MODEL_NAME}/ " f"--ref-load {MODEL_DIR}/{MODEL_NAME}/ "
 

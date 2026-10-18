@@ -1,3 +1,16 @@
+# [MODULE DOC] Single-case end-to-end test (ROCm, 4 MI350 GPUs): Qwen3-30B-A3B trained with the
+# Megatron bridge (direct Hugging Face load, no distributed-checkpoint conversion) against an FP8
+# SGLang rollout, using the mori all-to-all backend on the rollout side and the alltoall token
+# dispatcher on the training side. Built from the shared case configuration in the sibling common
+# module: context parallel 2, pipeline 1, tensor 2, expert 4, one rollout engine of 4 GPUs with
+# SGLang expert parallel 4, max 2048 tokens per GPU, colocated. Extra arguments select the mori
+# a2a backend with auto deepep mode; an environment variable sets the mori max dispatch tokens
+# per rank to 16384. Registration: ROCm CI suite 4-GPU MI350, est. 800 s, labels megatron and
+# amd, currently disabled with a fixme reason that cites no tracking issue. Five CI metric gates
+# are registered (grad norm, PPO KL, train/rollout logprob absolute difference, train/rollout KL,
+# raw reward). Run as a script: strips proxy variables, calls prepare then execute.
+# KNOWN ISSUE: the disabled reason is a bare fixme without an issue or PR reference, which the
+# registration rules require for new disabled entries.
 """AMD 4-GPU variant of test_deepep_fp8_bridge.py.
 
 Standalone rather than an IS_HIP branch in the original: the MI300X fleet is

@@ -1,3 +1,11 @@
+# [MODULE DOC] HELPER: Custom agent function for the session-server tool-call end-to-end test. The
+# agent drives a multi-turn conversation with a single mock weather tool through the session
+# proxy's chat completions route, feeding back canned tool results, and stops when a final answer
+# appears in answer tags, after 8 turns, or after more than 2 consecutive turns without a valid
+# tool call. Module constants: the maximum turns and retries, the retry hint text sent as a tool
+# message, the tool schema (one function taking a required city string), and four canned JSON
+# weather results used cyclically. Correctness of token handling is enforced server side (a prefix
+# mismatch causes an HTTP 500 that fails the request here); this module only generates traffic.
 """Custom agent function for the session-server tool-call e2e test.
 
 Runs a multi-turn tool-calling conversation through the session proxy
@@ -73,12 +81,16 @@ MOCK_TOOL_RESULTS = [
 
 
 def _is_task_complete(assistant_msg: dict) -> bool:
+    # [FUNCTION DOC] HELPER: Returns true when the assistant message's content (empty if missing or
+    # null) contains both the opening and closing final-answer tags.
     """Check if the assistant has produced a final answer."""
     content = assistant_msg.get("content") or ""
     return "<final_answer>" in content and "</final_answer>" in content
 
 
 def _extract_tool_calls(assistant_msg: dict) -> list[dict] | None:
+    # [FUNCTION DOC] HELPER: Returns the message's structured tool-call list if it is present and
+    # non-empty, otherwise none. No text-based fallback parsing is attempted.
     """Return structured tool_calls from the assistant message, or None.
 
     Only trusts the structured ``tool_calls`` field populated by sglang's
@@ -99,6 +111,13 @@ async def _chat(
     label="",
     tool_choice=None,
 ):
+    # [FUNCTION DOC] HELPER: Sends one chat completions request to the base URL's chat route using
+    # the given HTTP client. The payload is the messages, the module's tool schema, and the
+    # request-kwargs mapping merged in (so a "tools" entry in it would override the schema), plus
+    # the tool-choice if given. A "stream" entry in the request kwargs is removed from the payload
+    # and read (default true): when true, delegates to the shared streaming client (which consumes
+    # server-sent events and returns the assembled response); when false, posts normally, asserts
+    # HTTP status 200 with the label in the message, and returns the parsed JSON.
     """Send a chat completions request and return the response JSON."""
     payload = {
         "messages": messages,
@@ -118,6 +137,21 @@ async def _chat(
 
 
 async def run_agent(base_url, prompt, request_kwargs, metadata, **kwargs):
+    # [FUNCTION DOC] Runs the agent loop and returns a mapping with counts: turns completed, total
+    # tool calls, total rollbacks and total tool-message retries. Copies the prompt messages and
+    # the request kwargs minus any tools entry. Uses one async HTTP client with a 180 second
+    # timeout. For turn 1 through 8: send the conversation with automatic tool choice; append the
+    # assistant reply; stop if it holds a final answer. If it has structured tool calls: append a
+    # tool message per call with the canned result chosen cyclically by running call count and the
+    # call's id, add to the count and reset the consecutive-failure counter. Otherwise increment
+    # the consecutive-failure counter and stop if it exceeds 2; remove the failed assistant reply;
+    # with probability one half, and only if at least one tool call has already happened, leave it
+    # removed (a rollback: the next request resends earlier messages so the server detects and
+    # rolls back); else restore the reply and append a tool message carrying the retry hint with a
+    # deliberately invalid tool call id (some chat templates require an id field). Failed HTTP
+    # statuses surface as assertion or client errors. Uses the global random generator, so runs are
+    # not reproducible. Side effects: network calls, logging.
+    # KNOWN ISSUE: the metadata and extra keyword parameters are accepted but unused.
     """Multi-turn tool-call agent for e2e session pretokenization testing.
 
     Exercises the full TITO pipeline including both retry strategies:

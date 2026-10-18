@@ -1,3 +1,14 @@
+# [MODULE DOC] Single-case end-to-end test for Qwen3.5-35B-A3B with fully-asynchronous rollout and
+# rollout routing replay (R3), no speculative decoding and no MTP training, non-colocated on 8
+# GPUs: 4 training GPUs (tensor 1, data parallel 4, expert 4, alltoall dispatcher) and 4 rollout
+# GPUs forming one engine with data-parallel attention (data parallel 4) and expert parallel 4, no
+# DeepEP. Weights are broadcast. The pause mode is forced to in-place because retract-mode weight
+# updates with R3 have known SGLang issues. Registered for CUDA 8-GPU H200 (est. 2400 s) because
+# expert parallel must stay at least 4 (at 2 the gradient clipping exceeds the fixed tensor-handle
+# pool of the image's transformer-engine), and for ROCm 8-GPU MI350 nightly (est. 1400 s), with
+# five CI metric gates. Run as a script: strips proxy variables, prepares, and on ROCm (selected
+# by a hardware-platform environment variable) replaces the case with a copy whose extra args also
+# disable shared-experts fusion and enable the debug unified-grad fused logprob; then executes.
 """Qwen3.5-35B-A3B fully-async rollout with R3 and without speculative decoding.
 
 4 train GPUs (TP1, DP4, EP4) + one 4-GPU engine with DP attention (attention TP1 x DP4, EP4),

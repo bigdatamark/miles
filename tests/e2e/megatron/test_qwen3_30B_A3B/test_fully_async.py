@@ -1,3 +1,14 @@
+# [MODULE DOC] Single-case end-to-end test of fully-asynchronous rollout for Qwen3-30B-A3B on a
+# disaggregated layout (fully async cannot colocate): 3 training GPUs with pipeline parallel 3 and
+# an uneven layer split (first stage 17 layers, last stage 14, middle 17) so that layer offsets
+# differ from the even split on both non-first stages, plus 1 rollout GPU with one engine. Uses
+# broadcast weight transfer and runs 3 rollouts to cover a cold start, a drain from a warm queue,
+# and a drain across a weight update (which pauses generation and makes the persistent worker
+# recycle aborted groups). Registered for CUDA 4-GPU H200 (est. 1500 s) and ROCm 4-GPU MI350
+# nightly (est. 800 s), both currently disabled, with five CI metric gates (grad norm, PPO KL,
+# train/rollout logprob absolute difference, train/rollout KL, raw reward). Run as a script:
+# strips proxy variables, then prepare and execute.
+# KNOWN ISSUE: both registrations are disabled with a reason that cites no issue or PR.
 import os
 
 from tests.ci.ci_register import register_cuda_ci, register_rocm_ci

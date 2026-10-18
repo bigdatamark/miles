@@ -1,3 +1,14 @@
+# [MODULE DOC] End-to-end test of the inline SGLang configuration file feature with Qwen2.5-0.5B,
+# on 4 colocated GPUs using the Megatron-to-Hugging-Face bridge (no checkpoint conversion; the
+# reference load is the HF directory). The config is a YAML text passed as a pseudo file: one
+# named server entry with two server groups of 2 GPUs each at 1 GPU per engine (four engines in
+# total behind one router, with separate port cursors per group). The test passes if two short
+# GRPO rollouts on GSM8K (with an oversampling batch and a non-zero reward standard deviation
+# dynamic sampling filter) complete with the CI flag. Registered nightly-only for CUDA 4-GPU H200
+# (est. 400 s) and for ROCm 4-GPU MI350 nightly (est. 400 s). Run as a script: prepare, strip
+# proxy variables, execute.
+# KNOWN ISSUE: the comment above the YAML says the groups have different sizes, but both groups
+# have 2 GPUs. The eval interval (20) exceeds the number of rollouts (2), so evaluation never runs.
 import os
 
 from tests.ci.ci_register import register_cuda_ci, register_rocm_ci
@@ -32,6 +43,9 @@ sglang:
 
 
 def prepare():
+    # [FUNCTION DOC] Creates model/dataset directories, downloads the Qwen2.5-0.5B-Instruct model
+    # and the GSM8K dataset. No checkpoint conversion (bridge mode). Side effects: shell commands,
+    # network, filesystem.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -39,6 +53,14 @@ def prepare():
 
 
 def execute():
+    # [FUNCTION DOC] Writes the YAML config to a pseudo file and launches training with 4 GPUs.
+    # Rollout: GSM8K parquet, math reward, 2 rollouts of 8 prompts times 4 samples with an
+    # oversampling batch of 16 and the non-zero-reward-std dynamic sampling filter, 1024 response
+    # tokens, temperature 0.8, global batch 32. Eval flags on GSM8K (interval 20, top-k 1). All
+    # parallel sizes 1 with sequence parallel, dynamic batching at 9216 tokens per GPU. GRPO with
+    # KL loss at zero coefficient, Adam at 1e-6. SGLang: 1 GPU per engine, mem fraction 0.6,
+    # metrics, decode CUDA-graph max batch 32, config pseudo file. CI test flag; colocated; bridge
+    # conversion mode. Returns nothing.
     U = command_utils.default_config().create_backend()
     config_arg = command_utils.encode_pseudo_file(SGLANG_CONFIG_YAML)
 

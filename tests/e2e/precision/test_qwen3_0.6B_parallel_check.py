@@ -1,3 +1,19 @@
+# [MODULE DOC] End-to-end precision test intended to show that training on a fixed batch gives the
+# same gradient norm regardless of the parallelism layout, for Qwen3-0.6B on up to 8 GPUs,
+# colocated. Flow per outer iteration: (1) run an 8-GPU training that dumps the rollout data and
+# saves the gradient norm to files; (2) sweep over total GPU counts 8, 4 and 2 and over tensor,
+# pipeline and context parallel sizes, each time re-running training that loads the dumped rollout
+# and checks its gradient norm against the saved one (via the CI load-grad-norm flag). The second
+# outer iteration repeats with per-token-loss calculation added to all arguments. Module state:
+# an eval-enable flag read from an environment variable (default off, and unused in the arguments),
+# model name/type, 8 GPUs. Registered for CUDA 8-GPU H100 (est. 2400 s) but disabled for bugs.
+# Run as a script: prepare, strip proxy variables, then execute.
+# KNOWN ISSUE: the sweep keeps a running count of remaining GPUs that is divided by the tensor
+# size, then by the pipeline size, and is never restored between loop iterations, so after the
+# first iterations the remaining count shrinks cumulatively (also as a float) and most parallel
+# size combinations are skipped or wrong; it also never checks that the product of sizes divides
+# the GPU count. The eval-enable flag is defined but never used. A fixme comment above the
+# registration marks it as unfixed.
 import os
 
 from tests.ci.ci_register import register_cuda_ci
@@ -21,6 +37,9 @@ NUM_GPUS = 8
 
 
 def prepare():
+    # [FUNCTION DOC] Creates model/dataset directories, downloads Qwen3-0.6B and the dapo-math-17k
+    # dataset, and converts the model to a Megatron distributed checkpoint under the models
+    # directory on 8 GPUs. Side effects: shell commands, network, filesystem, GPU.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -32,6 +51,19 @@ def prepare():
 
 
 def execute():
+    # [FUNCTION DOC] Builds the shared argument string and runs the reference-then-sweep loop twice.
+    # Shared arguments: one rollout of 4 prompts times 8 samples, 8192 response tokens, temperature
+    # 0.8, global batch 32; GRPO with k1 KL loss at zero coefficient and clip 4e-4; Adam at 1e-6;
+    # SGLang with 2 GPUs per engine and mem fraction 0.8; CI test flag; dropout off; flash
+    # attention; colocated, one actor node. Each outer iteration i (0 and 1): run a reference
+    # training on 8 GPUs that saves rollout data to a file named from i and the rollout id
+    # placeholder and saves the grad norm to a file named from i. Then for each GPU count in 8, 4, 2
+    # and each tensor size in 1, 2, 4, 8, pipeline size in 1, 2, 4 and context size in 1, 2, 4, 8
+    # that passes the remaining-GPU filters, run a training job loading that rollout data and grad
+    # norm with those parallel sizes, sequence parallel, dynamic batching at 8192 tokens per GPU,
+    # and that GPU count. After each outer iteration the per-token-loss flag is appended to the
+    # shared arguments for later iterations. Returns nothing; failures come from the training
+    # runs' own checks.
     U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/models/{MODEL_NAME}_torch_dist "
 

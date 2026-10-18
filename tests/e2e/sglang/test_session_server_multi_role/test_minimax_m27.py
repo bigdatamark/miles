@@ -1,3 +1,12 @@
+# [MODULE DOC] Multi-role session-server token-in-token-out end-to-end test for MiniMax-M2.7.
+# Configuration: tensor parallel 4 (tensor parallel 2 runs out of memory allocating the 8-bit
+# MoE weights on 80 GB GPUs), 2 cycles, assistant-text threshold 0.1, append-user recovery (the
+# strict chat template rejects a tool message that does not follow an assistant tool call, so a
+# user-role retry hint is used), the append-think reasoning parser bound to the model's tokenizer
+# class, and Anthropic verification disabled because the model does not reliably honor forced
+# tool-use responses. Registered for CUDA 4-GPU H200 (est. 1200 s) but disabled because the model
+# is deprecated, with metric gates on the session mismatch rate of assistant text for session
+# versions v1 and v2. Run as a script: calls the test function.
 """MiniMax-M2.7 covers the MiniMax-M2.x e2e surface.
 
 MiniMax-M2.5 is intentionally omitted: M2.5 and M2.7 share tokenizer.json
@@ -55,6 +64,9 @@ CONFIG = ModelConfig(
 
 
 def test_minimax_m27():
+    # [FUNCTION DOC] Runs the full per-model verification matrix for this module's configuration
+    # through the shared runner (OpenAI on session v1 and v2; the Anthropic run is skipped here by
+    # configuration); any failure raised by the runner fails the test.
     run_both_versions(CONFIG)
 
 

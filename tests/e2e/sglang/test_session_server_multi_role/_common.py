@@ -1,3 +1,10 @@
+# [MODULE DOC] HELPER: Shared configuration type and runners for the per-model multi-role
+# session-server token-in-token-out end-to-end tests in this directory. Each sibling test file
+# defines one model configuration and calls the run-both-versions function. Module constants: the
+# allowed session server versions (v1, v2), endpoint kinds (openai, anthropic), the run matrix
+# (v1 with the OpenAI wire format, v2 with OpenAI, v2 with the Anthropic Messages format), and the
+# import paths of the Anthropic custom generate and agent functions. The heavy lifting is done by
+# the shared session-verify runner imported from the miles test utilities.
 """Shared types and runner for multi-role session-server TITO e2e tests.
 
 Each test file in this directory owns a single ``ModelConfig`` and drives it
@@ -31,6 +38,16 @@ _ANTHROPIC_AGENT = "miles.utils.test_utils.anthropic_session_verify_agent.run_ag
 
 @dataclass(frozen=True)
 class ModelConfig:
+    # [CLASS DOC] HELPER: Immutable per-model test configuration. Required: model name (used as the
+    # checkpoint), SGLang reasoning parser name, SGLang tool-call parser name (may be none), and
+    # the token-in-token-out model key. Optional with defaults: GPU count 4; tensor parallel size 1
+    # (becomes GPUs per rollout engine); context length, KV-cache dtype, mamba full-memory ratio
+    # (all unset); max response length (shared default); prefill CUDA-graph backend (unset); SGLang
+    # expert-parallel size 1; speculative decoding off; session-verify cycles 3; samples per prompt
+    # 4; assistant-text mismatch-ratio threshold (shared default) with an optional Anthropic-only
+    # override; hard special-token-count mismatch threshold 0; whether to verify the Anthropic
+    # endpoint (true); the required Anthropic intermediate-system expectation ("required" or
+    # "forbidden", unset by default); and the tool-call failure recovery mode (default "rollback").
     model_name: str
     reasoning_parser: str
     tool_call_parser: str | None
@@ -77,6 +94,21 @@ def run_one(
     endpoint: SessionEndpoint = "openai",
     rollout_batch_size: int = SESSION_VERIFY_INVARIANT_ARGS["rollout_batch_size"],
 ) -> None:
+    # [FUNCTION DOC] HELPER: Runs one session-verify pass for a model, given the session server
+    # version (default v2), wire endpoint (default OpenAI) and rollout batch size (default from the
+    # shared invariants). Raises a value error if the Anthropic endpoint is used with a version
+    # other than v2, or without an intermediate-system expectation in the config. Starts from a copy
+    # of the shared invariant arguments and overrides: server version, batch size; for Anthropic,
+    # the custom generate and agent function paths and the loose tool-call message matcher; global
+    # batch size = batch size times samples per prompt; max response length, prefill CUDA-graph
+    # backend, SGLang expert-parallel size, context length, KV-cache dtype, mamba memory ratio and
+    # speculative decoding from the config. The assistant-text threshold is the config's, or the
+    # Anthropic override when the endpoint is Anthropic and the override is set. Builds an argument
+    # namespace (checkpoint, token-in-token-out model, parsers, tensor parallel size as engine
+    # GPUs, one actor node with the config's GPUs, samples per prompt, cycles, failure mode,
+    # thresholds, the Anthropic expectation only for Anthropic) merged with the invariants, and
+    # calls the shared session-verify runner with the endpoint as wire format. Side effects:
+    # launches servers and GPU work through the runner.
     if endpoint == "anthropic" and session_server_version != "v2":
         raise ValueError("Anthropic per-model verification requires session server v2")
     if endpoint == "anthropic" and cfg.anthropic_intermediate_system_expectation is None:
@@ -124,6 +156,10 @@ def run_one(
 
 
 def run_both_versions(cfg: ModelConfig) -> None:
+    # [FUNCTION DOC] Runs the full per-model matrix in order: v1 with OpenAI, v2 with OpenAI, v2
+    # with Anthropic (skipped when the config disables Anthropic verification). Each run uses half
+    # of the shared default rollout batch size (the default divided by the number of server
+    # versions, integer division) so the total work stays near one batch.
     rollout_batch_size = SESSION_VERIFY_INVARIANT_ARGS["rollout_batch_size"] // len(_SESSION_SERVER_VERSIONS)
     for version, endpoint in _SESSION_RUNS:
         if endpoint == "anthropic" and not cfg.verify_anthropic:

@@ -1,3 +1,12 @@
+# [MODULE DOC] HELPER: Shared harness for the torchtitan training-backend end-to-end tests in this
+# directory (one file per case, each differing only in topology and model). Provides a validated
+# case-configuration dataclass, a prepare function (downloads), a pure function building the whole
+# command line for a case, and an execute function that strips proxy variables and launches
+# training through the legacy command utilities module (used as a module alias). Parallel flags use
+# Megatron's names; the backend copies them into the torchtitan parallelism config.
+# KNOWN ISSUE: the existing docstring says context parallelism is told to be 1 to the shared
+# training loop, but the command line passes the case's context-parallel size and the
+# divisibility check includes it.
 """Shared case harness for the torchtitan backend's end-to-end tests.
 
 One file per case, all of them differing only in a topology and a model, so the
@@ -18,6 +27,13 @@ import miles.utils.external_utils.command_utils.legacy as U
 
 @dataclass
 class CaseConfig:
+    # [CLASS DOC] HELPER: Mutable data holder for one case. Required: Hugging Face model repository,
+    # torchtitan model name and flavor, total GPUs for training, sequence length, max response
+    # length. Optional with defaults: tensor, pipeline, context and expert parallel sizes (1);
+    # rollout routing replay (off); a reference model with KL loss (off); colocation (on); rollout
+    # GPU count and GPUs per engine (unset); fully-async (off); SGLang static memory fraction 0.7;
+    # weight transfer mode (unset); number of rollouts (2); extra argument text. Exposes the
+    # derived engine size and local model directory as properties.
     """One end-to-end configuration.
 
     Topology values are passed explicitly rather than inferred, so a case file
@@ -46,6 +62,12 @@ class CaseConfig:
     extra_args: str = ""
 
     def __post_init__(self):
+        # [FUNCTION DOC] HELPER: Validation only; raises a value error if: fully-async is combined
+        # with colocation; not colocated and no rollout GPU count; total GPUs is not divisible by
+        # tensor times pipeline times context size; the sequence length does not exceed the max
+        # response length (a prompt needs room, because torchtitan sizes its rotary tables from the
+        # sequence length); or the rollout pool (total GPUs if colocated, else the rollout GPU
+        # count) is not divisible by the engine size.
         if self.fully_async and self.colocate:
             raise ValueError(
                 "fully_async cannot colocate: generation continues while training runs, "
@@ -69,22 +91,44 @@ class CaseConfig:
 
     @property
     def engine_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Property. GPUs per rollout engine: the explicit value if set,
+        # otherwise the whole rollout pool (all GPUs when colocated, else the rollout GPU count),
+        # i.e. one engine spanning the pool.
         if self.rollout_num_gpus_per_engine is not None:
             return self.rollout_num_gpus_per_engine
         return self.num_gpus if self.colocate else self.rollout_num_gpus
 
     @property
     def model_dir(self) -> str:
+        # [FUNCTION DOC] HELPER: Property. Local model path: the models root plus the last path
+        # component of the repository name.
         return f"/root/models/{self.model_repo.split('/')[-1]}"
 
 
 def prepare(case: CaseConfig) -> None:
+    # [FUNCTION DOC] Creates model/dataset directories, downloads the case's model repository into
+    # its local model directory and downloads the dapo-math-17k dataset. No checkpoint conversion
+    # (torchtitan loads Hugging Face weights). Side effects: shell commands, network, filesystem.
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download {case.model_repo} --local-dir {case.model_dir}")
     U.hf_download_dataset("zhuzilin/dapo-math-17k")
 
 
 def build_train_args(case: CaseConfig, *, wandb_file: str) -> str:
+    # [FUNCTION DOC] Builds the full space-separated argument string; reads the infinite-run
+    # environment switch and calls the wandb-args helper keyed on the given file. Sections:
+    # rollout (dapo-math data, deepscaler reward, 3000 rollouts if the infinite-run switch is on
+    # else the case's count, 8 prompts times 4 samples, case's max response length, temperature 1,
+    # global batch 32, balanced; for fully-async adds the fully-async flag and in-place pause mode
+    # because the default retract mode can deadlock cache flushing); GRPO with zero-coefficient KL
+    # and entropy terms and clip range 0.2 to 0.28, plus rollout routing replay if enabled; Adam at
+    # 1e-6; SGLang (engine size, decode log interval 1000, case's memory fraction); torchtitan
+    # (backend selection, model name and flavor, sequence length, the four parallel sizes, micro
+    # batch size 1, gradient checkpointing, 512 MiB weight update buffer); CI test with the KL
+    # checker disabled; misc (HF checkpoint dir, one actor node with the case's GPUs, colocate or
+    # explicit rollout GPUs, reference load plus KL loss if a reference is wanted, the transfer mode
+    # if set, and for disk-delta a published directory and a local checkpoint directory under a
+    # fixed root). The case's extra args end the string. Returns it.
     """The whole command line for `case`.
 
     Separate from `execute` so a CPU-only test can read the string back without
@@ -182,6 +226,10 @@ def build_train_args(case: CaseConfig, *, wandb_file: str) -> str:
 
 
 def execute(case: CaseConfig, *, wandb_file: str) -> None:
+    # [FUNCTION DOC] Removes proxy variables from the process environment, then launches training
+    # with the built arguments, no Megatron model type, GPUs equal to the case's GPUs plus the
+    # rollout GPUs when not colocated, and the async train script when fully-async else the
+    # standard one. Returns nothing.
     for proxy_var in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
         os.environ.pop(proxy_var, None)
 

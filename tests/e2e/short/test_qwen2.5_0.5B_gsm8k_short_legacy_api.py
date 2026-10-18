@@ -1,3 +1,12 @@
+# [MODULE DOC] End-to-end compatibility test of the legacy module-level command utilities API (used
+# through a module alias instead of a created backend object) on Qwen2.5-0.5B-Instruct with GSM8K,
+# 8 GPUs colocated (4 when a few-GPU environment flag is set), bridge mode, Mooncake object store
+# arguments with the Mooncake master started before the Ray job is submitted, and fault tolerance.
+# Rollout: 3 rollouts of 8 prompts times 4 samples, oversampling 16, non-zero reward std filter,
+# 1024 tokens, global batch 32; eval flags use interval 20 (never reached in 3 rollouts).
+# Registered for CUDA 8-GPU H100 (est. 400 s) and ROCm 8-GPU MI350 nightly (est. 300 s), labels
+# short and mooncake. A todo notes it should run on 4 GPUs. Run as a script: prepare, strip proxy
+# variables, execute.
 import os
 
 from tests.ci.ci_register import register_cuda_ci, register_rocm_ci
@@ -21,12 +30,21 @@ NUM_GPUS = 4 if FEW_GPU else 8
 
 
 def prepare():
+    # [FUNCTION DOC] Using the legacy helpers: creates model/dataset directories and downloads the
+    # Qwen2.5-0.5B-Instruct model and GSM8K. Side effects: shell commands, network, filesystem.
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
     U.hf_download_dataset("zhuzilin/gsm8k")
 
 
 def execute():
+    # [FUNCTION DOC] Builds the argument string and launches training through the legacy API with
+    # the module-level GPU count (4 or 8), colocated. Mooncake object store arguments come right
+    # after the checkpoint arguments. Settings: GRPO with KL loss at zero coefficient, Adam at
+    # 1e-6, all parallel sizes 1 with sequence parallel, dynamic batching at 9216 tokens per GPU,
+    # SGLang one GPU per engine with mem fraction 0.7 and metrics, CI test flag, fault tolerance
+    # flags, bridge mode. A hook starts the Mooncake master before the Ray job is submitted.
+    # Returns nothing.
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/models/{MODEL_NAME}/ "
 
     rollout_args = (

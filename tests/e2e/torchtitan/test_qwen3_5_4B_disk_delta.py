@@ -1,3 +1,12 @@
+# [MODULE DOC] Single-case end-to-end test of the disk-delta weight transfer mode with the
+# torchtitan backend and Qwen3.5-4B, on 8 GPUs non-colocated: 4 training GPUs and 4 rollout GPUs
+# (one engine), sequence length 8192, max response 4096, 3 rollouts, memory fraction 0.6. The
+# disk-delta transfer reconciles the weight stream against the checkpoint's own bytes, so it can
+# catch subtly wrong streams (earlier catches: float32 master weights versus bfloat16 checkpoint,
+# a multimodal config keeping dtype in its text sub-config, and mixed per-tensor dtypes). It also
+# exercises a protocol that declines its first round to capture the baseline for later deltas.
+# Registered for CUDA 8-GPU H200 (est. 1500 s, Hopper only), labels torchtitan and weight-update.
+# Run as a script: prepare then execute.
 from tests.ci.ci_register import register_cuda_ci
 from tests.e2e.torchtitan._common import CaseConfig, execute, prepare
 

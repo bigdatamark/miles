@@ -1,3 +1,13 @@
+# [MODULE DOC] Single-case end-to-end test: Qwen3-30B-A3B on 4 GPUs, colocated, using the shared
+# case configuration from the sibling common module. Topology: context parallel 2, pipeline
+# parallel 2, tensor parallel 1, expert parallel 2, one rollout engine over 4 GPUs. Features: the
+# Mooncake object store arguments are enabled; no DeepEP, no FP8/INT4 rollout, no bridge, no
+# rollout routing replay. Registered for CUDA (4-GPU H200, est. 1100 s) and ROCm (4-GPU MI350
+# nightly, est. 2000 s), both currently disabled; five CI metric gates are registered (grad
+# norm, PPO KL, train/rollout logprob absolute difference, train/rollout KL, raw reward).
+# Run as a script: strips proxy variables, then prepare and execute for the case.
+# KNOWN ISSUE: despite the file name, this is the Mooncake case and both registrations are
+# disabled with a reason that gives no issue or PR reference.
 import os
 
 from tests.ci.ci_register import register_cuda_ci, register_rocm_ci

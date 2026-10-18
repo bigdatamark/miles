@@ -1,3 +1,11 @@
+# [MODULE DOC] Single-case end-to-end test for Qwen3.5-35B-A3B on 4 colocated GPUs: MTP training
+# on, speculative decoding v2, rollout routing replay, DeepEP on both sides, FP8 rollout against
+# BF16 training (so weight updates re-quantize and the check allows quantization error).
+# Megatron: tensor 2, pipeline 1, context 1, expert 4 (tensor 4 hits an attention-output-gate
+# sharding bug). SGLang: one 4-GPU engine with data-parallel attention (data parallel 4) and expert
+# parallel 4. Weight check covers target and draft and skips vision weights. Registered for CUDA
+# 4-GPU H200 (est. 2200 s, Hopper only) with five CI metric gates. Run as a script: strips proxy
+# variables, then prepare and execute.
 """Qwen3.5-35B-A3B: 1 MTP layer + speculative-v2 + R3 + DeepEP on both sides + FP8 rollout.
 
 MTP training is on with one draft layer, so the rollout MTP/draft weights are synced from

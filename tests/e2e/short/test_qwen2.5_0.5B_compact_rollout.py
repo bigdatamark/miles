@@ -1,3 +1,12 @@
+# [MODULE DOC] End-to-end test of by-rollout accounting on Qwen2.5-0.5B-Instruct with 2 colocated
+# GPUs in bridge mode: a custom "compact split" generate function (from the manual tests package)
+# splits each rollout execution into two training samples sharing a rollout id, and training must
+# keep siblings in one step, count steps in rollouts and weight the loss per rollout (see the
+# existing docstring). Rollout: GSM8K, math reward, 2 rollouts of 8 prompts times 4 samples,
+# 1024 tokens, temperature 0.8, global batch 32; eval flags with interval 20 (never reached in 2
+# rollouts); all parallel sizes 1; SGLang one GPU per engine, mem fraction 0.7; CI test flag.
+# Registered nightly-only for CUDA 2-GPU H200 (est. 400 s) and ROCm 2-GPU MI350 nightly (est.
+# 400 s). Run as a script: prepare, strip proxy variables, execute.
 """E2E for by-rollout accounting: a compact generate fn splits every rollout
 execution into two training samples sharing ``rollout_id``; the rollout-side
 schedule must keep siblings in one step, count steps in rollouts, and train
@@ -20,6 +29,9 @@ NUM_GPUS = 2
 
 
 def prepare():
+    # [FUNCTION DOC] Creates model/dataset directories and downloads the Qwen2.5-0.5B-Instruct
+    # model and the GSM8K dataset. No checkpoint conversion (bridge mode). Side effects: shell
+    # commands, network, filesystem.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -27,6 +39,11 @@ def prepare():
 
 
 def execute():
+    # [FUNCTION DOC] Builds the argument string and launches training with 2 GPUs. Uses the
+    # Hugging Face directory as both checkpoint and reference load; the custom generate function
+    # path points at the compact split generator; GRPO with KL loss at zero coefficient, Adam at
+    # 1e-6, dynamic batching at 9216 tokens per GPU, colocated, bridge mode. The CI test flag is
+    # appended inline. Returns nothing.
     U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/models/{MODEL_NAME}/ "
 

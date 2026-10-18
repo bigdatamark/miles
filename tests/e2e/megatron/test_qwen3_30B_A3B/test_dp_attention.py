@@ -1,3 +1,12 @@
+# [MODULE DOC] Single-case end-to-end test: Qwen3-30B-A3B on 4 GPUs, colocated, with SGLang
+# data-parallel attention (data parallel 4 on one 4-GPU engine). Megatron side: context parallel
+# 2, pipeline 2, tensor 1, expert 2. The test exists to verify that the rollout-side data-parallel
+# schedule stays insensitive to completion order when the router dispatches by attention rank
+# (detailed in the existing docstring); the assertions are the standard CI checks inside training
+# plus the metric gates (grad norm, PPO KL, train/rollout logprob absolute difference,
+# train/rollout KL, raw reward). Registered nightly-only for CUDA 4-GPU H200 (est. 1200 s) and for
+# ROCm 4-GPU MI350 nightly (est. 800 s). Run as a script: strips proxy variables, then prepare
+# and execute.
 """E2E for sglang dp-attention x rollout-side DP schedule: with
 --sglang-enable-dp-attention the router runs dp-aware request dispatch
 (worker urls carry an @<rank> suffix, requests are hashed onto attention

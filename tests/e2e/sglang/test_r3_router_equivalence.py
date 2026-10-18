@@ -1,3 +1,20 @@
+# [MODULE DOC] End-to-end test that the SGLang gateway router and the miles Python router produce
+# identical rollout routing-replay data (mixture-of-experts routed expert ids) for the same
+# deterministic workload. For each model family in the sweep (Qwen3-30B-A3B and GLM-4.7-Flash by
+# default, or one family chosen by an environment variable), it downloads the model and dataset if
+# missing, then runs a rollout-only job twice (variants "miles" with the miles router and "sgl"
+# without), each dumping per-sample records to a JSON-lines file through a custom generate
+# function, and then asserts the two dumps are equal: same indices, status, response length and
+# tokens, rollout log probs within 1e-6, same routed-expert shapes and identical routed-expert
+# bytes. Rollout-only mode means no training actor is started and no checkpoint is converted.
+# Configuration comes from environment variables (dump root default under the system temp
+# directory, number of prompts default 8, max response length default 256, model family
+# override). Registered for CUDA 4-GPU H200 (est. 1100 s) but disabled because the miles router is
+# deprecated. Runnable under pytest (one test) or as a script.
+# KNOWN ISSUE: the large explanatory string after the registration call is not a module docstring
+# (it is not the first statement). It says a single H200 suffices, but each model config defaults to
+# 4 GPUs. A repository-root constant is computed (described as being used to extend the Ray actor
+# import path) but is never used.
 from tests.ci.ci_register import register_cuda_ci
 
 # Two model families run sequentially in one job, so est_time is roughly 2x
@@ -75,6 +92,10 @@ _REPO_ROOT = str(Path(__file__).resolve().parents[3])
 
 @dataclass(frozen=True)
 class ModelConfig:
+    # [CLASS DOC] HELPER: Immutable description of one model family under test: display name,
+    # Hugging Face repository, local directory, Megatron model type, optional SGLang reasoning
+    # parser name (default none), GPU count (default 4) and SGLang static memory fraction (default
+    # 0.7).
     model_name: str
     hf_repo: str
     local_dir: str
@@ -107,6 +128,9 @@ CONFIGS: list[str] = ["qwen3_30b_a3b", "glm47_flash"]
 
 
 def _resolve_configs() -> list[str]:
+    # [FUNCTION DOC] HELPER: Returns the list of model family keys to run: a single-element list
+    # holding the model-family environment variable if it is set and non-empty, otherwise a copy
+    # of the default sweep list.
     override = os.environ.get("ROUTER_EQ_MODEL_FAMILY")
     if override:
         return [override]
@@ -114,12 +138,18 @@ def _resolve_configs() -> list[str]:
 
 
 def _get_config(model_family: str) -> ModelConfig:
+    # [FUNCTION DOC] HELPER: Looks up a family key in the registry and returns its config. Raises a
+    # value error listing valid keys if unknown (the message names the environment variable).
     if model_family not in MODEL_REGISTRY:
         raise ValueError(f"Unknown ROUTER_EQ_MODEL_FAMILY={model_family!r}; choose from {list(MODEL_REGISTRY)}")
     return MODEL_REGISTRY[model_family]
 
 
 def prepare(model_family: str) -> None:
+    # [FUNCTION DOC] Ensures assets exist for a family: creates model and dataset directories,
+    # downloads the Hugging Face model into its local directory only if that directory is missing,
+    # and downloads the dapo-math-17k dataset only if the prompt file is missing. Raises a value
+    # error for an unknown family. Side effects: shell commands, network, filesystem.
     U = command_utils.default_config().create_backend()
     cfg = _get_config(model_family)
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
@@ -130,14 +160,28 @@ def prepare(model_family: str) -> None:
 
 
 def _variant_dir(model_family: str, variant: str) -> Path:
+    # [FUNCTION DOC] HELPER: Returns the dump directory for a family and variant: the dump root,
+    # then the family, then the variant name.
     return DUMP_ROOT / model_family / variant
 
 
 def _variant_dump_path(model_family: str, variant: str) -> Path:
+    # [FUNCTION DOC] HELPER: Returns the dump file path (a JSON-lines file with a fixed name) inside
+    # the family and variant directory.
     return _variant_dir(model_family, variant) / "dump.jsonl"
 
 
 def _build_train_args(cfg: ModelConfig, variant: str) -> str:
+    # [FUNCTION DOC] HELPER: Builds the argument string for one variant's rollout-only job.
+    # Checkpoint: only the Hugging Face directory (no reference load, no KL loss). Rollout: the
+    # math dataset, chat template, deepscaler reward, 1 rollout of the configured number of
+    # prompts with 1 sample each, configured max response length, temperature 0, global batch equal
+    # to the prompt count, seed 42, with no shuffling. Custom generate function path pointing at the
+    # router-equivalence generate function in the utils package. Routing replay on, plus the miles
+    # router flag only for the "miles" variant. Parallel sizes all 1 (only consumed by the argument
+    # parser since no actor starts). SGLang: engine GPUs from config, deterministic inference, mem
+    # fraction from config, optional reasoning parser. Infra: debug rollout-only, CI test,
+    # one actor node with the config's GPU count, colocated. Returns the concatenation in that order.
     ckpt_args = f"--hf-checkpoint {cfg.local_dir} "
 
     rollout_args = (
@@ -192,6 +236,12 @@ def _build_train_args(cfg: ModelConfig, variant: str) -> str:
 
 
 def _run_variant(model_family: str, cfg: ModelConfig, variant: str) -> None:
+    # [FUNCTION DOC] HELPER: Runs one variant. Deletes any previous dump directory for the family
+    # and variant, recreates it, builds the arguments, and launches training (rollout-only) with the
+    # config's GPU count and Megatron model type. The launch sets the import path to the Megatron
+    # checkout (replacing any existing value) and an environment variable telling the custom
+    # generate function where to write its dump file. Side effects: filesystem deletion and
+    # creation, subprocess and GPU use.
     U = command_utils.default_config().create_backend()
     dump_dir = _variant_dir(model_family, variant)
     if dump_dir.exists():
@@ -212,6 +262,8 @@ def _run_variant(model_family: str, cfg: ModelConfig, variant: str) -> None:
 
 
 def _load_dump(path: Path) -> list[dict]:
+    # [FUNCTION DOC] HELPER: Reads a JSON-lines dump file, skipping blank lines, and returns the
+    # parsed records sorted by their index field. Raises file-not-found or JSON errors on failure.
     with open(path) as f:
         records = [json.loads(line) for line in f if line.strip()]
     records.sort(key=lambda r: r["index"])
@@ -219,6 +271,12 @@ def _load_dump(path: Path) -> list[dict]:
 
 
 def _assert_records_equal(left: list[dict], right: list[dict]) -> None:
+    # [FUNCTION DOC] HELPER: Asserts two index-sorted record lists are equivalent. Same length. For
+    # each pair: same index; status, response length and tokens exactly equal; rollout log prob
+    # lists (missing treated as empty) of equal length with element differences at most 1e-6;
+    # routed-expert shapes equal; if both routed-expert payloads are absent the pair passes, if only
+    # one is absent it fails, otherwise the base64 payloads are decoded and the raw bytes must be
+    # identical. Raises assertion errors with the record index and field in the message.
     assert len(left) == len(right), f"dump length differs: {len(left)} vs {len(right)}"
 
     for i, (a, b) in enumerate(zip(left, right, strict=True)):
@@ -254,6 +312,9 @@ def _assert_records_equal(left: list[dict], right: list[dict]) -> None:
 
 
 def execute(model_family: str) -> None:
+    # [FUNCTION DOC] Runs both variants (miles first, then sgl) for the family, loads both dumps,
+    # asserts neither is empty, asserts record equivalence, and prints a summary with the sample
+    # count. Raises a value error for an unknown family and assertion errors on any mismatch.
     cfg = _get_config(model_family)
     for variant in ("miles", "sgl"):
         _run_variant(model_family, cfg, variant)
@@ -270,6 +331,8 @@ def execute(model_family: str) -> None:
 
 
 def _run_all() -> None:
+    # [FUNCTION DOC] HELPER: Removes proxy variables from the environment, then for each family in
+    # the resolved sweep prints a banner, prepares assets, and executes the comparison.
     for proxy_var in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
         os.environ.pop(proxy_var, None)
     for model_family in _resolve_configs():
@@ -282,6 +345,8 @@ def _run_all() -> None:
 
 
 def test_r3_router_equivalence():
+    # [FUNCTION DOC] The pytest entry: runs the full sweep (prepare and execute for each family);
+    # any assertion or launch error fails the test.
     _run_all()
 
 

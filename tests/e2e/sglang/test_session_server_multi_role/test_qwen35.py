@@ -1,3 +1,11 @@
+# [MODULE DOC] Multi-role session-server token-in-token-out end-to-end test for Qwen3.5-35B-A3B
+# (FP8). Configuration: tensor parallel 2 on the default 4 GPUs, speculative decoding on, qwen3
+# reasoning parser with the qwen3_coder tool-call parser, 2 cycles, append-tool recovery, a soft
+# Anthropic assistant-text threshold of 1.0 (the Anthropic conversion changes raw serialization;
+# hard gates stay strict), and the Anthropic expectation "forbidden". Registered for CUDA 4-GPU
+# H200 (est. 1400 s) and ROCm 4-GPU MI350 nightly (est. 750 s), with metric gates on the session
+# mismatch rate of assistant text for session versions v1 and v2. Run as a script: calls the test
+# function.
 from tests.ci.ci_register import register_cuda_ci, register_rocm_ci
 from tests.ci.metric_history import register_ci_gate
 from tests.e2e.sglang.test_session_server_multi_role._common import ModelConfig, run_both_versions
@@ -25,6 +33,9 @@ CONFIG = ModelConfig(
 
 
 def test_qwen35():
+    # [FUNCTION DOC] Runs the full per-model verification matrix for this module's configuration
+    # through the shared runner (OpenAI on session v1 and v2, Anthropic on v2); any failure raised
+    # by the runner fails the test.
     run_both_versions(CONFIG)
 
 

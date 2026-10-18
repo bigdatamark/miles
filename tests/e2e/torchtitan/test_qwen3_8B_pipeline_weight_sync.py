@@ -1,3 +1,12 @@
+# [MODULE DOC] Single-case end-to-end test of pushing weights out of a pipelined trainer with the
+# torchtitan backend and Qwen3-8B, on 8 GPUs non-colocated: 4 training GPUs (pipeline parallel 2,
+# so each stage holds only its layers and the export is rank-partial) and 4 rollout GPUs (one
+# engine), broadcast transfer mode, sequence length 8192, max response 4096, 2 rollouts, memory
+# fraction 0.6. It guards both halves of the export: completing the whole model on every rank is
+# unaffordable, and skipping completion within a stage once corrupted expert weights. The untied
+# dense model is used because torchtitan cannot tie the output head to the embedding across
+# pipeline stages. Registered for CUDA 8-GPU H200 (est. 1200 s, Hopper only), labels torchtitan
+# and weight-update. Run as a script: prepare then execute.
 from tests.ci.ci_register import register_cuda_ci
 from tests.e2e.torchtitan._common import CaseConfig, execute, prepare
 

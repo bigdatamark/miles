@@ -1,3 +1,13 @@
+# [MODULE DOC] End-to-end test of multi-policy training with a solver and a verifier policy on
+# GSM8K, fully asynchronous, driven by the example launcher script (its argument class and prepare
+# step) and a shared multi-policy execute helper from the e2e conftest module. There are no
+# test functions or constants beyond the rollout count (from an environment variable, default 5)
+# and a save interval of 2. When run as a script it builds the arguments from the default config
+# with those two overrides, prepares, strips proxy variables, then executes with the default
+# experiment-tracking arguments for this file. Registered for CUDA 4-GPU H200 (est. 3000 s) and
+# ROCm 4-GPU MI350 nightly (est. 1700 s), labels short, multi-policy and fully-async.
+# KNOWN ISSUE: the CUDA estimate of 3000 s exceeds the 2400 s cap for registrations that are
+# neither nightly nor labeled long.
 import dataclasses
 import os
 

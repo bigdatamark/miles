@@ -1,3 +1,12 @@
+# [MODULE DOC] End-to-end test of mixed offload (an updatable "actor" deployment and a frozen
+# "ref" deployment, 2 GPUs each, on 4 colocated GPUs with Qwen2.5-0.5B in bridge mode) with fault
+# tolerance enabled: the CI flag triggers a simulated engine crash on the actor server (the
+# existing docstring lists what recovery must show). Fault-tolerance arguments enable it with a
+# health check interval of 5 s, timeout of 10 s and no initial wait. Same YAML layout, rollout
+# settings (2 rollouts of 8 prompts times 4 samples, 512 tokens) and model as the non-fault-tolerant
+# sibling test. Registered nightly-only for CUDA 4-GPU H200 (est. 400 s) and ROCm 4-GPU MI350
+# nightly (est. 600 s). Run as a script: prepare, strip proxy variables, execute.
+# KNOWN ISSUE: the eval interval (20) exceeds the number of rollouts (2), so evaluation never runs.
 """E2E test: mixed offload with fault tolerance.
 
 Same two-model layout as test_sglang_config_mixed_offload.py but with
@@ -44,6 +53,9 @@ sglang:
 
 
 def prepare():
+    # [FUNCTION DOC] Creates model/dataset directories, downloads the Qwen2.5-0.5B-Instruct model
+    # and the GSM8K dataset. No checkpoint conversion (bridge mode). Side effects: shell commands,
+    # network, filesystem.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -51,6 +63,11 @@ def prepare():
 
 
 def execute():
+    # [FUNCTION DOC] Same as the non-fault-tolerant sibling's launcher (two-deployment YAML pseudo
+    # file, 2 rollouts, 512 tokens, bridge mode, 4 colocated GPUs, GRPO with a lower clip only,
+    # mem fraction 0.7, dynamic batching at 4096 tokens per GPU) with an extra argument group that
+    # enables fault tolerance and sets health-check interval 5, timeout 10 and first wait 0 seconds.
+    # Returns nothing.
     U = command_utils.default_config().create_backend()
     config_arg = command_utils.encode_pseudo_file(SGLANG_CONFIG_YAML)
 

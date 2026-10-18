@@ -1,3 +1,12 @@
+# [MODULE DOC] Single-case end-to-end test of the torchtitan backend with GLM-4.7-Flash (a
+# 30B-A3B mixture-of-experts model whose flavor is registered on the miles side, reusing the
+# DeepSeek-V3 blocks) on 8 colocated GPUs: tensor parallel 2, expert parallel 4, rollout routing
+# replay on, sequence length 16384, max response 8192, SGLang engines of 4 GPUs each (the model's
+# 20 attention heads do not divide by 8), memory fraction 0.5, triton attention and MoE runner so
+# Hopper and Blackwell behave alike (the flashinfer prefill kernel for Blackwell lacks the padded
+# query head size). Covers the Hugging Face load through the adapter, parallelism, replay and the
+# weight stream back into SGLang. Registered for CUDA 8-GPU H200 (est. 2400 s, Hopper only), labels
+# torchtitan and replay. Run as a script: prepare then execute the case.
 from tests.ci.ci_register import register_cuda_ci
 from tests.e2e.torchtitan._common import CaseConfig, execute, prepare
 

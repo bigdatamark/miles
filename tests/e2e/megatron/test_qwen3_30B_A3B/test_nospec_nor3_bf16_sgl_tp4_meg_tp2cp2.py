@@ -1,3 +1,12 @@
+# [MODULE DOC] Single-case end-to-end test: Qwen3-30B-A3B on 4 GPUs, colocated, using the
+# distributed Muon optimizer (the shared builder gives it chunked optimizer-state offload instead
+# of the Adam CPU offload, and skips parameter rematerialization from master weights). BF16
+# rollout, no speculative decoding, no DeepEP, no rollout routing replay (the file name encodes
+# this: SGLang tensor parallel 4 with one 4-GPU engine; Megatron tensor 2, context 2, pipeline 1,
+# expert 4). Registered for CUDA 4-GPU H200 (est. 1200 s, Hopper and Blackwell) and ROCm 4-GPU
+# MI350 nightly (est. 1000 s), with five CI metric gates (grad norm, PPO KL, train/rollout
+# logprob absolute difference, train/rollout KL, raw reward). Run as a script: strips proxy
+# variables, then prepare and execute.
 """Qwen3-30B-A3B with distributed Muon, BF16 rollout and no DeepEP or R3.
 
 Keep the BF16 DeepEP Adam control separate so its comparison with FP8 stays meaningful.

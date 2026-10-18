@@ -1,3 +1,9 @@
+# [MODULE DOC] End-to-end test of training offload (to CPU) in a non-colocated layout for
+# Qwen3-4B: 4 training GPUs (tensor parallel 2) and 4 separate rollout GPUs as single-GPU engines,
+# 8 GPUs in total. The CI flag requiring engines to verify received weights equal the trained
+# weights is on. The only assertions are those inside training. Registered for CUDA 8-GPU H100
+# (est. 400 s) and ROCm 8-GPU MI350 nightly (est. 300 s) with two CI metric gates (grad norm and
+# raw reward). Run as a script: prepare then execute.
 """E2E test for --offload-train with the rollout engines on separate GPUs.
 
 Four training GPUs and four rollout GPUs, no --colocate. The actor is asleep at the
@@ -29,6 +35,9 @@ register_ci_gate(metric_key="rollout/raw_reward")
 
 
 def prepare():
+    # [FUNCTION DOC] Creates model/dataset directories, downloads Qwen3-4B and the dapo-math-17k
+    # dataset, and converts the model to a Megatron distributed checkpoint using the training GPU
+    # count (4). Side effects: shell commands, network, filesystem, GPU.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -37,6 +46,14 @@ def prepare():
 
 
 def execute():
+    # [FUNCTION DOC] Builds the argument string and launches training. Rollout: 2 rollouts of 4
+    # prompts times 2 samples, 256 response tokens, temperature 0.8, global batch 8. Tensor
+    # parallel 2 with sequence parallel, full recompute, dynamic batching at 2048 tokens per GPU.
+    # GRPO with KL loss at zero coefficient, plain Adam. Training offload targets CPU. SGLang: 4
+    # rollout GPUs, one per engine, mem fraction 0.6. CI flags: CI test and check-weight-update-
+    # equal. No colocation flag, so actor and rollout are disjoint. The actor is asleep at the end
+    # of init, so the first weight sync happens against an offloaded trainer. Launches with
+    # training plus rollout GPUs (8) per node.
     U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/{MODEL_NAME}_torch_dist "
     rollout_args = (

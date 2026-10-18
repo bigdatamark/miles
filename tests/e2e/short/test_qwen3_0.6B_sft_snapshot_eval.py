@@ -1,3 +1,15 @@
+# [MODULE DOC] End-to-end test of supervised fine-tuning (train-only debug mode, no rollout
+# engines) on Qwen3-0.6B with periodic evaluation served from exported Hugging Face snapshots, on
+# 2 GPUs: 1 actor GPU and 1 dedicated eval engine GPU, bridge mode, using the standard train
+# script. Data: prepare builds an SFT parquet (GSM8K training conversations with an extra assistant
+# turn whose content is the label in a boxed expression) and an eval parquet (the first 256 test
+# questions rendered with the chat template, thinking disabled, plus labels), both under a derived
+# dataset directory. SFT settings: 4 rollouts of 16 samples, SFT loss with per-token loss
+# calculation and advantage computation disabled, 512 max length, eval every 2 rollouts with the
+# inference rollout function, snapshots in shared memory (keep 2). The CI checker expects exactly 3
+# eval reports on the GSM8K metric (before training, after rollout 1, after rollout 3) with
+# threshold 0.3. Registered for CUDA 2-GPU H200 (est. 300 s) and ROCm 2-GPU MI350 nightly (est. 300
+# s). Run as a script: prepare, strip proxy variables, execute.
 """Pure SFT (--debug-train-only) with a snapshot-eval fleet.
 
 No rollout engines exist in this mode; the only engine is the eval fleet, which loads
@@ -33,6 +45,14 @@ EVAL_DATA = "/root/datasets/gsm8k_sft_qwen3/eval.parquet"
 
 
 def _write_datasets():
+    # [FUNCTION DOC] HELPER: Creates the dataset directory and loads the tokenizer from the local
+    # model directory. SFT data: reads the GSM8K training parquet and, for every row, copies its
+    # messages and appends an assistant message whose content is the label wrapped in a boxed
+    # expression; writes a parquet with the messages and the label. Eval data: reads the first 256
+    # rows of the GSM8K test parquet, renders each row's messages with the chat template to text
+    # (not tokenized, generation prompt added, thinking disabled); writes a parquet with the
+    # prompt text and label. Side effects: filesystem writes; raises if the source datasets or model
+    # are missing.
     os.makedirs(os.path.dirname(SFT_DATA), exist_ok=True)
     tokenizer = AutoTokenizer.from_pretrained(f"/root/models/{MODEL_NAME}")
 
@@ -54,6 +74,9 @@ def _write_datasets():
 
 
 def prepare():
+    # [FUNCTION DOC] Creates model/dataset directories, downloads Qwen3-0.6B and GSM8K, then
+    # derives the SFT and eval parquet files from GSM8K. No checkpoint conversion (bridge mode).
+    # Side effects: shell commands, network, filesystem.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -62,6 +85,13 @@ def prepare():
 
 
 def execute():
+    # [FUNCTION DOC] Builds the argument string and launches training with 2 GPUs on the standard
+    # train script (the asynchronous trainer's snapshot-eval path is covered elsewhere). Uses the
+    # local Hugging Face directory as checkpoint and reference load. SFT settings and eval settings
+    # as in the module doc; eval uses 1 dedicated GPU with 1 engine at mem fraction 0.65 and the
+    # math reward type. All parallel sizes 1 with sequence parallel, dynamic batching at 9216
+    # tokens per GPU, Adam at 1e-6, dropouts off, flash attention, 1 actor GPU, bridge mode. Returns
+    # nothing.
     U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME} " f"--ref-load /root/models/{MODEL_NAME} "
 

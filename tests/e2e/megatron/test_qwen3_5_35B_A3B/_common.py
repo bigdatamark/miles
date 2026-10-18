@@ -1,3 +1,8 @@
+# [MODULE DOC] HELPER: Shared building blocks for the Qwen3.5-35B-A3B Megatron end-to-end cases in
+# this directory: a case-configuration dataclass, a prepare function, a pure function building the
+# training argument string, and an execute function launching training. Module constants: model
+# name and Megatron model type. The existing docstring below explains the speculative-decoding
+# by routing-replay case matrix and why the vision weights are excluded from the weight check.
 """Shared setup for Qwen3.5-35B-A3B e2e cases.
 
 Cases cover speculative decoding x R3 (the {spec}_{r3} fields of each file name):
@@ -28,6 +33,14 @@ MODEL_TYPE = "qwen3.5-35B-A3B"
 
 @dataclass
 class CaseConfig:
+    # [CLASS DOC] HELPER: Plain data holder describing one case. Required fields: GPUs per node,
+    # context/pipeline/tensor/expert parallel sizes, rollout GPUs per engine, whether MTP training
+    # is enabled, and whether rollout routing replay (R3) is used. Optional fields with defaults:
+    # max tokens per GPU (8192), weight-check selector ("all"), weight-check skip list (empty),
+    # SGLang DeepEP flag (off), DeepEP dispatch dtype (unset), FP8 rollout (off), speculative
+    # decoding (on), SGLang expert/data parallel sizes (unset), DP attention (off), Megatron token
+    # dispatcher ("flex"), rollout max response length (8192), colocate (on), rollout GPU count
+    # (unset), fully-async (off), optimizer (adam or dist_muon), and extra argument text.
     # Topology / GPU counts — explicit per case (see each file's CASE).
     num_gpus_per_node: int
     cp_size: int
@@ -71,6 +84,11 @@ class CaseConfig:
     extra_args: str = ""
 
     def __post_init__(self):
+        # [FUNCTION DOC] HELPER: Validation only. Raises a value error if: the optimizer name is
+        # unsupported; fully-async is combined with colocation; not colocated and no rollout GPU
+        # count; speculative decoding is off while MTP training is on or the weight-check selector
+        # is not "target" (no draft exists to check); or a DeepEP dispatch dtype is set without
+        # DeepEP. Unlike the Qwen3-30B sibling, it does not check divisibility of GPU counts.
         if self.optimizer not in ("adam", "dist_muon"):
             raise ValueError(f"unsupported optimizer: {self.optimizer}")
         if self.fully_async and self.colocate:
@@ -84,6 +102,10 @@ class CaseConfig:
 
 
 def prepare(case: CaseConfig) -> None:
+    # [FUNCTION DOC] Creates model/dataset directories, downloads the Hugging Face model (and its
+    # FP8 variant if the case uses FP8 rollout), downloads the dapo-math-17k and aime-2024
+    # datasets, and converts the model to a Megatron distributed checkpoint using the case's GPUs
+    # per node. Side effects: shell commands, network, filesystem, GPU.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -99,6 +121,31 @@ def prepare(case: CaseConfig) -> None:
 
 
 def build_train_args(case: CaseConfig, *, wandb_file: str) -> str:
+    # [FUNCTION DOC] Assembles the space-separated training argument string for a case; reads one
+    # environment variable (eval enable, accepts 1, true or yes in any case) and calls the wandb
+    # args helper keyed on the given test file path. Sections: checkpoint (HF checkpoint is the
+    # FP8 dir for FP8 rollout else the BF16 dir; reference load is the converted Megatron dir);
+    # rollout (8 prompts times 8 samples, 2 rollouts, case-specific max response length,
+    # temperature 1, global batch 32, balanced); eval flags (AIME-2024; the interval of 20 is only
+    # added when enabled); performance (parallel sizes from the case, expert tensor 1, full
+    # recompute, dynamic batching); GRPO with zero-coefficient KL loss; optimizer (Adam gets CPU
+    # offload and precision-aware optimizer, dist_muon gets chunked state offload with fraction 1.0
+    # and 1024 MB chunks); SGLang args. For SGLang max running requests: 512 normally; with DeepEP
+    # it is the smaller of 128 and the value 128 times engine GPUs divided by tokens per request
+    # (3 with speculative decoding else 1), rounded down to a multiple of 8, keeping each rank at
+    # or below the 128-token DeepEP low-latency cap. SGLang mem fraction is 0.6 because colocation
+    # leaves about 11 GB of training memory resident. Optional pieces: SGLang expert parallel size,
+    # EAGLE speculative flags (2 steps, top-k 1, 3 draft tokens, extra-buffer mamba radix cache),
+    # data parallel size, DP attention, rollout routing replay, DeepEP (a2a backend, decode CUDA
+    # graph batch of max running divided by the data parallel size, the deep_gemm runner for BF16,
+    # and the dispatch dtype). MTP args: with MTP training, one layer and loss scaling 0.2; else
+    # zero layers (overriding the model script's one layer). CI args: CI test, weight-check
+    # selector, optional skip list, allow-quant-error for FP8. Misc: dropouts off, flash attention,
+    # colocate or explicit rollout GPU count, fully-async, the Megatron token dispatcher, and
+    # parameter rematerialization when colocated with Adam. The case's extra args are appended.
+    # Returns the string.
+    # KNOWN ISSUE: the routing-replay flag is placed in the SGLang section but is a miles flag, and
+    # the eval data flags are always emitted even when evaluation is disabled.
     enable_eval = os.environ.get("MILES_TEST_ENABLE_EVAL", "0").lower() in ("1", "true", "yes")
 
     hf_checkpoint = f"/root/models/{MODEL_NAME}-FP8" if case.use_fp8_rollout else f"/root/models/{MODEL_NAME}"
@@ -271,6 +318,10 @@ def build_train_args(case: CaseConfig, *, wandb_file: str) -> str:
 
 
 def execute(case: CaseConfig, *, wandb_file: str) -> None:
+    # [FUNCTION DOC] Builds the argument string and launches training. GPU count is GPUs per node
+    # plus the rollout GPU count when not colocated. Uses the async train script when fully-async
+    # else the standard one. Sets an environment variable enabling SGLang speculative decoding v2
+    # only when the case uses speculative decoding. Returns nothing.
     U = command_utils.default_config().create_backend()
     train_args = build_train_args(case, wandb_file=wandb_file)
     U.execute_train(

@@ -1,3 +1,13 @@
+# [MODULE DOC] End-to-end test of PPO (with a learned critic) on Qwen3-4B, 4 colocated GPUs.
+# Megatron: tensor 1, pipeline 2, context 2; SGLang: engines of 2 GPUs. Three rollouts of 8
+# prompts times 8 samples (global batch 32, 8192 response tokens): the first rollout trains only
+# the critic (one critic-only step), so the third rollout is the first generated with trained
+# actor weights. Evaluation on AIME-2024 is configured, with an eval interval only when an
+# environment variable (module constant, default off) enables it. Registered for CUDA 4-GPU H200
+# (est. 1500 s) and ROCm 4-GPU MI350 nightly (est. 800 s). No metric gates. Run as a script:
+# prepare, strip proxy variables, then execute.
+# KNOWN ISSUE: a fixme comment above the registration marks the test as needing a fix, with no
+# detail. A todo comment in the main block mentions adopting a command-line library.
 import os
 
 from tests.ci.ci_register import register_cuda_ci, register_rocm_ci
@@ -25,6 +35,9 @@ NUM_GPUS = 4
 
 
 def prepare():
+    # [FUNCTION DOC] Creates model/dataset directories, downloads Qwen3-4B and the dapo-math-17k
+    # and aime-2024 datasets, and converts the model to a Megatron distributed checkpoint on 4
+    # GPUs. Side effects: shell commands, network, filesystem, GPU.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu("hf download Qwen/Qwen3-4B --local-dir /root/models/Qwen3-4B")
@@ -35,6 +48,15 @@ def prepare():
 
 
 def execute():
+    # [FUNCTION DOC] Builds the argument string and launches PPO training with 4 GPUs. Rollout:
+    # 3 rollouts of 8 prompts times 8 samples, 8192 response tokens, temperature 0.8, global
+    # batch 32, balanced data. Eval: AIME-2024, 1 sample per prompt, 16384 tokens, top-k 1, with
+    # an interval of 20 only if the eval environment flag is on (the eval data flags are always
+    # present). Parallelism: tensor 1, pipeline 2, context 2, full recompute, dynamic batching at
+    # 16384 tokens per GPU. PPO: advantage estimator ppo, KL loss of type k1 at zero coefficient,
+    # PPO clip 4e-4, one critic-only step, normalized advantages, critic learning rate 1e-5. Actor
+    # Adam at 1e-6. SGLang: 2 GPUs per engine, mem fraction 0.8, 512 max running requests, metrics.
+    # CI test flag; colocated. Returns nothing.
     U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/{MODEL_NAME}_torch_dist "
 

@@ -1,3 +1,12 @@
+# [MODULE DOC] End-to-end test of the asynchronous training script on Qwen2.5-0.5B-Instruct with
+# GSM8K, 4 GPUs non-colocated (2 actor GPUs, 2 rollout GPUs as single-GPU engines), bridge mode,
+# Mooncake object store arguments and fault tolerance (health check every 5 s, 10 s timeout, no
+# initial wait). Three rollouts (the async script prefetches the next rollout during training, so
+# the third is the first generated on updated weights) of 8 prompts times 4 samples with
+# oversampling 16 and a non-zero reward std filter, 1024 tokens, global batch 32; eval flags use
+# interval 8 which is never reached in 3 rollouts. Registered for CUDA 4-GPU H200 (est. 400 s) and
+# ROCm 4-GPU MI350 nightly (est. 300 s), labels short and mooncake. Run as a script: prepare,
+# strip proxy variables, execute.
 import os
 
 from tests.ci.ci_register import register_cuda_ci, register_rocm_ci
@@ -15,6 +24,9 @@ NUM_GPUS = 4
 
 
 def prepare():
+    # [FUNCTION DOC] Creates model/dataset directories and downloads the Qwen2.5-0.5B-Instruct
+    # model and the GSM8K dataset. No checkpoint conversion (bridge mode). Side effects: shell
+    # commands, network, filesystem.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -22,6 +34,12 @@ def prepare():
 
 
 def execute():
+    # [FUNCTION DOC] Builds the argument string and launches the asynchronous train script with 4
+    # GPUs per node. The Hugging Face directory is both checkpoint and reference load. Includes
+    # the Mooncake object store arguments right after the checkpoint arguments. All parallel
+    # sizes 1 with sequence parallel, dynamic batching at 9216 tokens per GPU, GRPO with KL loss at
+    # zero coefficient, Adam at 1e-6, SGLang one GPU per engine with mem fraction 0.65 and metrics,
+    # CI test flag, fault tolerance flags, 2 actor GPUs, 2 rollout GPUs, bridge mode. Returns nothing.
     U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/models/{MODEL_NAME}/ "
 

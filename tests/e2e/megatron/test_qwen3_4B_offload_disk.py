@@ -1,3 +1,10 @@
+# [MODULE DOC] End-to-end test of spilling the paused training actor's memory to node-local disk
+# files (instead of a pinned host copy) for Qwen3-4B on 4 colocated GPUs (tensor parallel 2).
+# After training, a post-run check reads Ray worker logs to confirm every rank armed disk offload
+# under its own directory (a silent fallback to CPU backup would otherwise pass). Registered for
+# CUDA 4-GPU H200 (est. 600 s) and ROCm 4-GPU MI350 nightly (est. 300 s) with five CI metric
+# gates. Module constants: model name/type, 4 GPUs, offload directory. Run as a script: prepare
+# then execute.
 """E2E test for --offload-train-target=disk.
 
 Colocate mode with the training actor's paused memory spilled to node-local files by
@@ -41,6 +48,9 @@ register_ci_gate(metric_key="rollout/raw_reward")
 
 
 def prepare():
+    # [FUNCTION DOC] Creates model/dataset directories, downloads Qwen3-4B and the dapo-math-17k
+    # dataset, and converts the model to a Megatron distributed checkpoint on 4 GPUs. Side effects:
+    # shell commands, network, filesystem, GPU.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -49,6 +59,13 @@ def prepare():
 
 
 def _assert_offloaded_to_disk():
+    # [FUNCTION DOC] HELPER: Post-run check over Ray's latest-session worker logs. Collects the
+    # directory path printed after the text "reclaim armed for" in every line reporting that the
+    # train disk-offload reclaim was armed. The expected set is one directory per rank under the
+    # offload directory, named from cell index 0 and the rank index via the shared name-index
+    # formatter. Fails with an assertion error if no logs exist or the collected set differs from
+    # the expected set. Prints how many ranks armed offload. Logs are read ignoring undecodable
+    # bytes.
     """Every rank must have armed disk offload under its own directory.
 
     The backup files themselves are gone by now -- each actor removes its directory on
@@ -75,6 +92,13 @@ def _assert_offloaded_to_disk():
 
 
 def execute():
+    # [FUNCTION DOC] Builds the argument string, runs training, then runs the disk-offload log
+    # assertion. Rollout: 2 rollouts of 4 prompts times 2 samples, 256 response tokens,
+    # temperature 0.8, global batch 8. Tensor parallel 2, sequence parallel, full recompute,
+    # dynamic batching at 2048 tokens per GPU. GRPO with KL loss at zero coefficient and the
+    # actor forward-only pass skipped; plain Adam. Offload flags: offload training state to disk
+    # in 64 MB chunks under the offload directory. One single-GPU SGLang engine per GPU with mem
+    # fraction 0.6; colocated. Launches with 4 GPUs.
     U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/{MODEL_NAME}_torch_dist "
 

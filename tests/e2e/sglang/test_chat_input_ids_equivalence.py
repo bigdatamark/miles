@@ -1,3 +1,12 @@
+# [MODULE DOC] End-to-end pytest module verifying that SGLang's token-level generate endpoint and
+# its OpenAI-style chat completions endpoint give identical results for the same prompt on
+# Qwen3-0.6B: same output text, same output token ids, matching per-token log probabilities (within
+# 1e-6 absolute) and prompt token ids equal to the locally applied chat template. Uses a single
+# module-scoped server fixture launched by the shared server helper. The model path comes from an
+# environment variable override; otherwise the model is downloaded to a default directory on first
+# use. Decoding is greedy with a fixed seed and at most 100 new tokens. Registered for CUDA 4-GPU
+# H200 (est. 190 s) and ROCm 4-GPU MI350 nightly (est. 80 s), label sglang. Run as a script: runs
+# pytest on this file in verbose mode and exits with its status.
 import math
 import os
 
@@ -21,12 +30,18 @@ LOGPROB_TOL = 1e-6
 
 
 def _prepare_model() -> None:
+    # [FUNCTION DOC] HELPER: Downloads the default model snapshot from the hub into the default
+    # local directory, but only when no model-path override environment variable is set. Network
+    # and filesystem side effects. Returns nothing.
     if MODEL_PATH_OVERRIDE is None:
         snapshot_download(DEFAULT_MODEL_ID, local_dir=DEFAULT_MODEL_PATH)
 
 
 @pytest.fixture(scope="module")
 def sglang_server():
+    # [FUNCTION DOC] HELPER: Module-scoped pytest fixture. Ensures the model is available, starts an
+    # SGLang server for the model path via the shared helper, yields the server object (which has a
+    # base URL), and always stops the server at teardown, even if tests fail.
     _prepare_model()
     server = start_sglang_server(model_path=MODEL_PATH)
     try:
@@ -36,6 +51,9 @@ def sglang_server():
 
 
 def _build_messages() -> list[dict]:
+    # [FUNCTION DOC] HELPER: Returns a fixed two-message conversation: a system message asking for
+    # concise answers and a user message asking for a one-word answer to a simple arithmetic
+    # question.
     return [
         {"role": "system", "content": "You are a concise assistant."},
         {"role": "user", "content": "Answer with one word: 2+2?"},
@@ -43,6 +61,14 @@ def _build_messages() -> list[dict]:
 
 
 def test_generate_and_chat_completions_equivalence(sglang_server):
+    # [FUNCTION DOC] The test. Loads the tokenizer (remote code trusted), applies the chat template
+    # with a generation prompt and tokenization to the fixed messages to get input ids (accepting
+    # either a plain list or a mapping with an input ids entry). Calls the token generate endpoint
+    # with those ids and the chat endpoint with the messages. Asserts, in order: output texts are
+    # equal; the generate endpoint's output token ids equal the tokenization (without special
+    # tokens) of the chat text; the chat response includes log probability content, has the same
+    # count as generate's, and each pair is within 1e-6 absolute; the chat response's prompt token
+    # ids are present and equal the locally computed input ids.
     """The /generate (token) and /v1/chat/completions (message) endpoints
     must produce identical output given the same prompt."""
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
@@ -85,6 +111,10 @@ def test_generate_and_chat_completions_equivalence(sglang_server):
 
 
 def _post_generate(base_url: str, input_ids: list[int]) -> dict:
+    # [FUNCTION DOC] HELPER: Posts to the server's generate endpoint with the input ids, greedy
+    # sampling (temperature 0), a fixed sampling seed, at most 100 new tokens, and log probabilities
+    # requested; 120-second timeout. Asserts HTTP status 200 (message is the response body),
+    # prints the generated text, and returns the parsed JSON response.
     payload = {
         "input_ids": input_ids,
         "sampling_params": {
@@ -102,6 +132,10 @@ def _post_generate(base_url: str, input_ids: list[int]) -> dict:
 
 
 def _post_chat(base_url: str, messages: list[dict]) -> dict:
+    # [FUNCTION DOC] HELPER: Posts to the server's chat completions endpoint with the model path as
+    # the model name, the messages, temperature 0, 100 max completion tokens, the same seed, log
+    # probabilities enabled, and the server extension that returns prompt token ids; 120-second
+    # timeout. Asserts HTTP status 200, prints the first choice's text, and returns the parsed JSON.
     payload = {
         "model": MODEL_PATH,
         "messages": messages,

@@ -1,3 +1,16 @@
+# [MODULE DOC] End-to-end pytest module (2 H200 GPUs) checking that incremental routing-replay
+# ("R3", routed mixture-of-experts expert ids) data returned per turn through the in-process
+# session server (version 1, token-in-token-out) adds up to exactly the routed experts of one full
+# forward pass over the whole conversation. Model: Qwen3-30B-A3B at a pinned revision (path may be
+# overridden by an environment variable), tensor parallel 2, fa3 attention, routed-experts return
+# enabled. Test flow: a 10-turn conversation with greedy decoding; after each turn the session
+# snapshot is read; an "oracle" generate call over the final token ids (minus the last token,
+# generating one token) returns the full routed experts; each turn's returned patch must equal the
+# matching slice of the oracle; finally the session's merged samples must hold the final tokens and
+# an int32 routed-experts array of shape tokens-minus-one by layers by top-k whose bytes equal the
+# oracle. Constants: 48 layers, top-k 8, each token row is layers times top-k times 4 bytes.
+# Registered for CUDA 2-GPU H200 (est. 400 s, Hopper only), labels sglang and replay. Run as a
+# script: runs pytest on this file verbosely with output capture off.
 import base64
 import os
 from collections.abc import Iterator
@@ -42,6 +55,11 @@ _HTTP_TIMEOUT_SECS = 120.0
 
 @pytest.fixture(scope="module")
 def sglang_server():
+    # [FUNCTION DOC] HELPER: Module-scoped pytest fixture. Asserts CUDA is available, at least two
+    # GPUs exist and the first is an H200. Downloads the pinned model revision to the default
+    # directory unless the path override is set. Starts an SGLang server with tensor parallel 2,
+    # fa3 attention, routed-experts return, and static memory fraction 0.7, yields it, and always
+    # stops it at teardown.
     assert torch.cuda.is_available()
     assert torch.cuda.device_count() >= 2
     assert "H200" in torch.cuda.get_device_name(0)
@@ -68,6 +86,15 @@ def sglang_server():
 
 @contextmanager
 def _serve_session(backend_url: str) -> Iterator[str]:
+    # [FUNCTION DOC] HELPER: Context manager that runs an in-process session server in a background
+    # thread in front of the given SGLang backend URL and yields its base URL. Picks a free port
+    # searching upward from 31000. Builds a namespace of server settings: model path as checkpoint,
+    # thinking disabled in chat template arguments, the qwen3 token-in-token-out model, session
+    # server version "v1", rollout routing replay on (indexer replay and sampling-support replay
+    # off), temperature 1, top-p 1, top-k disabled, no top logprobs, selected-token logprob mode, no
+    # trajectory dump, in-place pause mode, 48 layers, no LoRA, and the shared HTTP timeout. Computes
+    # the session server config on localhost with a fixed instance id, starts the server, and on
+    # exit always stops it.
     port = find_available_port(31000)
     args = SimpleNamespace(
         miles_router_timeout=_HTTP_TIMEOUT_SECS,
@@ -107,11 +134,32 @@ def _serve_session(backend_url: str) -> Iterator[str]:
 
 
 def _decode_r3(payload: str) -> bytes:
+    # [FUNCTION DOC] HELPER: Asserts the payload is a string and strictly base64-decodes it
+    # (invalid characters raise an error). Returns the raw bytes of the routed-experts rows.
     assert isinstance(payload, str)
     return base64.b64decode(payload, validate=True)
 
 
 def test_tito_session_addition_r3_matches_full_r3(sglang_server):
+    # [FUNCTION DOC] The test. Starts the session server on the shared backend and creates a
+    # session (expects HTTP 200 and a session id). Runs 10 turns: append a user message asking for
+    # an exact label for that turn (system message demands exact labels), post to the session's chat
+    # completions endpoint (greedy, 64 max tokens, seed, thinking disabled); assert status 200,
+    # finish reason stop, an assistant reply with non-empty content; append the reply; fetch the
+    # session snapshot and record its accumulated token ids as a checkpoint. After the loop: one
+    # record per turn. Oracle: post the final checkpoint minus its last token to the session's
+    # generate endpoint (1 new token, greedy, seed, ignore end-of-sequence, logprobs and routed
+    # experts requested); the single output token must equal the final checkpoint's last token and
+    # the decoded routed experts length must be (tokens minus one) rows. For each turn record: the
+    # request roles must be system, then user and assistant pairs, then user; the request must have
+    # asked for routed experts; the start offset must equal the rows covered so far (and for later
+    # turns the previous checkpoint length minus one and above zero); the end offset (request input
+    # length plus output tokens minus one) must equal the checkpoint length minus one; the decoded
+    # patch must have (end minus start) rows and equal the matching byte slice of the oracle. Total
+    # coverage must equal the oracle rows. Finally, post to the samples endpoint with no maximum
+    # sequence length, decode the reply and assert: no empty reason, exactly one sample, tokens
+    # equal the final checkpoint, routed experts present as int32 with shape (tokens minus one,
+    # layers, top-k) whose C-order bytes equal the oracle bytes.
     with _serve_session(sglang_server.base_url) as session_url:
         create_response = requests.post(f"{session_url}/sessions", timeout=_HTTP_TIMEOUT_SECS)
         assert create_response.status_code == 200, create_response.text

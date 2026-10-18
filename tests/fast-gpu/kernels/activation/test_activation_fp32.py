@@ -1,3 +1,10 @@
+# [MODULE DOC] GPU pytest module comparing two fp32-accumulating Triton kernels (SwiGLU
+# activation with optional per-token scale, and a residual depthwise causal short convolution with
+# packed-sequence boundaries) against straightforward float64 reference implementations, for the
+# forward output and all input gradients, using the relative norm error as the metric with a
+# threshold of 5e-3. The whole module is skipped when Triton is not importable or CUDA is not
+# available. Registered for CUDA 2-GPU stage-b H200 (est. 60 s, Hopper and Blackwell), label
+# precision. Run as a script: runs pytest on this file verbosely and exits with its status.
 """The fp32 SwiGLU and residual short conv Triton kernels against float64 torch references, forward and
 backward, including the per-token scale and packed-sequence boundaries."""
 
@@ -18,10 +25,17 @@ from miles.kernels.activation.swiglu_fp32 import swiglu_fp32  # noqa: E402
 
 
 def _rel_err(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    # [FUNCTION DOC] HELPER: Returns the relative error as a Python float: the norm of the
+    # difference between the actual tensor (converted to double) and the expected tensor, divided
+    # by the norm of the expected tensor. Undefined (division by zero) if the expected tensor is all
+    # zeros.
     return ((actual.double() - expected).norm() / expected.norm()).item()
 
 
 def _swiglu_reference(fc1_out: torch.Tensor, scale: torch.Tensor | None) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Reference SwiGLU. Splits the input in two equal halves along the last
+    # dimension (gate first, then up), returns the sigmoid-linear-unit of the gate times the up
+    # half; if a per-token scale vector is given, multiplies each token's row by its scale.
     gate, up = fc1_out.chunk(2, dim=-1)
     out = F.silu(gate) * up
     return out if scale is None else out * scale[:, None]
@@ -29,6 +43,13 @@ def _swiglu_reference(fc1_out: torch.Tensor, scale: torch.Tensor | None) -> torc
 
 @pytest.mark.parametrize("with_scale", [False, True])
 def test_swiglu_matches_float64_reference(with_scale):
+    # [FUNCTION DOC] Parameterized over whether a per-token scale is used. Seeds the random
+    # generator with 0. Inputs on the GPU: 257 tokens, width 384; the first-layer output in bfloat16
+    # with twice the width; optional float32 scale uniform in 0.5 to 1.5; a random bfloat16 upstream
+    # gradient. Runs the kernel on gradient-tracking clones and backpropagates the gradient; runs
+    # the reference in float64 on double copies with the same gradient. Asserts: the kernel output
+    # keeps the input dtype (bfloat16); relative errors below 5e-3 for the output, for the input
+    # gradient and, when scaled, for the scale gradient.
     torch.manual_seed(0)
     tokens, width = 257, 384
     fc1_out = torch.randn(tokens, 2 * width, device="cuda", dtype=torch.bfloat16)
@@ -53,6 +74,12 @@ def test_swiglu_matches_float64_reference(with_scale):
 
 
 def _sconv_reference(x: torch.Tensor, weight: torch.Tensor, seqlens: list[int]) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Reference residual short convolution on packed tokens. Splits the
+    # token-major input into segments with the given lengths. For each segment, applies a depthwise
+    # (one filter per channel) causal convolution whose kernel size comes from the weight's last
+    # dimension, with zeros padded on the left so no information crosses segment boundaries, and
+    # adds the result to the segment itself (residual). Concatenates the segments back and returns
+    # a tensor of the input's shape.
     kernel_size = weight.shape[-1]
     segments = [
         segment + F.conv1d(F.pad(segment.t()[None], (kernel_size - 1, 0)), weight, groups=weight.shape[0])[0].t()
@@ -63,6 +90,13 @@ def _sconv_reference(x: torch.Tensor, weight: torch.Tensor, seqlens: list[int]) 
 
 @pytest.mark.parametrize("seqlens", [[300], [70, 1, 129, 100]], ids=["single", "packed"])
 def test_sconv_matches_float64_reference(seqlens):
+    # [FUNCTION DOC] Parameterized over a single 300-token sequence and a packed set of four
+    # sequences (lengths 70, 1, 129, 100). Seeds the random generator with 0. Inputs on the GPU:
+    # bfloat16 tokens with 256 channels, a float32 depthwise filter of kernel size 4 scaled by 0.3,
+    # and a random upstream gradient. Runs the kernel (taking the sequence lengths) on
+    # gradient-tracking clones and backpropagates; runs the float64 reference and backpropagates
+    # the double gradient. Asserts: output keeps the input dtype; relative errors below 5e-3 for
+    # the output, the input gradient and the filter gradient.
     torch.manual_seed(0)
     tokens, channels, kernel_size = sum(seqlens), 256, 4
     x = torch.randn(tokens, channels, device="cuda", dtype=torch.bfloat16)

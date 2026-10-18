@@ -1,3 +1,13 @@
+# [MODULE DOC] Single-case end-to-end test of weight broadcast in a disaggregated (non-colocated)
+# layout: Qwen3-30B-A3B with 3 training GPUs (pipeline parallel 3, so three sender ranks) and 1
+# rollout GPU with one engine. The weight update transfer mode is plain broadcast. Interleaved
+# virtual pipeline stages of 8 layers per chunk are enabled via extra arguments; because virtual
+# pipelining rounds each step's micro-batch count up to a multiple of the pipeline size, max
+# tokens per GPU is 16384 so about two 8k-token samples pack per micro-batch. Registered for CUDA
+# 4-GPU H200 (est. 1500 s, labels megatron and weight-update) and ROCm 4-GPU MI350 nightly
+# (est. 900 s), with five CI metric gates (grad norm, PPO KL, train/rollout logprob absolute
+# difference, train/rollout KL, raw reward). Run as a script: strips proxy variables, then
+# prepare and execute.
 import os
 
 from tests.ci.ci_register import register_cuda_ci, register_rocm_ci

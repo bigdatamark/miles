@@ -1,3 +1,9 @@
+# [MODULE DOC] HELPER: Custom rollout generate function used by the router-equivalence end-to-end
+# test. It wraps the stock single-turn generate function and, when an environment variable names a
+# dump file, appends one JSON line per returned sample with the fields compared between router
+# variants. The module also copies the wrapped function's optional add-arguments hook (or none)
+# onto the new function so command-line argument registration still works. If the environment
+# variable is unset the wrapper logs a warning and dumps nothing.
 """Custom generate function for router-equivalence e2e test.
 
 Wraps the stock ``single_turn.generate`` and, after each rollout, appends a
@@ -30,6 +36,11 @@ _DUMP_PATH_ENV = "MILES_ROUTER_EQ_DUMP_PATH"
 
 
 def _dump_sample(sample: Sample) -> dict:
+    # [FUNCTION DOC] HELPER: Converts a sample into a JSON-serializable mapping with keys: index;
+    # status as text; response length; tokens as a list (or none); rollout log probs as a list (or
+    # none); routed-experts shape as a list of ints and routed-experts payload as base64 text of the
+    # C-contiguous int32 bytes (both none when the sample has no routed experts). The routed
+    # experts are cast to 32-bit integers before encoding.
     re = sample.rollout_routed_experts
     if re is not None:
         arr = np.ascontiguousarray(re, dtype=np.int32)
@@ -51,6 +62,11 @@ def _dump_sample(sample: Sample) -> dict:
 
 
 async def generate(input: GenerateFnInput) -> GenerateFnOutput:
+    # [FUNCTION DOC] Awaits the stock single-turn generate function on the same input. If the dump
+    # path environment variable is unset or empty, logs a warning and returns the output unchanged.
+    # Otherwise normalizes the output's samples to a list (a single sample is wrapped), creates the
+    # dump file's parent directory, appends one JSON line per sample (append mode, so repeated calls
+    # accumulate), and returns the original output unchanged. Side effects: filesystem writes.
     out = await _base_generate(input)
 
     dump_path = os.environ.get(_DUMP_PATH_ENV)

@@ -1,3 +1,14 @@
+# [MODULE DOC] End-to-end test running three fully-asynchronous evaluation postures in sequence on
+# Qwen3-4B with GSM8K: shared (eval on the rollout engines), fleet (one dedicated in-job eval
+# engine), and external (a self-launched SGLang server driven by a custom eval function). Each
+# posture is a separate training launch with the async train script. Layout: 2 actor GPUs
+# (tensor parallel 2, sequence parallel) and the rest rollout; total GPUs 8, or 4 when the few-GPU
+# environment flag is set (read at import time). The eval-hf snapshot directory is created per
+# mode in shared memory because CI containers share host IPC. The CI checker expects the GSM8K
+# eval metric to be reported 3 times and to meet a 0.4 threshold. Registered for CUDA 8-GPU H200
+# (est. 2400 s) and ROCm 8-GPU MI350 nightly (est. 1500 s) with five CI metric gates. Run as a
+# script: strip proxy variables, prepare, then execute for each mode.
+# KNOWN ISSUE: the existing docstring says it requires 8 GPUs, but the few-GPU flag allows 4.
 """E2E: every fully-async eval posture on Qwen3-4B, one short GRPO run each.
 
 Three cases, in the order of how much machinery each adds:
@@ -49,6 +60,10 @@ EVAL_MODES = ("shared", "fleet", "external")
 
 
 def prepare():
+    # [FUNCTION DOC] Creates model/dataset directories, downloads Qwen3-4B and the GSM8K dataset,
+    # and converts the model to a Megatron distributed checkpoint under the models directory using
+    # the total GPU count and an explicit Megatron path. Side effects: shell commands, network,
+    # filesystem, GPU.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -64,6 +79,18 @@ def prepare():
 
 
 def execute(eval_mode: str, eval_hf_dir: str):
+    # [FUNCTION DOC] Runs one training launch for the given eval posture (shared, fleet or
+    # external) with eval snapshots staged in the given directory. Rollout: fully-async, GSM8K
+    # parquet, math reward, 2 rollouts of 8 prompts times 4 samples, 1024 response tokens,
+    # temperature 0.8, global batch 32, in-place pause mode. Eval: every rollout, GSM8K test
+    # split, 1 sample, 1024 tokens, top-k 1. The rollout GPU count starts at total minus actor
+    # GPUs (2); any non-shared mode adds the snapshot directory and keeps 2 snapshots and removes
+    # one rollout GPU; fleet mode adds one dedicated eval GPU and engine; external mode sets the
+    # custom eval function path and passes an environment variable naming the number of GPUs
+    # (total minus one) for the external server. Parallelism: tensor 2 with sequence parallel,
+    # dynamic batching at 9216 tokens per GPU. GRPO with TIS and actor forward-only skipped. CI
+    # flags: CI test plus a metric checker on the GSM8K eval metric (threshold 0.4, expected 3
+    # reports). Launches the async train script with the total GPU count. Returns nothing.
     U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME} " f"--ref-load /root/models/{MODEL_NAME}_torch_dist "
 

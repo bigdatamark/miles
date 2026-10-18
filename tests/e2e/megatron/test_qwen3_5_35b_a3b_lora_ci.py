@@ -1,3 +1,13 @@
+# [MODULE DOC] End-to-end smoke test that drives the Qwen3.5-35B-A3B LoRA launcher script
+# (imported: its argument class, download step and train step) on one node with 8 GPUs, one
+# rollout, no experiment tracking. It runs two mixture-of-experts LoRA configurations one after
+# the other, each in a fresh Ray and SGLang state, and every combination must pass: shared-outer
+# LoRA with virtual experts serving, and per-expert LoRA without virtual experts. Extra arguments
+# enable the CI test flag and disable the logprob checker. Registered for CUDA 8-GPU H200 (est.
+# 1200 s; kept off Blackwell because on B200 the first step's KL check exceeds the very tight LoRA
+# limit) and ROCm 8-GPU MI350 nightly (est. 900 s). Run as a script: strips proxy variables,
+# downloads once, then loops over the combinations. The module-level list of configurations
+# holds a name and two booleans per entry.
 import os
 
 from scripts.run_qwen3_5_35b_a3b_lora import ScriptArgs, _prepare_download, _train
@@ -31,6 +41,13 @@ _CONFIGS = [
 
 
 def _args(shared_outer: bool, virtual_experts: bool) -> ScriptArgs:
+    # [FUNCTION DOC] HELPER: Builds the launcher's argument object from environment defaults for
+    # one combination: model Qwen3.5-35B-A3B, 1 node, 8 GPUs, 1 rollout, experiment tracking off,
+    # the given shared-outer expert LoRA flag. Extra argument text always starts with the CI test
+    # flag and disabling the logprob checker; if virtual experts are off it adds the flag that
+    # turns off SGLang LoRA virtual experts; on ROCm (hardware-platform environment variable) with
+    # shared-outer LoRA it adds disabling shared-experts fusion (fusion requires per-expert LoRA
+    # factors). Returns the argument object.
     extra_args = "--ci-test --ci-disable-logprobs-checker "
     if not virtual_experts:
         extra_args += "--no-sglang-lora-use-virtual-experts "
@@ -50,10 +67,14 @@ def _args(shared_outer: bool, virtual_experts: bool) -> ScriptArgs:
 
 
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Delegates to the launcher script's download step for the given arguments
+    # (model and dataset downloads, as the script defines). Returns nothing.
     _prepare_download(args)
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Delegates to the launcher script's train step for the given arguments, which
+    # runs the full rollout, train and save loop. Returns nothing.
     _train(args)
 
 

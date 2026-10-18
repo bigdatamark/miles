@@ -1,3 +1,11 @@
+# [MODULE DOC] Multi-role session-server token-in-token-out end-to-end test for the Inkling-Small
+# NVFP4 model. Configuration: tensor parallel 4 with the context length capped at 32768 (the
+# official 1M-context H200 recipe needs tensor parallel 8; this short-session lane trades context
+# for fitting on 4 GPUs), max response length 4096, prefill CUDA graph backend disabled, 2 cycles,
+# 1 sample per prompt, append-tool recovery, and the Anthropic intermediate-system expectation
+# "required". Registered for CUDA 4-GPU H200 only (est. 1800 s), with metric gates on the session
+# mismatch rate of assistant text for session versions v1 and v2. Run as a script: calls the test
+# function.
 from tests.ci.ci_register import register_cuda_ci
 from tests.ci.metric_history import register_ci_gate
 from tests.e2e.sglang.test_session_server_multi_role._common import ModelConfig, run_both_versions
@@ -26,6 +34,9 @@ CONFIG = ModelConfig(
 
 
 def test_inkling():
+    # [FUNCTION DOC] Runs the full per-model verification matrix for this module's configuration
+    # through the shared runner (OpenAI on session v1 and v2, Anthropic on v2); any failure raised
+    # by the runner fails the test.
     run_both_versions(CONFIG)
 
 

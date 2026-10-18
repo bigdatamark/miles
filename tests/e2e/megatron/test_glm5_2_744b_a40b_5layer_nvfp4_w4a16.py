@@ -1,3 +1,14 @@
+# [MODULE DOC] End-to-end CI test: a 5-layer slice of the GLM-5.2 744B-A40B mixture-of-experts model
+# (DSA attention) trained with GRPO using NVFP4 fake quantize-dequantize expert weights on the
+# training side and NVFP4 weight-only (4-bit weight, 16-bit activation) kernels in SGLang rollout.
+# Registered for the 8-GPU Blackwell (B200) CUDA suite with an estimated time of 1000 seconds.
+# Layout: 8 GPUs total, 4 for the Megatron actor (context parallel 4 and expert parallel 4) and
+# 4 for rollout (engines of 2 GPUs each, data-parallel attention). Rollout is non-colocated.
+# The module defines constants (model names, env-var dictionaries, a transformer-engine precision
+# config in YAML text), two small argument helpers, a checkpoint validator, and the two entry
+# points prepare() and execute(). Running the file as a script calls prepare(), strips proxy
+# environment variables, then calls execute(). There are no pytest test functions; pass/fail is
+# determined by the training run and the CI checkers enabled in its arguments.
 import json
 import os
 from pathlib import Path
@@ -72,14 +83,26 @@ matchers:
 
 
 def _extra_high_precision_layers_hf_args() -> str:
+    # [FUNCTION DOC] HELPER: Builds the command-line fragment that lists, for the Hugging Face
+    # checkpoint side, the layer-name patterns kept in high precision (the shared-experts
+    # modules). Returns the flag name followed by the space-joined patterns and a trailing space.
     return "--extra-high-precision-layers-hf " + " ".join(EXTRA_HIGH_PRECISION_LAYERS_HF) + " "
 
 
 def _extra_high_precision_layers_megatron_args() -> str:
+    # [FUNCTION DOC] HELPER: Same as the Hugging Face variant but for Megatron parameter names
+    # (the shared-experts first and second linear layers). Returns the flag name, the
+    # space-joined patterns and a trailing space.
     return "--extra-high-precision-layers-megatron " + " ".join(EXTRA_HIGH_PRECISION_LAYERS_MEGATRON) + " "
 
 
 def _validate_glm_checkpoint():
+    # [FUNCTION DOC] HELPER: Sanity-checks the downloaded Hugging Face checkpoint's config file
+    # under the model directory. Reads and parses the JSON config. Raises file-not-found if the
+    # config is missing; raises a runtime error if the model type is not the native GLM MoE DSA
+    # type, the architecture list is not exactly the GLM MoE DSA causal-LM class, or the hidden
+    # layer count is not 5; also raises a runtime error if the config contains an auto-map entry
+    # (meaning an outdated checkpoint with custom remote code). Returns nothing.
     config_path = Path(MODEL_DIR) / MODEL_NAME / "config.json"
     if not config_path.exists():
         raise FileNotFoundError(f"{config_path} not found")
@@ -102,6 +125,15 @@ def _validate_glm_checkpoint():
 
 
 def prepare():
+    # [FUNCTION DOC] Prepares models and data. Steps: create the backend from the default command
+    # config; merge the NVFP4 environment variables into the process environment; create the
+    # model and dataset directories; download the 5-layer GLM checkpoint and the dapo-math-17k
+    # dataset; validate the checkpoint config; delete any previous NVFP4 output and any previous
+    # Megatron distributed checkpoint; run the HF-to-NVFP4 conversion tool on the GPU (keeping the
+    # shared-experts layers in high precision); then convert the HF checkpoint to a Megatron
+    # distributed checkpoint on a single GPU with all parallel sizes 1, the DSA raw-mode
+    # arguments, and the configured Megatron path. Side effects: shell commands, filesystem
+    # writes, network downloads, GPU use, environment mutation. Returns nothing.
     U = command_utils.default_config().create_backend()
     os.environ.update(NVFP4_ENV)
     U.exec_command_cpu(f"mkdir -p {MODEL_DIR} {DATA_DIR}")
@@ -136,6 +168,21 @@ def prepare():
 
 
 def execute():
+    # [FUNCTION DOC] Runs the training job. Merges the NVFP4 and GLM-5 environment variables into
+    # the process environment, defaults the Ray temp directory, and writes the transformer-engine
+    # precision config to a pseudo file. Builds argument groups: checkpoints (NVFP4 HF checkpoint
+    # for rollout, Megatron distributed checkpoint as reference); rollout (math dataset, 2
+    # rollouts of 4 prompts times 4 samples, global batch 16, max response 100 tokens, per the
+    # partial-model CI sizing); performance (context and expert parallel equal to the actor GPU
+    # count, full recompute, dynamic batch size, gradient accumulation fusion disabled so the
+    # straight-through estimator reaches the original expert parameters); GRPO with TIS and
+    # zero KL/entropy coefficients; Adam with CPU offload; SGLang (NSA attention, flashinfer
+    # CuteDSL MoE runner, fp8 KV cache, DP attention); CI flags that disable the logprob,
+    # weight-update and KL checkers; mixed-precision flags (bf16 with the high-precision layer
+    # lists and the TE config file); and misc flags (routing replay, miles router, DeepEP flex
+    # dispatcher, packed broadcast weight update, fault tolerance, debug data dumps under a
+    # per-run shared directory). Event logging is omitted because SGLang cannot checksum NVFP4
+    # weights. Launches training through the backend with 8 GPUs. Returns nothing.
     U = command_utils.default_config().create_backend()
     os.environ.update(NVFP4_ENV)
     os.environ.update(GLM5_ENV)

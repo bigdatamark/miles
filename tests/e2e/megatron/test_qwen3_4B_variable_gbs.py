@@ -1,3 +1,11 @@
+# [MODULE DOC] End-to-end test of a global batch size that does not divide the collected rollout
+# size, for Qwen3-4B on 4 colocated GPUs in bridge mode (direct Hugging Face weights conversion).
+# Each rollout collects 8 prompts times 4 samples = 32 samples; global batch 24 with partial
+# train steps allowed and sample trimming disabled yields a full step of 24 and a final partial
+# step of 8. Context parallel 2 (tensor 1, pipeline 1), sequence parallel, dynamic batching at
+# 8192 tokens per GPU, 4096 response tokens, 2 rollouts. SGLang engines of 2 GPUs. Registered for
+# CUDA 4-GPU H200 (est. 500 s) and ROCm 4-GPU MI350 nightly (est. 500 s). Run as a script: prepare,
+# strip proxy variables, then execute.
 """E2E for variable global batch sizes: global_batch_size does not divide the
 collected rollout count, trim is disabled, and --allow-partial-train-step
 trains the trailing rollouts as a smaller final step (e.g. steps of [24, 8]).
@@ -19,6 +27,9 @@ NUM_GPUS = 4
 
 
 def prepare():
+    # [FUNCTION DOC] Creates model/dataset directories, downloads Qwen3-4B and the dapo-math-17k
+    # dataset, and converts the model to a Megatron distributed checkpoint on 4 GPUs. Side effects:
+    # shell commands, network, filesystem, GPU.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -27,6 +38,12 @@ def prepare():
 
 
 def execute():
+    # [FUNCTION DOC] Builds the argument string and launches training with 4 GPUs. Rollout: 2
+    # rollouts of 8 prompts times 4 samples, 4096 response tokens, temperature 0.8, global batch
+    # 24 with the allow-partial-train-step and disable-trim-samples flags. Parallelism: context 2,
+    # sequence parallel, full recompute, dynamic batching at 8192 tokens per GPU. GRPO with KL loss
+    # at zero coefficient, Adam at 1e-6. SGLang: 2 GPUs per engine, mem fraction 0.7. The CI test
+    # flag is appended inline; colocated, with bridge conversion mode. Returns nothing.
     U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/{MODEL_NAME}_torch_dist "
 

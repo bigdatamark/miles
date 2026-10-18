@@ -1,3 +1,13 @@
+# [MODULE DOC] Longer end-to-end test of GRPO training with the FSDP training backend (not
+# Megatron) on Qwen3-0.6B with GSM8K, 2 GPUs colocated, one 2-GPU rollout engine. Runs 60 rollouts
+# (3000 if the infinite-run environment switch is on) of 32 prompts times 8 samples with
+# oversampling 64 and a non-zero reward std filter, global batch 256, temperature 1, evaluating
+# every 20 rollouts on the GSM8K test split. Weight updates use a 512 MiB bucket. CI checks: CI test
+# mode with the KL checker disabled and a metric checker requiring the GSM8K eval metric of at
+# least 0.71 (a loose threshold at 60 steps). The KL loss flag is commented out, so only the
+# coefficient arguments remain. Registered for CUDA 2-GPU H200 (est. 3000 s) and ROCm 2-GPU MI350
+# nightly (est. 3900 s) with label long. Model and data directories come from shared helpers. Run
+# as a script: prepare, strip proxy variables, execute.
 import os
 
 from tests.ci.ci_register import register_cuda_ci, register_rocm_ci
@@ -24,6 +34,9 @@ NUM_GPUS = 2
 
 
 def prepare():
+    # [FUNCTION DOC] Creates the model and data directories, downloads Qwen3-0.6B into the model
+    # directory and GSM8K into the data directory. Side effects: shell commands, network,
+    # filesystem.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu(f"mkdir -p {MODEL_DIR} {DATA_DIR}")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir {MODEL_DIR}/{MODEL_NAME}")
@@ -31,6 +44,14 @@ def prepare():
 
 
 def execute():
+    # [FUNCTION DOC] Builds the argument string and launches training with 2 GPUs and no Megatron
+    # model type (FSDP backend). The checkpoint argument is only the Hugging Face directory.
+    # Settings as in the module doc, plus: GRPO with zero-coefficient KL and entropy terms and clip
+    # range 0.2 to 0.28, Adam at 1e-6, SGLang with 2 GPUs per engine, decode log interval 1000 and
+    # metrics, dynamic batching at 32768 tokens per GPU, FSDP train backend selected in the misc
+    # arguments. Returns nothing.
+    # KNOWN ISSUE: sharded versus full state-dict selection is described in comments but the
+    # full-params flag is left commented out, so the default sharded mode is always used.
     U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint {MODEL_DIR}/{MODEL_NAME} "
 

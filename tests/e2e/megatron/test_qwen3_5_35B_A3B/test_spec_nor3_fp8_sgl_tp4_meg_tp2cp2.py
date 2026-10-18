@@ -1,3 +1,13 @@
+# [MODULE DOC] Single-case end-to-end test for Qwen3.5-35B-A3B on 4 colocated GPUs: speculative
+# decoding v2 from the checkpoint draft with MTP training off, no routing replay, FP8 rollout
+# against BF16 training. Megatron: tensor 2, context 2, expert 4, max tokens per GPU 4096 (the
+# context-parallel gated delta-net backward kernel runs out of memory at 8192). SGLang: one 4-GPU
+# tensor-parallel engine with no expert parallelism or DP attention, so every FP8 shard stays
+# block aligned. Weight check uses the target-only selector, skips vision weights and allows
+# quantization error. Registered for CUDA 4-GPU H200 (est. 2100 s, Hopper only until a Blackwell
+# run passes) and ROCm 4-GPU MI350 nightly (est. 1600 s) with five CI metric gates. Run as a
+# script: strips proxy variables, prepares, on ROCm (selected by a hardware-platform environment
+# variable) replaces the case with a copy using the alltoall Megatron dispatcher, then executes.
 """Qwen3.5-35B-A3B: 0 MTP layers + speculative-v2 (no R3) on an FP8 TP-only rollout.
 
 MTP training is OFF and R3 is off. The rollout still runs EAGLE spec from the

@@ -1,3 +1,14 @@
+# [MODULE DOC] Single-case end-to-end test of tensor plus pipeline parallelism with the torchtitan
+# backend and Qwen3-8B on 4 colocated GPUs (tensor 2, pipeline 2), sequence length 4096, max
+# response 2048, with a reference model and KL loss enabled. It checks the two conventions the
+# backend must satisfy: tensor parallelism shards the vocabulary and the loss reduces the softmax
+# over the tensor group, so logits must arrive as the local shard (gathering them would shift every
+# log prob by minus the natural log of the tensor size); pipeline parallelism infers stage buffers
+# once, so every micro-batch is padded to the sequence length with consecutive positions rather
+# than zeros. The untied dense model is used because the output head cannot be tied to the
+# embedding across stages, and it is not truncated because the weight check compares every layer.
+# Registered for CUDA 4-GPU H200 (est. 900 s, Hopper only), label torchtitan. Run as a script:
+# prepare then execute.
 from tests.ci.ci_register import register_cuda_ci
 from tests.e2e.torchtitan._common import CaseConfig, execute, prepare
 
