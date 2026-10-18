@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# End-to-end script checking that the FSDP and Megatron training backends compute the same
+# gradient norm on identical data, for Qwen3-0.6B on 2 GPUs (colocated). Registered as a
+# 900-second 2-GPU H200 CUDA test (hopper and blackwell, fsdp label) and an 800-second nightly
+# 2-GPU MI350 ROCm test. Module constants: model name and Megatron type, 2 GPUs, context parallel
+# 1, Megatron tensor and pipeline parallel 1. As a script: prepare (download model and math
+# dataset, convert to Megatron format), strip proxy variables, then execute three training jobs:
+# (1) FSDP generates and saves the rollout debug data; (2) FSDP trains only on that saved data
+# and saves its gradient norm; (3) Megatron trains only on the same data and checks its gradient
+# norm against the saved one. Temporary files (gradient norm file, debug data for rollout 0) are
+# removed afterwards even on failure.
 import os
 
 from tests.ci.ci_register import register_cuda_ci, register_rocm_ci
@@ -26,6 +37,10 @@ MEGATRON_PP_SIZE = 1
 
 
 def prepare():
+    # [FUNCTION DOC] Through the command backend: create the models and datasets directories,
+    # download the model and the math training dataset, and convert the Hugging Face checkpoint to
+    # the Megatron distributed format across 2 GPUs into the models directory. Side effects:
+    # network downloads, filesystem, GPU job.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -40,6 +55,20 @@ def prepare():
 
 
 def execute():
+    # [FUNCTION DOC] Run three training jobs sharing a common argument string (HF checkpoint, one
+    # rollout of 8 prompts with 8 samples on the math dataset with deepscaler reward and up to 8192
+    # tokens, global batch 64, dynamic batch with 8192 tokens per GPU, GRPO with zero coefficients
+    # and clip 4e-4, Adam learning rate 1e-6, one rollout GPU per engine with chunked prefill 4096
+    # and memory fraction 0.75, CI test mode, colocated on 2 GPUs). Job 1 (FSDP backend with
+    # flash_attention_2, gradient checkpointing, context parallel 1, 512 MiB update buffer,
+    # expandable-segments allocator in the training process) also saves the rollout debug data to a
+    # templated file. Job 2 (same FSDP settings) loads that data, saves its gradient norm to a
+    # file and runs train-only. Job 3 (Megatron backend with tensor, pipeline, context parallel 1,
+    # sequence parallel, full recompute, a 3 GiB training memory margin, flash attention, fp32
+    # accumulation, dropout off) loads the same data, checks against the saved gradient norm and
+    # skips the actor forward-only pass, train-only. In a finally block, deletes the gradient norm
+    # file and the rollout-0 debug data file if they exist. Side effects: three GPU jobs, files in
+    # the working directory.
     U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/"
 

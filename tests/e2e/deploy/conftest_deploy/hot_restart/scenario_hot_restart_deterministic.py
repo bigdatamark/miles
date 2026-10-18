@@ -1,3 +1,18 @@
+# [MODULE DOC]
+# HELPER: Scenario for the deterministic hot-restart deploy tests. Compares two deployed runs of
+# the Qwen3-0.6B hot-restart example (a "baseline" side that trains straight through and a
+# "target" side that is frozen at scheduled steps and taken over by hot restarts) on a Kubernetes
+# cluster. Both train 6 rollouts with deterministic settings, a shared checkpoint directory
+# per side, weight decay zero and mooncake object store arguments; the target's first freeze is
+# armed through a freeze plan file and later freezes are written by the relaunch closure. Two
+# modes: "checkpointed" (save every 2 steps; freeze after step 2 holding iteration 1, and after
+# step 4 holding iteration 3; verdict: only post-checkpoint steps redone) and "no_checkpoint"
+# (save every 4; freeze after step 1 with no checkpoint; verdict: redone from scratch). After the
+# runs it checks the evidence (take-overs replaced only the script, redo accounting) and that the
+# deterministic metrics and engine count of both sides match (at least 4 trained rollouts;
+# weight-version metrics excluded). Module state: a mapping from dump directory to the training
+# arguments installed there, so relaunches repeat exactly the installed arguments. Exposes a
+# command-line app with one sub-command per mode.
 import dataclasses
 import hashlib
 import shlex
@@ -85,6 +100,10 @@ AssertRedoneFn = Callable[..., object]
 
 @dataclass(frozen=True)
 class HotRestartMode:
+    # [CLASS DOC] HELPER: Immutable description of one hot-restart scenario: its name, the
+    # checkpoint save interval in rollouts, the tuple of scheduled freezes, and the verdict function
+    # (called with keyword arguments: dump directory, checkpoint directory, records, number of
+    # rollouts and schedule) that checks which steps were redone.
     name: str
     save_interval: int
     schedule: tuple[ScheduledFreeze, ...]
@@ -92,14 +111,17 @@ class HotRestartMode:
 
     @property
     def test_name(self) -> str:
+        # [FUNCTION DOC] HELPER: The test name: "hot_restart_" followed by the mode name.
         return f"hot_restart_{self.name}"
 
     @property
     def num_restarts(self) -> int:
+        # [FUNCTION DOC] HELPER: Number of scheduled take-overs.
         return len(self.schedule)
 
     @property
     def frozen_rollout_ids(self) -> tuple[int, ...]:
+        # [FUNCTION DOC] HELPER: Tuple of the frozen rollout ids of the schedule, in order.
         return tuple(one.frozen_rollout_id for one in self.schedule)
 
 
@@ -125,6 +147,12 @@ MODES: tuple[HotRestartMode, ...] = (CHECKPOINTED, NO_CHECKPOINT)
 
 
 def create_app_and_run_ci(restart_mode: HotRestartMode) -> tuple[typer.Typer, Callable[[], None]]:
+    # [FUNCTION DOC] Build the comparison command-line app and CI entry point for a mode, via the
+    # fault-tolerance comparison framework: baseline arguments plain, target arguments with the
+    # first freeze armed, comparison function for the mode, a target-side context manager that
+    # drives take-overs, a per-side configuration function that suffixes the run id with the side
+    # name, and a mode resolver that always returns the single dense 4-GPU context-parallel mode.
+    # Returns the app and the CI callable wrapped so it first asserts the cluster can deploy runs.
     app, run_ci = create_comparison_app_and_run_ci(
         test_name=restart_mode.test_name,
         build_baseline_args=partial(_build_args, restart_mode),
@@ -138,10 +166,16 @@ def create_app_and_run_ci(restart_mode: HotRestartMode) -> tuple[typer.Typer, Ca
 
 
 def run_ci(restart_mode: HotRestartMode) -> None:
+    # [FUNCTION DOC] Build the CI entry point for the mode and call it immediately (running the
+    # whole baseline-versus-target comparison on the cluster). Side effects: deploys and runs
+    # training.
     create_app_and_run_ci(restart_mode)[1]()
 
 
 def read_installed_args(dump_dir: str) -> str:
+    # [FUNCTION DOC] Return the training arguments last installed for the dump directory in this
+    # process; asserts they exist (a relaunch must repeat the installed arguments, since rebuilding
+    # them would render a different pod template).
     assert (args := _TRAIN_ARGS_OF_DUMP_DIR.get(dump_dir)) is not None, (
         f"nothing installed a run under {dump_dir} in this process; a relaunch that rebuilds its arguments instead "
         f"of repeating the installed ones renders a pod template of its own"
@@ -152,6 +186,9 @@ def read_installed_args(dump_dir: str) -> str:
 def _config_for_comparison_side(
     side: str, config: command_utils.ExecuteTrainConfig
 ) -> command_utils.ExecuteTrainConfig:
+    # [FUNCTION DOC] HELPER: Return a copy of the configuration whose run id gets the suffix "-"
+    # plus the side name, giving each side its own release. Asserts the side is the baseline or
+    # target name, and that the longer run id still fits the maximum run id length.
     assert side in (BASELINE_SIDE, TARGET_SIDE), f"unknown comparison side {side!r}"
     suffix = f"-{side}"
     assert len(config.run_id) + len(suffix) <= RUN_ID_MAX_LENGTH, "run id too long for a side suffix"
@@ -162,6 +199,14 @@ def _config_for_comparison_side(
 
 
 def _build_args(restart_mode: HotRestartMode, mode: FTTestMode, dump_dir: str, enable_dumper: bool = True) -> str:
+    # [FUNCTION DOC] HELPER: Build the training argument string for one side. Builds the example's
+    # script arguments, builds the example's training arguments and sets weight decay to zero;
+    # points both the save and load flags at the side's checkpoint directory; if a tracking group
+    # flag is present, sets the tracking group and run id flags to a group name derived from the
+    # test name and a hash of the dump directory (so a relaunch continues the same tracking run);
+    # appends the mooncake object store arguments; then asserts the mode's declared parallelism
+    # matches, that one training event is logged per rollout, and that asynchronous save is not
+    # used. Records the arguments in the module mapping for the dump directory and returns them.
     checkpoint_dir = str(compute_checkpoint_dir(dump_dir))
     script_args = _build_script_args(restart_mode, mode=mode, dump_dir=dump_dir, enable_dumper=enable_dumper)
 
@@ -182,6 +227,11 @@ def _build_args(restart_mode: HotRestartMode, mode: FTTestMode, dump_dir: str, e
 
 
 def _assert_one_train_event_per_step(train_args: str) -> None:
+    # [FUNCTION DOC] HELPER: Parse the global batch size, rollout batch size and samples-per-prompt
+    # values (each must be defined exactly once, else unpacking fails) and assert the global batch
+    # size equals rollout batch size times samples per prompt, so each rollout takes exactly one
+    # optimizer step and logs one training-step event (the redo accounting counts one per
+    # rollout).
     argv = shlex.split(train_args)
     [global_batch_size] = ArgvManipulator.get(argv, GLOBAL_BATCH_SIZE_FLAG)
     [rollout_batch_size] = ArgvManipulator.get(argv, ROLLOUT_BATCH_SIZE_FLAG)
@@ -196,6 +246,9 @@ def _assert_one_train_event_per_step(train_args: str) -> None:
 
 
 def _assert_run_saves_before_step_report(train_args: str) -> None:
+    # [FUNCTION DOC] HELPER: Assert the asynchronous-save flag is not present in the arguments
+    # (an async checkpoint could land after the step that triggered it, breaking the pinned
+    # checkpoint assumption of the take-overs).
     assert not ArgvManipulator.is_defined(shlex.split(train_args), ASYNC_SAVE_FLAG), (
         f"{ASYNC_SAVE_FLAG} lets a checkpoint land after the step that triggered it, and every take-over here is "
         f"pinned to the checkpoint the frozen run is already holding"
@@ -205,6 +258,10 @@ def _assert_run_saves_before_step_report(train_args: str) -> None:
 def _build_frozen_args(
     restart_mode: HotRestartMode, mode: FTTestMode, dump_dir: str, enable_dumper: bool = True
 ) -> str:
+    # [FUNCTION DOC] HELPER: Build the target side's arguments: the plain arguments for the side,
+    # then arm the first scheduled freeze (deleting any stale sentinel, writing the freeze plan for
+    # the first frozen rollout id, appending the plan flag). Stores the final arguments in the
+    # module mapping for the dump directory (overwriting the unarmed ones) and returns them.
     # TODO ad hoc hack: revert after the args refactor
     args = arm_first_freeze(
         _build_args(restart_mode, mode, dump_dir, enable_dumper),
@@ -218,6 +275,13 @@ def _build_frozen_args(
 def _build_script_args(
     restart_mode: HotRestartMode, *, mode: FTTestMode, dump_dir: str, enable_dumper: bool
 ) -> ScriptArgs:
+    # [FUNCTION DOC] HELPER: Build the example's script arguments. Asserts the mode has real
+    # rollout engines and is not colocated (trainers and engines must stay up on separate GPUs
+    # while the script is replaced), and that the freeze schedule leaves a redo window. Then
+    # builds the arguments from the default execute-train configuration with: the mode's model name
+    # and Megatron type, 6 rollouts, the mode's save interval, actor GPUs, engine count and GPUs per
+    # engine, model and data directories, and extra deterministic-run arguments for the dump
+    # directory and dumper switch.
     assert mode.has_real_rollout, (
         f"{restart_mode.test_name} replaces the rollout executor of a live run, and mode {mode.model_name} has no "
         f"engines for it to drive"
@@ -246,6 +310,8 @@ def _build_script_args(
 
 
 def _compute_wandb_group(*, test_name: str, dump_dir: str) -> str:
+    # [FUNCTION DOC] HELPER: Return the test name, an underscore, and the first 12 hex characters of
+    # the SHA-256 of the dump directory string.
     return f"{test_name}_{hashlib.sha256(dump_dir.encode()).hexdigest()[:12]}"
 
 
@@ -256,6 +322,14 @@ def _compute_wandb_group(*, test_name: str, dump_dir: str) -> str:
 def _driving_take_overs_of(
     restart_mode: HotRestartMode, mode: FTTestMode, dump_dir: str, config: command_utils.ExecuteTrainConfig
 ) -> Iterator[None]:
+    # [FUNCTION DOC] HELPER: Context manager used around the target side's launch. Computes the
+    # release and freeze plan path for the side, deletes the side's dump directory (ignoring
+    # errors), defines a relaunch closure (writes the freeze plan for the next frozen rollout id,
+    # or an empty plan after the last, then relaunches with hot restart using the installed
+    # arguments for the dump directory), builds a driver (event log directory, namespace, default
+    # trainer id, schedule of the mode) and runs the body under the driver's context manager
+    # (which writes the evidence file). After the body completes, asserts all scheduled restarts
+    # happened.
     release = compute_release_of_config(config)
     # TODO ad hoc hack: revert after the args refactor
     plan_path = compute_freeze_plan_path(dump_dir)
@@ -263,6 +337,9 @@ def _driving_take_overs_of(
     shutil.rmtree(dump_dir, ignore_errors=True)
 
     def relaunch(frozen_rollout_id: int | None) -> None:
+        # [FUNCTION DOC] HELPER: Write the freeze plan for the given rollout id (empty plan if
+        # none), then relaunch the installed release with the hot-restart configuration using the
+        # installed arguments of the dump directory.
         write_freeze_plan(plan_path, frozen_rollout_id=frozen_rollout_id)
         relaunch_with_hot_restart(
             train_args=read_installed_args(dump_dir), mode=mode, config=config, installed_release=release
@@ -289,6 +366,13 @@ def _driving_take_overs_of(
 
 
 def assert_freeze_schedule_leaves_redo_window(restart_mode: HotRestartMode) -> None:
+    # [FUNCTION DOC] Validate a mode's schedule against its save interval. Asserts: the save
+    # interval is below the number of rollouts; the largest frozen rollout id is below the last
+    # rollout id (leaving a step after the last take-over that is not a redone one); frozen rollout
+    # ids are all distinct (the driver tells freezes apart by the step in the sentinel). With the
+    # set of rollout ids that save a checkpoint, asserts for each scheduled freeze: its frozen step
+    # is not itself a save step; and its pinned saved iteration equals the latest save step below
+    # the frozen step (or none when there is none).
     assert restart_mode.save_interval < NUM_ROLLOUTS, (
         f"{restart_mode.test_name} watches the run save after a take-over, and a run of {NUM_ROLLOUTS} step(s) "
         f"saving every {restart_mode.save_interval} only ever saves the last step it trains"
@@ -319,10 +403,19 @@ def assert_freeze_schedule_leaves_redo_window(restart_mode: HotRestartMode) -> N
 
 
 def compute_saved_rollout_ids(*, save_interval: int) -> frozenset[int]:
+    # [FUNCTION DOC] Return the rollout ids (zero-based, below the number of rollouts) after which
+    # a checkpoint is saved: those whose one-based step number is a multiple of the save interval,
+    # plus the final rollout.
     return frozenset(one for one in range(NUM_ROLLOUTS) if (one + 1) % save_interval == 0 or one == NUM_ROLLOUTS - 1)
 
 
 def _compare(restart_mode: HotRestartMode, dump_dir: str, mode: FTTestMode) -> None:
+    # [FUNCTION DOC] HELPER: Final comparison of both sides, then print a pass message. Loads the
+    # target side's evidence; asserts take-overs replaced only the script (restart count taken from
+    # the evidence records, minimum from the mode's schedule); calls the mode's redone verdict with
+    # the target's dump and checkpoint directories, the records, 6 rollouts and the schedule; then
+    # compares the deterministic metrics of baseline and target sides (at least 4 trained rollouts,
+    # weight-version statistics excluded) and checks the engine count equals the mode's.
     baseline_dir: str = f"{dump_dir}/{BASELINE_SIDE}"
     target_dir: str = f"{dump_dir}/{TARGET_SIDE}"
 

@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Offline tests of the metric-history store contract, run against the in-memory SQLite backend.
+# Covers: writing a run and reading back trusted values newest-first, rejection of non-finite
+# values before any insert, the limit cap, isolation between runs of different identity
+# (test path, backend, suite) and between different coordinate columns (metric key, steps key,
+# constraint key, step), marking runs untrusted by run id / github run id / commit sha
+# (idempotent, exactly one selector required), exclusion of untrusted runs from baselines, a
+# guard that the SQLite baseline query keeps the authoritative shape, and that the Neon store
+# refuses to construct without a connection string. The module registers itself as a CPU test
+# in the stage-a-cpu suite. Module constants: one canonical run identity, one provenance record,
+# and canonical-JSON strings standing in for steps keys and constraint keys.
 """Offline unit tests for the metric-history store contract.
 
 These run against :class:`SQLiteMetricHistoryStore` with an in-memory database:
@@ -46,6 +57,9 @@ ABS_CONSTRAINT_KEY = '{"abs_floor_down":0.02,"abs_floor_up":0.02}'
 
 
 def _sample(metric_key, value, *, steps_key=LAST_STEPS_KEY, constraint_key=REL_CONSTRAINT_KEY, step=-1):
+    # [FUNCTION DOC] HELPER: Build a metric sample from a metric key and a value, with the
+    # steps key, constraint key and step defaulting to the "last" selection, the relative
+    # constraint and the reduction sentinel step.
     return MetricSample(metric_key, steps_key, constraint_key, step, value)
 
 
@@ -59,6 +73,9 @@ def _recent(
     identity=IDENTITY,
     limit=10,
 ):
+    # [FUNCTION DOC] HELPER: Query the store for the most recent trusted values of one metric
+    # coordinate under the given run identity (default canonical identity), newest run first,
+    # at most the given limit (default 10). Returns the list of values from the store.
     return store.recent_trusted_values(
         identity.test_path,
         identity.backend,
@@ -73,6 +90,8 @@ def _recent(
 
 @pytest.fixture
 def store():
+    # [FUNCTION DOC] HELPER: Test fixture that yields a fresh in-memory SQLite metric-history
+    # store and closes it after the test finishes.
     s = SQLiteMetricHistoryStore(":memory:")
     yield s
     s.close()
@@ -87,10 +106,15 @@ def _write(
     trusted=True,
     values,
 ):
+    # [FUNCTION DOC] HELPER: Write one run to the store. The creation timestamp and the list of
+    # metric samples are required (keyword only); identity and provenance default to the
+    # module constants and the run is trusted by default. Returns the new run id.
     return store.write_run(identity, provenance, created_at, trusted, values)
 
 
 def test_write_then_recent_returns_written_values(store):
+    # [FUNCTION DOC] Writes two trusted runs on consecutive days, each with one reward sample, and
+    # asserts the baseline query returns both values with the newest run first.
     _write(
         store,
         created_at="2026-06-01T00:00:00+00:00",
@@ -107,6 +131,10 @@ def test_write_then_recent_returns_written_values(store):
 
 
 def test_write_run_rejects_non_finite_before_persisting(store):
+    # [FUNCTION DOC] For each of nan, positive infinity and negative infinity, writes a run holding
+    # one finite sample plus one non-finite sample and asserts a value error mentioning
+    # "non-finite". Then asserts the finite sibling was never persisted (baseline is empty),
+    # proving validation happens before any insert.
     for bad in (float("nan"), float("inf"), float("-inf")):
         with pytest.raises(ValueError, match="non-finite"):
             _write(
@@ -121,6 +149,8 @@ def test_write_run_rejects_non_finite_before_persisting(store):
 
 
 def test_limit_caps_and_orders_newest_first(store):
+    # [FUNCTION DOC] Writes three runs with increasing timestamps and values 0.0, 1.0, 2.0, then
+    # queries with a limit of two and asserts only the two newest values come back, newest first.
     for i, created in enumerate(
         ["2026-06-01T00:00:00+00:00", "2026-06-02T00:00:00+00:00", "2026-06-03T00:00:00+00:00"]
     ):
@@ -130,6 +160,9 @@ def test_limit_caps_and_orders_newest_first(store):
 
 
 def test_identity_isolation(store):
+    # [FUNCTION DOC] Writes a reference run under the canonical identity, then three newer runs
+    # with a large value each differing from the canonical identity in exactly one field (backend,
+    # suite, test path). Asserts the canonical baseline contains only its own single value.
     # Reference run under the canonical identity.
     _write(store, created_at="2026-06-01T00:00:00+00:00", values=[_sample("reward_mean", 0.5)])
 
@@ -150,6 +183,9 @@ def test_identity_isolation(store):
 
 
 def test_coordinate_isolation(store):
+    # [FUNCTION DOC] Writes one run holding four samples of one metric key: a base coordinate and
+    # three variants differing in exactly one of steps key, constraint key or step. Asserts each
+    # exact coordinate query returns only its own value (plain equality on every column).
     # Four values under one metric_key; each non-base row differs from the
     # base coordinate in exactly one coordinate column.
     _write(
@@ -172,6 +208,9 @@ def test_coordinate_isolation(store):
 
 
 def test_mark_untrusted_by_run_id_excludes_immediately(store):
+    # [FUNCTION DOC] Writes two runs, marks the newer one untrusted by run id, and asserts exactly
+    # one run was affected, the very next baseline query excludes it (no rebaseline step needed),
+    # the older run remains, and the two run ids differ.
     keep = _write(store, created_at="2026-06-01T00:00:00+00:00", values=[_sample("reward_mean", 0.5)])
     drop = _write(store, created_at="2026-06-02T00:00:00+00:00", values=[_sample("reward_mean", 0.9)])
 
@@ -185,6 +224,9 @@ def test_mark_untrusted_by_run_id_excludes_immediately(store):
 
 
 def test_mark_untrusted_by_github_run_id(store):
+    # [FUNCTION DOC] Writes two runs sharing one provenance (github run id 7777, no pull request
+    # number), marks untrusted by github run id, and asserts both runs were affected and the
+    # baseline is empty.
     prov = RunProvenance("c1", None, 7777, 1, "push", "refs/heads/main")
     _write(store, provenance=prov, created_at="2026-06-01T00:00:00+00:00", values=[_sample("m", 1.0)])
     _write(store, provenance=prov, created_at="2026-06-02T00:00:00+00:00", values=[_sample("m", 2.0)])
@@ -195,6 +237,8 @@ def test_mark_untrusted_by_github_run_id(store):
 
 
 def test_mark_untrusted_by_commit_sha(store):
+    # [FUNCTION DOC] Writes one run with a distinctive commit sha and asserts marking untrusted by
+    # that commit sha affects exactly one run.
     prov = RunProvenance("badc0de", 5, 1, 1, "pull_request", "refs/pull/5/merge")
     _write(store, provenance=prov, created_at="2026-06-01T00:00:00+00:00", values=[_sample("m", 1.0)])
     affected = store.mark_untrusted(commit_sha="badc0de")
@@ -202,6 +246,8 @@ def test_mark_untrusted_by_commit_sha(store):
 
 
 def test_mark_untrusted_is_idempotent(store):
+    # [FUNCTION DOC] Marks one run untrusted twice by run id; asserts the first call affects one
+    # run and the second affects zero since it is already untrusted.
     rid = _write(store, created_at="2026-06-01T00:00:00+00:00", values=[_sample("m", 1.0)])
     assert store.mark_untrusted(run_id=rid) == 1
     # Already untrusted -> no rows change.
@@ -209,6 +255,8 @@ def test_mark_untrusted_is_idempotent(store):
 
 
 def test_mark_untrusted_requires_exactly_one_key(store):
+    # [FUNCTION DOC] Asserts a value error when marking untrusted with no selector at all and when
+    # giving two selectors (run id and commit sha) at once.
     with pytest.raises(ValueError):
         store.mark_untrusted()
     with pytest.raises(ValueError):
@@ -216,11 +264,17 @@ def test_mark_untrusted_requires_exactly_one_key(store):
 
 
 def test_untrusted_run_never_in_baseline(store):
+    # [FUNCTION DOC] Writes a run flagged untrusted at write time and asserts it never appears in
+    # the baseline query results.
     _write(store, created_at="2026-06-01T00:00:00+00:00", trusted=False, values=[_sample("m", 5.0)])
     assert _recent(store, "m") == []
 
 
 def test_baseline_sql_matches_authoritative_shape():
+    # [FUNCTION DOC] Imports the private baseline query text of the SQLite store, collapses and
+    # lowercases its whitespace, and asserts it contains each required fragment: the join of
+    # metric values to runs, equality predicates on test path, backend, suite, metric key, steps
+    # key, constraint key and step, the trusted filter, newest-first ordering and a limit.
     # Guard against drift from the authoritative query: identity predicates,
     # plain equality on every coordinate column, trusted filter,
     # created_at DESC, LIMIT.
@@ -245,6 +299,9 @@ def test_baseline_sql_matches_authoritative_shape():
 
 
 def test_neon_store_requires_dsn(monkeypatch):
+    # [FUNCTION DOC] Removes the Neon connection-string environment variable and asserts that
+    # constructing the Neon store without an explicit one raises a runtime error naming that
+    # variable, without attempting any connection.
     # No DSN passed and the env var unset: construction fails with a clear error
     # (not NotImplementedError -- the backend is implemented now). It must not
     # attempt a connection, so the failure is purely about the missing DSN.

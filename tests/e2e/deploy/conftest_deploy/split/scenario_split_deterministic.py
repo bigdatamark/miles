@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# HELPER: Scenario for the deterministic split-deployment deploy test. Compares a baseline side
+# (the Qwen3-0.6B split-deployment example run as one unsplit release, with mooncake object store
+# arguments) against a target side (the same run deployed as several separate releases, each with
+# its own training arguments and a fresh run uuid), both deterministic, on a Kubernetes cluster:
+# 3 rollouts, 4 training GPUs with context parallel 2, 2 rollout engines of 1 GPU each, weight
+# decay zero. The comparison requires at least 2 trained rollouts and matching engine counts and
+# deterministic metrics. Exposes a command-line app and a CI entry point wrapped to require a
+# deployable cluster. Module constants: test name, rollout counts, two rollout-GPU flag names, and
+# the single dense test mode.
+# KNOWN ISSUE: the two rollout-GPU flag name constants are defined but never used in this file.
 import dataclasses
 from collections.abc import Callable
 
@@ -45,6 +56,12 @@ _MODE: FTTestMode = FTTestMode(
 def _build_script_args(
     mode: FTTestMode, dump_dir: str, enable_dumper: bool, config: ExecuteTrainConfig | None = None
 ) -> ScriptArgs:
+    # [FUNCTION DOC] HELPER: Build the example's script arguments. Asserts the mode has real
+    # rollout engines and is not colocated (the trainer and engines are deployed separately).
+    # Starts from the given execute-train configuration, or the default one when absent, and sets:
+    # the mode's model name and Megatron type, 3 rollouts, actor GPUs, engine count and GPUs per
+    # engine, model and data directories, and extra deterministic-run arguments for the dump
+    # directory and dumper switch.
     assert mode.has_real_rollout, (
         f"{TEST_NAME} deploys the engines of a run as releases of their own, and mode {mode.model_name} has no "
         f"engines to deploy"
@@ -72,6 +89,10 @@ def _build_script_args(
 def _build_args(
     mode: FTTestMode, dump_dir: str, enable_dumper: bool = True, config: ExecuteTrainConfig | None = None
 ) -> str:
+    # [FUNCTION DOC] HELPER: Build the unsplit training argument string: build the script arguments,
+    # have the example build its training arguments with the rollout GPU count equal to the mode's
+    # total rollout GPUs, set weight decay to zero, assert the mode's declared parallelism matches,
+    # and return the string. The enable-dumper flag defaults to true.
     args = _build_script_args(mode, dump_dir, enable_dumper, config)
     train_args = without_weight_decay(build_train_args(args, rollout_num_gpus=mode.total_rollout_gpus))
 
@@ -82,10 +103,17 @@ def _build_args(
 def _build_baseline_args(
     mode: FTTestMode, dump_dir: str, enable_dumper: bool = True, config: ExecuteTrainConfig | None = None
 ) -> str:
+    # [FUNCTION DOC] HELPER: The unsplit training arguments with the mooncake object store
+    # arguments appended (baseline side only).
     return _build_args(mode, dump_dir, enable_dumper, config) + get_mooncake_object_store_args()
 
 
 def _build_deployments(request: RunSideRequest) -> list[RunDeployment]:
+    # [FUNCTION DOC] HELPER: Build the target side's list of deployments. Builds the script
+    # arguments from the request's mode, dump directory, dumper switch and configuration; for each
+    # (deploy component, deploy instance id) identity computed by the example from those
+    # arguments, makes a copy of the arguments with that identity and builds that deployment's
+    # training arguments (weight decay zero). The order of the identities is preserved.
     args = _build_script_args(request.mode, request.dump_dir, request.enable_dumper, request.config)
 
     return [
@@ -103,6 +131,9 @@ def _build_deployments(request: RunSideRequest) -> list[RunDeployment]:
 
 
 def _compare(dump_dir: str, mode: FTTestMode) -> None:
+    # [FUNCTION DOC] HELPER: Compare the deterministic outputs of the baseline and target side
+    # directories under the dump directory (at least 2 trained rollouts, engine count of the mode),
+    # then print a pass message.
     compare_deterministic_sides(
         baseline_dir=f"{dump_dir}/{BASELINE_SIDE}",
         target_dir=f"{dump_dir}/{TARGET_SIDE}",
@@ -117,6 +148,11 @@ def _compare(dump_dir: str, mode: FTTestMode) -> None:
 
 
 def _create_app_and_run_ci() -> tuple[typer.Typer, Callable[[], None]]:
+    # [FUNCTION DOC] HELPER: Build the comparison command-line app and CI callable through the
+    # fault-tolerance comparison framework with: baseline arguments with the object store, target
+    # arguments plain, the comparison function, a run-side function that runs the baseline as one
+    # release and the target as split deployments, and a resolver that always returns the single
+    # dense mode. Returns the app and the CI callable wrapped to require a deployable cluster.
     app, run_ci = create_comparison_app_and_run_ci(
         test_name=TEST_NAME,
         build_baseline_args=_build_baseline_args,

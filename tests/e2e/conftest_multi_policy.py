@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# HELPER: Shared execution and verification helpers for the multi-policy (solver and verifier)
+# GSM8K end-to-end tests. The execute function launches a training run through the example
+# launcher and then verifies the run's audit event logs: every trainer rank reported its
+# environment with the per-policy argument overrides it was built with, every policy logged at
+# least one held-out evaluation point, and (optionally) evaluation scores rose within bounds.
+# The module-level mapping fixes how many override arguments each policy (solver 25, verifier
+# 26) must have, so a shrinking verification fails loudly.
 from pathlib import Path
 from typing import NamedTuple
 
@@ -18,6 +26,10 @@ from miles.utils.audit_utils.process_identity import TrainProcessIdentity
 
 
 class EvalScoreBounds(NamedTuple):
+    # [CLASS DOC] HELPER: Learning bounds for one policy's evaluation score series. Fields: the
+    # highest allowed first score (to prove the run did not start already solved), the lowest
+    # required peak score, and an optional minimum growth from first to peak score (not checked
+    # when absent).
     initial_max: float
     peak_min: float
     min_growth: float | None = None
@@ -32,6 +44,13 @@ def execute(
     wandb_args: str,
     eval_score_bounds: dict[str, EvalScoreBounds] | None = None,
 ) -> None:
+    # [FUNCTION DOC] Run the multi-policy training and verify it. Steps: compute the audit events
+    # directory and the Megatron configuration (list of trainers with model ids and overrides) from
+    # the script arguments; build the training arguments (with the given tracking arguments) and
+    # launch the training (side effect: a long GPU job); then assert that every trainer rank
+    # trained with its policy's arguments (expected rank count = actor GPUs per policy), that each
+    # trainer's model id reported at least one evaluation point on the evaluation dataset, and,
+    # only if evaluation score bounds are given, that scores satisfy them. Raises assertion errors.
     events_dir = compute_events_dir(args)
     megatron_config = compute_megatron_config(args)
 
@@ -50,6 +69,17 @@ def execute(
 
 
 def assert_ranks_trained_with_policy_args(events_dir: Path, *, megatron_config: dict, expected_num_ranks: int) -> None:
+    # [FUNCTION DOC] Verify from the audit event logs that each policy's trainer ranks were built
+    # with the intended arguments. Reads all events under the directory and groups environment
+    # report events whose source is a training process by model id. Asserts: (1) the set of model
+    # ids reported equals the set of trainer model ids in the configuration (a policy with no
+    # reports was never trained); (2) for every policy, the sorted distinct (cell index, rank
+    # within cell) pairs number exactly the expected rank count, and equal the union of ranks seen
+    # over all policies; (3) for every trainer, the number of its override arguments equals the
+    # fixed expected count for its model id (the claimed verification size must not shrink);
+    # (4) for every report of that policy, the reported trainer model id equals the policy's, all
+    # override keys are present in the reported argument values, and their values equal the
+    # overrides. Raises assertion errors with descriptive messages.
     reports_by_model_id: dict[str, list[EnvReportEvent]] = {}
     for event in read_events(events_dir):
         if isinstance(event, EnvReportEvent) and isinstance(event.source, TrainProcessIdentity):
@@ -99,6 +129,10 @@ def assert_ranks_trained_with_policy_args(events_dir: Path, *, megatron_config: 
 
 
 def assert_policies_reported_eval_points(events_dir: Path, *, model_ids: list[str], dataset_name: str) -> None:
+    # [FUNCTION DOC] For each model id, collect from the event logs under the directory the
+    # values of the metric named "eval/<dataset>/<model id>" across all metric events (re-reading
+    # the events for each model), and assert at least one point exists; otherwise fail saying held-
+    # out evaluation never ran for that policy.
     for model_id in model_ids:
         eval_key = f"eval/{dataset_name}/{model_id}"
         points = [
@@ -115,6 +149,10 @@ def assert_policies_reported_eval_points(events_dir: Path, *, model_ids: list[st
 def assert_policy_eval_scores_learned(
     events_dir: Path, *, bounds: dict[str, EvalScoreBounds], dataset_name: str
 ) -> None:
+    # [FUNCTION DOC] For each model id in the bounds mapping, read its evaluation score series
+    # (ordered by weight version) and assert: the series is non-empty; the first score is at most
+    # the initial maximum; the peak (maximum) score is at least the peak minimum; and, if a
+    # minimum growth is set, peak minus first is at least that growth. Raises assertion errors.
     for model_id, model_bounds in bounds.items():
         scores = _read_eval_score_series(events_dir, model_id=model_id, dataset_name=dataset_name)
         assert scores, f"policy {model_id!r}: no eval/{dataset_name}/{model_id} points under {events_dir}"
@@ -133,6 +171,10 @@ def assert_policy_eval_scores_learned(
 
 
 def _read_eval_score_series(events_dir: Path, *, model_id: str, dataset_name: str) -> list[float]:
+    # [FUNCTION DOC] HELPER: Return the evaluation scores of one policy, in training order. From
+    # every metric event under the directory that has the metric "eval/<dataset>/<model id>", pair
+    # the maximum weight version metric for it (default 0 if absent) with the score, sort the
+    # pairs (by version, then score) and return just the scores.
     eval_key = f"eval/{dataset_name}/{model_id}"
     version_key = f"{eval_key}/weight_version/max"
     points = [

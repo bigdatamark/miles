@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# End-to-end checkpoint save/load script for GLM-4.7-Flash on 8 GPUs (Megatron backend,
+# multi-token-prediction training and EAGLE speculative decoding enabled). Registered as a
+# disabled 2400-second 8-GPU H100 CUDA test (hopper and blackwell hardware, ckpt label) with the
+# reason "Disabled due to bugs." Module settings: evaluation off, DeepEP off, a tight-host-memory
+# switch read from an environment variable (default off), model name and Megatron model type,
+# 8 GPUs. As a script it prepares the model, strips proxy variables, then runs four training
+# jobs in order: synchronous save, load of the latest checkpoint, asynchronous save, load of the
+# latest checkpoint again (loading checks the model hash saved earlier).
 import os
 
 from tests.ci.ci_register import register_cuda_ci
@@ -24,6 +33,10 @@ NUM_GPUS = 8
 
 
 def _get_latest_checkpointed_iteration() -> int:
+    # [FUNCTION DOC] HELPER: Read the latest-checkpointed-iteration marker file in the saved
+    # checkpoint directory of this model (under the models root, directory name ending in
+    # "_miles"), strip whitespace, and return the iteration number as an integer. Raises a value
+    # error if the text is not all digits; a missing file raises the usual file-not-found error.
     latest_path = f"/root/models/{MODEL_NAME}_miles/latest_checkpointed_iteration.txt"
     with open(latest_path, encoding="utf-8") as f:
         latest_text = f.read().strip()
@@ -33,6 +46,12 @@ def _get_latest_checkpointed_iteration() -> int:
 
 
 def prepare():
+    # [FUNCTION DOC] Prepare the GLM-4.7-Flash run. Through the command backend: create the models
+    # and datasets directories, download the model from the hub into the models directory, delete
+    # any previous saved-checkpoint directory (suffix "_miles"), download the math training
+    # dataset and the AIME 2024 dataset, then convert the Hugging Face checkpoint to the Megatron
+    # distributed format across 8 GPUs into the models directory. Side effects: network downloads,
+    # filesystem changes, GPU job.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download zai-org/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -49,6 +68,24 @@ def prepare():
 
 
 def execute(mode: str = "", ckpt_step: int | None = None):
+    # [FUNCTION DOC] Run one training job in the given checkpoint mode. Mode "save": save every
+    # step to the miles checkpoint directory. Mode "async_save": same plus asynchronous save with a
+    # persistent checkpoint worker. Mode "load": load from that directory at the given checkpoint
+    # step (the step is then required; it is interpolated as-is). Any other mode (the default
+    # empty string): only the reference checkpoint is loaded and nothing is saved. Fixed
+    # settings: 2 rollouts of batch 4 with 2 samples per prompt on the math dataset (deepscaler
+    # reward, response up to 1024 tokens, temperature 1), global batch 8, tensor parallel 2,
+    # pipeline 2 (23 layers in the last stage), context 2, expert parallel 4, full recompute,
+    # dynamic batch with 8192 tokens per GPU, GRPO with low-variance KL loss coefficient 0,
+    # Adam with CPU offload and precision-aware optimizer, rollout engines of 4 GPUs with 0.7
+    # memory fraction and EAGLE speculative decoding, MTP training with loss factor 0.2,
+    # all-to-all token dispatcher (DeepEP variant only when the module switch is on), colocated on
+    # 1 node. Tight-host-memory mode adds 16-bit optimizer moment dtypes. CI test mode is on; save
+    # modes also save the model hash and load mode checks it. Evaluation arguments are added only
+    # when the module switch is on. The job is launched through the backend's execute-train with
+    # an environment variable setting the routing-replay threshold to 1.0.
+    # KNOWN ISSUE: a comment says an optimizer equality check should be added here (FIXME in the
+    # code); the test only checks the model hash.
     U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/models/{MODEL_NAME}_torch_dist "
     if mode == "save":

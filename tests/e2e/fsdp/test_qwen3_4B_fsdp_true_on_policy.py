@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# End-to-end script for FSDP true-on-policy training of Qwen3-4B on 2 GPUs (colocated) with
+# deterministic inference. Registered as an 800-second 2-GPU H200 CUDA test (hopper only, fsdp
+# label). Module settings: an evaluation switch from an environment variable (default on) and
+# 2 GPUs. As a script: download the model, the math training dataset and AIME 2024, strip proxy
+# variables, train 2 rollouts of 8 prompts with 8 samples (up to 4096 tokens, global batch 32) with
+# GRPO, CI test mode and the true-on-policy settings.
 import os
 
 from tests.ci.ci_register import register_cuda_ci
@@ -18,6 +25,9 @@ MODEL_NAME = "Qwen3-4B"
 
 
 def prepare():
+    # [FUNCTION DOC] Through the command backend: create the models and datasets directories,
+    # download the Qwen3-4B model into the models directory and download the math training dataset
+    # and the AIME 2024 dataset. Side effects: network downloads, filesystem.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -26,6 +36,19 @@ def prepare():
 
 
 def execute():
+    # [FUNCTION DOC] Launch the training job through the backend's execute-train (no Megatron
+    # model type) with extra environment variables (tree allreduce algorithm, non-deterministic
+    # algorithms disallowed, fixed cuBLAS workspace configuration, single CUDA device connection).
+    # Arguments: the HF checkpoint; math rollouts (2 rollouts of 8 prompts with 8 samples, up to
+    # 4096 tokens, temperature 1, global batch 32); Adam learning rate 1e-6 with weight decay 0.1;
+    # GRPO with zero KL-loss, KL and entropy coefficients and clipping 0.2 / 0.28; FSDP backend with
+    # a 512 MiB update buffer; evaluation arguments on the AIME 2024 dataset (1 sample, 4096 tokens,
+    # top-p 0.7); SGLang with one GPU per engine, metrics, deterministic inference, the dense
+    # Qwen3 true-on-policy contract, fa3 attention backends and deterministic plus true-on-policy
+    # modes; CI test mode; one node, 2 GPUs, colocated.
+    # KNOWN ISSUE: the evaluation switch only controls the evaluation interval flag; when it is off
+    # the evaluation dataset arguments are still passed, so evaluation arguments are never fully
+    # removed.
     U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME} "
 

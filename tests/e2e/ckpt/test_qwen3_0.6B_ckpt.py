@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# End-to-end checkpoint save/load script for Qwen3-0.6B on 2 GPUs (Megatron backend). Registered
+# as a 900-second 2-GPU H200 CUDA test (hopper and blackwell, ckpt label) and a 1500-second
+# nightly 2-GPU MI350 ROCm test. Module settings: an evaluation switch read from an environment
+# variable (default on), model name and Megatron model type, 2 GPUs, and a container-local save
+# directory under the checkpoints root (not the models root, which is a host directory shared by
+# all runners). As a script it prepares the model, strips proxy variables, then runs four
+# training jobs: synchronous save, load of the latest checkpoint, asynchronous save, load of the
+# latest checkpoint again (loading checks the model hash saved earlier).
+# KNOWN ISSUE: the evaluation switch is defined but never used, so no evaluation arguments are
+# ever passed (the evaluation dataset is still downloaded in the prepare step).
 import os
 
 from tests.ci.ci_register import register_cuda_ci, register_rocm_ci
@@ -17,6 +28,9 @@ SAVE_DIR = f"/root/checkpoints/{MODEL_NAME}_miles"
 
 
 def _get_latest_checkpointed_iteration() -> int:
+    # [FUNCTION DOC] HELPER: Read the latest-checkpointed-iteration marker file in the save
+    # directory, strip whitespace, and return the iteration number as an integer. Raises a value
+    # error if the text is not all digits; a missing file raises the usual file-not-found error.
     latest_path = f"{SAVE_DIR}/latest_checkpointed_iteration.txt"
     with open(latest_path, encoding="utf-8") as f:
         latest_text = f.read().strip()
@@ -26,6 +40,11 @@ def _get_latest_checkpointed_iteration() -> int:
 
 
 def prepare():
+    # [FUNCTION DOC] Prepare the Qwen3-0.6B run. Through the command backend: create the models
+    # and datasets directories, download the model into the models directory, delete the save
+    # directory, download the math training dataset and the AIME 2024 dataset, then convert the
+    # Hugging Face checkpoint to the Megatron distributed format across 2 GPUs into the models
+    # directory. Side effects: network downloads, filesystem changes, GPU job.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -39,6 +58,19 @@ def prepare():
 
 
 def execute(mode: str = "", ckpt_step: int | None = None):
+    # [FUNCTION DOC] Run one training job in the given checkpoint mode. Mode "save": save every
+    # step to the save directory. Mode "async_save": same plus asynchronous save with a persistent
+    # checkpoint worker. Mode "load": load from the save directory at the given checkpoint step
+    # (required; interpolated as-is) with low-memory resume. Any other mode (default empty
+    # string): only the reference checkpoint is loaded and nothing is saved. Fixed settings: 2
+    # rollouts of batch 4 with 2 samples per prompt on the math dataset (deepscaler reward,
+    # response up to 1024 tokens, temperature 0.8), global batch 8, tensor parallel 2 with
+    # sequence parallel, full recompute, dynamic batch with 16384 tokens per GPU, GRPO with zero
+    # KL and entropy coefficients and clip 0.2, Adam learning rate 1e-6, one rollout engine over
+    # 2 GPUs with 0.7 memory fraction and a list of decode CUDA graph batch sizes, dropout off,
+    # fp32 gradient accumulation and softmax, flash attention backend, colocated on 1 node. CI
+    # test mode is on; save modes also save the model hash and load mode checks it. Launched
+    # through the backend's execute-train.
     U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/models/{MODEL_NAME}_torch_dist "
     if mode == "save":

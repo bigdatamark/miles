@@ -1,3 +1,16 @@
+# [MODULE DOC]
+# HELPER: Scenario for the multi-policy split-deployment deploy test: the solver-and-verifier GSM8K
+# multi-policy example deployed as separate releases on a Kubernetes cluster, then verified from
+# the audit event logs and metric files. Command-line app with "run" (check the cluster, set the
+# training extra environment variables in the process environment, prepare data and models, install
+# and run the deployments, verify) and "verify" (only verify a previous run, identified by the
+# run id environment variable). Verification: the output events directory exists; every trainer rank
+# trained with its policy's arguments; the leader policy trained on every rollout 0..N-1; for
+# each policy, the gradient norm and loss are finite and non-zero over at least 2 rollouts, and
+# the train-versus-rollout log probability absolute difference was reported over at least 2
+# rollouts, is finite, and never exceeds 0.1. Constants: test name, minimum rollouts, the
+# log-probability tolerance, and the unified-gradient fused log-probability debug flag added to
+# the extra arguments.
 import dataclasses
 import math
 import os
@@ -33,6 +46,12 @@ UNIFIED_GRAD_FUSED_LOGPROB_FLAG: str = "--debug-unified-grad-fused-logprob"
 
 
 def _run(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] HELPER: Run the whole scenario. Calls the example's prepare step (downloads and
+    # conversions); makes a configuration copy with a freshly generated run uuid and the extra
+    # arguments extended with the unified-gradient fused log-probability debug flag (stripped of
+    # surrounding whitespace); installs the deployments built from that configuration, launching
+    # through the example's training launcher, into its dump directory (removed first if present);
+    # finally verifies using the original arguments. Side effects: long GPU job, cluster releases.
     prepare(args)
 
     config = dataclasses.replace(
@@ -51,6 +70,9 @@ def _run(args: ScriptArgs) -> None:
 
 
 def _build_deployments(args: ScriptArgs) -> list[RunDeployment]:
+    # [FUNCTION DOC] HELPER: For each (deploy component, deploy instance id) identity computed by the
+    # example from the arguments, make a copy of the arguments with that identity and build the
+    # deployment's training arguments; return the deployments in identity order.
     return [
         RunDeployment(
             deploy_component=deploy_component,
@@ -64,6 +86,13 @@ def _build_deployments(args: ScriptArgs) -> list[RunDeployment]:
 
 
 def _verify(args: ScriptArgs) -> None:
+    # [FUNCTION DOC] HELPER: Verify a finished run. Computes the audit events directory and the dump
+    # directory (its parent). Asserts the events directory exists (message explains verifying a
+    # previous run needs its run id in the environment). Asserts every trainer rank trained with
+    # its policy's overrides (expected ranks = actor GPUs per policy) and that the leader policy
+    # trained on every rollout. For each policy model id: the gradient norm and loss metrics are
+    # finite and non-zero over at least 2 rollouts, and the trainer-scores-engine-output check
+    # passes. Prints a pass message.
     events_dir = compute_events_dir(args)
     dump_dir = _compute_dump_dir(args)
 
@@ -96,6 +125,9 @@ def _verify(args: ScriptArgs) -> None:
 
 
 def _assert_leader_policy_ran_all_rollouts(dump_dir: str, *, num_rollout: int) -> None:
+    # [FUNCTION DOC] HELPER: Read the leader policy's gradient norm series (pairs of rollout id and
+    # value) and assert the sorted distinct rollout ids are exactly 0..num_rollout-1 (a missing
+    # one means a deployment failed rather than the run finishing).
     series = read_metric_series(dump_dir, key=f"{LEADER_MODEL_ID}/train/grad_norm")
     trained_rollout_ids = sorted({rollout_id for rollout_id, _ in series})
 
@@ -106,6 +138,10 @@ def _assert_leader_policy_ran_all_rollouts(dump_dir: str, *, num_rollout: int) -
 
 
 def _assert_trainer_scores_engine_output(dump_dir: str, *, model_id: str) -> None:
+    # [FUNCTION DOC] HELPER: For the policy's train-versus-rollout log-probability absolute
+    # difference metric series: assert it was reported for at least 2 distinct rollouts; assert no
+    # value is non-finite (the maximum would silently skip over nan); assert the maximum value is
+    # at most 0.1, i.e. the trainer and the engines serve the same weights.
     key = f"{model_id}/train/train_rollout_logprob_abs_diff"
     series = read_metric_series(dump_dir, key=key)
 
@@ -129,6 +165,8 @@ def _assert_trainer_scores_engine_output(dump_dir: str, *, model_id: str) -> Non
 
 
 def _compute_dump_dir(config: ExecuteTrainConfig) -> str:
+    # [FUNCTION DOC] HELPER: The dump directory of a run: the parent of the example's events
+    # directory for the configuration, as a string.
     return str(compute_events_dir(config).parent)
 
 
@@ -136,6 +174,10 @@ def _compute_dump_dir(config: ExecuteTrainConfig) -> str:
 
 
 def _run_ci_on_deployable_cluster() -> None:
+    # [FUNCTION DOC] HELPER: The "run" command and CI entry point. Reads the default configuration
+    # for the script-arguments class, asserts the cluster can deploy runs, updates the process
+    # environment with the example's training extra environment variables (side effect), and
+    # runs the scenario.
     config = command_utils.default_config(ScriptArgs)
     assert_cluster_can_deploy_runs(config)
     os.environ.update(TRAIN_EXTRA_ENV_VARS)
@@ -143,6 +185,8 @@ def _run_ci_on_deployable_cluster() -> None:
 
 
 def _verify_previous_run_output() -> None:
+    # [FUNCTION DOC] HELPER: The "verify" command: verify the output of a previous run, using the
+    # default configuration (whose run id comes from the environment); no cluster check, no setup.
     _verify(command_utils.default_config(ScriptArgs))
 
 

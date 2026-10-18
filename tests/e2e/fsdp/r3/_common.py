@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# HELPER: Shared driver for the FSDP rollout-routing-replay end-to-end cases. A case describes a
+# model (name, hub repository, GPU count, GPUs per rollout engine, SGLang attention backend and
+# transformers attention implementation). The driver prepares the model and math dataset, strips
+# proxy variables, and launches a short colocated GRPO job on the FSDP backend with routing replay
+# and CI test mode on (which checks that the training engine reproduces the rollout's routing).
+# Cases import this module as a library; their own file registers the CI declarations.
 """Shared driver for the FSDP rollout-routing-replay (R3) e2e cases.
 
 Each case runs a short GRPO job with ``--use-rollout-routing-replay`` and ``--ci-test``, which
@@ -19,6 +26,11 @@ from miles.utils.external_utils import command_utils
 
 @dataclass
 class CaseConfig:
+    # [CLASS DOC] HELPER: Mutable description of one routing-replay case: the local model directory
+    # name under the models root, the hub repository to download it from, the number of GPUs used
+    # (the job is colocated on one node), the GPUs per rollout engine, the SGLang attention backend
+    # (default "fa3") and the model attention implementation (default "flash_attention_3"). Callers
+    # may override the two attention fields after construction (the GLM case does for ROCm).
     model_name: str
     hf_repo: str
     num_gpus: int
@@ -28,6 +40,9 @@ class CaseConfig:
 
 
 def prepare(case: CaseConfig) -> None:
+    # [FUNCTION DOC] HELPER: Through the command backend: create the models and datasets
+    # directories, download the case's model from the hub into the models directory under its
+    # name, and download the math training dataset. Side effects: network downloads, filesystem.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download {case.hf_repo} --local-dir /root/models/{case.model_name}")
@@ -35,6 +50,18 @@ def prepare(case: CaseConfig) -> None:
 
 
 def execute(case: CaseConfig, wandb_file: str) -> None:
+    # [FUNCTION DOC] HELPER: Launch the training job for the case through the backend's
+    # execute-train (no Megatron model type). Arguments: the model checkpoint; 2 rollouts of 8
+    # prompts with 8 samples each on the math dataset (math reward, response up to 1024 tokens,
+    # temperature 1), global batch 32; Adam learning rate 1e-6 with weight decay 0.1; GRPO with zero
+    # KL, KL-loss and entropy coefficients and asymmetric clipping 0.2 / 0.28; the FSDP backend
+    # with gradient checkpointing (which exercises the backward replay cursor), a weight update
+    # buffer of 512 MiB, dynamic batch sizing with 8192 tokens per GPU, and an expandable-segments
+    # CUDA allocator setting scoped to the training process only (it would break memory release
+    # by colocated SGLang engines elsewhere); routing replay; SGLang with the case's GPUs per
+    # engine, memory fraction 0.8, chunked prefill 4096 and the case's attention backends; CI test
+    # mode; one node with the case's GPU count, colocated; plus the default tracking arguments
+    # derived from the given file path.
     U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint /root/models/{case.model_name} "
 
@@ -118,6 +145,9 @@ def execute(case: CaseConfig, wandb_file: str) -> None:
 
 
 def main(case: CaseConfig, wandb_file: str) -> None:
+    # [FUNCTION DOC] HELPER: Entry point used by case scripts. Prepares the case, removes the
+    # lower- and upper-case http and https proxy variables from the process environment (side
+    # effect, applied after downloads so they could use the proxy), and executes the training job.
     prepare(case)
     for proxy_var in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
         os.environ.pop(proxy_var, None)

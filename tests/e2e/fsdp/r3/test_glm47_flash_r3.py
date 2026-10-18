@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# End-to-end routing-replay case for GLM-4.7-Flash on 8 GPUs with 2 GPUs per rollout engine, run
+# as a script through the shared FSDP routing-replay driver. Registered as an 800-second 8-GPU
+# H200 CUDA test (hopper only; fsdp and replay labels) and an 800-second nightly 8-GPU MI350 ROCm
+# test; declares history gates for the gradient norm, policy KL and raw reward (defaults from the
+# gate table). On ROCm (hardware platform environment variable equal to "rocm") the case switches
+# to the triton SGLang attention backend and the flash_attention_2 implementation.
 """FSDP R3 on glm4_moe_lite (GLM-4.7-Flash): 47 decoder layers of which 46 are MoE
 (``first_k_dense_replace=1`` makes layer 0 dense), 64 experts, topk 4, group-limited routing.
 

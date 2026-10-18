@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# End-to-end script testing FSDP weight updates through the "disk-delta" transfer protocol on
+# Qwen3-0.6B with 4 GPUs (2 for training, 2 for rollout, not colocated, asynchronous training
+# script). Registered as a 900-second 4-GPU H200 CUDA test (hopper only, weight-update label) and a
+# 500-second nightly 4-GPU MI350 ROCm test. Uses the legacy module-level command helper API (not
+# the backend object). Flow as a script: download the model and GSM8K, strip proxy variables, run
+# 3 rollouts of 32 prompts with 8 samples each (oversampling 64 with a dynamic filter requiring
+# non-zero reward spread, global batch 256) with weight updates published to a disk directory and
+# reconciled against a local checkpoint directory under the root filesystem. KL checker disabled.
 import os
 
 from tests.ci.ci_register import register_cuda_ci, register_rocm_ci
@@ -21,12 +30,24 @@ NUM_GPUS = 4
 
 
 def prepare():
+    # [FUNCTION DOC] Create the models and datasets directories, download the model from the hub
+    # into the models directory, and download the GSM8K dataset, all through the legacy helper
+    # functions. Side effects: network downloads, filesystem.
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
     U.hf_download_dataset("zhuzilin/gsm8k")
 
 
 def execute():
+    # [FUNCTION DOC] Launch the training job through the legacy execute-train helper with no
+    # Megatron model type and the asynchronous training script. Arguments: the HF checkpoint; GSM8K
+    # rollouts (math reward, 3 rollouts, batch 32, 8 samples, up to 1024 tokens, temperature 1,
+    # oversampling 64 with a non-zero-reward-spread filter, global batch 256); Adam learning rate
+    # 1e-6 with weight decay 0.1; GRPO with zero KL-loss, KL and entropy coefficients and clipping
+    # 0.2 / 0.28 (KL loss left disabled); one rollout GPU per engine with SGLang metrics; a node
+    # with half the GPUs (2) for training and half (2) for rollout (not colocated), the FSDP
+    # backend, disk-delta weight transfer with a published directory and a local checkpoint
+    # directory; CI test mode with the KL checker disabled.
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME} "
 
     rollout_args = (

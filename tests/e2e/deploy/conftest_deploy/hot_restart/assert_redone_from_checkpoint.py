@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# HELPER: Verdict for the checkpointed hot-restart scenario: after take-overs of a run that had
+# already saved checkpoints, only the training steps after the latest checkpoint were redone.
+# Works purely from event logs. Each take-over rolls the live event log aside into a directory
+# matching a "trash" glob inside the dump directory, and every checkpoint save writes a copy of
+# the event log (in a "debug_events" folder beside each iteration directory). A step's log entry
+# is the JSON of its training-step metric event; a step trained again produces a different
+# entry. The module checks that rolled-aside logs, the surviving log and the checkpoint copies
+# are consistent with the schedule of freezes (which iteration was saved, after which step the
+# run was frozen), and returns summary data. Constants: the two glob patterns.
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +27,10 @@ CHECKPOINT_SNAPSHOT_GLOB: str = "iter_*/debug_events"
 
 @dataclass(frozen=True)
 class RedoneSteps:
+    # [CLASS DOC] HELPER: Immutable summary of what the checks found. Fields: for each take-over,
+    # in order, the rollout id it resumed from (the last step kept), the rollout id the run had
+    # reached when frozen, and a mapping from every rollout id to the number of distinct times it
+    # was trained.
     resume_rollout_ids: tuple[int, ...]
     frozen_rollout_ids: tuple[int, ...]
     attempts_of_rollout_id: dict[int, int]
@@ -33,6 +47,20 @@ def assert_only_post_checkpoint_steps_redone(
     num_rollouts: int,
     schedule: Sequence[ScheduledFreeze],
 ) -> RedoneSteps:
+    # [FUNCTION DOC] Main verdict. Steps: (1) assert records is non-empty and that each record was
+    # triggered with a saved checkpoint and matches the schedule; (2) read the rolled-aside
+    # event directories and assert there is exactly one per restart record and each has at least
+    # one finished step; sort those logs by their highest step and append the surviving live log;
+    # (3) assert the highest step of each rolled-aside log equals the scheduled frozen step, in
+    # order; (4) for each rolled-aside log and its successor, assert the log holds a contiguous run
+    # of steps from zero, and that the steps whose log entry is unchanged in the successor form a
+    # contiguous prefix; that prefix end is the resume point (minus one if none); (5) assert the
+    # resume points equal the scheduled saved iterations; (6) assert the surviving log holds
+    # each step 0..num_rollouts-1 exactly once; (7) assert each resume point is the step set of
+    # some checkpoint event-log copy; (8) count for every rollout id the distinct entries over all
+    # logs, assert equality with the expected attempts of the schedule, and assert the set of
+    # attempt counts is exactly one and two. Returns the summary. Raises assertion errors with
+    # explanatory messages; reads files.
     assert (
         records
     ), f"{dump_dir} holds a run nothing restarted, so it says nothing about which steps a take-over redoes"
@@ -115,6 +143,10 @@ def assert_only_post_checkpoint_steps_redone(
 
 
 def compute_expected_attempts(*, num_rollouts: int, schedule: Sequence[ScheduledFreeze]) -> dict[int, int]:
+    # [FUNCTION DOC] Return, for each rollout id from 0 to num_rollouts-1, the expected number of
+    # times it is trained: one plus the number of scheduled freezes whose redone window contains
+    # it (window: after the saved iteration, up to and including the frozen step; a missing saved
+    # iteration counts as minus one, so the window starts at step 0).
     return {
         rollout_id: 1 + sum(1 for one in schedule if _is_inside_redone_window(rollout_id, scheduled=one))
         for rollout_id in range(num_rollouts)
@@ -122,6 +154,8 @@ def compute_expected_attempts(*, num_rollouts: int, schedule: Sequence[Scheduled
 
 
 def _is_inside_redone_window(rollout_id: int, *, scheduled: ScheduledFreeze) -> bool:
+    # [FUNCTION DOC] HELPER: True when the rollout id is strictly greater than the resume point (the
+    # saved iteration, or minus one if none) and at most the frozen rollout id.
     resumed_from = -1 if scheduled.saved_iteration is None else scheduled.saved_iteration
     return resumed_from < rollout_id <= scheduled.frozen_rollout_id
 
@@ -132,6 +166,9 @@ def _is_inside_redone_window(rollout_id: int, *, scheduled: ScheduledFreeze) -> 
 def _assert_take_overs_handed_frozen_run(
     records: Sequence[HotRestartRecord], *, schedule: Sequence[ScheduledFreeze]
 ) -> None:
+    # [FUNCTION DOC] HELPER: Assert every restart record was fired against a run holding a
+    # checkpoint (saved iteration at trigger not missing), and that the list of (saved iteration at
+    # trigger, frozen rollout id) pairs of the records equals the scheduled pairs, in order.
     triggered = [
         (one.saved_iteration_at_trigger, one.frozen_rollout_id)
         for one in records
@@ -149,6 +186,11 @@ def _assert_take_overs_handed_frozen_run(
 
 
 def _assert_resume_points_are_checkpoints(*, checkpoint_dir: str, resume_rollout_ids: Sequence[int]) -> None:
+    # [FUNCTION DOC] HELPER: Assert that each resume point corresponds to a real checkpoint. Reads
+    # the event-log copies saved beside the checkpoints (must be non-empty) and maps each
+    # checkpoint iteration directory name to its sorted finished steps. For every resume point
+    # (index and value), requires some copy whose steps are exactly 0..resume, otherwise fails
+    # saying the take-over resumed from something no save wrote.
     snapshot_dirs = read_checkpoint_snapshot_dirs(checkpoint_dir)
     assert snapshot_dirs, (
         f"{checkpoint_dir} holds no event log snapshot beside any checkpoint, so what the run resumed from was "
@@ -169,6 +211,9 @@ def _assert_resume_points_are_checkpoints(*, checkpoint_dir: str, resume_rollout
 
 
 def _read_finished_steps(events_dir: Path) -> dict[int, str]:
+    # [FUNCTION DOC] HELPER: Read the training-step events under the directory and assert no
+    # rollout id appears more than once (a take-over rolls the log back before redoing). Returns a
+    # mapping from rollout id to the single JSON entry.
     events_of_rollout_id = read_step_events(events_dir)
 
     repeated = {rollout_id: len(logged) for rollout_id, logged in events_of_rollout_id.items() if len(logged) > 1}
@@ -180,6 +225,10 @@ def _read_finished_steps(events_dir: Path) -> dict[int, str]:
 
 
 def read_step_events(events_dir: Path) -> dict[int, list[str]]:
+    # [FUNCTION DOC] Read all events under the directory and keep metric events that have a
+    # rollout id and contain the training-step metric key. Returns a mapping from rollout id to
+    # the list of those events serialized as JSON strings, in read order, with keys sorted
+    # ascending.
     events_of_rollout_id: dict[int, list[str]] = {}
     for event in read_events(events_dir):
         if isinstance(event, MetricEvent) and event.rollout_id is not None and TRAIN_STEP_METRIC_KEY in event.metrics:
@@ -188,8 +237,12 @@ def read_step_events(events_dir: Path) -> dict[int, list[str]]:
 
 
 def read_discarded_event_dirs(dump_dir: str) -> list[Path]:
+    # [FUNCTION DOC] Return the sorted list of directories directly inside the dump directory that
+    # match the "trash" glob, i.e. the event logs moved aside by take-overs.
     return sorted(Path(dump_dir).glob(DISCARDED_EVENTS_GLOB))
 
 
 def read_checkpoint_snapshot_dirs(checkpoint_dir: str) -> list[Path]:
+    # [FUNCTION DOC] Return the sorted list of event-log copy directories saved beside the
+    # checkpoints: those matching the pattern "iter_*/debug_events" under the checkpoint directory.
     return sorted(Path(checkpoint_dir).glob(CHECKPOINT_SNAPSHOT_GLOB))

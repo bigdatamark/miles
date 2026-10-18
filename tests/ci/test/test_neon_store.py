@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Tests of the Neon (Postgres) metric-history store. Two layers: (1) offline tests that replace
+# the psycopg driver module (inserted into the module table by a fixture) with a fake
+# connection/cursor recording executed statements, parameters, commits, rollbacks, connects and
+# closes, asserting the store's SQL shape, parameter order, single-transaction writes, rollback
+# on failure, validation before any statement, connection string resolution (explicit argument
+# beats the environment variable; missing is a runtime error), no connection at construction and
+# one fresh connection per operation that is always closed; (2) one live round-trip test, skipped
+# unless the test Postgres connection-string environment variable is set, which provisions the
+# two tables (runs and metric values plus indexes) as an admin and exercises write, read and
+# mark-untrusted. Registers itself as a CPU test in the stage-a-cpu suite.
 """Tests for :class:`NeonMetricHistoryStore`.
 
 Two layers:
@@ -52,6 +63,9 @@ REL_CONSTRAINT_KEY = '{"rel_down":0.2,"rel_up":0.2}'
 
 
 def _sample(metric_key, value, *, steps_key=LAST_STEPS_KEY, constraint_key=REL_CONSTRAINT_KEY, step=-1):
+    # [FUNCTION DOC] HELPER: Build a metric sample from a metric key and value, with steps key,
+    # constraint key and step defaulting to the "last" selection, the relative constraint and the
+    # reduction sentinel step.
     return MetricSample(metric_key, steps_key, constraint_key, step, value)
 
 
@@ -61,21 +75,33 @@ def _sample(metric_key, value, *, steps_key=LAST_STEPS_KEY, constraint_key=REL_C
 
 
 def _norm(sql: str) -> str:
+    # [FUNCTION DOC] HELPER: Normalize SQL text for comparison: collapse every whitespace run to a
+    # single space, strip the ends and lowercase. Returns the normalized string.
     return re.sub(r"\s+", " ", sql).strip().lower()
 
 
 class _FakeCursor:
+    # [CLASS DOC] HELPER: Fake database cursor (context manager) bound to a fake connection. Every
+    # execute / executemany is appended to the connection's event list with normalized SQL and
+    # parameters; it can raise a simulated error and expose a pinned row count and fetched rows.
     def __init__(self, conn: _FakeConn):
+        # [FUNCTION DOC] HELPER: Keep the owning fake connection; the row count starts at minus one.
         self._conn = conn
         self.rowcount = -1
 
     def __enter__(self):
+        # [FUNCTION DOC] HELPER: Context manager entry; returns the cursor itself.
         return self
 
     def __exit__(self, *exc):
+        # [FUNCTION DOC] HELPER: Context manager exit; never suppresses exceptions.
         return False
 
     def execute(self, sql, params=None):
+        # [FUNCTION DOC] HELPER: Record an "execute" event with the normalized SQL and the
+        # parameters. If the connection is set to fail, raise a runtime error "boom: simulated db
+        # error" after recording. Otherwise, if the connection has a pinned next row count, copy it
+        # to this cursor's row count. Returns the cursor.
         self._conn.events.append(("execute", _norm(sql), params))
         if self._conn.fail_on_execute:
             raise RuntimeError("boom: simulated db error")
@@ -85,6 +111,9 @@ class _FakeCursor:
         return self
 
     def executemany(self, sql, seq):
+        # [FUNCTION DOC] HELPER: Materialize the parameter sequence into a list, record an
+        # "executemany" event with the normalized SQL and that list, raise the simulated runtime
+        # error if the connection is set to fail, else return the cursor.
         seq = list(seq)
         self._conn.events.append(("executemany", _norm(sql), seq))
         if self._conn.fail_on_execute:
@@ -92,11 +121,18 @@ class _FakeCursor:
         return self
 
     def fetchall(self):
+        # [FUNCTION DOC] HELPER: Return a copy of the rows configured on the connection.
         return list(self._conn.fetch_rows)
 
 
 class _FakeConn:
+    # [CLASS DOC] HELPER: Fake database connection. Records an ordered list of events (executes,
+    # commits, rollbacks) and counters for commits, rollbacks, connects, closes, plus the list of
+    # connection strings used. Test knobs: fail every execute, rows returned by fetch, and a
+    # pinned row count for the next statement.
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Initialize empty event list, zero counters, no failure, no fetch
+        # rows and no pinned row count.
         self.events: list = []
         self.commit_count = 0
         self.rollback_count = 0
@@ -108,28 +144,38 @@ class _FakeConn:
         self.next_rowcount: int | None = None
 
     def cursor(self):
+        # [FUNCTION DOC] HELPER: Return a new fake cursor bound to this connection.
         return _FakeCursor(self)
 
     def commit(self):
+        # [FUNCTION DOC] HELPER: Increment the commit counter and record a "commit" event.
         self.commit_count += 1
         self.events.append(("commit", None, None))
 
     def rollback(self):
+        # [FUNCTION DOC] HELPER: Increment the rollback counter and record a "rollback" event.
         self.rollback_count += 1
         self.events.append(("rollback", None, None))
 
     def close(self):
+        # [FUNCTION DOC] HELPER: Increment the close counter.
         self.close_count += 1
 
 
 @pytest.fixture
 def fake_conn(monkeypatch):
+    # [FUNCTION DOC] HELPER: Fixture. Creates one shared fake connection and a fake driver module
+    # whose connect function counts the call, records the connection string and returns that
+    # connection; the fake module replaces the real driver in the module table for the test
+    # (restored by the monkeypatch). Returns the fake connection for assertions.
     """Install a fake `psycopg` module whose `connect` hands out one shared
     fake connection while recording every connect call and its DSN."""
     conn = _FakeConn()
     fake_psycopg = types.ModuleType("psycopg")
 
     def _connect(dsn):
+        # [FUNCTION DOC] HELPER: Fake driver connect: count the call, record the connection string
+        # and return the shared fake connection.
         conn.connect_count += 1
         conn.connected_dsns.append(dsn)
         return conn
@@ -141,6 +187,8 @@ def fake_conn(monkeypatch):
 
 @pytest.fixture
 def store(fake_conn):
+    # [FUNCTION DOC] HELPER: Fixture returning a Neon store constructed with a fake connection
+    # string, on top of the fake driver (so no connection happens at construction).
     return NeonMetricHistoryStore(dsn="postgresql://fake/db")
 
 
@@ -150,12 +198,16 @@ def store(fake_conn):
 
 
 def test_requires_dsn_when_env_unset(monkeypatch):
+    # [FUNCTION DOC] With the connection-string environment variable removed and no argument,
+    # constructing the store raises a runtime error that names the variable.
     monkeypatch.delenv(NEON_DATABASE_URL_ENV, raising=False)
     with pytest.raises(RuntimeError, match=NEON_DATABASE_URL_ENV):
         NeonMetricHistoryStore()
 
 
 def test_reads_dsn_from_env(monkeypatch, fake_conn):
+    # [FUNCTION DOC] Sets the environment variable, builds the store with no argument, performs a
+    # read, and asserts the fake driver was connected with the environment value.
     monkeypatch.setenv(NEON_DATABASE_URL_ENV, "postgresql://env/db")
     s = NeonMetricHistoryStore()
     s.recent_trusted_values("t", "b", "s", "m", LAST_STEPS_KEY, REL_CONSTRAINT_KEY, -1, limit=1)
@@ -163,6 +215,8 @@ def test_reads_dsn_from_env(monkeypatch, fake_conn):
 
 
 def test_explicit_dsn_takes_precedence(monkeypatch, fake_conn):
+    # [FUNCTION DOC] With the environment variable removed, builds the store with an explicit
+    # connection string, performs a read, and asserts the driver was connected with that string.
     monkeypatch.delenv(NEON_DATABASE_URL_ENV, raising=False)
     s = NeonMetricHistoryStore(dsn="postgresql://explicit/db")
     s.recent_trusted_values("t", "b", "s", "m", LAST_STEPS_KEY, REL_CONSTRAINT_KEY, -1, limit=1)
@@ -170,6 +224,8 @@ def test_explicit_dsn_takes_precedence(monkeypatch, fake_conn):
 
 
 def test_no_ddl_at_construction(store, fake_conn):
+    # [FUNCTION DOC] After building the store (via the fixture) asserts zero connects and no
+    # recorded events: schema is provisioned out of band and connections are per operation.
     # Construction must not connect nor issue any statement -- schema is
     # provisioned out-of-band and connections are per-operation.
     assert fake_conn.connect_count == 0
@@ -182,6 +238,13 @@ def test_no_ddl_at_construction(store, fake_conn):
 
 
 def test_write_run_single_transaction_one_commit(store, fake_conn):
+    # [FUNCTION DOC] Writes one run with three samples (one reduced, two at steps 0 and 1) and
+    # asserts: the returned run id is a 32-character hex string; the event sequence is exactly one
+    # execute, one bulk execute, one commit (one commit, no rollback); the first statement inserts
+    # into the runs table with the run id first, then test path, backend, suite as the next three
+    # parameters, and the trusted flag last as a native boolean; the second statement inserts into
+    # the metric values table with one tuple per sample of run id, metric key, steps key,
+    # constraint key, step and value.
     values = [
         _sample("reward_mean", 0.83),
         _sample("pass_rate", 0.6, step=0),
@@ -219,6 +282,8 @@ def test_write_run_single_transaction_one_commit(store, fake_conn):
 
 
 def test_write_run_rolls_back_on_error(store, fake_conn):
+    # [FUNCTION DOC] With every execute failing, a write raises the simulated runtime error;
+    # asserts zero commits, one rollback, and a rollback event in the recorded events.
     fake_conn.fail_on_execute = True
     with pytest.raises(RuntimeError, match="boom"):
         store.write_run(IDENTITY, PROVENANCE, "2026-06-02T00:00:00+00:00", True, [_sample("m", 1.0)])
@@ -228,6 +293,8 @@ def test_write_run_rolls_back_on_error(store, fake_conn):
 
 
 def test_write_run_rejects_non_finite_before_any_statement(store, fake_conn):
+    # [FUNCTION DOC] For nan and both infinities mixed with a finite sample, a write raises a value
+    # error "non-finite"; asserts no statement was issued and no commit or rollback happened.
     # The DB is the write boundary where validity is enforced (store contract:
     # validate_finite_values); the raise must land before any SQL is issued.
     for bad in (float("nan"), float("inf"), float("-inf")):
@@ -250,6 +317,12 @@ def test_write_run_rejects_non_finite_before_any_statement(store, fake_conn):
 
 
 def test_recent_trusted_values_issues_baseline_join(store, fake_conn):
+    # [FUNCTION DOC] Configures two fetched rows and reads with a limit of 10. Asserts the values
+    # come back flattened in fetch order; exactly one execute event; the SQL contains the join of
+    # metric values to runs, percent-s placeholders for each identity and coordinate predicate,
+    # the trusted-true filter, newest-first order and a limit placeholder; the parameters are in
+    # exact placeholder order (test path, backend, suite, metric key, steps key, constraint key,
+    # step, limit); and no commit or rollback occurs for a read.
     fake_conn.fetch_rows = [(0.83,), (0.81,)]
     got = store.recent_trusted_values(
         IDENTITY.test_path,
@@ -304,6 +377,8 @@ def test_recent_trusted_values_issues_baseline_join(store, fake_conn):
 
 
 def test_mark_untrusted_requires_exactly_one_key(store, fake_conn):
+    # [FUNCTION DOC] Marking untrusted with no selector, or with two selectors, raises a value
+    # error; asserts the guard fires before any statement is issued.
     with pytest.raises(ValueError):
         store.mark_untrusted()
     with pytest.raises(ValueError):
@@ -321,6 +396,11 @@ def test_mark_untrusted_requires_exactly_one_key(store, fake_conn):
     ],
 )
 def test_mark_untrusted_issues_parameterized_update(store, fake_conn, kwargs, column, value):
+    # [FUNCTION DOC] Parametrized over selecting by run id, github run id and commit sha. Pins the
+    # row count to 2 and asserts the returned affected count is 2; exactly one execute, whose SQL
+    # updates the runs table setting trusted to false where the selected column equals a
+    # placeholder and trusted is currently true, with the single parameter being the value; one
+    # commit and no rollback.
     fake_conn.next_rowcount = 2
     affected = store.mark_untrusted(**kwargs)
     assert affected == 2
@@ -335,6 +415,8 @@ def test_mark_untrusted_issues_parameterized_update(store, fake_conn, kwargs, co
 
 
 def test_each_operation_opens_and_closes_its_own_connection(store, fake_conn):
+    # [FUNCTION DOC] One write and one read on the same store lead to two connects and two closes,
+    # so no connection is cached across the long gaps between end-to-end tests.
     # A store built at suite start must not cache a connection across the
     # minutes-long gaps between e2e tests (Neon kills idle sockets); every
     # operation gets a fresh connection and releases it before returning.
@@ -345,6 +427,8 @@ def test_each_operation_opens_and_closes_its_own_connection(store, fake_conn):
 
 
 def test_connection_closed_even_when_operation_fails(store, fake_conn):
+    # [FUNCTION DOC] A failing write raises the simulated error and the connection is still closed
+    # exactly once.
     fake_conn.fail_on_execute = True
     with pytest.raises(RuntimeError, match="boom"):
         store.write_run(IDENTITY, PROVENANCE, "2026-06-02T00:00:00+00:00", True, [_sample("m", 1.0)])
@@ -352,6 +436,8 @@ def test_connection_closed_even_when_operation_fails(store, fake_conn):
 
 
 def test_mark_untrusted_rolls_back_on_error(store, fake_conn):
+    # [FUNCTION DOC] A failing mark-untrusted raises the simulated error with zero commits and one
+    # rollback.
     fake_conn.fail_on_execute = True
     with pytest.raises(RuntimeError, match="boom"):
         store.mark_untrusted(run_id="abc")
@@ -407,6 +493,12 @@ CREATE INDEX IF NOT EXISTS metric_values_run_id_idx
     reason=f"{_LIVE_DSN_ENV} not set; skipping live-Postgres round-trip",
 )
 def test_live_postgres_round_trip():
+    # [FUNCTION DOC] Live test, skipped unless the test Postgres connection-string environment
+    # variable is set. Side effects on that server: as an admin connection drops the metric values
+    # and runs tables if present and recreates them from the provisioning script, then commits.
+    # Then with the store: writes two trusted runs (values 0.5 then 0.9, a day apart) and asserts
+    # their ids differ; reading returns [0.9, 0.5]; marking the newer one untrusted affects one run
+    # and the next read returns [0.5]; marking it again affects zero. The store is always closed.
     # Only reached when a real DSN is configured; imports the driver, provisions
     # the two tables on that server, then round-trips the contract.
     import psycopg

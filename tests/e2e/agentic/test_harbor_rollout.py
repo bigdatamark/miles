@@ -1,3 +1,15 @@
+# [MODULE DOC]
+# Manual end-to-end script (not run in CI: registered as a disabled 2-GPU H200 test of the
+# agentic label because CI runners hold no sandbox credential) that runs Harbor agent trials on
+# a real cloud sandbox through the whole rollout path, rollout only (no optimizer step) so the
+# GLM-4.7-Flash model fits on 2 GPUs. Constants: repository root, the Harbor example launcher
+# directory (inserted at the front of the module search path so the launcher helpers import),
+# the terminal-bench task repository URL and local task directory, the smoke task name
+# "fix-git", model repo and local model directory, 2 GPUs, the one-row prompt data path, and the
+# trial output directory. Flow when run as a script: build the worker environment (credential
+# and SDK preflight), probe the E2B endpoint, prepare model/tasks/prompt data, remove proxy
+# variables from the environment, run the rollout, then check that at least one trial finished
+# without an exception file.
 """Harbor trials on real cloud sandboxes, through the full rollout path.
 
 What the sandbox smoke (``test_sandbox_golden.py``, next to this file) cannot
@@ -78,6 +90,15 @@ TRIALS_DIR = "/tmp/harbor_trials_e2e"
 
 
 def harbor_worker_env() -> dict[str, str]:
+    # [FUNCTION DOC] Build the environment variable mapping that rollout workers need for Harbor.
+    # Side effects: sets (only if not already set) the per-trial timeout to 1200 seconds and the
+    # agent maximum iterations to 30 in the process environment, bounding looping agents. Builds a
+    # namespace of launcher arguments: sandbox backend type and extra kwargs from the environment
+    # (empty if unset), the task and trial directories, agent model name "model", agent timeout
+    # 600, plus for every provider in the credential table its key-file argument taken from that
+    # provider's key-file environment variable (empty if unset). Returns the launcher's
+    # environment mapping for those arguments; the launcher raises with a provisioning hint when a
+    # credential or SDK is missing, which makes this the preflight.
     """The rollout workers' Harbor environment, assembled by the launcher's own code.
 
     Building it is also the credential and SDK preflight: the launcher raises
@@ -102,6 +123,12 @@ def harbor_worker_env() -> dict[str, str]:
 
 
 def probe_e2b_endpoint() -> None:
+    # [FUNCTION DOC] Fail early when a self-hosted E2B endpoint is unreachable. Does nothing
+    # unless the backend type is "e2b" (case-insensitive, trimmed) and the E2B API URL environment
+    # variable is non-empty. Otherwise sends one network request (10 second timeout) to the
+    # nodes path of that URL with a dummy API key. An HTTP error response (such as 401) counts as
+    # success since the control plane answered; any other operating-system level error (connection
+    # failure, timeout) exits the process with a message naming the URL and the error.
     """Fail before the model download when a configured endpoint is unreachable.
 
     Only a self-hosted E2B endpoint gets one: its address comes from
@@ -121,6 +148,14 @@ def probe_e2b_endpoint() -> None:
 
 
 def prepare():
+    # [FUNCTION DOC] Prepare model, tasks and prompt data. Deletes the trial output directory
+    # (stale trials must not vouch for this run); creates the model and dataset directories;
+    # downloads the model with the Hugging Face CLI if its config file is absent; if the smoke
+    # task directory is absent, deletes any partial task clone and does a shallow git clone of the
+    # terminal-bench repository; writes a one-line JSON prompt file with a non-empty placeholder
+    # user message (unused by the Harbor path, whose task directory carries the instruction) and
+    # metadata naming the instance id (the smoke task) and the terminus-2 agent. The rollout runs
+    # this one prompt as a group of 2 samples. Shell commands run through the command backend.
     U = command_utils.default_config().create_backend()
     # a stale trial dir from a prior manual run must not vouch for this one
     shutil.rmtree(TRIALS_DIR, ignore_errors=True)
@@ -142,6 +177,17 @@ def prepare():
 
 
 def execute(worker_env: dict[str, str]):
+    # [FUNCTION DOC] Launch the rollout-only training command with the given worker environment.
+    # Arguments assembled: the Hugging Face checkpoint; rollout settings (prompt file, input and
+    # metadata keys, one rollout, batch size 1, 2 samples per prompt, oversampling batch 1, max
+    # response 8192 tokens, temperature 0.8, max sequence 65536, global batch 2); agent arguments
+    # from the launcher with the glm47 token-in-token-out model and 4 session-server workers;
+    # SGLang settings (1 GPU per engine, memory fraction 0.7, glm45 reasoning parser, glm47 tool
+    # parser); miscellaneous (1 node, 2 GPUs, colocated, FSDP backend, rollout-only debug mode,
+    # CI test mode) plus the default tracking arguments. Extra environment for the job: module
+    # search path of the agentic directories plus the repository root, merged with the worker
+    # environment. Runs through the backend's execute-train with no Megatron model type (skipping
+    # Megatron initialization). Side effect: starts the job.
     U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint {MODEL_DIR} "
     rollout_args = (
@@ -185,6 +231,11 @@ def execute(worker_env: dict[str, str]):
 
 
 def check_trials():
+    # [FUNCTION DOC] Verify the Harbor trials after the rollout. Lists trial directories for the
+    # smoke task under the trial output directory (sorted), asserts at least one exists, counts
+    # those without an exception file, prints the totals, and asserts at least one trial ended
+    # without an exception (i.e. reached its verifier and produced a reward). Raises an assertion
+    # error otherwise.
     """The rollout finishing is not enough: at least one Harbor trial must
     have reached its verifier (a reward, no exception)."""
     trial_dirs = sorted(Path(TRIALS_DIR).glob(f"{SMOKE_TASK}__*"))

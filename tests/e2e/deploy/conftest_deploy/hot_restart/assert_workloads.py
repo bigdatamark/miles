@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# HELPER: Assertions about which Kubernetes workloads and pods a hot restart touches. Using the
+# list of cluster snapshots in the hot-restart evidence, it verifies that only the workloads
+# expected to be rolled by a hot restart (the orchestration script's workloads) lost pods,
+# changed pod template and carried restart stamps, that each of them was stamped once per
+# restart, and that no pod belongs to an unknown workload. Pod-to-workload attribution is by name:
+# a pod belongs to the longest workload name that is a prefix of the pod name followed by a dash.
 from collections.abc import Iterable, Sequence
 
 from tests.e2e.deploy.conftest_deploy.hot_restart.assert_process import (
@@ -18,6 +25,10 @@ from tests.e2e.deploy.conftest_deploy.hot_restart.evidence import HotRestartEvid
 def assert_take_overs_replaced_only_script(
     evidence: HotRestartEvidence, *, num_restarts: int, minimum_restarts: int
 ) -> None:
+    # [FUNCTION DOC] Top-level check that take-overs replaced only the orchestration script.
+    # Asserts the number of restarts is at least the minimum, then runs in order: the
+    # watched-closely check, the baseline-before-first-take-over check, the only-orchestration-
+    # restarted check, and the trainer-not-rebooted check. Raises assertion errors.
     assert num_restarts >= minimum_restarts, (
         f"the run was taken over {num_restarts} time(s) of the {minimum_restarts} it needs, so it ran to the end "
         f"without its orchestration script ever being replaced"
@@ -30,6 +41,13 @@ def assert_take_overs_replaced_only_script(
 
 
 def assert_only_orchestration_restarted(evidence: HotRestartEvidence, *, num_restarts: int) -> None:
+    # [FUNCTION DOC] Compute the expected set of rolled workloads from the evidence's release, then
+    # assert: (1) no pod seen in a whole-release snapshot is unattributed to a workload; (2) the
+    # workloads with replaced pods (recreated uid, container restart, or pod set changing between
+    # snapshots) are exactly the expected set; (3) the workloads whose pod template fingerprint
+    # or restart stamp changed are exactly the expected set; (4) each expected workload was
+    # observed with exactly num_restarts distinct restart stamps; (5) no workload outside the
+    # expected set carries any stamp. Raises assertion errors with explanatory messages.
     expected = compute_hot_restart_workloads(evidence.release)
 
     unattributed = _compute_unattributed_pod_names(evidence.snapshots)
@@ -68,6 +86,8 @@ def assert_only_orchestration_restarted(evidence: HotRestartEvidence, *, num_res
 
 
 def _compute_unattributed_pod_names(snapshots: Sequence[ClusterSnapshot]) -> set[str]:
+    # [FUNCTION DOC] HELPER: Return names of pods, in snapshots that describe the whole release,
+    # that match none of that snapshot's workload names.
     return {
         pod.name
         for snapshot in snapshots
@@ -78,6 +98,13 @@ def _compute_unattributed_pod_names(snapshots: Sequence[ClusterSnapshot]) -> set
 
 
 def _compute_workloads_with_replaced_pods(snapshots: Sequence[ClusterSnapshot]) -> dict[str, list[str]]:
+    # [FUNCTION DOC] HELPER: Return a mapping from workload name to a sorted list of human-readable
+    # reasons it lost a pod, for workloads with any. Across all snapshots it records, per pod
+    # name, the set of uids and of container restart counts, and per workload the set of pod name
+    # sets seen. Reasons: a pod seen with more than one uid (recreated), a pod with more than one
+    # restart count (container restarted), a workload whose set of pod names differs between
+    # snapshots (pods came and went; note this also counts partial snapshots). Pods matching no
+    # workload are ignored here. Result keys are sorted.
     workloads = sorted({name for snapshot in snapshots for name in snapshot.workload_names})
     uids_of_pod: dict[str, set[str]] = {}
     restart_counts_of_pod: dict[str, set[int]] = {}
@@ -114,6 +141,8 @@ def _compute_workloads_with_replaced_pods(snapshots: Sequence[ClusterSnapshot]) 
 
 
 def _compute_workloads_with_changed_template(snapshots: Sequence[ClusterSnapshot]) -> set[str]:
+    # [FUNCTION DOC] HELPER: Return the names of workloads that were observed with more than one
+    # pod template fingerprint, or with more than one restart stamp, over all snapshots.
     fingerprints_of_workload: dict[str, set[str]] = {}
     stamps_of_workload = _compute_restart_stamps_of_workload(snapshots)
     for snapshot in snapshots:
@@ -127,6 +156,8 @@ def _compute_workloads_with_changed_template(snapshots: Sequence[ClusterSnapshot
 
 
 def _compute_restart_stamps_of_workload(snapshots: Sequence[ClusterSnapshot]) -> dict[str, set[str]]:
+    # [FUNCTION DOC] HELPER: Return a mapping from every workload name seen in any snapshot to the
+    # set of distinct non-missing restart stamps observed on it (possibly empty).
     stamps_of_workload: dict[str, set[str]] = {}
     for snapshot in snapshots:
         for workload in snapshot.workloads:
@@ -137,5 +168,7 @@ def _compute_restart_stamps_of_workload(snapshots: Sequence[ClusterSnapshot]) ->
 
 
 def _compute_workload_of_pod(pod_name: str, *, workloads: Iterable[str]) -> str | None:
+    # [FUNCTION DOC] HELPER: Return the longest workload name for which the pod name starts with
+    # that name followed by a dash, or nothing if there is none.
     candidates = [one for one in workloads if pod_name.startswith(f"{one}-")]
     return max(candidates, key=len) if candidates else None

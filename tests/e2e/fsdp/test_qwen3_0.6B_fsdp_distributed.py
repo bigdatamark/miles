@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# End-to-end script for a long FSDP distributed training run of Qwen3-0.6B on GSM8K using 4 GPUs
+# (2 for training, 2 for rollout, not colocated, asynchronous training script) with periodic
+# evaluation and a metric threshold check. Registered as a 2200-second 4-GPU H200 CUDA test
+# (hopper and blackwell, long label) and a 2400-second nightly 4-GPU MI350 ROCm test. As a script
+# it downloads the model and dataset, strips proxy variables, then trains: 65 rollouts (3000 when
+# the infinite-run environment switch is on; the count is chosen not to be an exact multiple of the
+# evaluation interval because the asynchronous mode causes offsets), evaluating every 20 rollouts
+# on GSM8K test with greedy decoding, and requires the GSM8K evaluation score to reach a loose 0.71
+# threshold.
 import os
 
 from tests.ci.ci_register import register_cuda_ci, register_rocm_ci
@@ -21,6 +31,9 @@ NUM_GPUS = 4
 
 
 def prepare():
+    # [FUNCTION DOC] Through the command backend: create the models and datasets directories,
+    # download the model into the models directory and download the GSM8K dataset. Side effects:
+    # network downloads, filesystem.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -28,6 +41,15 @@ def prepare():
 
 
 def execute():
+    # [FUNCTION DOC] Launch the training job through the backend's execute-train with no Megatron
+    # model type and the asynchronous training script. Arguments: the HF checkpoint; GSM8K
+    # rollouts (math reward, 65 rollouts or 3000 in infinite-run mode, batch 32, 8 samples, up to
+    # 1024 tokens, temperature 1, oversampling 64 with a non-zero-reward-spread filter, global
+    # batch 256); evaluation every 20 rollouts on GSM8K test (1 sample, 1024 tokens, top-k 1);
+    # Adam learning rate 1e-6 with weight decay 0.1; GRPO with zero KL-loss, KL and entropy
+    # coefficients and clipping 0.2 / 0.28; one rollout GPU per engine with SGLang metrics; half the
+    # GPUs (2) for training and half for rollout, FSDP backend; CI test mode with the KL checker
+    # disabled and a metric check that "eval/gsm8k" reaches 0.71.
     U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME} "
 

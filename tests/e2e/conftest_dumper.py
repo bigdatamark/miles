@@ -1,3 +1,15 @@
+# [MODULE DOC]
+# HELPER: Shared helpers for the dumper end-to-end tests that compare tensors dumped from
+# Megatron (training side) and SGLang (inference side). Provides: the list of dumped field names
+# that are patched into the source; three YAML source-patcher configurations (strings) that
+# insert dump calls after or before matched lines of Megatron transformer layer, attention and
+# MoE router code (one for packed "thd" layout and one for padded "bshd" layout, each annotating
+# tensor dimensions with context-parallel zigzag, sequence-parallel, tensor- and
+# expert-parallel replication) and of the SGLang Qwen3-MoE decoder layer, attention and MoE
+# block; a mapping from layout name ("thd", "bshd") to the Megatron YAML; a function clearing
+# proxy variables; a dump directory checker; a comparator output logger; and a function running
+# the SGLang comparator as a subprocess and asserting success. Requires torch. The assertions in
+# this file must stay strict (comparator must report everything passed).
 # WARNING: Do NOT relax any assert logic in this file. All assertions must remain strict.
 # The comparator must report all-passed with zero failures — no exceptions.
 # NOTE: Dump raw tensors as-is — never reshape/squeeze/flatten before dumping.
@@ -182,6 +194,8 @@ MEGATRON_PATCHER_YAMLS: dict[str, str] = {
 
 
 def clear_proxy_env() -> None:
+    # [FUNCTION DOC] HELPER: Remove the lower- and upper-case http and https proxy variables from
+    # the process environment (those not set are ignored). Side effect: mutates the environment.
     for proxy_var in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
         os.environ.pop(proxy_var, None)
 
@@ -191,6 +205,13 @@ def check_dump_dir(
     exp_pattern: str,
     expected_fields: list[str] | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Check a dump phase directory. Asserts: the directory exists; at least
+    # one subdirectory matches the glob pattern; the first such subdirectory (in glob order)
+    # contains at least one tensor dump file (recursive, ".pt" suffix); the first dump file found
+    # loads (full unpickling, not weights-only) to a mapping containing both a "value" and a "meta"
+    # key. If expected field names are given, asserts for each that some ".pt" file anywhere under
+    # the phase directory has a file name containing "name=<field>". Raises assertion errors with
+    # descriptive messages. Side effect: reads files from disk.
     """Verify dump directory structure: .pt files exist, contain value + meta keys, contain expected fields."""
     assert phase_dir.exists(), f"Missing dump dir: {phase_dir}"
     dump_subdirs: list[Path] = list(phase_dir.glob(exp_pattern))
@@ -208,6 +229,8 @@ def check_dump_dir(
 
 
 def log_comparator_output(stdout: str, stderr: str) -> None:
+    # [FUNCTION DOC] HELPER: Print the comparator's standard output and standard error, each under
+    # a "[comparator stdout]" / "[comparator stderr]" header, but only if the text is non-blank.
     if stdout.strip():
         print(f"[comparator stdout]\n{stdout}")
     if stderr.strip():
@@ -219,6 +242,14 @@ def run_and_verify_comparator(
     target_dir: Path,
     extra_args: list[str] | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Run the SGLang debug comparator module as a subprocess with the
+    # current interpreter, comparing the baseline directory against the target directory, JSON
+    # output, the "sglang_megatron" preset, and an allowed-skipped pattern covering input ids,
+    # positions, cumulative sequence lengths for q and kv, and the qkv format; any extra arguments
+    # are appended. Captures text output, logs it via the logging helper, and asserts return code
+    # zero, else fails with the code and the last 2000 characters of standard error.
+    # KNOWN ISSUE: the docstring names the option "--allow-skip-pattern" but the code passes
+    # "--allow-skipped-pattern".
     """Run comparator subprocess and rely on its exit code (--allow-skip-pattern limits allowed skips)."""
     cmd: list[str] = [
         sys.executable,

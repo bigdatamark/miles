@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# HELPER: Verdict for the unsaved hot-restart scenario: a run frozen before its first checkpoint
+# is taken over exactly once and restarts from step zero, so every step it had trained is trained
+# again, and it must save afterwards. Uses the event-log reading helpers of the checkpointed
+# verdict module (rolled-aside directories, step events, checkpoint copies, expected attempts).
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +21,8 @@ from miles.utils.audit_utils.event_logger.logger import EVENTS_DIRNAME
 
 @dataclass(frozen=True)
 class RedoneFromScratch:
+    # [CLASS DOC] HELPER: Immutable summary: the rollout id the run had reached when frozen, and a
+    # mapping from every rollout id to the number of distinct times it was trained.
     frozen_rollout_id: int
     attempts_of_rollout_id: dict[int, int]
 
@@ -28,6 +35,16 @@ def assert_unsaved_run_redone_from_scratch(
     num_rollouts: int,
     schedule: Sequence[ScheduledFreeze],
 ) -> RedoneFromScratch:
+    # [FUNCTION DOC] Main verdict. Steps: (1) extract the single scheduled freeze that has no prior
+    # save and the single restart record without a save; (2) assert the record's frozen rollout
+    # id equals the scheduled one; (3) assert exactly one rolled-aside event directory exists,
+    # whose log (each step exactly once) covers steps 0..frozen; (4) assert the surviving live
+    # log holds each of steps 0..num_rollouts-1 exactly once; (5) assert no step has an identical
+    # entry in both logs (nothing was carried over); (6) count distinct entries per rollout id over
+    # the two logs and assert equality with the schedule's expected attempts; (7) assert the run
+    # saved after the restart: the last saved iteration exists and exceeds the frozen step, and
+    # at least one event-log copy exists beside the checkpoints. Returns the summary. Raises
+    # assertion errors with explanatory messages; reads files.
     scheduled = _read_only_freeze_without_prior_save(schedule)
     record = _read_only_record_without_save(records)
     assert record.frozen_rollout_id == scheduled.frozen_rollout_id, (
@@ -79,6 +96,9 @@ def assert_unsaved_run_redone_from_scratch(
 
 
 def _read_steps_written_once(events_dir: Path, *, what: str) -> dict[int, str]:
+    # [FUNCTION DOC] HELPER: Read the step events under the directory and assert every rollout id
+    # has exactly one entry (the message uses the given description). Returns a mapping from
+    # rollout id to that entry.
     logged = read_step_events(events_dir)
     repeated = {rollout_id: len(events) for rollout_id, events in logged.items() if len(events) != 1}
     assert not repeated, (
@@ -91,6 +111,8 @@ def _read_steps_written_once(events_dir: Path, *, what: str) -> dict[int, str]:
 def _read_only_freeze_without_prior_save(
     schedule: Sequence[ScheduledFreeze],
 ) -> ScheduledFreeze:
+    # [FUNCTION DOC] HELPER: Assert the schedule has exactly one freeze and that it has no saved
+    # iteration (the run holds no checkpoint). Returns that freeze.
     assert len(schedule) == 1, (
         f"a run holds no checkpoint only until its first save, so it is taken over once; this schedule pins "
         f"{len(schedule)} freeze(s), and every take-over after the first resumes from something it had written"
@@ -104,6 +126,8 @@ def _read_only_freeze_without_prior_save(
 
 
 def _read_only_record_without_save(records: Sequence[HotRestartRecord]) -> HotRestartRecord:
+    # [FUNCTION DOC] HELPER: Assert there is exactly one restart record and that its saved
+    # iteration at trigger is missing (no checkpoint when it fired). Returns that record.
     assert len(records) == 1, (
         f"a run holds no checkpoint only until its first save, so it is taken over once; {len(records)} restart(s) "
         f"were recorded, and every one after the first resumed from something it had written"
@@ -117,6 +141,10 @@ def _read_only_record_without_save(records: Sequence[HotRestartRecord]) -> HotRe
 
 
 def _assert_run_saved_after_restart(*, checkpoint_dir: str, dump_dir: str, frozen_rollout_id: int) -> None:
+    # [FUNCTION DOC] HELPER: Assert that the run checkpointed after being restarted. Reads the last
+    # saved iteration of the checkpoint directory: it must exist and be greater than the frozen
+    # rollout id (so it was written after the restart). Then require at least one event-log copy
+    # directory beside the checkpoints. The dump directory is only used in the failure message.
     assert (saved := read_last_saved_iteration(Path(checkpoint_dir))) is not None, (
         f"{checkpoint_dir} holds no checkpoint even after the run ended, so this run says nothing about saving "
         f"once a take-over has restarted it"

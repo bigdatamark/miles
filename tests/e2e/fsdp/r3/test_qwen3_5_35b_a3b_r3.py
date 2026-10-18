@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# End-to-end routing-replay case for Qwen3.5-35B-A3B on 8 GPUs with 2 GPUs per rollout engine, run
+# as a script through the shared FSDP routing-replay driver (default fa3 / flash_attention_3
+# attention). Registered as an 1800-second 8-GPU H200 CUDA test (hopper only; fsdp and replay
+# labels); declares history gates for the gradient norm, policy KL and raw reward (defaults from
+# the gate table).
 """FSDP R3 on qwen3_5_moe (Qwen3.5-35B-A3B): 40 MoE layers, 256 experts, topk 8."""
 
 from tests.ci.ci_register import register_cuda_ci

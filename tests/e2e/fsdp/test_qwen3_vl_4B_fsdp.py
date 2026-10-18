@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# End-to-end script for FSDP training of the vision-language model Qwen3-VL-4B-Instruct on the
+# geometry (geo3k) image-URL dataset with 2 GPUs (colocated). Registered as an 800-second 2-GPU
+# H200 CUDA test (hopper only, fsdp label). Module settings: an evaluation switch from an
+# environment variable (default on), 2 GPUs, model and dataset names. As a script: download model
+# and dataset, strip proxy variables one by one, then train 2 rollouts of 8 prompts with 8 samples
+# (up to 4096 tokens, global batch 32) with GRPO, gradient checkpointing, multimodal image keys
+# and CI test mode.
 import os
 
 from tests.ci.ci_register import register_cuda_ci
@@ -19,6 +27,9 @@ DATASET_NAME = "chenhegu/geo3k_imgurl"
 
 
 def prepare():
+    # [FUNCTION DOC] Through the command backend: create the models and datasets directories,
+    # download the vision-language model into the models directory and download the geo3k
+    # dataset. Side effects: network downloads, filesystem.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -26,6 +37,18 @@ def prepare():
 
 
 def execute():
+    # [FUNCTION DOC] Launch the training job through the backend's execute-train (no Megatron
+    # model type) with the extra environment variable setting a single CUDA device connection.
+    # Arguments: the HF checkpoint; geo3k rollouts (problem key, answer label, math reward, 2
+    # rollouts of 8 prompts with 8 samples, up to 4096 tokens, temperature 1, global batch 32); the
+    # multimodal keys mapping "image" to the "images" column; Adam learning rate 1e-6 with weight
+    # decay 0.1; GRPO with zero KL-loss, KL and entropy coefficients and clipping 0.2 / 0.28; FSDP
+    # backend with gradient checkpointing and a 512 MiB update buffer; evaluation arguments on the
+    # geo3k test set (1 sample, 4096 tokens), with the interval flag (every 20 rollouts) only when
+    # the evaluation switch is on; SGLang with one GPU per engine, memory fraction 0.6, metrics,
+    # fa3 attention backends; CI test mode; one node, 2 GPUs, colocated.
+    # KNOWN ISSUE: when the evaluation switch is off the evaluation dataset arguments are still
+    # passed; only the interval flag is dropped.
     U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME} "
 

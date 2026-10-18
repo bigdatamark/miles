@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# End-to-end script testing FSDP true-on-policy training with sampling-support replay (top-p /
+# top-k sampling) for Qwen3-0.6B on 2 GPUs colocated, run on GSM8K for 5 rollouts. CI test mode
+# asserts the training log probabilities equal the rollout log probabilities on every rollout.
+# Registered as a 600-second 2-GPU H200 CUDA test (hopper only; fsdp, sglang, replay labels) with
+# history gates on the train/rollout log-probability absolute difference, the train/rollout KL and
+# the policy KL (all expected to stay at zero under true-on-policy). As a script: download model
+# and dataset, strip proxy variables, execute.
 import os
 
 from tests.ci.ci_register import register_cuda_ci
@@ -22,6 +30,9 @@ NUM_GPUS = 2
 
 
 def prepare() -> None:
+    # [FUNCTION DOC] Through the command backend: create the models and datasets directories,
+    # download the model into the models directory and download the GSM8K dataset. Side effects:
+    # network downloads, filesystem.
     backend = U.default_config().create_backend()
     backend.exec_command_cpu("mkdir -p /root/models /root/datasets")
     backend.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -29,6 +40,17 @@ def prepare() -> None:
 
 
 def execute() -> None:
+    # [FUNCTION DOC] Launch the training job through the backend's execute-train (no Megatron
+    # model type). Arguments: the HF checkpoint; GSM8K rollouts (math reward, 5 rollouts of 4
+    # prompts with 4 samples, up to 1024 tokens, temperature 1, top-p 0.8, top-k 32 which turns on
+    # sampling-support replay, global batch 16); Adam learning rate 1e-6 with weight decay 0.1;
+    # GRPO with zero coefficients; FSDP backend with a 512 MiB update buffer; one GPU per rollout
+    # engine with memory fraction 0.4; true-on-policy settings (deterministic inference with the
+    # dense Qwen3 true-on-policy contract, fa3 attention backends, deterministic and
+    # true-on-policy modes); default tracking arguments; CI test mode on one node, 2 GPUs,
+    # colocated. Extra environment: tree allreduce algorithm, non-deterministic algorithms
+    # disallowed, fixed cuBLAS workspace configuration and a single CUDA device connection. The CI
+    # check asserts equality of log probabilities, which holds only through bf16 rounding.
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME} "
 
     # Top-p/top-k enables sampling-support replay; --ci-test asserts log_probs == rollout_log_probs on every rollout.
