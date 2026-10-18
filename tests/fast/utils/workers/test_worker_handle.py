@@ -47,6 +47,7 @@ class TestBaseWorkerHandle:
         class Minimal(BaseWorkerHandle):
             # [CLASS DOC] HELPER: Minimal concrete handle: no-op readiness wait and a death probe
             # that reports dead.
+            # [FUNCTION DOC] HELPER: Readiness wait with no body; does nothing.
             async def wait_ready(self, *, timeout: float) -> None: ...
 
             async def probe_is_dead(self) -> bool:
@@ -76,6 +77,7 @@ class TestBaseWorkerHandle:
 
         class ReadyOnly(BaseWorkerHandle):
             # [CLASS DOC] HELPER: Subclass implementing only the readiness wait.
+            # [FUNCTION DOC] HELPER: Readiness wait with no body; does nothing.
             async def wait_ready(self, *, timeout: float) -> None: ...
 
         with pytest.raises(TypeError):
@@ -88,6 +90,7 @@ class TestBaseWorkerHandle:
 
         class DeadOnly(BaseWorkerHandle):
             # [CLASS DOC] HELPER: Subclass implementing only the death wait.
+            # [FUNCTION DOC] HELPER: Death wait with no body; does nothing.
             async def wait_dead(self, *, timeout: float) -> None: ...
 
         with pytest.raises(TypeError):
@@ -110,6 +113,8 @@ class _FakeRemoteMethod:
     # [CLASS DOC] HELPER: Fake ray remote method. Holds a list of factories producing awaitables;
     # each remote call records its arguments and uses the next factory (the last one repeats).
     def __init__(self, coro_factories):
+        # [FUNCTION DOC] HELPER: Copies the factories into a list, sets the call count to zero and
+        # creates empty lists for the positional and keyword arguments seen.
         self._coro_factories = list(coro_factories)
         self.call_count = 0
         self.args_seen: list[tuple] = []

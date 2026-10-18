@@ -57,13 +57,18 @@ class _GroupedWorker:
     # (group kill_self), wrapped_isolated (group fault_injector declared above a wrapper),
     # outer_declaration_wins (two markers, outer kill_self over inner heartbeat_status),
     # isolated_echo (kill_self, returns the text repeated) and an unmarked plain method.
+    # [FUNCTION DOC] HELPER: Rpc method with no body, declared in concurrency group kill_self.
     @rpc(concurrency_group="kill_self")
     def isolated(self) -> None: ...
 
+    # [FUNCTION DOC] HELPER: Rpc method with no body, declared in group fault_injector above a
+    # pass-through wrapper, so the group must be found through the wrapper.
     @rpc(concurrency_group="fault_injector")
     @_passthrough
     def wrapped_isolated(self) -> None: ...
 
+    # [FUNCTION DOC] HELPER: Rpc method with no body carrying two group markers around a
+    # pass-through wrapper; the outer one (kill_self) must win over the inner (heartbeat_status).
     @rpc(concurrency_group="kill_self")
     @_passthrough
     @rpc(concurrency_group="heartbeat_status")
@@ -74,6 +79,7 @@ class _GroupedWorker:
         # [FUNCTION DOC] HELPER: Returns the text repeated the given number of times (default 1).
         return value * times
 
+    # [FUNCTION DOC] HELPER: Method with no body and no rpc marker (no concurrency group).
     def plain(self) -> None: ...
 
 
@@ -81,6 +87,7 @@ class DemoServeWorker:
     # [CLASS DOC] HELPER: Fake serve worker taking only keyword arguments (kept in kwargs), with a
     # ping method and an echo method. Imported by path from a fresh interpreter in one test.
     def __init__(self, **kwargs):
+        # [FUNCTION DOC] HELPER: Stores the keyword arguments on the instance as a mapping.
         self.kwargs = kwargs
 
     def ping(self) -> str:
@@ -165,6 +172,8 @@ class _RecordingCapability(BackendCapability):
     # [CLASS DOC] HELPER: Backend capability that records which pool ids were requested for dynamic
     # and static providers and returns plain objects.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates a plain object as the operations handle and two empty lists
+        # for the requested dynamic pool id lists and requested static pool ids.
         self.operations = object()
         self.requested_pool_ids: list[list[str]] = []
         self.requested_static_pool_ids: list[str] = []
@@ -644,6 +653,7 @@ class TestTheBootstrappedClass:
 class DemoRpcServeWorker:
     # [CLASS DOC] HELPER: Fake serve worker for the rpc mode; keeps its keyword arguments.
     def __init__(self, **kwargs) -> None:
+        # [FUNCTION DOC] HELPER: Stores the keyword arguments on the instance as a mapping.
         self.kwargs = kwargs
 
     def echo(self, *, value: int) -> int:

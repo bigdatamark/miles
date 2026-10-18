@@ -37,6 +37,7 @@ def _make_cell_info(workers_hash: str = "hash-1") -> CellInfo:
 class _Recorder:
     # [CLASS DOC] HELPER: Records the add and remove callbacks as ordered tuples.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Starts with an empty list of recorded call tuples.
         self.calls: list[tuple] = []
 
     async def add(self, cell_id: str, observed: CellInfo) -> None:

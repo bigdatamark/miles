@@ -95,6 +95,7 @@ class TestRayWorkerProviderGetAddrs:
 class _FakeStopCellsMethod:
     # [CLASS DOC] HELPER: Fake remote stop method that signals entry and blocks until released.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates the entered and release events (both initially unset).
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
 
@@ -260,6 +261,7 @@ async def _wait_until(predicate, *, timeout_seconds: float = 2.0) -> None:
 class _RecordingReconciler:
     # [CLASS DOC] HELPER: Reconcile callback that records every (cell id, info or none) call.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Starts with an empty list of recorded calls.
         self.calls: list[tuple[str, CellInfo | None]] = []
 
     async def __call__(self, cell_id: str, info: CellInfo | None) -> None:
@@ -271,6 +273,8 @@ class _FailingOnceReconciler(_RecordingReconciler):
     # [CLASS DOC] HELPER: Recording reconciler that raises a runtime error the first time it is
     # called for a given cell id (without recording that call) and records normally afterwards.
     def __init__(self, *, failing_cell_id: str) -> None:
+        # [FUNCTION DOC] HELPER: Initializes the base recorder and arms the one-shot failure for the
+        # given cell id.
         super().__init__()
         self._failing_cell_id: str | None = failing_cell_id
 
@@ -287,6 +291,7 @@ class _FailingForCellReconciler(_RecordingReconciler):
     # [CLASS DOC] HELPER: Recording reconciler that records every call, then raises a runtime error
     # whenever the cell id is the configured failing one (every time).
     def __init__(self, *, failing_cell_id: str) -> None:
+        # [FUNCTION DOC] HELPER: Initializes the base recorder and stores the failing cell id.
         super().__init__()
         self._failing_cell_id = failing_cell_id
 
@@ -310,6 +315,8 @@ class _BlockingReconciler(_RecordingReconciler):
     # [CLASS DOC] HELPER: Recording reconciler that blocks forever after recording, signalling entry
     # and noting if it was cancelled.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Initializes the base recorder, an unset entered event and a
+        # cancelled flag that starts false.
         super().__init__()
         self.entered = asyncio.Event()
         self.cancelled = False
@@ -330,6 +337,8 @@ class _StuckOnCancelReconciler(_RecordingReconciler):
     # [CLASS DOC] HELPER: Recording reconciler that blocks forever after recording, and when
     # cancelled delays finishing until the release event is set.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Initializes the base recorder and the unset entered and release
+        # events.
         super().__init__()
         self.entered = asyncio.Event()
         self.release = asyncio.Event()

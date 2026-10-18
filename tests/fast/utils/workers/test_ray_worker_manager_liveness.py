@@ -25,6 +25,7 @@ class DemoWorker:
     # [CLASS DOC] HELPER: Trivial serve worker class referenced by import path in the specs; stores
     # its keyword arguments.
     def __init__(self, **kwargs) -> None:
+        # [FUNCTION DOC] HELPER: Stores the keyword arguments on the instance as a mapping.
         self.kwargs = kwargs
 
 
@@ -302,6 +303,7 @@ class _ManagerHandleShim:
     """The provider talks to the manager as a ray actor; here it is the object itself."""
 
     def __init__(self, manager: RayWorkerManager) -> None:
+        # [FUNCTION DOC] HELPER: Exposes the manager's cell-info query wrapped in the remote-call shim.
         self.get_cell_infos = _ShimMethod(manager.get_cell_infos)
 
 
@@ -309,6 +311,7 @@ class _ShimMethod:
     # [CLASS DOC] HELPER: Wraps a function so that calling remote with keyword arguments invokes it
     # and returns an awaitable of the result.
     def __init__(self, fn) -> None:
+        # [FUNCTION DOC] HELPER: Keeps the wrapped function for later remote calls.
         self._fn = fn
 
     def remote(self, **kwargs):
@@ -326,6 +329,7 @@ class _RecordingReconciler:
     # [CLASS DOC] HELPER: Reconcile callback for the provider's cell watcher; records each
     # (cell id, info or none) call in order.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Starts with an empty list of recorded calls.
         self.calls: list[tuple[str, object | None]] = []
 
     async def __call__(self, cell_id: str, info) -> None:

@@ -18,8 +18,10 @@ class _Handle(BaseWorkerHandle):
     # [CLASS DOC] HELPER: Minimal concrete handle that remembers the worker name; readiness wait is
     # a no-op and the death probe always reports alive.
     def __init__(self, worker_name: str) -> None:
+        # [FUNCTION DOC] HELPER: Remembers the worker name.
         self.worker_name = worker_name
 
+    # [FUNCTION DOC] HELPER: Readiness wait with no body; does nothing and ignores the timeout.
     async def wait_ready(self, *, timeout: float) -> None: ...
 
     async def probe_is_dead(self) -> bool:
@@ -32,6 +34,9 @@ class _RecordingProvider(BaseWorkerProvider):
     # given name, generation 0, no addresses or gpus, with the given worker class) and recording the
     # cell id lists it is asked about.
     def __init__(self, *worker_names: str, worker_class: str | None = "pkg.Worker") -> None:
+        # [FUNCTION DOC] HELPER: Creates an empty list of requested cell id lists and builds one
+        # worker info per name (generation 0, empty address mapping, no gpu ids, the given worker
+        # class, default "pkg.Worker").
         self.requested_cell_ids: list[list[str]] = []
         self._infos = [
             WorkerInfo(name=name, generation=0, self_addrs={}, gpu_ids=[], worker_class=worker_class)
