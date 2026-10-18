@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Tests for the dataclass-to-argparse bridge and the in-place argument override context manager.
+# The bridge registers a frozen dataclass's fields as command line options (with an optional name
+# prefix and an argument group title), builds a dataclass instance back from a parsed namespace, and
+# serializes an instance to a command line string. Covers required vs defaulted fields, booleans as
+# flags, optional values, round trips, and validation of unsupported types. The override context
+# manager temporarily changes attributes of a namespace and restores them on exit.
 """Tests for DataclassArgparseBridge."""
 
 from __future__ import annotations
@@ -12,6 +19,9 @@ from miles.utils.argparse_utils import DataclassArgparseBridge, inplace_modify_a
 
 @dataclasses.dataclass(frozen=True)
 class _SampleArgs:
+    # [CLASS DOC] HELPER: Frozen sample dataclass used with the bridge: three required fields (string,
+    # integer, float), three defaulted fields (string "default", integer 10, float 0.5), a boolean
+    # flag defaulting to false, and three optional fields (string, integer, float) defaulting to none.
     mandatory_str: str
     mandatory_int: int
     mandatory_float: float
@@ -33,6 +43,8 @@ _BRIDGE: DataclassArgparseBridge[_SampleArgs] = DataclassArgparseBridge(
 
 @dataclasses.dataclass(frozen=True)
 class _NoPrefixArgs:
+    # [CLASS DOC] HELPER: Frozen sample dataclass with a required string name and a boolean debug flag
+    # defaulting to false; used with a bridge having an empty option prefix.
     name: str
     debug: bool = False
 
@@ -44,7 +56,10 @@ _NO_PREFIX_BRIDGE: DataclassArgparseBridge[_NoPrefixArgs] = DataclassArgparseBri
 
 
 class TestRegisterOnParser:
+    # [CLASS DOC] Tests of registering dataclass fields as parser options.
     def test_required_fields_are_required(self) -> None:
+        # [FUNCTION DOC] Parsing an empty argument list after registering the sample fields exits the
+        # parser (system exit), since the required fields are missing.
         parser: argparse.ArgumentParser = argparse.ArgumentParser()
         _BRIDGE.register_on_parser(parser)
 
@@ -52,6 +67,9 @@ class TestRegisterOnParser:
             parser.parse_args([])
 
     def test_parses_all_field_types(self) -> None:
+        # [FUNCTION DOC] Passes every field with the sample prefix (options named with the prefix and
+        # dashes) and asserts each namespace attribute (prefix plus underscored field name) holds the
+        # given value converted to its declared type; the flag becomes true.
         parser: argparse.ArgumentParser = argparse.ArgumentParser()
         _BRIDGE.register_on_parser(parser)
 
@@ -91,6 +109,8 @@ class TestRegisterOnParser:
         assert namespace.sample_optional_float == 0.9
 
     def test_defaults_are_applied(self) -> None:
+        # [FUNCTION DOC] Passing only the three required options leaves defaulted fields at their
+        # defaults, the flag false and all optional fields none.
         parser: argparse.ArgumentParser = argparse.ArgumentParser()
         _BRIDGE.register_on_parser(parser)
 
@@ -114,6 +134,8 @@ class TestRegisterOnParser:
         assert namespace.sample_optional_float is None
 
     def test_no_prefix(self) -> None:
+        # [FUNCTION DOC] With an empty prefix the options are plain field names (name and debug) and
+        # the namespace attributes carry no prefix.
         parser: argparse.ArgumentParser = argparse.ArgumentParser()
         _NO_PREFIX_BRIDGE.register_on_parser(parser)
 
@@ -123,7 +145,10 @@ class TestRegisterOnParser:
 
 
 class TestFromNamespace:
+    # [CLASS DOC] Tests of building a dataclass instance from a parsed namespace.
     def test_constructs_dataclass_from_namespace(self) -> None:
+        # [FUNCTION DOC] Parses a mix of required, flag and one optional option, builds the instance,
+        # and asserts the fields carry the parsed values, defaults and none for unspecified optionals.
         parser: argparse.ArgumentParser = argparse.ArgumentParser()
         _BRIDGE.register_on_parser(parser)
 
@@ -152,6 +177,8 @@ class TestFromNamespace:
         assert instance.optional_int is None
 
     def test_no_prefix_from_namespace(self) -> None:
+        # [FUNCTION DOC] With the no-prefix bridge, parses a name only and asserts the built instance
+        # has that name and a false debug flag.
         parser: argparse.ArgumentParser = argparse.ArgumentParser()
         _NO_PREFIX_BRIDGE.register_on_parser(parser)
 
@@ -163,7 +190,10 @@ class TestFromNamespace:
 
 
 class TestToCliArgs:
+    # [CLASS DOC] Tests of serializing a dataclass instance to a command line string.
     def test_serializes_all_types(self) -> None:
+        # [FUNCTION DOC] Serializes a fully populated sample instance and asserts the string contains
+        # each prefixed option followed by its value, and the bare flag option for the true boolean.
         instance: _SampleArgs = _SampleArgs(
             mandatory_str="hello",
             mandatory_int=42,

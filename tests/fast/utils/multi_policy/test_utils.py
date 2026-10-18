@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Tests for the multi-policy driver helpers: startup argument validation (which run shapes are
+# refused for a multi-policy fully asynchronous run), creation of one trainer per policy keyed by
+# model id (including resume positions, the shared rollout executor load position, and the
+# requirement of a global rollout data-source state file), weights-and-biases metric group
+# declarations per policy prefix, consistency checks between restored policy positions and the saved
+# global checkpoint record, and rejection of a single checkpoint iteration selector. External
+# collaborators (sglang config resolution, trainer creation, handles, takeover) are replaced with
+# fakes via monkeypatching.
 from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,10 +24,19 @@ from miles.utils.multi_policy.utils import TrainerInfo
 
 
 def _make_config(*model_ids: str) -> MegatronConfig:
+    # [FUNCTION DOC] HELPER: Resolves a Megatron config declaring one trainer per given model id,
+    # by encoding the ids with the shared fixture and resolving it from a namespace with the critic
+    # disabled. Returns the resolved config.
     return resolve_megatron_config(Namespace(megatron_config=encode_megatron_config(*model_ids), use_critic=False))
 
 
 def _make_args(*model_ids: str, **overrides: Any) -> Namespace:
+    # [FUNCTION DOC] HELPER: Builds a namespace of arguments for a valid multi-policy run: the encoded
+    # Megatron config for the given model ids, no critic, not colocated, fully asynchronous, no
+    # evaluation or saving, an sglang config file name, no debug-only rollout, drop handler for
+    # unused samples, and none of the dump, debug-rollout load/save, rollout injection or checkpoint
+    # step options. Keyword overrides replace those defaults. The result is merged on top of the
+    # shared parser defaults fixture so every other option exists; explicit values win.
     defaults = dict(
         megatron_config=encode_megatron_config(*model_ids),
         use_critic=False,
@@ -41,22 +59,34 @@ def _make_args(*model_ids: str, **overrides: Any) -> Namespace:
 
 
 def _stub_sglang_models(monkeypatch, *names_updatable: tuple[str, bool]) -> None:
+    # [FUNCTION DOC] HELPER: Replaces the module's sglang config resolver with a fake returning an
+    # object whose models list has one entry per (name, updatable) pair, each carrying the name and
+    # the update-weights flag (false means a frozen engine). Mutates the module via the monkeypatch.
     """Answer resolve_sglang_config with just the model names and their update_weights flag."""
     models = [SimpleNamespace(name=name, update_weights=updatable) for name, updatable in names_updatable]
     monkeypatch.setattr(multi_policy_utils, "resolve_sglang_config", lambda args: SimpleNamespace(models=models))
 
 
 class TestValidateMultiPolicyArgs:
+    # [CLASS DOC] Tests of the multi-policy startup validator: accepted run shapes and the refusals
+    # for each unsupported option or mismatch with the sglang models.
     def _validate(self, args: Namespace) -> None:
+        # [FUNCTION DOC] HELPER: Runs the multi-policy argument validator on the given arguments, with
+        # the Megatron config resolved from the same arguments.
         multi_policy_utils.validate_multi_policy_args(args, megatron_config=resolve_megatron_config(args))
 
     def test_a_run_naming_every_policy_on_both_sides_is_accepted(self, monkeypatch):
+        # [FUNCTION DOC] Two policies a and b, both with updatable sglang models of the same names:
+        # validation passes without raising.
         """The happy path has to stay reachable, or every refusal below is vacuous."""
         _stub_sglang_models(monkeypatch, ("a", True), ("b", True))
 
         self._validate(_make_args("a", "b"))
 
     def test_a_policy_without_a_matching_sglang_model_is_refused(self, monkeypatch):
+        # [FUNCTION DOC] Policies a and b but only an sglang model for a: validation raises an
+        # assertion error saying the Megatron config model list containing only b has no matching
+        # sglang model.
         """This is the only startup check that stops a weight update from finding no engine at all."""
         _stub_sglang_models(monkeypatch, ("a", True))
 
@@ -64,6 +94,8 @@ class TestValidateMultiPolicyArgs:
             self._validate(_make_args("a", "b"))
 
     def test_an_sglang_model_that_is_frozen_does_not_count_as_a_match(self, monkeypatch):
+        # [FUNCTION DOC] The sglang model for b exists but is not updatable (frozen): validation still
+        # raises the no-matching-model assertion error for b.
         """A frozen engine is never handed weights, so the policy pointing at it would train into nothing."""
         _stub_sglang_models(monkeypatch, ("a", True), ("b", False))
 
@@ -71,6 +103,8 @@ class TestValidateMultiPolicyArgs:
             self._validate(_make_args("a", "b"))
 
     def test_a_single_policy_config_is_sent_back_to_train_async(self, monkeypatch):
+        # [FUNCTION DOC] A config with only one policy raises an assertion error telling the user to
+        # run the single-policy asynchronous training script instead.
         """One policy through this driver would silently skip everything train_async.py does."""
         _stub_sglang_models(monkeypatch, ("a", True))
 
@@ -92,6 +126,11 @@ class TestValidateMultiPolicyArgs:
         ],
     )
     def test_the_unsupported_run_shapes_are_refused(self, monkeypatch, overrides, message):
+        # [FUNCTION DOC] Parametrized over argument overrides and an expected message fragment: colocate,
+        # not fully asynchronous, critic enabled, debug rollout only, the retry unused-sample handler,
+        # a dump-details path, a debug rollout data load path, a rollout injection path, and a
+        # checkpoint step. With valid sglang models for a and b, each override makes validation raise an
+        # assertion error matching the fragment.
         """Each of these silently breaks a different assumption the one-loop-per-policy driver makes."""
         _stub_sglang_models(monkeypatch, ("a", True), ("b", True))
 
@@ -99,18 +138,23 @@ class TestValidateMultiPolicyArgs:
             self._validate(_make_args("a", "b", **overrides))
 
     def test_a_run_saving_rollout_data_is_accepted(self, monkeypatch):
+        # [FUNCTION DOC] Setting a debug rollout data save path template is accepted (no error).
         """Rollout dumps are keyed per policy since the executor stamps the trainer model id into the stem."""
         _stub_sglang_models(monkeypatch, ("a", True), ("b", True))
 
         self._validate(_make_args("a", "b", save_debug_rollout_data="/tmp/{rollout_id}.pt"))
 
     def test_a_shared_engine_evaluating_run_is_accepted(self, monkeypatch):
+        # [FUNCTION DOC] An evaluation interval of 10 with default (shared engine) evaluation is
+        # accepted.
         """train_multi_policy.py dispatches shared-engine eval, so --eval-interval alone is a valid run."""
         _stub_sglang_models(monkeypatch, ("a", True), ("b", True))
 
         self._validate(_make_args("a", "b", eval_interval=10))
 
     def test_a_snapshot_evaluating_run_is_refused(self, monkeypatch):
+        # [FUNCTION DOC] An evaluation interval together with the evaluate-using-snapshots flag raises
+        # an assertion error saying evaluation supports shared rollout engines only.
         """A snapshot backend exports one trainer's checkpoint, which cannot represent several policies."""
         _stub_sglang_models(monkeypatch, ("a", True), ("b", True))
 
@@ -118,6 +162,8 @@ class TestValidateMultiPolicyArgs:
             self._validate(_make_args("a", "b", eval_interval=10, eval_uses_snapshots=True))
 
     def test_a_run_without_an_sglang_config_is_refused(self, monkeypatch):
+        # [FUNCTION DOC] With the sglang config option unset, validation raises an assertion error
+        # saying the run needs the sglang config option.
         """Without one inference model per policy, every update would land on the same engines."""
         _stub_sglang_models(monkeypatch, ("a", True), ("b", True))
 
@@ -125,6 +171,8 @@ class TestValidateMultiPolicyArgs:
             self._validate(_make_args("a", "b", sglang_config=None))
 
     def test_a_checkpointing_run_is_accepted(self, monkeypatch):
+        # [FUNCTION DOC] A save directory plus save interval of 10 is accepted (saving is no longer
+        # refused).
         """Saving was refused until the global checkpoint existed, and nothing else must reintroduce the refusal."""
         _stub_sglang_models(monkeypatch, ("a", True), ("b", True))
 
@@ -132,6 +180,12 @@ class TestValidateMultiPolicyArgs:
 
 
 def _make_trainer_args(*model_ids: str, **overrides: Any) -> Namespace:
+    # [FUNCTION DOC] HELPER: Builds a namespace for trainer creation: encoded Megatron config for the
+    # given ids, no critic, global rollout dataset on, no trainer model id, tokenizer and HF checkpoint
+    # paths set to a fixed fake path, no save, load, reference load or reference checkpoint step,
+    # core Megatron-to-HF mode, no optimizer/rng skipping, not finetune, no start rollout id and no
+    # trainer controller addresses. Keyword overrides replace defaults; the result is layered over the
+    # shared parser defaults.
     defaults = dict(
         megatron_config=encode_megatron_config(*model_ids),
         use_critic=False,
@@ -155,13 +209,26 @@ def _make_trainer_args(*model_ids: str, **overrides: Any) -> Namespace:
 
 
 class TestCreatePolicyTrainers:
+    # [CLASS DOC] Tests of the create-trainers helper with the training model creation, handle
+    # creation and takeover step replaced by fakes: trainers are keyed by model id, carry their own
+    # restored start rollout id and parallel config, and the shared rollout executor is loaded at the
+    # leader's position; resume requires the global rollout state file.
     @staticmethod
     def _stub_create_training_model(
         monkeypatch, start_rollout_ids: dict[str, int], *, resumed: bool = False
     ) -> list[dict]:
+        # [FUNCTION DOC] HELPER: Patches three module functions. The training model creator becomes a
+        # fake that gives the handle an asynchronous parallel-config getter returning a string naming
+        # the trainer id, appends a record (trainer id, args, handle, resumed flag) to a list, and
+        # returns an object with the handle and the start rollout id looked up by the args' trainer
+        # model id in the given mapping. The handle creator returns a mapping from each trainer id to
+        # an async mock. The takeover function becomes an async mock returning the resumed argument.
+        # Returns the list of creation records, filled as trainers are created.
         created: list[dict] = []
 
         async def _create(trainer_args, *, handle, trainer_id, resumed):
+            # [FUNCTION DOC] HELPER: Fake training model creator; see the enclosing stub for the
+            # recorded fields and return value.
             handle.get_train_parallel_config = AsyncMock(return_value=f"parallel-config-of-{trainer_id}")
             created.append(dict(trainer_id=trainer_id, args=trainer_args, handle=handle, resumed=resumed))
             return SimpleNamespace(handle=handle, start_rollout_id=start_rollout_ids[trainer_args.trainer_model_id])
@@ -176,6 +243,10 @@ class TestCreatePolicyTrainers:
         return created
 
     async def test_every_policy_gets_a_trainer_keyed_by_its_model_id(self, monkeypatch):
+        # [FUNCTION DOC] Creates trainers for policies a and b. Asserts trainer ids a-actor and b-actor
+        # were created in order, each creation received args whose trainer model id is its own policy,
+        # the returned mapping is keyed a then b, each trainer info carries its model id, and each
+        # holds the handle that was created for it.
         """The driver looks a trainer up by model id on every round; a wrong key trains the wrong policy."""
         created = self._stub_create_training_model(monkeypatch, dict(a=0, b=0))
 
@@ -188,6 +259,8 @@ class TestCreatePolicyTrainers:
         assert [trainer.handle for trainer in trainers.values()] == [entry["handle"] for entry in created]
 
     async def test_every_trainer_carries_the_rollout_its_own_checkpoint_restored(self, monkeypatch):
+        # [FUNCTION DOC] With restored start rollout ids a=4 and b=2, asserts each returned trainer
+        # info keeps its own start rollout id.
         """Each policy resumes from its own position, so the position travels beside its handle."""
         self._stub_create_training_model(monkeypatch, dict(a=4, b=2))
 
@@ -196,6 +269,9 @@ class TestCreatePolicyTrainers:
         assert {model_id: trainer.start_rollout_id for model_id, trainer in trainers.items()} == dict(a=4, b=2)
 
     async def test_every_policy_publishes_its_own_parallel_config(self, monkeypatch):
+        # [FUNCTION DOC] With a mock rollout executor, asserts its set-train-parallel-config method was
+        # awaited once per policy, in order, with that trainer's parallel config as the positional
+        # argument and the policy's model id as the trainer model id keyword.
         """The executor splits each policy's batch by that policy's own dp size."""
         self._stub_create_training_model(monkeypatch, dict(a=0, b=0))
         rollout_executor = AsyncMock()
@@ -208,6 +284,9 @@ class TestCreatePolicyTrainers:
         ] == [("parallel-config-of-a-actor", "a"), ("parallel-config-of-b-actor", "b")]
 
     async def test_the_executor_is_loaded_at_the_leader_policys_position(self, monkeypatch):
+        # [FUNCTION DOC] With start rollout ids a=4 and b=2 (the first policy is the leader), asserts the
+        # rollout executor's load method is awaited exactly once with 3, i.e. the leader's start
+        # rollout id minus one.
         """One executor serves every policy, and the leader is the policy whose index names the run."""
         self._stub_create_training_model(monkeypatch, dict(a=4, b=2))
         rollout_executor = AsyncMock()
@@ -217,6 +296,8 @@ class TestCreatePolicyTrainers:
         rollout_executor.load.assert_awaited_once_with(3)
 
     async def test_a_lagging_leader_still_decides_where_the_executor_loads(self, monkeypatch):
+        # [FUNCTION DOC] With the leader behind its follower (a=2, b=9), asserts the executor load is
+        # awaited once with 1 (leader's start rollout id minus one), not derived from the follower.
         """Picking any other trainer would replay the global rollout data from a position the leader never stood at."""
         self._stub_create_training_model(monkeypatch, dict(a=2, b=9))
         rollout_executor = AsyncMock()
@@ -226,6 +307,9 @@ class TestCreatePolicyTrainers:
         rollout_executor.load.assert_awaited_once_with(1)
 
     async def test_a_taken_over_run_loads_the_executor_at_the_leaders_position(self, monkeypatch):
+        # [FUNCTION DOC] With the takeover fake reporting a resumed run and start ids a=4, b=2, asserts
+        # both trainer creations received the resumed flag set, and the executor load is awaited once
+        # with 3.
         """Every policy resumed from a checkpoint, so the shared dataset has to be asked for the same position."""
         created = self._stub_create_training_model(monkeypatch, dict(a=4, b=2), resumed=True)
         rollout_executor = AsyncMock()
@@ -236,6 +320,9 @@ class TestCreatePolicyTrainers:
         rollout_executor.load.assert_awaited_once_with(3)
 
     async def test_a_resume_without_the_global_rollout_state_is_refused(self, monkeypatch, tmp_path):
+        # [FUNCTION DOC] Both policies restored at rollout 4 with a load directory (a temporary,
+        # empty one) lacking the global dataset state file: creation raises an assertion error naming
+        # the missing file for leader rollout id 3.
         """The models would resume at rollout 4 while the data source silently restarts at the first prompt."""
         self._stub_create_training_model(monkeypatch, dict(a=4, b=4))
 
@@ -245,6 +332,9 @@ class TestCreatePolicyTrainers:
             )
 
     async def test_a_resume_with_the_global_rollout_state_loads_it(self, monkeypatch, tmp_path):
+        # [FUNCTION DOC] Creates an empty file for the global dataset state of rollout 3 under a rollout
+        # subdirectory of the load directory, then creates trainers restored at rollout 4. Asserts
+        # creation succeeds and the executor load is awaited once with 3.
         """The supported resume shape has to stay reachable, or no multi policy run could ever restart."""
         self._stub_create_training_model(monkeypatch, dict(a=4, b=4))
         state = tmp_path / "rollout" / "global_dataset_state_dict_3.pt"
@@ -259,6 +349,8 @@ class TestCreatePolicyTrainers:
         rollout_executor.load.assert_awaited_once_with(3)
 
     async def test_a_trainer_config_without_a_policy_model_id_is_refused(self, monkeypatch):
+        # [FUNCTION DOC] Trainer args whose Megatron config is unset (so trainers have no policy model
+        # id): creation raises an assertion error saying the trainer carries no policy model id.
         """Every state this driver keys is keyed by model id, so an unnamed trainer has nowhere to live."""
         self._stub_create_training_model(monkeypatch, {})
 
@@ -269,13 +361,19 @@ class TestCreatePolicyTrainers:
 
 
 class TestAssertGlobalRolloutStateExists:
+    # [CLASS DOC] Tests of the private check that the global rollout data-source state file exists
+    # when resuming; only the cases where the check is skipped are covered here.
     def test_a_non_global_data_source_needs_no_global_rollout_state(self, tmp_path: Path) -> None:
+        # [FUNCTION DOC] With the global dataset option off and an existing (empty) load directory, the
+        # check passes without raising.
         """A custom data source does not use Miles' global dataset state file when resuming."""
         args = Namespace(rollout_global_dataset=False, load=str(tmp_path))
 
         multi_policy_utils._assert_global_rollout_state_exists(args, leader_rollout_id=3)
 
     def test_a_resume_without_a_load_directory_skips_the_global_state_file_check(self) -> None:
+        # [FUNCTION DOC] With the global dataset option on but no load directory, the check passes
+        # without raising.
         """A takeover or save-only resume has no load directory whose dataset state can be checked."""
         args = Namespace(rollout_global_dataset=True, load=None)
 
@@ -283,7 +381,12 @@ class TestAssertGlobalRolloutStateExists:
 
 
 class TestDefinePolicyMetricGroups:
+    # [CLASS DOC] Tests of the per-policy metric group declaration.
     def test_a_multi_policy_run_binds_every_prefixed_curve_to_its_own_step(self, monkeypatch):
+        # [FUNCTION DOC] Replaces the step-key metric group definer with a recorder, then declares the
+        # groups for a config with policies a and b. Asserts four calls in order: for each policy, one
+        # with the policy prefix and a rollout-step key, then one with the policy-and-train prefix and
+        # a train-step key.
         """An undeclared prefix is plotted against wandb's internal counter instead of its own rollout step."""
         calls: list[dict] = []
         monkeypatch.setattr(multi_policy_utils, "define_step_key_metric_group", lambda **kwargs: calls.append(kwargs))
@@ -299,29 +402,43 @@ class TestDefinePolicyMetricGroups:
 
 
 class TestAssertConsistentRestore:
+    # [CLASS DOC] Tests of the check that restored policy positions match the saved global checkpoint
+    # record (leader fixed to policy a): fresh runs, exact matches, mismatches, missing or foreign
+    # records, and unknown leaders.
     @staticmethod
     def _trainers(**start_rollout_ids: int) -> dict[str, TrainerInfo]:
+        # [FUNCTION DOC] HELPER: Builds a mapping from model id to a trainer info with that id, the
+        # given start rollout id and an async mock handle.
         return {
             model_id: TrainerInfo(model_id=model_id, start_rollout_id=value, handle=AsyncMock())
             for model_id, value in start_rollout_ids.items()
         }
 
     def _assert(self, args, **start_rollout_ids: int) -> None:
+        # [FUNCTION DOC] HELPER: Runs the consistency check with trainers built from the given start
+        # rollout ids and policy a as leader.
         multi_policy_utils.assert_consistent_restore(
             args, trainers=self._trainers(**start_rollout_ids), leader_model_id="a"
         )
 
     def test_a_fresh_run_needs_no_record(self, tmp_path):
+        # [FUNCTION DOC] All policies start at rollout 0 with no record present: passes.
         """Nothing was ever saved, so there is nothing to be consistent with."""
         self._assert(Namespace(save=str(tmp_path), load=None), a=0, b=0)
 
     def test_the_policies_resume_at_the_positions_the_record_names(self, tmp_path):
+        # [FUNCTION DOC] A record saved with rollout ids a=4, b=2; trainers start at 5 and 3 (one past
+        # each recorded id): passes, so a lagging policy is a legal resume.
         """Fully async policies run at their own pace, so a lagging policy is a legal resume."""
         MultiPolicyCheckpointState(leader_model_id="a", rollout_ids={"a": 4, "b": 2}).save(tmp_path)
 
         self._assert(Namespace(save=str(tmp_path), load=None), a=5, b=3)
 
     def test_the_record_is_read_from_the_load_directory(self, tmp_path):
+        # [FUNCTION DOC] The record (a=4, b=2) is saved in an old directory used as the load
+        # directory while the save directory is a different new one; trainers start at 5 and 5. Raises
+        # an assertion error that the policies must resume exactly where the record says, proving the
+        # record is read from the load directory.
         """Resuming with --load elsewhere and a fresh --save is the common shape and used to skip the check."""
         load_dir = tmp_path / "old"
         MultiPolicyCheckpointState(leader_model_id="a", rollout_ids={"a": 4, "b": 2}).save(load_dir)
@@ -331,6 +448,8 @@ class TestAssertConsistentRestore:
             self._assert(args, a=5, b=5)
 
     def test_a_policy_restored_past_its_recorded_position_is_refused(self, tmp_path):
+        # [FUNCTION DOC] Record a=4, b=2 but trainers start at 5 and 4 (the second is past its
+        # recorded position): raises the must-resume-exactly assertion error.
         """The global rollout data was snapshotted at the recorded moment, not at this one."""
         MultiPolicyCheckpointState(leader_model_id="a", rollout_ids={"a": 4, "b": 2}).save(tmp_path)
 
@@ -338,11 +457,15 @@ class TestAssertConsistentRestore:
             self._assert(Namespace(save=str(tmp_path), load=None), a=5, b=4)
 
     def test_a_resume_without_a_record_fails_loudly(self, tmp_path):
+        # [FUNCTION DOC] Trainers resume at 5 and 3 but the save directory holds no record: raises an
+        # assertion error saying there is no record.
         """Silently skipping the check is exactly the mixture of checkpoints the record exists to refuse."""
         with pytest.raises(AssertionError, match="no record of"):
             self._assert(Namespace(save=str(tmp_path), load=None), a=5, b=3)
 
     def test_a_record_written_under_another_leader_is_refused(self, tmp_path):
+        # [FUNCTION DOC] The record names b as leader but the check uses a as leader: raises an
+        # assertion error mentioning the leader policy.
         """The global rollout index means whatever the leader's index meant when it was written."""
         MultiPolicyCheckpointState(leader_model_id="b", rollout_ids={"a": 4, "b": 4}).save(tmp_path)
 
@@ -350,16 +473,22 @@ class TestAssertConsistentRestore:
             self._assert(Namespace(save=str(tmp_path), load=None), a=5, b=5)
 
     def test_a_policy_restored_while_the_leader_starts_from_scratch_is_refused(self, tmp_path):
+        # [FUNCTION DOC] Leader a starts at 0 while b starts at 3: raises an assertion error that the
+        # leader starts from scratch.
         """The data source would be replayed from zero into a policy that already trained on it."""
         with pytest.raises(AssertionError, match="starts from scratch"):
             self._assert(Namespace(save=str(tmp_path), load=None), a=0, b=3)
 
     def test_a_resume_without_any_state_directory_is_refused(self):
+        # [FUNCTION DOC] Neither save nor load directory is set while the trainers resume (5 and 3):
+        # raises an assertion error saying the resume is without load or save.
         """A run resuming with neither --load nor --save has nowhere to read the other policies from."""
         with pytest.raises(AssertionError, match="without --load or --save"):
             self._assert(Namespace(save=None, load=None), a=5, b=3)
 
     def test_a_leader_that_is_not_one_of_the_policies_is_reported(self, tmp_path):
+        # [FUNCTION DOC] Calls the check directly with leader id c, which is not among the trainers
+        # (a and b): raises a key error naming c.
         """Every position this check compares hangs off the leader, so a leader nobody trains is unanswerable."""
         with pytest.raises(KeyError, match="'c'"):
             multi_policy_utils.assert_consistent_restore(
@@ -368,7 +497,11 @@ class TestAssertConsistentRestore:
 
 
 class TestTheIterationAResumeStartsFrom:
+    # [CLASS DOC] Tests that the argument validator rejects the single checkpoint step selector, since
+    # each policy stands at its own iteration.
     def test_a_resume_that_names_one_iteration_for_every_policy_is_refused(self, monkeypatch):
+        # [FUNCTION DOC] A checkpoint step of 7 makes validation raise an assertion error saying every
+        # policy stands at an iteration of its own.
         """The followers would restore the leader's iteration and only fail the consistency check afterwards."""
         _stub_sglang_models(monkeypatch, ("a", True), ("b", True))
 
@@ -378,6 +511,8 @@ class TestTheIterationAResumeStartsFrom:
             )
 
     def test_the_iteration_zero_a_selector_can_name_is_refused_too(self, monkeypatch):
+        # [FUNCTION DOC] A checkpoint step of 0 is still refused (the check must test for presence,
+        # not truthiness).
         """Zero is a checkpoint like any other, and a falsy check would let this one resume."""
         _stub_sglang_models(monkeypatch, ("a", True), ("b", True))
 
@@ -387,6 +522,7 @@ class TestTheIterationAResumeStartsFrom:
             )
 
     def test_a_run_that_names_no_iteration_is_accepted(self, monkeypatch):
+        # [FUNCTION DOC] With the checkpoint step unset, validation passes.
         """Every multi policy resume reads the iteration each policy recorded, and this is that run."""
         _stub_sglang_models(monkeypatch, ("a", True), ("b", True))
 

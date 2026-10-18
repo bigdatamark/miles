@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Tests that the LoRA target patterns Miles derives from a Hugging Face model config actually match
+# parameters of the real, natively implemented Transformers model classes. For every supported native
+# model type (dense, mixture-of-experts, linear-attention and multimodal variants) a tiny config is
+# built, the model is instantiated on the meta device (no memory), and each attention, mlp and unembed
+# target pattern is checked against the model's two- or three-dimensional parameters. Also covers the
+# GLM launcher scripts' expert-LoRA ablation switch and the weight mapping for a remote-code config
+# whose class name collides with a native one.
 import argparse
 import importlib
 import shlex
@@ -37,6 +45,17 @@ _MULTIMODAL_MODELS = {"qwen3_5", "qwen3_5_moe"}
 
 
 def _small_config(model_type, overrides):
+    # [FUNCTION DOC] HELPER: Builds a tiny Hugging Face config for the given model type. Starts from a
+    # shared set of small text dimensions (vocab 64, hidden 32, two layers, four attention heads, two
+    # key/value heads, head dim 8), then layers on type-specific fields: expert counts and sparse-step
+    # settings for the mixture-of-experts families, layer-type lists and linear-attention head sizes
+    # for the qwen3 next/3.5 families, local-expert counts for gpt-oss, dense-replacement, routed and
+    # shared expert and grouping fields for the deepseek/glm families, low-rank query/key-value and
+    # head-dim fields for deepseek v2/v3 and the glm dsa variant, plus indexer fields and per-layer
+    # mlp types for the dsa variant. The caller overrides are applied last and win. Returns a config
+    # object created through the auto-config factory; for the multimodal types the text fields are
+    # passed as the text sub-config together with a minimal one-layer vision sub-config, otherwise the
+    # fields are passed flat.
     text = dict(
         vocab_size=64,
         hidden_size=32,
@@ -98,6 +117,11 @@ def _small_config(model_type, overrides):
 
 
 def test_native_model_coverage():
+    # [FUNCTION DOC] Asserts that the list of natively testable model types equals the set of model
+    # types registered in the library's LoRA model table minus a fixed non-native set (custom-code
+    # models, a Miles alias, and a type newer than the pinned Transformers: deepseek v32, the kimi
+    # variants and the inkling variants). Fails when a model type is added to the table without being
+    # added to the native list here (or to the non-native exclusions).
     # These entries use custom code, a Miles alias, or a version newer than the pinned Transformers.
     non_native = {
         "deepseek_v32",
@@ -139,6 +163,18 @@ def test_native_model_coverage():
     ],
 )
 def test_targets_match_native_hf_model(model_type, overrides):
+    # [FUNCTION DOC] Parametrized over every native model type plus variants (uncompressed query for
+    # deepseek, all-dense or all-moe layer layouts, full vs linear attention layer types, dense vs
+    # sparse glm dsa layers). Builds the tiny config, instantiates the matching causal-LM class (or the
+    # image-text class for the multimodal types) on the meta device with eager attention, and collects
+    # every two- or three-dimensional parameter keyed by name without the weight suffix (keeping tied
+    # heads; packed expert projections have no weight suffix). Asserts: there are projections and all
+    # parameters are meta; the Miles weight mapping built from the config lists exactly those parameter
+    # names; for each of the attention, mlp and unembed groups of the LoRA layout, the group is
+    # non-empty and each target glob matches at least one projection, all matches are non-empty
+    # tensors, and none is an indexer projection. Finally the default resolved targets equal the
+    # attention plus mlp targets, and requesting attention, mlp and unembed resolves to all three
+    # groups combined.
     config = _small_config(model_type, overrides)
     model_cls = AutoModelForImageTextToText if model_type in _MULTIMODAL_MODELS else AutoModelForCausalLM
     with torch.device("meta"):
@@ -173,6 +209,16 @@ def test_targets_match_native_hf_model(model_type, overrides):
 
 @pytest.mark.parametrize("launcher", ["run_glm5_1_744b_a40b_lora", "run_glm5_2_744b_a40b_lora"])
 def test_glm_launcher_ablation_selects_only_attention(monkeypatch: pytest.MonkeyPatch, launcher: str) -> None:
+    # [FUNCTION DOC] Parametrized over the two GLM-5 LoRA launcher scripts. Imports the launcher
+    # module, sets the keep-expert-LoRA environment variable to zero and removes the expert-LoRA layers
+    # variable, builds the script arguments with experiment tracking off, and replaces the backend
+    # factory with a fake backend whose train call just records the training argument string. Runs the
+    # launcher's train function, then parses the recorded command with a small parser that only knows
+    # the target-modules and exclude-modules options. Asserts exactly one training command was issued,
+    # and that after resolving the target modules and applying the exclusions against a tiny glm dsa
+    # config the selected targets equal the model's attention targets only. Also asserts the selected
+    # targets map to real parameters of the weight mapping, all inside self-attention and none in the
+    # indexer.
     """Disabling expert LoRA selects only attention targets in both GLM launchers."""
     module = importlib.import_module(f"scripts.{launcher}")
     train_commands = []
@@ -204,6 +250,11 @@ def test_glm_launcher_ablation_selects_only_attention(monkeypatch: pytest.Monkey
 
 
 def test_remote_config_with_native_class_name():
+    # [FUNCTION DOC] Creates a config class named like the native deepseek v2 config but derived
+    # directly from the generic pretrained-config base (simulating remote custom code), instantiated
+    # from the native config's field dictionary with the head dimension field removed. Asserts the
+    # weight mapping built from this remote-style config has the same parameter names as the mapping
+    # from the native config, i.e. mapping selection works by model type rather than class identity.
     config = _small_config("deepseek_v2", {})
     remote_config_class = type("DeepseekV2Config", (PretrainedConfig,), {"model_type": "deepseek_v2"})
     remote_fields = config.to_dict()
