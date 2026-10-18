@@ -255,6 +255,9 @@ _ALL = set(KNOWN_LABELS)
 
 
 class TestResolvePolicy:
+    # [CLASS DOC] Tests for the policy resolution function: for each cadence (regular, nightly,
+    # weekly, release) and set of labels, which domain labels are included and whether fast-fail is
+    # bypassed.
     @pytest.mark.parametrize(
         ("cadence", "labels", "expected", "bypass"),
         [

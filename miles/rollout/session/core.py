@@ -253,6 +253,9 @@ class SessionCore:
         *,
         use_addition_r3=False,
     ):
+        # [FUNCTION DOC] Stores the proxy backend, session registry and server config, the optional
+        # server instance id (kept as the instance id attribute), and the keyword-only additional
+        # routing replay flag (default false). No validation or I/O.
         self.backend = backend
         self.registry = registry
         self.config = config

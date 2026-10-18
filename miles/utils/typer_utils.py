@@ -19,10 +19,15 @@ _F = TypeVar("_F", bound=Callable[..., object])
 SCRIPT_ENV_VAR_PREFIX = "MILES_SCRIPT_"
 
 
+# [FUNCTION DOC] HELPER: Typing-only overload for bare decoration: takes the function and
+# returns it with the same type. No runtime body.
 @overload
 def dataclass_cli(func: _F) -> _F: ...
 
 
+# [FUNCTION DOC] HELPER: Typing-only overload for decoration with a keyword-only environment
+# variable prefix (default: the script prefix constant): takes no function and returns a decorator.
+# No runtime body.
 @overload
 def dataclass_cli(
     func: None = None,

@@ -193,6 +193,10 @@ class DeepSeekV4Family(DeepSeekFamily):
 
 
 class DeepSeekV41Family(DeepSeekV4Family):
+    # [CLASS DOC] V4.1 family using sglang's V4.1 encoder module. Differs from V4 in three ways:
+    # the encode config always carries a reasoning effort (caller value, else environment-derived
+    # default), tools are injected using the V4.1 payload that keeps only client-sent fields, and
+    # the generation prompt suffix rule is inherited from V4 unchanged.
     """V4.1 mirrors sglang's ``serving_chat`` dsv41 branch: tools keep only the
     fields the client sent, ``reasoning_effort`` always reaches the encoder (the
     server default comes from ``SGLANG_DSV41_REASONING_EFFORT``), and a

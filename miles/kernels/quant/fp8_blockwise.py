@@ -87,6 +87,9 @@ def fp8_blockwise_cast(x: torch.Tensor, block_size=None) -> tuple[torch.Tensor, 
     s = torch.empty(ceil_div(M, BLOCK_M), ceil_div(N, BLOCK_N), dtype=torch.float32, device=x.device)
 
     def grid(meta):
+        # [FUNCTION DOC] HELPER: Launch grid callback. Returns a two-element grid: row blocks (M
+        # divided by the tuned block M, rounded up) and column blocks (N divided by the tuned block
+        # N, rounded up).
         return (triton.cdiv(M, meta["BLOCK_M"]), triton.cdiv(N, meta["BLOCK_N"]))
 
     if x.is_contiguous():

@@ -500,6 +500,10 @@ def invoke_fused_moe_backward_kernel(
 
     # ===================== Compute grad_input =====================
     def grid_input(META):
+        # [FUNCTION DOC] HELPER: Launch grid callback for the input-gradient kernel. Given the
+        # autotuned meta parameters, returns a one-element grid size: the number of row blocks
+        # (sorted token count divided by block size M, rounded up) times the number of column
+        # blocks (N divided by block size N, rounded up).
         return (triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),)
 
     fused_moe_backward_input_kernel[grid_input](
@@ -534,6 +538,9 @@ def invoke_fused_moe_backward_kernel(
 
     # Use same grid configuration as forward kernel: encode both M and N dimensions
     def grid_weight(META):
+        # [FUNCTION DOC] HELPER: Launch grid callback for the weight-gradient kernel. Same shape as
+        # the forward kernel grid: a one-element grid holding row blocks (sorted token count over
+        # block size M, rounded up) times column blocks (N over block size N, rounded up).
         return (triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),)
 
     fused_moe_backward_weight_kernel[grid_weight](
@@ -565,6 +572,9 @@ def invoke_fused_moe_backward_kernel(
     if mul_routed_weight and grad_topk_weights is not None:
 
         def grid_topk(META):
+            # [FUNCTION DOC] HELPER: Launch grid callback for the routing-weight gradient kernel.
+            # Returns a one-element grid with only the row block count (sorted token count over
+            # block size M, rounded up); there is no column dimension.
             return (triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"]),)
 
         fused_moe_backward_topk_weights_kernel[grid_topk](

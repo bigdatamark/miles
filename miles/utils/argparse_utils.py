@@ -81,6 +81,9 @@ class DataclassArgparseBridge(Generic[T]):
         prefix: str,
         group_title: str | None = None,
     ) -> None:
+        # [FUNCTION DOC] Binds the bridge to a dataclass type. Raises a type error if the argument is
+        # not a dataclass. Stores the type, the prefix, the group title (falling back to the class
+        # name plus "args" when none or empty), and the resolved type hints of the dataclass.
         if not dataclasses.is_dataclass(dataclass_type):
             raise TypeError(f"{dataclass_type!r} is not a dataclass")
 

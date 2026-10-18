@@ -94,6 +94,11 @@ def act_quant_kernel(
         Y: T.Tensor[(M, N), out_dtype],
         S: T.Tensor[(M, T.ceildiv(N, group_size)), scale_dtype],
     ):
+        # [FUNCTION DOC] HELPER: The device program built by the factory above (see its notes for
+        # the algorithm). Inputs: X, the M-by-N input; outputs written in place: Y, the M-by-N
+        # quantized (or fake-quantized) result, and S, the per-row per-group scales. One thread block
+        # handles a 32-row by group-width tile, using shared and register fragments, a single-iteration
+        # pipelined loop, and a parallel per-row scale computation.
         with T.Kernel(T.ceildiv(M, blk_m), T.ceildiv(N, group_size), threads=128) as (
             pid_m,
             pid_n,

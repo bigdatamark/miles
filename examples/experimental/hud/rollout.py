@@ -244,6 +244,9 @@ def _resync_whitespace(
     """
 
     def sans_ws(ids: list[int]) -> str:
+        # [FUNCTION DOC] HELPER: Decodes the token ids to text with the enclosing tokenizer, then
+        # removes all whitespace characters, returning the compacted string. Used to compare token
+        # sequences while ignoring whitespace differences.
         return "".join(tokenizer.decode(ids).split())
 
     WINDOW = 4
