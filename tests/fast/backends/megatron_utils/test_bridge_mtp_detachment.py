@@ -1,3 +1,10 @@
+# [MODULE DOC] CPU regression test for the bridge model-provider helper that applies the run's
+# runtime configuration to a bridge-built provider, specifically the multi-token-prediction head
+# detachment flag. The helper function is extracted from the provider module's source by parsing
+# and executing only its definition (so no GPU-only Megatron imports happen). The test runs
+# it on a simple provider with one MTP layer and checks the flag semantics: enabling MTP training
+# turns detachment on; an already-on flag stays on; disabling or a missing training flag never turns
+# detachment on and never turns an already-on flag off.
 """CPU regression tests for MTP detachment on bridge-built providers."""
 
 import argparse
@@ -15,6 +22,11 @@ register_cpu_ci(est_time=1, suite="stage-a-cpu", labels=[])
 
 @pytest.fixture(scope="module")
 def apply_bridge_runtime_config() -> Callable:
+    # [FUNCTION DOC] HELPER: Module-scoped fixture. Locates the provider source file four levels
+    # above this test file's directory under the package path, parses it, selects the top-level
+    # function named for applying bridge runtime config (raises a stop-iteration error if absent),
+    # compiles a module containing only that function and executes it in a namespace that provides
+    # only the argument-parsing module. Returns the extracted callable.
     # Execute the production helper without importing GPU-only Megatron modules.
     path = Path(__file__).resolve().parents[4] / "miles/backends/megatron_utils/model_provider.py"
     tree = ast.parse(path.read_text())
@@ -28,6 +40,10 @@ def apply_bridge_runtime_config() -> Callable:
 
 @pytest.fixture
 def runtime_args() -> argparse.Namespace:
+    # [FUNCTION DOC] HELPER: Fixture returning a fresh arguments namespace with the parallelism
+    # sizes all 1, sequence parallel off, per-token loss and variable sequence lengths on, no
+    # recompute or offload, no fp8, automatic attention backend and the all-to-all MoE dispatcher. It
+    # deliberately has no MTP training flag.
     return argparse.Namespace(
         tensor_model_parallel_size=1,
         pipeline_model_parallel_size=1,
@@ -73,6 +89,11 @@ def test_bridge_mtp_detachment(
     initial_detach: bool,
     expected_detach: bool,
 ) -> None:
+    # [FUNCTION DOC] Parametrized over the MTP-training flag (true, false, or absent) and the
+    # provider's initial detach flag. Sets the flag on the arguments unless absent, applies the helper
+    # to a simple provider with one MTP layer, and asserts the resulting detach flag equals the expected
+    # value (true when training is enabled or it was already true, else false) and that the number of
+    # MTP layers is unchanged at 1.
     # A missing flag covers callers that only register Megatron's arguments.
     if enabled is not None:
         runtime_args.enable_mtp_training = enabled

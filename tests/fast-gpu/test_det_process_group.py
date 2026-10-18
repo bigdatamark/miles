@@ -1,3 +1,14 @@
+# [MODULE DOC] Tests for the deterministic NCCL process-group backend ("det_nccl") from the test
+# utilities package, which makes sum and average reductions bitwise reproducible by gathering every
+# rank's contribution and folding them in a fixed pairwise-tree order (ascending sequential fold for
+# non-power-of-two worlds), and delegates every other collective to native NCCL. Two parts:
+# (1) CPU-only unit tests using fake process groups that serve gathers from in-memory per-rank
+# tensors, covering fold order, chunked gathering under a tiny buffer cap, non-contiguous inputs,
+# average handling, world size one, and the list-form gather route used by torchft-style groups;
+# (2) four-GPU tests that spawn worker processes (spawn, free local port, NCCL) and check all-reduce,
+# reduce-scatter (tensor, list, uneven, aliased), coalescing manager, delegation of other collectives,
+# dtype handling, multi-chunk folds and object collectives bitwise against a reference tree fold, plus
+# using det_nccl as the world default backend. Registered for CUDA (4-GPU) and ROCm nightly suites.
 from tests.ci.ci_register import register_cuda_ci, register_rocm_ci
 
 register_cuda_ci(est_time=240, suite="stage-c-4-gpu-h200", labels=["precision"], hardware=["hopper", "blackwell"])
@@ -32,16 +43,27 @@ _SEED = 1234
 
 
 class _FakeFlatGroup:
+    # [CLASS DOC] HELPER: Fake process group exposing only a size method and the flat gather
+    # primitive. Remembers a running read offset into each rank's data, so successive gather calls
+    # return consecutive chunks (the code under test requests chunks in ascending order).
     """CPU stand-in with the c10d backend gather (_allgather_base); serves ascending chunk requests."""
 
     def __init__(self, per_rank: list[torch.Tensor]) -> None:
+        # [FUNCTION DOC] HELPER: Stores the list of per-rank tensors (their flattened elements are
+        # the data served) and resets the chunk offset to zero.
         self._per_rank = per_rank
         self._offset = 0
 
     def size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns the number of simulated ranks.
         return len(self._per_rank)
 
     def _allgather_base(self, output: torch.Tensor, input: torch.Tensor, opts: object) -> _CompletedWork:
+        # [FUNCTION DOC] HELPER: Fake flat all-gather. The input's element count is the chunk length;
+        # the output is viewed as (ranks, chunk length) and each row is filled from the corresponding
+        # rank's flattened data starting at the current offset (the real input tensor values are
+        # ignored; the options are unused). Advances the offset by the chunk length. Returns an
+        # already-completed work handle.
         count = input.numel()
         rows = output.view(self.size(), count)
         for row, src in zip(rows, self._per_rank, strict=True):
@@ -51,11 +73,16 @@ class _FakeFlatGroup:
 
 
 class _FakeTorchftGroup(dist.ProcessGroup):
+    # [CLASS DOC] HELPER: Fake process group that is a real process-group subclass (rank 0, size equal
+    # to the number of simulated ranks) overriding only the list-form all-gather, serving consecutive
+    # chunks of per-rank data like the flat fake does.
     """CPU stand-in mirroring torchft: a ProcessGroup subclass overriding only the list-form allgather
     (so it inherits a broken ``_allgather_base`` from the C++ base, exactly like the real wrappers);
     serves ascending chunk requests."""
 
     def __init__(self, per_rank: list[torch.Tensor]) -> None:
+        # [FUNCTION DOC] HELPER: Initializes the base group with rank 0 and size equal to the list
+        # length; stores the per-rank tensors and zeroes the chunk offset.
         super().__init__(0, len(per_rank))
         self._per_rank = per_rank
         self._offset = 0
@@ -63,6 +90,9 @@ class _FakeTorchftGroup(dist.ProcessGroup):
     def allgather(
         self, output_lists: list[list[torch.Tensor]], input_list: list[torch.Tensor], opts: object
     ) -> _CompletedWork:
+        # [FUNCTION DOC] HELPER: Fake list-form all-gather. Chunk length is the element count of the
+        # first input tensor; fills each tensor of the first output list from the matching rank's
+        # flattened data at the current offset, then advances the offset. Returns a completed work handle.
         count = input_list[0].numel()
         for row, src in zip(output_lists[0], self._per_rank, strict=True):
             row.copy_(src.reshape(-1)[self._offset : self._offset + count])
@@ -71,6 +101,9 @@ class _FakeTorchftGroup(dist.ProcessGroup):
 
 
 def _pairwise_tree_fold(partials: list[torch.Tensor]) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Reference reduction. Repeatedly adds adjacent pairs (elements 0+1, 2+3,
+    # ...) until one tensor remains. Valid only for a power-of-two count (an odd leftover would raise an
+    # index error). Returns the single result.
     """Inline reference fold (pairwise tree for power-of-two): independent of the module."""
     running = list(partials)
     while len(running) > 1:
@@ -79,11 +112,15 @@ def _pairwise_tree_fold(partials: list[torch.Tensor]) -> torch.Tensor:
 
 
 def test_det_nccl_backend_name_constant_value():
+    # [FUNCTION DOC] Asserts the exported backend name constant equals the string det_nccl.
     """DET_NCCL_BACKEND_NAME is the literal "det_nccl" the backend registers and reports under."""
     assert DET_NCCL_BACKEND_NAME == "det_nccl"
 
 
 def test_reduceop_equality_vs_containment_footgun():
+    # [FUNCTION DOC] Documents a torch quirk: an allreduce options object whose reduce op was set to
+    # sum compares equal to the sum op, yet is not found by tuple membership against (sum, average).
+    # Asserts both facts, justifying explicit equality checks in the code under test.
     """Documents why dispatch uses explicit ==: an options ReduceOp equals SUM yet tuple containment is False."""
     opts = dist.AllreduceOptions()
     opts.reduceOp = dist.ReduceOp.SUM
@@ -120,6 +157,10 @@ def test_reduceop_equality_vs_containment_footgun():
     ],
 )
 def test_fold_gathered_sum(parts: list[float], dtype: torch.dtype, expected: float):
+    # [FUNCTION DOC] Parametrized with per-rank one-element values, a dtype and the expected result,
+    # computed by hand to pin the summation order (pairwise tree for 2, 4, 8 ranks; ascending
+    # sequential fold otherwise, including 3 and 5 ranks) in float64, float32 and int64. Builds
+    # one-element tensors, calls the fold helper and asserts the result equals the literal exactly.
     """The fold's exact bracketing is pinned by hand-computed literals where any other order changes the bits."""
     tensors = [torch.tensor([value], dtype=dtype) for value in parts]
 
@@ -129,6 +170,8 @@ def test_fold_gathered_sum(parts: list[float], dtype: torch.dtype, expected: flo
 
 
 def test_reduce_op_of_extracts_reduceop_from_options_object():
+    # [FUNCTION DOC] Checks the reduce-op extraction helper on an allreduce options object (sum), a
+    # reduce-scatter options object (average), and a bare reduce op (max passes through unchanged).
     """_reduce_op_of reads .reduceOp from an options object and passes a bare ReduceOp through."""
     ar_opts = AllreduceOptions()
     ar_opts.reduceOp = dist.ReduceOp.SUM
@@ -142,6 +185,9 @@ def test_reduce_op_of_extracts_reduceop_from_options_object():
 
 
 def test_det_all_reduce_equals_manual_pairwise_tree_fold():
+    # [FUNCTION DOC] Four fake ranks each hold 16 random float32 values (seeded). The deterministic
+    # all-reduce is run in place on rank 0's copy over the flat fake group; asserts it equals the
+    # manual pairwise-tree fold bitwise.
     """det_all_reduce over a fake group equals the manual pairwise-tree fold bitwise."""
     gen = torch.Generator().manual_seed(_SEED)
     per_rank = [torch.randn(16, generator=gen, dtype=torch.float32) for _ in range(_WORLD_SIZE)]
@@ -153,6 +199,8 @@ def test_det_all_reduce_equals_manual_pairwise_tree_fold():
 
 
 def test_det_all_reduce_avg_equals_tree_fold_divided_by_world():
+    # [FUNCTION DOC] Same setup as the sum test with the average reduce op; asserts the result equals
+    # the tree fold divided by the world size (4), bitwise.
     """det_all_reduce with reduce_op=AVG equals the pairwise-tree fold divided by world_size bitwise."""
     gen = torch.Generator().manual_seed(_SEED + 31)
     per_rank = [torch.randn(16, generator=gen, dtype=torch.float32) for _ in range(_WORLD_SIZE)]
@@ -164,6 +212,10 @@ def test_det_all_reduce_avg_equals_tree_fold_divided_by_world():
 
 
 def test_det_all_reduce_avg_non_contiguous_recursion_passes_reduce_op_through():
+    # [FUNCTION DOC] Each fake rank holds 32 values; rank 0's data is reshaped 4 by 8 and transposed
+    # to a non-contiguous view (asserted non-contiguous). Runs the deterministic all-reduce with
+    # average on that view and asserts its flattened contents equal tree fold divided by the world size,
+    # proving the op survives the internal re-call on a contiguous copy.
     """A non-contiguous input with reduce_op=AVG recurses with the op preserved, writing tree/world back."""
     gen = torch.Generator().manual_seed(_SEED + 32)
     per_rank = [torch.randn(8 * 4, generator=gen, dtype=torch.float32) for _ in range(_WORLD_SIZE)]
@@ -178,6 +230,10 @@ def test_det_all_reduce_avg_non_contiguous_recursion_passes_reduce_op_through():
 
 
 def test_det_all_reduce_multi_chunk_matches_single_chunk(monkeypatch: pytest.MonkeyPatch):
+    # [FUNCTION DOC] Patches the module's gather buffer cap to 4 ranks times 7 elements of 4 bytes so
+    # a 50-element tensor needs several chunks (the last partial), runs the deterministic all-reduce
+    # on the flat fake group and asserts bitwise equality with the tree fold. The patch is undone by
+    # the monkeypatch fixture.
     """A tiny gather-buffer cap (forcing many chunks) gives bitwise-identical results to one chunk."""
     import miles.utils.test_utils.det_process_group as dpg
 
@@ -193,6 +249,9 @@ def test_det_all_reduce_multi_chunk_matches_single_chunk(monkeypatch: pytest.Mon
 
 
 def test_det_reduce_scatter_multi_chunk_slice_matches_full_fold(monkeypatch: pytest.MonkeyPatch):
+    # [FUNCTION DOC] With the same tiny gather cap as above and 48-element inputs, calls the
+    # deterministic reduce-scatter for rank 1 of 4 into a 12-element output and asserts it equals
+    # elements 12 to 24 of the full tree fold bitwise.
     """det_reduce_scatter under a tiny chunk cap writes exactly this rank's slice of the full fold."""
     import miles.utils.test_utils.det_process_group as dpg
 
@@ -209,6 +268,9 @@ def test_det_reduce_scatter_multi_chunk_slice_matches_full_fold(monkeypatch: pyt
 
 
 def test_det_all_reduce_torchft_list_gather_matches_flat_gather_bitwise():
+    # [FUNCTION DOC] Runs the deterministic all-reduce once over the flat fake group and once over
+    # the torchft-style fake group with identical per-rank data (32 floats) and asserts both results are
+    # bitwise equal to each other and to the tree fold.
     """The torchft list-form gather path is bitwise-identical to the _allgather_base path."""
     gen = torch.Generator().manual_seed(_SEED + 7)
     per_rank = [torch.randn(32, generator=gen, dtype=torch.float32) for _ in range(_WORLD_SIZE)]
@@ -224,6 +286,10 @@ def test_det_all_reduce_torchft_list_gather_matches_flat_gather_bitwise():
 
 
 def test_gather_into_routes_process_group_instances_to_list_form_allgather():
+    # [FUNCTION DOC] Builds the torchft-style fake group (which does have the flat gather attribute
+    # via inheritance) and asserts that attribute exists; then calls the module's private gather helper
+    # with an output of 4 times 8 floats and rank 0's input, and asserts the output rows equal the
+    # stacked per-rank tensors, i.e. the helper used the overridden list-form gather.
     """Regression: ProcessGroup subclasses inherit _allgather_base from the C++ base (hasattr is
     always True), so routing must key on isinstance and take the overridden list-form allgather."""
     import miles.utils.test_utils.det_process_group as dpg
@@ -240,6 +306,9 @@ def test_gather_into_routes_process_group_instances_to_list_form_allgather():
 
 
 def test_det_all_reduce_non_contiguous_input_writes_summed_values_back():
+    # [FUNCTION DOC] Same as the average variant but with the default sum: a transposed
+    # (non-contiguous) view of 32 values is reduced in place over the flat fake group; asserts its
+    # flattened contents equal the tree fold bitwise.
     """A non-contiguous (.t() view) input gets the correct summed values written back."""
     gen = torch.Generator().manual_seed(_SEED + 11)
     per_rank = [torch.randn(8 * 4, generator=gen, dtype=torch.float32) for _ in range(_WORLD_SIZE)]
@@ -254,6 +323,8 @@ def test_det_all_reduce_non_contiguous_input_writes_summed_values_back():
 
 
 def test_det_all_reduce_world_size_one_leaves_tensor_unchanged():
+    # [FUNCTION DOC] With a fake group of a single rank holding the same four floats, the in-place
+    # deterministic all-reduce must leave the tensor equal to the original.
     """A 1-rank group gathers only the local copy, so the tensor is unchanged."""
     original = torch.tensor([1.0, -2.5, 3.25, 0.0], dtype=torch.float32)
     tensor = original.clone()
@@ -262,6 +333,10 @@ def test_det_all_reduce_world_size_one_leaves_tensor_unchanged():
 
 
 def test_det_all_reduce_fold_order_checksum_pin():
+    # [FUNCTION DOC] Four ranks with four elements each (an integer-like column, a large cancelling
+    # pair of +-1e8 columns, and a column of 0.25). Asserts the result equals the reference tree fold
+    # and also a hard-coded literal [10, 0, 0, 1], including exact hexadecimal float representation of
+    # elements 0 and 3, so a change from tree to linear order fails.
     """Pin exact fold result so an accidental fold-order change (tree->linear) fails loudly."""
     per_rank = [
         torch.tensor([1.0, 1e8, -1e8, 0.25], dtype=torch.float32),
@@ -282,6 +357,8 @@ def test_det_all_reduce_fold_order_checksum_pin():
 
 
 def test_completed_work_future_wait_returns_result():
+    # [FUNCTION DOC] Asserts the completed-work helper's wait returns true and its future's wait
+    # returns none, without blocking.
     """_CompletedWork().get_future().wait() returns the (None) result without blocking."""
     work = _CompletedWork()
     assert work.wait() is True
@@ -289,6 +366,10 @@ def test_completed_work_future_wait_returns_result():
 
 
 def _order_sensitive_input(rank: int, seed: int = _SEED) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Builds a GPU float32 tensor of 1,048,576 elements whose sum across ranks
+    # depends strongly on summation order: a shared random vector (same seed on all ranks) scaled by
+    # 0.5 with sign alternating by rank parity, plus a small rank-specific random vector scaled by 1e-4.
+    # The shared parts cancel across ranks, leaving large relative rounding sensitivity.
     """Per-rank input whose cross-rank sum catastrophically cancels (~1e-4 from +-0.5)."""
     shared = torch.randn(_NUMEL, generator=torch.Generator().manual_seed(seed), dtype=torch.float32)
     own = torch.randn(_NUMEL, generator=torch.Generator().manual_seed(seed + 1 + rank), dtype=torch.float32)
@@ -297,6 +378,9 @@ def _order_sensitive_input(rank: int, seed: int = _SEED) -> torch.Tensor:
 
 
 def _manual_tree_sum(partials: list[torch.Tensor]) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Pairwise-tree reduction of a power-of-two-length list of tensors
+    # (adjacent pairs repeatedly added); returns the result.
+    # KNOWN ISSUE: duplicates the CPU-side pairwise tree fold helper defined earlier in this file.
     running = list(partials)
     while len(running) > 1:
         running = [running[i] + running[i + 1] for i in range(0, len(running), 2)]
@@ -304,6 +388,9 @@ def _manual_tree_sum(partials: list[torch.Tensor]) -> torch.Tensor:
 
 
 def _fixed_tree_reference(x: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Collective on the default group (all ranks must call it). All-gathers the
+    # tensor from every rank with native NCCL and returns the pairwise tree sum of the gathered copies
+    # in rank order.
     """Gather every rank's tensor (data movement only) and fold in the fixed tree order."""
     gathered = [torch.empty_like(x) for _ in range(_WORLD_SIZE)]
     dist.all_gather(gathered, x)
@@ -311,6 +398,9 @@ def _fixed_tree_reference(x: torch.Tensor) -> torch.Tensor:
 
 
 def _assert_bitwise(name: str, actual: torch.Tensor, expected: torch.Tensor) -> None:
+    # [FUNCTION DOC] HELPER: Returns silently if the tensors are exactly equal. Otherwise raises an
+    # assertion error whose message has the label, the number of mismatching elements out of the total,
+    # and the maximum absolute difference (this may itself fail for mismatched shapes or dtypes).
     if torch.equal(actual, expected):
         return
     mismatch = int((actual != expected).sum().item())
@@ -319,11 +409,18 @@ def _assert_bitwise(name: str, actual: torch.Tensor, expected: torch.Tensor) -> 
 
 
 def _shard_of(full: torch.Tensor, rank: int) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Returns the rank's equal-size contiguous slice (a view) of the flat
+    # tensor, with slice length equal to the element count divided by the world size (4).
     shard_numel = full.numel() // _WORLD_SIZE
     return full[rank * shard_numel : (rank + 1) * shard_numel]
 
 
 def _check_allreduce(rank: int, det1: dist.ProcessGroup, det2: dist.ProcessGroup, x, tree) -> None:
+    # [FUNCTION DOC] HELPER: Worker-side check (collective). On clones of the rank's input, asserts
+    # bitwise: sum all-reduce over the first deterministic group equals the reference tree; the same
+    # over a second group (a distinct communicator) gives the same bits; average equals tree divided by
+    # the world size; max over the deterministic group equals native NCCL max (delegation). The rank
+    # parameter is unused.
     a = x.clone()
     dist.all_reduce(a, op=dist.ReduceOp.SUM, group=det1)
     _assert_bitwise("allreduce SUM vs fixed tree", a, tree)
@@ -344,6 +441,10 @@ def _check_allreduce(rank: int, det1: dist.ProcessGroup, det2: dist.ProcessGroup
 
 
 def _check_reduce_scatter_vs_allreduce(rank: int, det1: dist.ProcessGroup, x, tree) -> None:
+    # [FUNCTION DOC] HELPER: Worker-side check. The expected output is this rank's slice of the
+    # reference tree sum. Asserts bitwise that sum reduce-scatter equals it via three routes: the flat
+    # tensor form; the aliased form where the output is a view into the input buffer (distributed
+    # optimizer style); and the list form with the input split into four contiguous chunks.
     expected_shard = _shard_of(tree, rank)
 
     rs = torch.empty_like(expected_shard)
@@ -363,6 +464,10 @@ def _check_reduce_scatter_vs_allreduce(rank: int, det1: dist.ProcessGroup, x, tr
 
 
 def _check_uneven_reduce_scatter(rank: int, det1: dist.ProcessGroup) -> None:
+    # [FUNCTION DOC] HELPER: Worker-side check. Each rank builds four random input slots of sizes 3, 5,
+    # 7, 9 (seeded by rank), gathers each slot across ranks with native all-gather (one slot at a time
+    # so shapes match), tree-sums the copies of its own slot as the expected result, runs the list-form
+    # sum reduce-scatter over the deterministic group and asserts bitwise equality.
     """List-form reduce_scatter with uneven slot sizes folds each slot at its true offset."""
     device = torch.device("cuda", torch.cuda.current_device())
     slot_sizes = [3, 5, 7, 9]
@@ -382,6 +487,9 @@ def _check_uneven_reduce_scatter(rank: int, det1: dist.ProcessGroup) -> None:
 
 
 def _expected_slot_fold(rank: int, inputs: list[torch.Tensor]) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Collective reference for list reduce-scatter. For each of the four slots
+    # in order, all-gathers that slot (made contiguous) from every rank with native NCCL, keeps the
+    # gathered copies of the slot whose index equals this rank, and returns their tree sum flattened.
     """Reference for list reduce_scatter: gather every rank's copy of MY slot and tree-fold.
 
     Gathers slot by slot: within one all_gather every rank contributes the SAME slot,
@@ -399,6 +507,12 @@ def _expected_slot_fold(rank: int, inputs: list[torch.Tensor]) -> torch.Tensor:
 
 
 def _check_uneven_reduce_scatter_shapes(rank: int, det1: dist.ProcessGroup) -> None:
+    # [FUNCTION DOC] HELPER: Worker-side check of list reduce-scatter with per-slot differing shapes
+    # (2x3, 5, 4x2, 3x3). Cases, each compared bitwise to the per-slot reference tree fold: float32
+    # inputs; bfloat16 inputs; transposed non-contiguous slot inputs and a transposed output, invoked
+    # through the group's method directly because the high-level wrapper would densify them; and a run
+    # with the module's gather buffer cap temporarily lowered to force multiple chunks (restored in a
+    # finally block).
     """List reduce_scatter with per-slot distinct multi-dim shapes, non-contiguous slots/output,
     bf16, and a forced multi-chunk fold all match the per-slot tree fold bitwise."""
     import miles.utils.test_utils.det_process_group as dpg
@@ -407,6 +521,8 @@ def _check_uneven_reduce_scatter_shapes(rank: int, det1: dist.ProcessGroup) -> N
     slot_shapes = [(2, 3), (5,), (4, 2), (3, 3)]
 
     def make_inputs(seed: int, dtype: torch.dtype) -> list[torch.Tensor]:
+        # [FUNCTION DOC] HELPER: Returns one random GPU tensor per slot shape of the given dtype,
+        # generated on the CPU from a generator seeded with the seed plus 17 times the rank.
         gen = torch.Generator().manual_seed(seed + 17 * rank)
         return [torch.randn(shape, generator=gen, dtype=dtype).to(device) for shape in slot_shapes]
 
@@ -452,6 +568,11 @@ def _check_uneven_reduce_scatter_shapes(rank: int, det1: dist.ProcessGroup) -> N
 
 
 def _check_coalescing_manager(rank: int, det1: dist.ProcessGroup, x, tree, x2, tree2) -> None:
+    # [FUNCTION DOC] HELPER: Worker-side check that collectives issued inside the distributed
+    # coalescing manager context still give deterministic results. Two all-reduces (inputs x and x2)
+    # must equal their reference trees; two tensor reduce-scatters must equal this rank's slices of the
+    # trees; an all-gather into a tensor of per-rank constant shards (value equal to the rank, 128
+    # elements) must equal the concatenation of the constants in rank order.
     device = torch.device("cuda", torch.cuda.current_device())
 
     ar1, ar2 = x.clone(), x2.clone()
@@ -478,6 +599,10 @@ def _check_coalescing_manager(rank: int, det1: dist.ProcessGroup, x, tree, x2, t
 
 
 def _check_non_contiguous(rank: int, det1: dist.ProcessGroup) -> None:
+    # [FUNCTION DOC] HELPER: Worker-side check. Each rank has a random 64x64 matrix; the reference is
+    # the tree sum of the all-gathered transposes made contiguous. Sum all-reduce is run in place on the
+    # non-contiguous transposed view over the deterministic group; asserts its contiguous contents equal
+    # the reference bitwise.
     base = torch.randn(64, 64, generator=torch.Generator().manual_seed(_SEED + 100 + rank)).cuda()
     non_contiguous = base.t()
     assert not non_contiguous.is_contiguous()
@@ -491,6 +616,12 @@ def _check_non_contiguous(rank: int, det1: dist.ProcessGroup) -> None:
 
 
 def _check_delegation(rank: int, det1: dist.ProcessGroup) -> None:
+    # [FUNCTION DOC] HELPER: Worker-side check that non-reduction collectives over the deterministic
+    # group behave like native ones: broadcast from rank 0; list all-gather and tensor all-gather of
+    # per-rank constants; max reduce to rank 0 (checked on rank 0 only); all-to-all single exchange
+    # with the expected value rank plus 10 times source; paired send/receive between neighbours (even
+    # ranks send first, odd ranks receive first); a barrier; finally asserts the group's backend name
+    # is the deterministic backend name.
     device = torch.device("cuda", torch.cuda.current_device())
 
     broadcasted = torch.full((8,), float(rank), device=device)
@@ -539,6 +670,9 @@ def _check_delegation(rank: int, det1: dist.ProcessGroup) -> None:
 
 
 def _check_batch_isend_irecv_ring(rank: int, det1: dist.ProcessGroup) -> None:
+    # [FUNCTION DOC] HELPER: Worker-side check. Each rank sends a 16-element constant (its rank) to
+    # the next rank and receives from the previous rank in one batched point-to-point call, waits on
+    # all requests, and asserts the received data equals the previous rank's constant.
     """Ring batch_isend_irecv over det1 exercises the no-op coalescing hooks with batched p2p."""
     device = torch.device("cuda", torch.cuda.current_device())
     next_rank = (rank + 1) % _WORLD_SIZE
@@ -557,6 +691,10 @@ def _check_batch_isend_irecv_ring(rank: int, det1: dist.ProcessGroup) -> None:
 
 
 def _check_dtype_allreduce(rank: int, det1: dist.ProcessGroup) -> None:
+    # [FUNCTION DOC] HELPER: Worker-side check. bfloat16: every rank regenerates all ranks' order
+    # sensitive inputs cast to bfloat16, computes their tree sum locally as expected, and asserts the
+    # in-place sum all-reduce of its own input matches bitwise. int64: each rank holds 256 copies of
+    # rank plus one; the all-reduce must equal 1+2+3+4.
     """bf16 and int64 SUM allreduce over det1 match the manual fold / exact integer sum bitwise."""
     device = torch.device("cuda", torch.cuda.current_device())
 
@@ -573,6 +711,9 @@ def _check_dtype_allreduce(rank: int, det1: dist.ProcessGroup) -> None:
 
 
 def _check_reduce_scatter_avg(rank: int, det1: dist.ProcessGroup, x: torch.Tensor, tree: torch.Tensor) -> None:
+    # [FUNCTION DOC] HELPER: Worker-side check. Expected is this rank's slice of the tree sum divided
+    # by the world size. Asserts bitwise equality for the tensor-form and the list-form (four
+    # contiguous chunks) average reduce-scatter.
     """AVG reduce_scatter (tensor + list variant) equals this rank's slice of tree/world bitwise."""
     expected_shard = _shard_of(tree, rank) / _WORLD_SIZE
 
@@ -587,6 +728,9 @@ def _check_reduce_scatter_avg(rank: int, det1: dist.ProcessGroup, x: torch.Tenso
 
 
 def _check_reduce_sum_avg_fold(rank: int, det1: dist.ProcessGroup, x: torch.Tensor, tree: torch.Tensor) -> None:
+    # [FUNCTION DOC] HELPER: Worker-side check. Reduces clones of the input to destination rank 0 with
+    # sum and with average over the deterministic group; on rank 0 only, asserts bitwise equality with
+    # the tree sum and with the tree sum divided by the world size respectively.
     """dist.reduce SUM/AVG over det1 folds in fixed tree order; the dst rank matches tree (/world)."""
     summed = x.clone()
     dist.reduce(summed, dst=0, op=dist.ReduceOp.SUM, group=det1)
@@ -600,6 +744,9 @@ def _check_reduce_sum_avg_fold(rank: int, det1: dist.ProcessGroup, x: torch.Tens
 
 
 def _check_min_delegation(rank: int, det1: dist.ProcessGroup) -> None:
+    # [FUNCTION DOC] HELPER: Worker-side check with a 64-element tensor filled with rank plus one.
+    # Asserts min all-reduce over the deterministic group equals native min all-reduce, and (rank 0
+    # only) min reduce to rank 0 equals ones.
     """MIN allreduce and MIN reduce over det1 delegate to native NCCL bitwise."""
     device = torch.device("cuda", torch.cuda.current_device())
     operand = torch.full((64,), float(rank + 1), device=device)
@@ -617,6 +764,9 @@ def _check_min_delegation(rank: int, det1: dist.ProcessGroup) -> None:
 
 
 def _check_reduce_scatter_uneven_avg(rank: int, det1: dist.ProcessGroup) -> None:
+    # [FUNCTION DOC] HELPER: Worker-side check. Four random slots of sizes 3, 5, 7, 9 per rank; the
+    # expected value is the reference per-slot tree fold of this rank's slot divided by the world size;
+    # asserts bitwise equality with the list-form average reduce-scatter over the deterministic group.
     """Uneven list-form reduce_scatter with AVG folds each slot at its true offset and divides by world."""
     device = torch.device("cuda", torch.cuda.current_device())
     slot_sizes = [3, 5, 7, 9]
@@ -631,6 +781,10 @@ def _check_reduce_scatter_uneven_avg(rank: int, det1: dist.ProcessGroup) -> None
 
 
 def _check_multi_chunk_through_nccl(rank: int, det1: dist.ProcessGroup, x: torch.Tensor, tree: torch.Tensor) -> None:
+    # [FUNCTION DOC] HELPER: Worker-side check. Temporarily sets the module's gather buffer cap to
+    # world size times 64 elements' worth of bytes (restored in a finally block), then asserts sum
+    # all-reduce and tensor reduce-scatter over the deterministic group are bitwise equal to the
+    # single-chunk tree reference (and its slice for this rank).
     """A tiny gather-buffer cap forces multi-chunk gathers through real NCCL; SUM allreduce and
     reduce_scatter_tensor over det1 stay bitwise equal to the single-chunk tree reference."""
     import miles.utils.test_utils.det_process_group as dpg
@@ -652,6 +806,11 @@ def _check_multi_chunk_through_nccl(rank: int, det1: dist.ProcessGroup, x: torch
 
 
 def _check_reduce_scatter_base_uneven_raises(rank: int, det1: dist.ProcessGroup) -> None:
+    # [FUNCTION DOC] HELPER: Worker-side check. Calls the group's flat reduce-scatter primitive
+    # directly with an input whose element count (4 times world size plus 1) is not divisible by the
+    # world size and expects an assertion error. The rank parameter is unused.
+    # KNOWN ISSUE: re-imports the reduce-scatter options class that is already imported at module
+    # level (harmless redundancy).
     """Calling det1._reduce_scatter_base directly with an indivisible input numel fails loud."""
     from torch.distributed.distributed_c10d import ReduceScatterOptions
 
@@ -666,6 +825,9 @@ def _check_reduce_scatter_base_uneven_raises(rank: int, det1: dist.ProcessGroup)
 
 
 def _check_object_collectives(rank: int, det1: dist.ProcessGroup) -> None:
+    # [FUNCTION DOC] HELPER: Worker-side check. All-gathers one small dictionary per rank (rank and
+    # seven times rank) and asserts the list equals those dictionaries in rank order; broadcasts a
+    # dictionary payload from rank 0 and asserts every rank receives it.
     """Object collectives (all_gather_object + broadcast_object_list) delegate correctly over det1."""
     gathered: list[object] = [None] * _WORLD_SIZE
     dist.all_gather_object(gathered, {"rank": rank, "tag": rank * 7}, group=det1)
@@ -677,6 +839,12 @@ def _check_object_collectives(rank: int, det1: dist.ProcessGroup) -> None:
 
 
 def _worker(rank: int, world_size: int, port: int) -> None:
+    # [FUNCTION DOC] HELPER: Process entry point run once per rank under multiprocessing spawn. Sets
+    # the rendezvous environment variables (localhost and the given port), binds the GPU equal to the
+    # rank, registers the deterministic backend, initializes the default NCCL group, creates two
+    # deterministic groups over all ranks, builds the order-sensitive inputs (two seeds) and their
+    # reference tree sums, runs all the check helpers in sequence, then barriers and destroys the
+    # process group. Any failed assertion propagates and fails the spawned process.
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(port)
     torch.cuda.set_device(rank)
@@ -713,12 +881,18 @@ def _worker(rank: int, world_size: int, port: int) -> None:
 
 
 def _free_port() -> int:
+    # [FUNCTION DOC] HELPER: Returns a currently free local TCP port number by binding a socket to
+    # port 0 on localhost and reading the assigned port (the socket is closed before returning, so the
+    # port could theoretically be taken by another process before use).
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("localhost", 0))
         return sock.getsockname()[1]
 
 
 def test_det_process_group_multi_gpu():
+    # [FUNCTION DOC] Raises a runtime error if fewer than 4 GPUs are visible (rather than skipping).
+    # Otherwise spawns four worker processes running the worker entry point on a free port and joins
+    # them; any worker failure fails the test.
     """det_nccl backend: bitwise fixed-order SUM/AVG (allreduce + reduce_scatter, incl. under
     the coalescing manager) and faithful delegation of every other collective, on 4 GPUs."""
     if torch.cuda.device_count() < _WORLD_SIZE:
@@ -728,6 +902,11 @@ def test_det_process_group_multi_gpu():
 
 
 def _world_backend_worker(rank: int, world_size: int, port: int) -> None:
+    # [FUNCTION DOC] HELPER: Per-rank spawn entry point for the world-backend test. Same rendezvous
+    # setup as the other worker, but initializes the default group directly with the deterministic
+    # backend, barriers, asserts the default-group sum all-reduce of the order-sensitive input equals the
+    # reference tree sum bitwise and that the default backend name is the deterministic name, barriers
+    # again and destroys the group.
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(port)
     torch.cuda.set_device(rank)
@@ -749,6 +928,8 @@ def _world_backend_worker(rank: int, world_size: int, port: int) -> None:
 
 
 def test_det_nccl_as_world_backend_multi_gpu():
+    # [FUNCTION DOC] Same GPU-count check (raises a runtime error below 4 GPUs) and spawn pattern as
+    # the multi-GPU test, running the world-backend worker on four processes.
     """det_nccl wired as the DEFAULT-group backend (train_actor shape): barrier + bitwise tree SUM."""
     if torch.cuda.device_count() < _WORLD_SIZE:
         raise RuntimeError(f"requires {_WORLD_SIZE} GPUs, found {torch.cuda.device_count()}")

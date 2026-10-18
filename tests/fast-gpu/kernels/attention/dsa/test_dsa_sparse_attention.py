@@ -1,3 +1,9 @@
+# [MODULE DOC] GPU tests for the DSA sparse attention op (forward and backward, tilelang and optional
+# FlashMLA forward backends) against the float32 reference in the sibling dsa_reference module,
+# loaded by file path. Covers multi-query (DeepSeek-V4 style, with attention sink) and latent
+# (GLM-5 / DeepSeek-V3.2 style, with a rotary tail, no sink) case tables, rows with no selected keys,
+# sink effect, backend agreement, and an end-to-end packed-sequence path. Registered for a 2-GPU Hopper
+# suite with the precision label; skipped without tilelang or CUDA.
 import importlib.util
 import itertools
 import pathlib
@@ -22,6 +28,9 @@ CONFIGS = ["default", *BACKENDS]
 
 
 def _config(backend):
+    # [FUNCTION DOC] HELPER: Maps a backend label to a sparse attention config. The label "default"
+    # yields no config (so the op's default is used); any other label yields a config whose forward
+    # backend is that label.
     return None if backend == "default" else SparseAttentionConfig(forward_backend=backend)
 
 
@@ -31,6 +40,10 @@ _spec.loader.exec_module(reference)
 
 
 def _random_indices(batch, seq_len, groups, seq_len_kv, topk):
+    # [FUNCTION DOC] HELPER: Builds random selected-key indices on the GPU, shape (batch, seq_len,
+    # groups, topk), int32. Each (batch, query, group) row is an independent random permutation prefix
+    # of min(topk, seq_len_kv) distinct key positions (no causality). If topk exceeds the key count the
+    # remaining slots are padded with -1. Consumes the global random state.
     actual = min(topk, seq_len_kv)
     rows = [torch.randperm(seq_len_kv, device="cuda")[:actual] for _ in range(batch * seq_len * groups)]
     idx = torch.stack(rows).view(batch, seq_len, groups, actual).int()
@@ -40,6 +53,10 @@ def _random_indices(batch, seq_len, groups, seq_len_kv, topk):
 
 
 def _inputs(batch, seq_len, heads, groups, d_v, d_tail, seq_len_kv, topk, sink):
+    # [FUNCTION DOC] HELPER: Builds random GPU inputs: bfloat16 queries (batch, seq_len, heads,
+    # d_v + d_tail), bfloat16 key/value tensor (batch, seq_len_kv, groups, d_v + d_tail), random
+    # indices, and a float32 per-head sink vector when sink is true (otherwise none). Returns the
+    # four-tuple (q, kv, indices, attn_sink).
     q = torch.randn(batch, seq_len, heads, d_v + d_tail, device="cuda", dtype=torch.bfloat16)
     kv = torch.randn(batch, seq_len_kv, groups, d_v + d_tail, device="cuda", dtype=torch.bfloat16)
     indices = _random_indices(batch, seq_len, groups, seq_len_kv, topk)
@@ -66,6 +83,8 @@ MLA_CASES = [  # GLM-5 / DeepSeek-V3.2: RoPE tail, no sink
 
 
 def IDS(cases):
+    # [FUNCTION DOC] HELPER: Builds readable pytest ids from case tuples, one string per case encoding
+    # batch, seq, heads, groups, value dim, tail dim, kv length, top-k and sink or nosink.
     return [
         f"b{c[0]}_s{c[1]}_h{c[2]}_g{c[3]}_dv{c[4]}_dt{c[5]}_kv{c[6]}_top{c[7]}_{'sink' if c[8] else 'nosink'}"
         for c in cases
@@ -75,6 +94,10 @@ def IDS(cases):
 @pytest.mark.parametrize("backend", CONFIGS)
 @pytest.mark.parametrize("case", MQA_CASES + MLA_CASES, ids=IDS(MQA_CASES + MLA_CASES))
 def test_forward_matches_reference(case, backend):
+    # [FUNCTION DOC] For every multi-query and latent case and every config (default, tilelang and
+    # FlashMLA when installed): runs the forward op with softmax scale of the inverse square root of
+    # the full head width, and compares to the float32 reference. Asserts the output shape, relative
+    # difference below 1e-3, and max absolute error below 0.1.
     torch.manual_seed(0)
     batch, seq_len, heads, groups, d_v, d_tail, seq_len_kv, topk, sink = case
     q, kv, indices, attn_sink = _inputs(batch, seq_len, heads, groups, d_v, d_tail, seq_len_kv, topk, sink)
@@ -92,6 +115,11 @@ BACKWARD_CASES = MQA_CASES[:4] + MQA_CASES[-1:] + MLA_CASES[:3] + MLA_CASES[-1:]
 @pytest.mark.parametrize("backend", CONFIGS)
 @pytest.mark.parametrize("case", BACKWARD_CASES, ids=IDS(BACKWARD_CASES))
 def test_backward_matches_autograd(case, backend):
+    # [FUNCTION DOC] For a subset of cases (BACKWARD_CASES) and each config: backpropagates a random
+    # float32 upstream gradient through the float32 reference (autograd) and through the op, then
+    # asserts relative differences below 0.05 for the gradients of queries, keys/values and (when
+    # the case has a sink) the sink. The tolerance is loose because of bfloat16 matmuls and atomic
+    # accumulation of key/value gradients.
     torch.manual_seed(0)
     batch, seq_len, heads, groups, d_v, d_tail, seq_len_kv, topk, sink = case
     q, kv, indices, attn_sink = _inputs(batch, seq_len, heads, groups, d_v, d_tail, seq_len_kv, topk, sink)
@@ -126,6 +154,10 @@ def test_backward_matches_autograd(case, backend):
 @pytest.mark.skipif(len(BACKENDS) < 2, reason="FlashMLA not installed")
 @pytest.mark.parametrize("case", MQA_CASES + MLA_CASES, ids=IDS(MQA_CASES + MLA_CASES))
 def test_forward_backends_agree(case):
+    # [FUNCTION DOC] Skipped unless FlashMLA is installed. For each case, runs forward and backward
+    # with each backend on cloned inputs and the same upstream gradient, collecting output and the
+    # gradients of queries, keys/values and sink. Asserts every tensor of the tilelang run matches the
+    # FlashMLA run with relative difference below 1e-5.
     """Both forwards feed the same TileLang backward, so the log-sum-exp conversion must be exact enough
     that gradients agree to bf16 noise."""
     torch.manual_seed(0)
@@ -148,6 +180,9 @@ def test_forward_backends_agree(case):
 
 
 def test_sink_changes_output():
+    # [FUNCTION DOC] Runs the op with a zero sink and with a sink of value 10 on the same inputs
+    # (8 heads, value dim 512, no tail, no sink supplied by the input builder) and asserts the outputs
+    # differ by more than 1e-3 in max absolute value.
     torch.manual_seed(0)
     q, kv, indices, _ = _inputs(1, 128, 8, 1, 512, 0, 160, 64, sink=False)
     sm_scale = 512**-0.5
@@ -157,6 +192,8 @@ def test_sink_changes_output():
 
 
 def test_query_with_no_valid_key_returns_zero():
+    # [FUNCTION DOC] Sets every index of the first query to -1 (with a sink present) and asserts the
+    # output is finite everywhere and exactly zero for that query.
     torch.manual_seed(0)
     q, kv, indices, attn_sink = _inputs(1, 64, 8, 1, 512, 0, 80, 64, sink=True)
     indices[0, 0] = -1
@@ -168,6 +205,10 @@ def test_query_with_no_valid_key_returns_zero():
 @pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("sink", [False, True], ids=["nosink", "sink"])
 def test_rows_with_no_selected_keys(backend, sink):
+    # [FUNCTION DOC] For tilelang and FlashMLA backends, with and without sink: 128 queries, 64 heads,
+    # first five queries fully padded. Compares to the float32 reference with autograd. Asserts the
+    # padded rows output exactly zero, output and all gradients are finite, output relative
+    # difference below 1e-3 and gradient relative differences below 0.05.
     """Rows whose indices are all -1 attend to nothing (or only the sink): zero output, finite gradients."""
     torch.manual_seed(0)
     batch, seq_len, heads, d_v, seq_len_kv, topk = 1, 128, 64, 512, 160, 64
@@ -210,6 +251,15 @@ def test_rows_with_no_selected_keys(backend, sink):
     "heads, d_tail, topk, sink", [(16, 64, 128, False), (32, 0, 64, True)], ids=["glm5", "deepseek_v4"]
 )
 def test_packed_sequences_end_to_end(segments, heads, d_tail, topk, sink, backend):
+    # [FUNCTION DOC] Parametrized over two segment layouts, two model-style configs and all backend
+    # configs. Steps: build cumulative lengths and causal ranges for the packed tokens; compute random
+    # indexer logits and check the infinity pattern against the reference; take top-k with the torch
+    # top-k function and assert every picked index lies inside its query's causal range; then run
+    # sparse attention (batch 1, kv length equal to total tokens) with those indices and compare
+    # forward and gradients with the float32 reference. Asserts finite outputs and gradients, output
+    # relative difference below 1e-3 and gradient relative differences below 0.05.
+    # KNOWN ISSUE: the sparse attention indices come from the indexer, but the attention inputs are
+    # unrelated random tensors, so only index validity (not semantic consistency) is exercised.
     """The packed path: causal_ranges -> indexer -> top-k (-1 past a short segment) -> sparse attention."""
     torch.manual_seed(0)
     cu_seqlens = torch.tensor([0, *itertools.accumulate(segments)], device="cuda", dtype=torch.int32)

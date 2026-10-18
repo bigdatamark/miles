@@ -1,3 +1,11 @@
+# [MODULE DOC] GPU tests comparing the Qwen3.8-Flash-Next Triton kernels and plugin ops against
+# plain-torch references, forward and backward: the n-gram hash id computation (range check, and
+# agreement with sglang's implementation and fused kernel when installed), hyper-connection mix with
+# optional injection gate, hyper-connection combine, the per-layer-embedding gate plus segmented
+# causal convolution, and sparse attention over a per-query index list. Includes the references
+# (grouped per-stream RMS norm, hyper-connection mix/inject/combine, causal depthwise convolution,
+# the per-layer-embedding pipeline, mask-based sparse attention) and a max-relative-error metric.
+# Registered for 2-GPU CUDA and ROCm nightly suites (miles-plugin label).
 """Qwen3.8-Flash-Next triton kernels must match their torch references, forward and backward."""
 
 from tests.ci.ci_register import register_cuda_ci, register_rocm_ci
@@ -19,6 +27,11 @@ from miles_plugins.models.qwen3_8_next.ops.ple import ngram_hash_ids, shift_righ
 
 
 def grouped_gemma_rmsnorm(x: Tensor, weight: Tensor, n: int, eps: float) -> Tensor:
+    # [FUNCTION DOC] HELPER: Reference per-stream RMS norm in the Gemma style. Splits the last
+    # dimension into n equal streams, normalizes each by the reciprocal root of its mean square plus
+    # epsilon, flattens, and multiplies by (1 + weight) where the weight is flat over all streams.
+    # Computation dtype is float32 unless the input is float32 or float64 (then the input's dtype).
+    # KNOWN ISSUE: the docstring says it returns float32, but a float64 input produces float64 output.
     """Per-stream RMSNorm; the scale enters as ``1 + weight``; returns fp32."""
     acc = x.dtype if x.dtype in (torch.float32, torch.float64) else torch.float32
     xg = x.to(acc).unflatten(-1, (n, x.shape[-1] // n))
@@ -27,6 +40,11 @@ def grouped_gemma_rmsnorm(x: Tensor, weight: Tensor, n: int, eps: float) -> Tens
 
 
 def hc_mix(normed, w_down, w_up, n, hidden, out_dtype):
+    # [FUNCTION DOC] HELPER: Reference hyper-connection mix. A low-rank gate is computed from the
+    # normalized stream tensor: down projection, divided by the stream count, silu, then up projection
+    # and sigmoid (weights cast to the input dtype). The gate (per stream-channel) multiplies the
+    # normalized input, both viewed as (streams, hidden), and the product is averaged over streams.
+    # Returns the mixed tensor cast to the requested output dtype.
     """The ``/ n`` sits before the SiLU; the reduction is a mean over streams."""
     gate = F.silu(F.linear(normed, w_down.to(normed.dtype)) / n)
     gate = torch.sigmoid(F.linear(gate, w_up.to(normed.dtype)))
@@ -35,10 +53,16 @@ def hc_mix(normed, w_down, w_up, n, hidden, out_dtype):
 
 
 def hc_inject_gate(normed, w_inject, n):
+    # [FUNCTION DOC] HELPER: Reference per-stream injection (post) weights: linear projection of the
+    # normalized streams to one value per stream, divided by the stream count, passed through a
+    # sigmoid and doubled (range 0 to 2).
     return 2 * torch.sigmoid(F.linear(normed, w_inject.to(normed.dtype)) / n)
 
 
 def hc_combine_reference(residual, block_output, h_post, n, hidden):
+    # [FUNCTION DOC] HELPER: Reference combine in float32: adds to each of the n residual streams
+    # the block output (broadcast across streams) scaled by that stream's post weight; flattens and
+    # casts back to the residual dtype.
     out_dtype = residual.dtype
     R = residual.float().unflatten(-1, (n, hidden))
     injection = block_output.float().unsqueeze(-2) * h_post.float().unsqueeze(-1)
@@ -46,10 +70,17 @@ def hc_combine_reference(residual, block_output, h_post, n, hidden):
 
 
 def causal_depthwise_conv(x, weight, dilation, cu_seqlens=None):
+    # [FUNCTION DOC] HELPER: Reference dilated causal depthwise convolution. x is (tokens, channels),
+    # weight is (channels, 1, kernel). Each sequence is left-padded by (kernel - 1) x dilation zeros
+    # and convolved with one group per channel. With cumulative sequence lengths, each non-empty
+    # segment is convolved independently (no leakage across boundaries) and written into an output
+    # buffer; without them the whole input is one sequence. Returns (tokens, channels).
     channels, _, kernel = weight.shape
     pad = (kernel - 1) * dilation
 
     def _conv(seq):
+        # [FUNCTION DOC] HELPER: Convolves one (length, channels) sequence: moves channels first,
+        # left-pads, applies the grouped dilated convolution, returns (length, channels).
         h = seq.transpose(0, 1).unsqueeze(0)
         h = F.conv1d(F.pad(h, (pad, 0)), weight, groups=channels, dilation=dilation)
         return h.squeeze(0).transpose(0, 1)
@@ -65,6 +96,14 @@ def causal_depthwise_conv(x, weight, dilation, cu_seqlens=None):
 
 
 def ple_reference(hc, key, value, wk, wq, wc, convw, n, eps, dil, cu):
+    # [FUNCTION DOC] HELPER: Reference for the per-layer-embedding gate plus convolution. Inputs:
+    # hidden-connection streams (tokens, n x C) used as the query, key (same shape), value (tokens, C),
+    # three norm weights (key, query, conv), conv weight, stream count, epsilon, dilation and cumulative
+    # segment lengths. Steps: Gemma-style grouped norm of key and of query; per-stream score = dot
+    # product over channels divided by the square root of C; gate = sigmoid(sign(score) x sqrt(max(|score|,
+    # 1e-6))); gated = gate times the value broadcast across streams, flattened; norm the gated tensor
+    # with the conv norm weight; dilated causal depthwise convolution (per segment) followed by silu;
+    # result = gated plus conv, cast to the hidden dtype.
     T = hc.shape[0]
     C = hc.shape[1] // n
     kn = grouped_gemma_rmsnorm(key, wk, n, eps).reshape(T, n, C)
@@ -78,6 +117,12 @@ def ple_reference(hc, key, value, wk, wq, wc, convw, n, eps, dil, cu):
 
 
 def qsa_reference(q, k, v, indices, scale):
+    # [FUNCTION DOC] HELPER: Reference sparse attention in float32. q is (T, Hq, D), k and v are
+    # (S, Hkv, D) with grouped-query sharing (Hq divisible by Hkv), indices (T, K) of keys per query
+    # with negative meaning padding. Builds a boolean query-by-key mask from the valid indices, computes
+    # scaled scores per head, masks others to negative infinity, softmax over keys (NaNs from fully
+    # masked rows become zero), and multiplies by values. Returns (T, Hq, D) float32. Duplicate indices
+    # collapse to one (mask semantics) unlike the kernel, which counts duplicates twice.
     """Attention over exactly the listed indices (list semantics, unique rows)."""
     T, Hq, D = q.shape
     S, Hkv, _ = k.shape
@@ -96,6 +141,8 @@ def qsa_reference(q, k, v, indices, scale):
 
 
 def rel_err(a, b):
+    # [FUNCTION DOC] HELPER: Returns max absolute difference divided by the max absolute value of
+    # b (floored at 1e-6), both in float32, as a Python float.
     a, b = a.float(), b.float()
     return ((a - b).abs().max() / b.abs().max().clamp_min(1e-6)).item()
 
@@ -129,13 +176,19 @@ for s in SIZES[:-1]:
 
 
 def _hash_tensors():
+    # [FUNCTION DOC] HELPER: Returns three GPU int64 tensors: the hash multipliers, the per-head
+    # table sizes and their cumulative row offsets (module constants).
     def t(v):
+        # [FUNCTION DOC] HELPER: Converts a Python list to a GPU int64 tensor.
         return torch.tensor(v, dtype=torch.long, device="cuda")
 
     return t(MULT), t(SIZES), t(OFFS)
 
 
 def test_ngram_hash_ids_land_in_each_heads_row_range():
+    # [FUNCTION DOC] Hashes 256 random contexts of 3 tokens each (seeded GPU generator) into per-head
+    # row ids and asserts the output shape is (256, number of heads = 16) and that each head's column
+    # lies within that head's [offset, offset + size) range.
     mult, sizes, offs = _hash_tensors()
     ctx = torch.randint(
         0,
@@ -155,6 +208,12 @@ def test_ngram_hash_ids_land_in_each_heads_row_range():
 
 @pytest.mark.parametrize("eos_frac", [0.0, 0.25])
 def test_ngram_hash_matches_sglang(eos_frac):
+    # [FUNCTION DOC] Parametrized over end-of-sequence fractions 0 and 0.25. Skipped if the sglang
+    # model module is missing. Part 1: for shift amounts 0..2, the plugin's shift-right-ignoring-eos op
+    # on random 3 by 16 tokens (some replaced by the eos id when the fraction is nonzero) must equal
+    # sglang's private shift method exactly. Part 2: skipped if sglang's fused kernel module is missing
+    # or if it declines the input; otherwise the plugin's hash ids for 128 random contexts must equal
+    # the fused kernel's ids exactly.
     qwen4_exp = pytest.importorskip("sglang.srt.models.qwen4_exp")
     mult, sizes, offs = _hash_tensors()
     g = torch.Generator(device="cuda").manual_seed(1)
@@ -186,6 +245,10 @@ HC_DTYPES = [(torch.float32, 2e-5, 1e-5), (torch.bfloat16, 3e-2, 1e-2)]
 
 
 def _hc_params(W, R, n, dtype, g):
+    # [FUNCTION DOC] HELPER: Draws gradient-requiring GPU parameters from the generator: a norm
+    # weight (W, scaled 0.05), a down projection (R by W) and an up projection (W by R), and an
+    # injection projection (n by W), each normal scaled by the inverse square root of its fan-in.
+    # Returns (weight, w_down, w_up, w_inj).
     weight = (0.05 * torch.randn(W, device="cuda", dtype=dtype, generator=g)).requires_grad_()
     w_down = (torch.randn(R, W, device="cuda", dtype=dtype, generator=g) / W**0.5).requires_grad_()
     w_up = (torch.randn(W, R, device="cuda", dtype=dtype, generator=g) / R**0.5).requires_grad_()
@@ -197,6 +260,13 @@ def _hc_params(W, R, n, dtype, g):
 @pytest.mark.parametrize("dtype,tol_mix,tol_comb", HC_DTYPES)
 @pytest.mark.parametrize("with_inject", [True, False])
 def test_hc_mix_inject(T, C, n, R, dtype, tol_mix, tol_comb, with_inject):
+    # [FUNCTION DOC] Parametrized over two shapes, float32 and bfloat16 (with tolerances), and with or
+    # without the injection head. Builds random inputs, runs the torch reference (norm, mix and optional
+    # injection gates) with autograd using random upstream gradients, saves parameter gradients and
+    # clears them, then runs the Triton fused op with the same upstream gradients. Asserts the mix
+    # output (and injection output when present) are within the mix tolerance in max relative error, and
+    # each parameter gradient (input, norm weight, down, up, injection) too. The combine tolerance
+    # parameter is unused here.
     g = torch.Generator(device="cuda").manual_seed(T)
     W, eps = n * C, 1e-6
     x = torch.randn(T, W, device="cuda", dtype=dtype, generator=g).requires_grad_()
@@ -231,6 +301,10 @@ def test_hc_mix_inject(T, C, n, R, dtype, tol_mix, tol_comb, with_inject):
 @pytest.mark.parametrize("T,C,n,R", HC_SHAPES)
 @pytest.mark.parametrize("dtype,tol_mix,tol_comb", HC_DTYPES)
 def test_hc_combine(T, C, n, R, dtype, tol_mix, tol_comb):
+    # [FUNCTION DOC] Parametrized as the mix test. Random residual, block output and post weights
+    # (uniform times 2); runs the reference combine with autograd and the Triton combine with the same
+    # upstream gradient; asserts the output and the gradients of residual, block output and post weights
+    # are within the combine tolerance in max relative error. The mix tolerance and rank R are unused.
     g = torch.Generator(device="cuda").manual_seed(T + 1)
     W = n * C
     res = torch.randn(T, W, device="cuda", dtype=dtype, generator=g).requires_grad_()
@@ -253,6 +327,9 @@ def test_hc_combine(T, C, n, R, dtype, tol_mix, tol_comb):
 
 
 def test_hc_mix_inject_3d_leading_shape():
+    # [FUNCTION DOC] Runs the fused mix/inject op on a float32 input with two leading dimensions
+    # (17 by 2) and asserts the output shapes are (17, 2, 64) for the mix and (17, 2, 4) for the post
+    # weights, i.e. leading dimensions are preserved.
     g = torch.Generator(device="cuda").manual_seed(99)
     x3 = torch.randn(17, 2, 4 * 64, device="cuda", dtype=torch.float32, generator=g)
     weight, w_down, w_up, w_inj = _hc_params(4 * 64, 16, 4, torch.float32, g)
@@ -271,10 +348,17 @@ PLE_CASES = [
 @pytest.mark.parametrize("T,C,n,segs", PLE_CASES)
 @pytest.mark.parametrize("dtype,tol", [(torch.float32, 5e-4), (torch.bfloat16, 4e-2)])
 def test_ple_gate_conv(T, C, n, segs, dtype, tol):
+    # [FUNCTION DOC] Parametrized over two cases (64 tokens with C 64; 128 tokens with C 2560; each
+    # with packed segment boundaries) and dtypes float32 (looser than other kernels because the gate's
+    # derivative blows up near its clamp) and bfloat16. Conv kernel size 4, dilation 3. Builds random
+    # inputs and weights, runs the reference with autograd and the fused Triton op with the same upstream
+    # gradient; asserts the output and gradients of hidden streams, key, value, the three norm weights
+    # and the conv weight are within tolerance in max relative error.
     g = torch.Generator(device="cuda").manual_seed(T)
     W, eps, K, dil = n * C, 1e-6, 4, 3
 
     def mk(*shape):
+        # [FUNCTION DOC] HELPER: Draws a standard-normal GPU tensor of the given shape and test dtype.
         return torch.randn(*shape, device="cuda", dtype=dtype, generator=g)
 
     hc = mk(T, W).requires_grad_()
@@ -313,6 +397,13 @@ QSA_CASES = [
 
 @pytest.mark.parametrize("T,S,Hq,Hkv,D,K,dtype", QSA_CASES)
 def test_qsa_sparse_attention(T, S, Hq, Hkv, D, K, dtype):
+    # [FUNCTION DOC] Parametrized over four shapes (queries, keys, query heads, kv heads, head dim,
+    # indices per query, dtype). Indices are the top-K of random scores per query (unique per row, since
+    # the kernel counts duplicates twice while the reference mask cannot), about 30 percent of them
+    # replaced by -1 padding with the first column always kept. Runs the kernel forward and backward with
+    # scale of the inverse square root of D and a random upstream gradient, then the mask-based
+    # reference on detached copies. Asserts output and gradients of q, k, v agree within tolerance
+    # (2e-2 for bfloat16, 2e-4 for float32) in max relative error.
     g = torch.Generator(device="cuda").manual_seed(T)
     q = torch.randn(T, Hq, D, device="cuda", dtype=dtype, generator=g, requires_grad=True)
     k = torch.randn(S, Hkv, D, device="cuda", dtype=dtype, generator=g, requires_grad=True)

@@ -1,3 +1,12 @@
+# [MODULE DOC] CPU tests of the chain that keeps Qwen3.5's A_log parameter in float32 through
+# model wrapping and weight loading: (1) the helper that marks a parameter with a forced dtype and the
+# helper that re-casts marked parameters after the model is wrapped in a half-precision module
+# (preserving parameter object identity, leaving unmarked parameters alone, idempotent, walking all
+# model chunks, returning the names it covers); (2) the Qwen3.5 bridge's HF-to-Megatron conversion
+# override for A_log names (including MTP layers) that returns float32 regardless of the bridge dtype
+# or input dtype (bridge tests skipped without mbridge); (3) an end-to-end replay of the dtype-relevant
+# steps of the loader showing bit-exact preservation, plus a negative control showing that without
+# the post-wrap re-cast the value is demoted to bfloat16.
 """Tests for the A_log fp32 preservation chain.
 
 Feature: Qwen3.5's ``A_log`` must end up as fp32 in the Megatron parameter
@@ -41,11 +50,16 @@ from miles.backends.megatron_utils.fp32_param_utils import (
 
 
 class _ToyModule(nn.Module):
+    # [CLASS DOC] HELPER: Toy module with a marked float32 A_log parameter (log of values uniform in
+    # [0, 16), one per head) and an unmarked bias-free linear projection (16 inputs, one output per
+    # head).
     """Minimal stand-in for Qwen3_5GatedDeltaNet: one marked fp32 param plus
     one regular bf16-target param, so we can check the collateral damage
     boundary of ``enforce_marked_param_dtypes``."""
 
     def __init__(self, num_heads: int = 8):
+        # [FUNCTION DOC] HELPER: Builds A_log from random values (default 8 heads), marks it with the
+        # float32 forced dtype, and adds the linear projection.
         super().__init__()
         A = torch.empty(num_heads).uniform_(0, 16)
         self.A_log = nn.Parameter(torch.log(A).to(torch.float32))
@@ -54,12 +68,15 @@ class _ToyModule(nn.Module):
 
 
 class TestMarkParamDtype:
+    # [CLASS DOC] Tests of the helper that records a forced dtype on a parameter.
     def test_attaches_expected_attribute(self):
+        # [FUNCTION DOC] After marking a parameter with float32, its forced-dtype attribute is float32.
         p = nn.Parameter(torch.zeros(4))
         mark_param_dtype(p, torch.float32)
         assert getattr(p, FORCED_PARAM_DTYPE_ATTR) is torch.float32
 
     def test_overwrites_previous_mark(self):
+        # [FUNCTION DOC] Marking float32 then float64 leaves float64 as the forced dtype.
         p = nn.Parameter(torch.zeros(4))
         mark_param_dtype(p, torch.float32)
         mark_param_dtype(p, torch.float64)
@@ -67,7 +84,11 @@ class TestMarkParamDtype:
 
 
 class TestEnforceMarkedParamDtypes:
+    # [CLASS DOC] Tests of the helper that re-casts marked parameters of a list of model chunks to
+    # their forced dtype in place (mutating parameter data only) and returns the covered names.
     def test_recasts_marked_param_back_to_fp32_after_float16_wrap(self):
+        # [FUNCTION DOC] A toy module starts with float32 A_log, becomes bfloat16 after the module-wide
+        # cast, and is float32 again after the helper runs.
         """Simulates the full Megatron path: construct -> bfloat16() (what
         ``Float16Module(...)`` does) -> enforce. A_log must come out fp32."""
         m = _ToyModule()
@@ -82,6 +103,8 @@ class TestEnforceMarkedParamDtypes:
         assert m.A_log.dtype == torch.float32
 
     def test_preserves_parameter_identity(self):
+        # [FUNCTION DOC] After the module-wide bfloat16 cast and the helper, the A_log attribute is
+        # still the same parameter object (same id and identity) as before.
         """Optimizer and DDP bucket parameters by Python identity, set up
         AFTER ``enforce_marked_param_dtypes`` runs. If we re-bind via
         ``self.A_log = nn.Parameter(...)`` the id changes and the optimizer
@@ -97,6 +120,7 @@ class TestEnforceMarkedParamDtypes:
         assert m.A_log is before_param_obj
 
     def test_leaves_unmarked_params_alone(self):
+        # [FUNCTION DOC] The unmarked linear weight stays bfloat16 after the helper runs.
         m = _ToyModule()
         m.bfloat16()
         assert m.in_proj.weight.dtype == torch.bfloat16
@@ -105,6 +129,8 @@ class TestEnforceMarkedParamDtypes:
         assert m.in_proj.weight.dtype == torch.bfloat16
 
     def test_is_noop_when_already_target_dtype(self):
+        # [FUNCTION DOC] After a first enforcement, a second call leaves A_log float32 with the same
+        # data pointer (no reallocation) and still returns a list containing an A_log name.
         """Idempotency — second call must not re-allocate or change anything.
         Guards against accidental double-work when the hook is called on
         both the training and conversion entrypoints in the same process."""
@@ -122,6 +148,8 @@ class TestEnforceMarkedParamDtypes:
         assert any(n.endswith("A_log") for n in updated)
 
     def test_walks_multiple_model_chunks(self):
+        # [FUNCTION DOC] With two toy modules cast to bfloat16, one helper call restores float32 A_log
+        # in both.
         """``setup_model_and_optimizer`` passes a list of model chunks (for
         virtual pipeline parallelism). The helper must iterate all of them."""
         chunks = [_ToyModule(), _ToyModule()]
@@ -133,6 +161,8 @@ class TestEnforceMarkedParamDtypes:
             assert c.A_log.dtype == torch.float32
 
     def test_returns_empty_when_no_marks(self):
+        # [FUNCTION DOC] For a plain bfloat16 linear with no marked parameters, the helper returns an
+        # empty list.
         m = nn.Linear(4, 4)
         m.bfloat16()
         assert enforce_marked_param_dtypes([m]) == []
@@ -145,6 +175,8 @@ class TestEnforceMarkedParamDtypes:
 
 @pytest.fixture(scope="module")
 def bridge_stub():
+    # [FUNCTION DOC] HELPER: Module-scoped fixture; skips if mbridge is unavailable. Returns a Qwen3.5
+    # bridge instance created without running its constructor (tests set the dtype attribute directly).
     """Build a ``Qwen3_5Bridge`` without invoking ``__init__`` — ``__init__``
     needs a real HF config. The A_log branch only reads ``self.dtype``, which
     we set directly, so skipping init is safe and lets this test stay
@@ -157,9 +189,13 @@ def bridge_stub():
 
 
 class TestQwen3_5BridgeALogOverride:
+    # [CLASS DOC] Tests of the bridge's HF-to-Megatron conversion for the A_log parameter name; the
+    # class attribute is a sample decoder A_log parameter name.
     A_LOG_NAME = "decoder.layers.0.self_attention.linear_attn.A_log"
 
     def test_returns_fp32_when_bridge_dtype_is_bf16(self, bridge_stub):
+        # [FUNCTION DOC] With bridge dtype bfloat16 and a float32 input, the converted weight is
+        # float32, bit-equal to the input and contiguous.
         """The override must bypass mbridge's ``w.to(self.dtype)`` pre-cast
         that would otherwise round HF fp32 to bf16 here."""
         bridge_stub.dtype = torch.bfloat16
@@ -172,6 +208,7 @@ class TestQwen3_5BridgeALogOverride:
         assert out.is_contiguous()
 
     def test_upcasts_when_hf_input_is_bf16(self, bridge_stub):
+        # [FUNCTION DOC] A bfloat16 input still yields float32 output.
         """A_log arriving as bf16 (non-canonical ckpt) is still forced to
         fp32 — the invariant is the output dtype, not the input's."""
         bridge_stub.dtype = torch.bfloat16
@@ -182,6 +219,8 @@ class TestQwen3_5BridgeALogOverride:
         assert out.dtype == torch.float32
 
     def test_mtp_layer_a_log_also_matches(self, bridge_stub):
+        # [FUNCTION DOC] A multi-token-prediction layer's A_log name (matched by suffix) also yields
+        # float32 output.
         """The override uses ``endswith`` so MTP-layer A_log
         (``mtp.layers.{idx}...``) also matches — MTP is a real Qwen3.5
         variant and must not silently skip the override."""
@@ -208,6 +247,11 @@ class TestALogLoadPathEndToEnd:
     """
 
     def test_lossless_roundtrip(self, bridge_stub):
+        # [FUNCTION DOC] Replays: build a toy model (32 heads) with a marked float32 A_log; cast the
+        # model to bfloat16; re-cast with the helper; convert a random float32 HF tensor with the bridge
+        # (float32 expected despite bridge dtype bfloat16); stage it to the parameter's device and dtype
+        # (no-op cast, asserted float32); copy into the parameter. Asserts the parameter is float32 and
+        # bit-equal to the HF tensor.
         a_log_name = "decoder.layers.0.self_attention.linear_attn.A_log"
         hf_tensor = torch.randn(32, dtype=torch.float32)
 
@@ -240,6 +284,10 @@ class TestALogLoadPathEndToEnd:
         assert torch.equal(model.A_log.data, hf_tensor)
 
     def test_old_patch_only_regresses_without_enforce(self, bridge_stub):
+        # [FUNCTION DOC] Negative control: toy model cast to bfloat16 without the re-cast helper. The
+        # bridge conversion still gives float32, but staging to the parameter's (bfloat16) dtype demotes
+        # it; asserts the staged tensor is bfloat16 and, converted back to float32, differs from the HF
+        # value 0.970378123 repeated 8 times (rounding is observable).
         """Negative control: if we DROP ``enforce_marked_param_dtypes`` and
         only keep the upstream override (the shape of the old patch), the
         downstream ``t.to(param.dtype)`` still rounds to bf16. This pins the

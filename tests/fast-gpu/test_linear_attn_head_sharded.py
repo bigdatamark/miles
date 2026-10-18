@@ -1,3 +1,12 @@
+# [MODULE DOC] Distributed script-style test (torchrun with N GPUs; self-bootstrapping to 2
+# processes) comparing head-sharded linear-attention layers (gated delta net in the qwen3_5 and
+# qwen3_next layouts, and Kimi delta attention) at tensor parallel size equal to the world size
+# against unsharded reference modules from the sibling linear_attn_reference module (put on the
+# import path by this file). Each case compares the forward output, the input gradient and all
+# parameter gradients (gathered to full layout). Relative errors must be below 2e-2, except the
+# output at world size 1 which must be below 1e-6. Registered for the 4-GPU CUDA suite with the
+# precision label.
+# KNOWN ISSUE: registered on a 4-GPU stage but the self-bootstrap launches only 2 processes.
 """Head-sharded GDN (Qwen3.5, Qwen3-Next layouts) and KDA against their replicated references at
 TP = world size: forward output and every input / parameter gradient, gathered to the full layout.
 
@@ -40,6 +49,15 @@ CASES = {
 
 
 def check(name, config, tp_group):
+    # [FUNCTION DOC] Runs one case (qwen3_5, qwen3_next or kda). Seeds 7 and builds the replicated
+    # reference in bfloat16 on the GPU, then the sharded layer from it. Seeds 11 for a (1, 512, hidden)
+    # input; the packed sequences have boundaries at 0, 200, 512. The reference takes the batch-first
+    # input; the sharded layer takes the sequence-first transposed copy plus packed-sequence params.
+    # Seeds 13 for the output gradient and backpropagates through both. Returns a mapping from
+    # quantity name to relative error: output, input gradient, log decay and decay-bias gradients
+    # (gathered along dim 0), norm weight gradient (not gathered, replicated), output projection
+    # gradient (gathered along dim 1), each convolution and each sharded projection gradient (gathered
+    # along dim 0), and for the delta attention case the replicated forget down-projection gradient.
     torch.manual_seed(7)
     heads = CASES[name]
     ref = (
@@ -81,6 +99,13 @@ def check(name, config, tp_group):
 
 
 def main():
+    # [FUNCTION DOC] Per-rank entry point. Reads rank, world size and local rank from the
+    # environment, selects the GPU, initializes NCCL (120 second timeout) and Megatron parallel state
+    # with tensor parallel size equal to the world size, seeds the model-parallel RNG with 1234, and
+    # builds a one-layer bfloat16 transformer config (hidden 256, 8 heads). For every case it runs the
+    # check, prints (rank 0) the errors, and records errors above 2e-2 (above 1e-6 for the output when
+    # the world size is 1) as failures. After a barrier it tears down distributed state; if any case
+    # failed it prints the failures and exits with status 1, else rank 0 prints a success line.
     rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl", timeout=timedelta(seconds=120))

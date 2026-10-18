@@ -1,3 +1,12 @@
+# [MODULE DOC] Unit tests for helper functions of the debug-utils run_megatron worker entry module
+# (argument parsing, source patching, forward/backward driver, dumper finalization). Placed in the
+# GPU test directory because that module imports heavy Megatron and sglang packages at top level.
+# To import it, the test first imports the real miles package tree, then installs stub modules
+# (mock objects) in the module table for the missing Megatron training/core modules and for several
+# miles Megatron-utils submodules, and finally imports the functions under test. All tests mock the
+# worker module's collaborators; no real distributed or model execution happens. Each fast-GPU test
+# file runs in its own subprocess so the module stubbing cannot leak. Registered for 2-GPU CUDA and ROCm
+# nightly suites (megatron label).
 """Unit tests for worker/main.py helper functions.
 
 Lives under tests/fast-gpu/ because worker/main.py has heavy top-level
@@ -34,6 +43,10 @@ import torch
 
 
 def _ensure_module(dotted: str) -> ModuleType:
+    # [FUNCTION DOC] HELPER: For a dotted module path, walks each ancestor prefix and registers an
+    # empty stub module in the global module table for any prefix not already present (existing
+    # modules are untouched). Returns the module for the full path. Side effect: mutates the module
+    # table.
     """Ensure *dotted* exists in sys.modules, creating stubs for any missing segments."""
     parts = dotted.split(".")
     for i in range(len(parts)):
@@ -110,6 +123,8 @@ _MODULE = "miles.utils.debug_utils.run_megatron.worker.main"
 
 
 class TestParseArgs:
+    # [CLASS DOC] Tests for the worker's argument parser wrapper, with the Megatron parser and the
+    # script-args bridge patched out.
     @patch(f"{_MODULE}.WORKER_SCRIPT_ARGS_BRIDGE")
     @patch(f"{_MODULE}.parse_args")
     def test_ref_load_overrides_args_load(
@@ -117,6 +132,10 @@ class TestParseArgs:
         mock_parse_args: MagicMock,
         mock_bridge: MagicMock,
     ) -> None:
+        # [FUNCTION DOC] The patched Megatron parser returns a namespace with no load path; the
+        # patched bridge returns script args whose reference-load path is set to a path object. Asserts
+        # the returned args' load field becomes the path as a string and the returned script args are
+        # exactly the bridge's object.
         """When script_args.ref_load is set, args.load is overridden."""
         args = argparse.Namespace(load=None)
         mock_parse_args.return_value = args
@@ -137,6 +156,8 @@ class TestParseArgs:
         mock_parse_args: MagicMock,
         mock_bridge: MagicMock,
     ) -> None:
+        # [FUNCTION DOC] Same setup but the namespace has load "/orig" and the reference-load is none;
+        # asserts the load field is unchanged.
         """When script_args.ref_load is None, args.load stays as-is."""
         args = argparse.Namespace(load="/orig")
         mock_parse_args.return_value = args
@@ -151,12 +172,19 @@ class TestParseArgs:
 
 
 class TestApplySourcePatches:
+    # [CLASS DOC] Tests for the helper that loads a YAML patch config file and applies source patches.
     @patch(f"{_MODULE}.apply_patches_from_config")
     def test_reads_yaml_and_calls_patcher(
         self,
         mock_apply: MagicMock,
         tmp_path: Path,
     ) -> None:
+        # [FUNCTION DOC] Writes a small YAML config file in a temp directory, calls the helper with
+        # its path, and asserts the patched patch-applier was called exactly once with the file's text
+        # as first positional argument and with either an extra-imports keyword or a second positional
+        # argument.
+        # KNOWN ISSUE: the last assertion is weak (an either-or condition), so it does not pin down
+        # how the extra imports are passed.
         config_file = tmp_path / "patches.yaml"
         config_file.write_text("patches:\n  - target: foo")
 
@@ -169,6 +197,8 @@ class TestApplySourcePatches:
 
 
 class TestRunForwardBackward:
+    # [CLASS DOC] Tests for the worker's forward/backward driver with the distributed module and the
+    # pipeline schedule getter patched out (rank reported as 1, i.e. not the first rank).
     @patch(f"{_MODULE}.dist")
     @patch(f"{_MODULE}.get_forward_backward_func")
     def test_forward_only_when_run_backward_false(
@@ -176,6 +206,9 @@ class TestRunForwardBackward:
         mock_get_fb: MagicMock,
         mock_dist: MagicMock,
     ) -> None:
+        # [FUNCTION DOC] The schedule function mock returns an empty list. With script args saying
+        # no backward, a one-sample batch (4 tokens, labels with ignore index) and a single mock model
+        # chunk, asserts the schedule function was called with forward-only true.
         """run_backward=False → forward_only=True passed to the func."""
         mock_fb_func = MagicMock(return_value=[])
         mock_get_fb.return_value = mock_fb_func
@@ -204,6 +237,8 @@ class TestRunForwardBackward:
         mock_get_fb: MagicMock,
         mock_dist: MagicMock,
     ) -> None:
+        # [FUNCTION DOC] Same mocks; with a 2-token batch and no backward, asserts the driver
+        # returns none when the schedule function captured no logits (as on non-last pipeline stages).
         """If no logits captured (non-last PP stage), returns None."""
         mock_fb_func = MagicMock(return_value=[])
         mock_get_fb.return_value = mock_fb_func
@@ -228,11 +263,15 @@ class TestRunForwardBackward:
 
 
 class TestFinalizeDumper:
+    # [CLASS DOC] Tests for the helper that finishes the tensor dumper when an environment variable
+    # enables it; the dumper object is patched with a mock.
     @patch(f"{_MODULE}.dumper")
     def test_dumper_enable_env_triggers_step_and_disable(
         self,
         mock_dumper: MagicMock,
     ) -> None:
+        # [FUNCTION DOC] With the dumper-enable environment variable set to 1, calls the helper and
+        # asserts the dumper's step was called once and its configure was called once with enable false.
         with patch.dict(os.environ, {"DUMPER_ENABLE": "1"}):
             _finalize_dumper()
 
@@ -244,6 +283,11 @@ class TestFinalizeDumper:
         self,
         mock_dumper: MagicMock,
     ) -> None:
+        # [FUNCTION DOC] With the environment cleared (and the enable variable explicitly removed and
+        # restored afterwards), calls the helper and asserts the dumper's step and configure were never
+        # called.
+        # KNOWN ISSUE: the variable removal and restore are redundant since the environment is already
+        # cleared by the patch context.
         with patch.dict(os.environ, {}, clear=True):
             env_backup = os.environ.pop("DUMPER_ENABLE", None)
             try:

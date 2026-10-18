@@ -1,3 +1,10 @@
+# [MODULE DOC] Integration test of the rollout server-concurrency limit using the mock rollout
+# environment from the fast rollout integration utilities: runs the training rollout with 10 data
+# rows, batch size 4 and 2 samples per prompt, 50 ms simulated per-request latency, and checks the
+# mock server's observed maximum concurrent requests: exactly 1 when the concurrency flag is 1, and
+# between 2 and 999 when it is 999. Pinned to a GPU suite because CPU runners serialize dispatch too
+# fast for the unlimited case; currently disabled in CI with a FIXME reason.
+# KNOWN ISSUE: the disabled reason is a FIXME without an issue or PR reference.
 from tests.ci.ci_register import register_cuda_ci
 
 # `no_limit` asserts max_concurrent >= 2 with --sglang-server-concurrency=999
@@ -42,6 +49,10 @@ _BASE_ARGV = ["--rollout-batch-size", "4", "--n-samples-per-prompt", "2"]
     indirect=["rollout_env"],
 )
 def test_max_concurrent(rollout_env, expected_range):
+    # [FUNCTION DOC] Parametrized (indirectly through the rollout environment fixture) over the
+    # limit-1 case (expected range 1 to 1) and the unlimited case (2 to 999). Runs the shared
+    # load-and-call-train helper on the environment's args and data source, then asserts the mock
+    # server's recorded maximum concurrency lies in the inclusive expected range.
     env = rollout_env
     load_and_call_train(env.args, env.data_source)
     min_expected, max_expected = expected_range

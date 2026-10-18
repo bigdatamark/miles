@@ -1,3 +1,9 @@
+# [MODULE DOC] GPU tests for the compressed-tensors parameter quantizer used when pushing weights
+# (the Megatron-to-HF processor): that only the weights whose base names are in the packed set are
+# re-quantized (replaced by packed and scale tensors) while other 2-D weights pass through, and that
+# the MXFP4 quantizer is the exact inverse of the checkpoint dequantizer and that the MXFP4 branch
+# emits only packed and scale tensors. The quantizer uses CUDA tensors internally, hence the GPU suite.
+# Registered for the 2-GPU CUDA suite with the precision label.
 """`quantize_params_compressed_tensors` re-quantizes exactly the weights the checkpoint stores packed."""
 
 from tests.ci.ci_register import register_cuda_ci
@@ -20,6 +26,11 @@ CONFIG = {
 
 
 def test_only_the_packed_basenames_are_quantized():
+    # [FUNCTION DOC] Passes three random 256 by 256 GPU weights (an expert w1, a router gate, and an
+    # attention q projection) with the integer-quantized config (group size 128, symmetric) and the
+    # packed base-name set containing only the expert w1. Asserts the output names include the expert's
+    # packed-weight name and not its original weight name, while the gate and q projection weights pass
+    # through under their original names.
     """A 2-D BF16 weight the checkpoint keeps unpacked (router, residual projection) must pass through."""
     params = [
         ("model.layers.0.experts.0.w1.weight", torch.randn(256, 256, device="cuda")),
@@ -37,6 +48,12 @@ def test_only_the_packed_basenames_are_quantized():
 
 
 def test_mxfp4_quantize_inverts_the_checkpoint_dequantizer():
+    # [FUNCTION DOC] Part 1: builds random packed bytes (16 by 64) and scale bytes in [96, 144) (16 by
+    # 4) with group size 32, dequantizes them to a weight, re-quantizes and dequantizes again, and
+    # asserts the round trip is exactly equal. Part 2: runs the compressed-tensors quantizer on a random
+    # 64 by 64 weight with an MXFP4 pack-quantized config (4-bit float, uint8 scale) and asserts the
+    # output is exactly two tensors in order: packed weight (uint8, shape 64 by 32) and scale (uint8,
+    # shape 64 by 2), with the expected names, i.e. no shape or zero-point extras.
     """``quantize_mxfp4`` must be the exact inverse of the dequantizer used to
     read the K3 checkpoint: any value that came out of an MXFP4 checkpoint has
     to re-encode to the same bits, or every weight sync degrades the rollout

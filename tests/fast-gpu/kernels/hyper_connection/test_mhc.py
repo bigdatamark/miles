@@ -1,3 +1,7 @@
+# [MODULE DOC] GPU tests for the hyper-connection mix and aggregate Triton ops, compared forward and
+# backward with float64 torch references. Uses 4 residual streams, sequence 37, batch 2, hidden sizes
+# 1000 (not a power of two) and 2048, bfloat16 data and float32 mixing coefficients. Registered for a
+# 2-GPU Hopper suite with the precision label; skipped without Triton or CUDA.
 """The DeepSeek-V4.1 hyper-connection residual mix and stream aggregation Triton kernels against
 float64 torch references, forward and backward."""
 
@@ -18,10 +22,16 @@ NUM_STREAMS = 4
 
 
 def _rel_err(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    # [FUNCTION DOC] HELPER: Returns the Frobenius norm of the difference (actual converted to
+    # float64) divided by the norm of expected, as a Python float.
     return ((actual.double() - expected).norm() / expected.norm()).item()
 
 
 def _mix_reference(x, residual, h_res, h_post, n):
+    # [FUNCTION DOC] HELPER: Reference residual mix. The residual (seq, batch, n*hidden) is viewed as
+    # n streams; output stream j is the sum over input streams i of the residual mixing weight
+    # h_res[i, j] times stream i, plus h_post[j] times the layer output x (seq, batch, hidden).
+    # Returns a tensor shaped (seq, batch, n*hidden). Differentiable torch ops in the input dtype.
     s, b, _ = residual.shape
     streams = residual.view(s, b, n, -1)
     mixed = torch.einsum("sbij,sbid->sbjd", h_res, streams)
@@ -29,11 +39,16 @@ def _mix_reference(x, residual, h_res, h_post, n):
 
 
 def _aggregate_reference(x, pre, n):
+    # [FUNCTION DOC] HELPER: Reference stream aggregation. x (seq, batch, n*hidden) is viewed as n
+    # streams, each scaled by its pre weight (seq, batch, n) and summed over streams, giving
+    # (seq, batch, hidden).
     s, b, nc = x.shape
     return (pre.unsqueeze(-1) * x.view(s, b, n, nc // n)).sum(dim=2)
 
 
 def _leaves(*tensors):
+    # [FUNCTION DOC] HELPER: Given tensors, returns two lists of fresh gradient-requiring leaves: clones
+    # in the original dtype for the kernel, and float64 copies for the reference.
     kernel = [t.clone().requires_grad_() for t in tensors]
     reference = [t.double().requires_grad_() for t in tensors]
     return kernel, reference
@@ -41,6 +56,10 @@ def _leaves(*tensors):
 
 @pytest.mark.parametrize("hidden", [1000, 2048])
 def test_mix_matches_float64_reference(hidden):
+    # [FUNCTION DOC] Runs the mix kernel on random inputs and the float64 reference. Asserts output
+    # dtype equals the residual dtype and relative error below 5e-3; then backpropagates the same random
+    # gradient through both and asserts every input gradient keeps its input dtype (kernel side) and has
+    # relative error below 5e-3 versus the reference.
     torch.manual_seed(0)
     seq, batch, n = 37, 2, NUM_STREAMS
     x = torch.randn(seq, batch, hidden, device="cuda", dtype=torch.bfloat16)
@@ -64,6 +83,9 @@ def test_mix_matches_float64_reference(hidden):
 
 @pytest.mark.parametrize("hidden", [1000, 2048])
 def test_aggregate_matches_float64_reference(hidden):
+    # [FUNCTION DOC] Same structure as the mix test for the aggregate kernel: asserts output dtype
+    # equals input dtype, forward relative error below 5e-3, and gradient relative errors below 5e-3
+    # for the stream tensor and the pre weights.
     torch.manual_seed(0)
     seq, batch, n = 37, 2, NUM_STREAMS
     x = torch.randn(seq, batch, n * hidden, device="cuda", dtype=torch.bfloat16)

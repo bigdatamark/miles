@@ -1,3 +1,12 @@
+# [MODULE DOC] GPU tests comparing the Triton fused mixture-of-experts gate/up projection and down
+# projection autograd functions (forward and backward) against slow pure-PyTorch reference autograd
+# functions defined in this file that loop over tokens and selected experts. Test data: 64 tokens,
+# hidden 128, intermediate 256, 4 experts, top-2 routing, bfloat16, seed 42. Registered for a 2-GPU
+# stage but currently disabled (the required sglang fused MoE module was removed by an sglang bump);
+# skipped without CUDA or that sglang module. Also runnable as a script through a manual runner.
+# KNOWN ISSUE: every comparison uses relative and absolute tolerance of 1, which is so loose that
+# it can only catch gross errors; gradient comparisons are also guarded by "grad is not None" checks
+# and silently pass if a gradient is missing.
 """
 Test script to compare Triton backward implementation with Python backward implementation.
 
@@ -29,6 +38,9 @@ pytest.importorskip(
 
 
 class GateUpProjFunctionPython(torch.autograd.Function):
+    # [CLASS DOC] HELPER: Reference autograd function for the first expert projection: each token's
+    # hidden vector is multiplied by the transposed first-layer weight of each of its top-k selected
+    # experts, without applying routing weights. Output has one row per (token, selected expert).
     @staticmethod
     def forward(
         ctx,
@@ -37,6 +49,13 @@ class GateUpProjFunctionPython(torch.autograd.Function):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ):
+        # [FUNCTION DOC] HELPER: Inputs: hidden_states (tokens, input dim), w1 (experts, out dim, input
+        # dim), topk_weights (tokens, topk; only saved, unused in the math), topk_ids (tokens, topk)
+        # expert indices. Asserts the input dims match (raises assertion error otherwise). Loops over
+        # tokens and slots computing the matrix-vector product with the chosen expert's weight into an
+        # uninitialized output of shape (tokens * topk, out dim) in the input dtype; row index is
+        # token * topk + slot. Saves inputs for backward on the context and stores token count and topk.
+        # Returns the output.
         num_tokens, D_in = hidden_states.shape
         E, N, K = w1.shape
         assert D_in == K, f"hidden_states dim {D_in} != w1 dim {K}"
@@ -68,6 +87,13 @@ class GateUpProjFunctionPython(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        # [FUNCTION DOC] HELPER: Input: grad_output of shape (tokens * topk, out dim). Processes tokens
+        # in chunks of 65536 (the chunk loop runs one extra, possibly empty, iteration that is skipped).
+        # For each token and slot: adds grad_output row times the expert weight to the token's hidden
+        # gradient, and adds the outer product of the grad row and the token's hidden vector into a
+        # float32 per-expert weight gradient, which is cast to the hidden dtype at the end. The routing
+        # weight gradient is returned as zeros; the expert id input gets no gradient. Returns the four
+        # gradients (hidden, w1, topk weights, none). The explicit Python loops make it slow.
         """
         Backward pass for GateUpProjFunction - Pure Python implementation.
 
@@ -143,6 +169,10 @@ class GateUpProjFunctionPython(torch.autograd.Function):
 
 
 class DownProjFunctionPython(torch.autograd.Function):
+    # [CLASS DOC] HELPER: Reference autograd function for the second expert projection: each
+    # (token, selected expert) row of the activated intermediate is multiplied by that expert's
+    # transposed second-layer weight and scaled by the routing weight. Output keeps the per-slot
+    # dimension (tokens, topk, hidden) and is not summed over slots.
     @staticmethod
     def forward(
         ctx,
@@ -151,6 +181,12 @@ class DownProjFunctionPython(torch.autograd.Function):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ):
+        # [FUNCTION DOC] HELPER: Inputs: intermediate_cache2 (tokens * topk, intermediate size), w2
+        # (experts, hidden, intermediate size), topk_weights (tokens, topk), topk_ids (tokens, topk).
+        # Derives the token count from the row count and topk; asserts intermediate sizes match. For
+        # each token and slot computes routing weight times the matrix-vector product with the chosen
+        # expert weight into an output of shape (tokens, topk, hidden) in the input dtype. Saves tensors
+        # and token count / topk on the context. Returns the output.
         total_tokens, intermediate_size = intermediate_cache2.shape
         topk = topk_ids.shape[1]
         num_tokens = total_tokens // topk
@@ -184,6 +220,13 @@ class DownProjFunctionPython(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        # [FUNCTION DOC] HELPER: Input: grad_output (tokens, topk, hidden). Chunked by 65536 tokens.
+        # Per token and slot: the intermediate gradient row is routing weight times grad row times the
+        # expert weight; the expert weight gradient accumulates (in float32, cast back to the input
+        # dtype at the end) routing weight times the outer product of grad row and intermediate row; the
+        # routing weight gradient is the dot product of the grad row with the unweighted forward output
+        # (intermediate row times transposed expert weight). Returns gradients for intermediate cache,
+        # w2, topk weights, and none for the ids. Slow, explicit Python loops.
         """
         Backward pass for DownProjFunction - Pure Python implementation.
 
@@ -284,6 +327,11 @@ from miles.kernels.moe.fused_experts import GateUpProjFunction as GateUpProjFunc
 
 @pytest.fixture
 def setup_moe_params():
+    # [FUNCTION DOC] HELPER: Pytest fixture. Seeds the generator with 42 and returns a dictionary with
+    # random bfloat16 hidden states (64 x 128), first-layer weights (4 experts, 512 x 128), second-layer
+    # weights (4 experts, 128 x 256), routing weights (64 x 2, rows normalized to sum to one), integer
+    # expert ids (64 x 2, each row a random distinct pair of experts), plus the device (cuda if
+    # available, otherwise cpu) and dtype.
     """Setup MOE parameters for testing."""
     torch.manual_seed(42)
 
@@ -330,9 +378,12 @@ def setup_moe_params():
 
 
 class TestGateUpProjBackward:
+    # [CLASS DOC] Compares the Triton and Python gate/up projection functions on the shared fixture.
     """Test GateUpProjFunction backward pass comparison."""
 
     def test_forward_consistency(self, setup_moe_params):
+        # [FUNCTION DOC] Runs both implementations on cloned fixture tensors and asserts outputs are
+        # close with relative and absolute tolerance of 1 (very loose). Prints a pass message.
         """Test that Triton and Python implementations produce same forward output."""
         params = setup_moe_params
 
@@ -357,6 +408,10 @@ class TestGateUpProjBackward:
         print("✓ GateUpProjFunction forward test passed")
 
     def test_backward_consistency(self, setup_moe_params):
+        # [FUNCTION DOC] Runs both implementations on separate gradient-requiring clones, backpropagates
+        # the same random output gradient, prints the max absolute differences, and asserts the hidden
+        # states and first-layer weight gradients are close (tolerance 1 relative and absolute). The
+        # checks are skipped if a gradient is missing. The routing weight gradient is not compared.
         """Test that Triton and Python implementations produce same gradients."""
         params = setup_moe_params
 
@@ -422,9 +477,13 @@ class TestGateUpProjBackward:
 
 
 class TestDownProjBackward:
+    # [CLASS DOC] Compares the Triton and Python down projection functions on the shared fixture,
+    # using random intermediate activations of shape (tokens * topk, intermediate size).
     """Test DownProjFunction backward pass comparison."""
 
     def test_forward_consistency(self, setup_moe_params):
+        # [FUNCTION DOC] Builds a random intermediate activation, runs both implementations on clones and
+        # asserts the outputs are close (tolerance 1 relative and absolute).
         """Test that Triton and Python implementations produce same forward output."""
         params = setup_moe_params
 
@@ -457,6 +516,10 @@ class TestDownProjBackward:
         print("✓ DownProjFunction forward test passed")
 
     def test_backward_consistency(self, setup_moe_params):
+        # [FUNCTION DOC] Runs both implementations on separate gradient-requiring copies of a random
+        # intermediate activation, w2 and routing weights, backpropagates one random output gradient and
+        # asserts closeness (tolerance 1) of the intermediate, routing weight and w2 gradients, printing
+        # max differences. Each check is skipped if the gradient is missing.
         """Test that Triton and Python implementations produce same gradients."""
         params = setup_moe_params
 
@@ -548,6 +611,12 @@ class TestDownProjBackward:
 
 
 def run_all_tests():
+    # [FUNCTION DOC] HELPER: Manual runner (not collected by pytest). Prints a banner and returns
+    # early with a warning if CUDA is unavailable. Otherwise builds the same kind of parameter
+    # dictionary as the fixture (seed 42) and calls the four test methods directly with that
+    # dictionary in place of the fixture. Prints progress; no return value.
+    # The test methods are called with a plain dictionary standing in for the pytest fixture, which
+    # works because they only index into it.
     """Run all tests."""
     print("=" * 80)
     print("Running Fused Experts Backward Tests")

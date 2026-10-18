@@ -1,3 +1,11 @@
+# [MODULE DOC] GPU tests for the NVMe-streamed optimizer step, which builds float32 gradients one
+# bucket at a time instead of all at once. Verifies bit-exact agreement with Megatron's eager
+# reference path (float32 grads for all shards, in-place clipping by total norm, then fused Adam) for
+# three clip thresholds, that stepping without a recorded gradient norm fails with an assertion
+# error, and that Megatron's gradient-norm collection and gradient clipping treat streamed main
+# parameters (which have no gradient attribute outside the step) correctly. Uses three parameters of
+# sizes 1000/3000/500 in two bucket files, built with hand-made stand-ins for the distributed
+# optimizer. Registered for the 2-GPU CUDA suite (miles-plugin label).
 """The streamed step builds fp32 grads per bucket and must match Megatron's eager path bit for bit.
 
 Megatron copies every shard's BF16 grad to fp32 up front, clips the fp32 grads in place and steps;
@@ -28,12 +36,25 @@ DTYPES = {segment: torch.float32 for segment in ("main", "exp_avg", "exp_avg_sq"
 
 
 def _adam(params):
+    # [FUNCTION DOC] HELPER: Builds Megatron's fused Adam optimizer over the given parameters in one
+    # group with the module learning rate (1e-3), no weight decay and decoupled (AdamW) mode.
     from megatron.core.optimizer import Adam
 
     return Adam([{"params": params, "lr": LR, "weight_decay": 0.0}], adam_w_mode=True)
 
 
 def _setup(tmp_path, clip_grad: float):
+    # [FUNCTION DOC] HELPER: Seeds the generator with 0 and builds a streamed store test fixture.
+    # For each size in (1000, 3000, 500): a bfloat16 GPU model parameter with random values and a
+    # random bfloat16 main-grad buffer, an fp32 empty main tensor flagged as tensor-parallel (so its
+    # norm contribution counts without parallel groups) with storage released, a range map for the
+    # shard, and a cumulative offset into a shared bfloat16 parameter buffer (initially zeros). Builds a
+    # namespace standing in for the distributed optimizer (empty fp32 groups, one Adam param group,
+    # the buffer/bucket mappings, range lookup, and the clip threshold). Splits the three entries into
+    # two buckets (first two, last one) each with its own file under the temp directory and its own Adam
+    # optimizer sharing one 64 KiB stager. Creates the store without its constructor, sets its fields
+    # (no fp32 adam, no recorded norm) and initializes main parameters from the model parameters (which
+    # writes them to the bucket files). Returns (store, model params, entries, shared param buffer).
     torch.manual_seed(0)
     model_params, entries, ranges, offset = [], [], {}, 0
     param_data = torch.zeros(sum(SIZES), dtype=torch.bfloat16, device="cuda")
@@ -75,6 +96,11 @@ def _setup(tmp_path, clip_grad: float):
 
 
 def _eager_reference(model_params, grad_norm: torch.Tensor | float, clip_grad: float) -> list[torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Computes the expected result by Megatron's eager route. Makes an fp32
+    # copy of each model parameter as a main parameter with its gradient set to the fp32 version of
+    # the parameter's main-grad buffer; if the clip threshold is positive, clips all gradients in place
+    # using the given total norm (a tensor or plain float, whichever the caller's type convention is);
+    # then takes one fused Adam step. Returns the list of updated main parameters.
     """Megatron's path: fp32 grads for every shard, clip_grad_by_total_norm_fp32, then Adam."""
     from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32
 
@@ -88,12 +114,24 @@ def _eager_reference(model_params, grad_norm: torch.Tensor | float, clip_grad: f
 
 
 def _read_main(bucket: _Bucket, index: int, numel: int) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Reads numel float32 values (4 bytes each) of the entry at the given
+    # index from the bucket's file at the main segment's offset for that entry; returns a CPU float32
+    # tensor.
     raw = os.pread(bucket.fd, numel * 4, bucket.offsets["main"][index])
     return torch.frombuffer(bytearray(raw), dtype=torch.float32)
 
 
 @pytest.mark.parametrize("clip_grad", [1.0, 0.0, 1.0e6])
 def test_streamed_grads_match_eager_fp32_grads(tmp_path, clip_grad):
+    # [FUNCTION DOC] Parametrized over clip thresholds 1.0, 0.0 (no clipping) and 1e6 (effectively
+    # none). Builds the fixture; asks the store for its gradient-norm tensors (exactly one) and asserts
+    # it matches the vector norm of all bfloat16 main grads (relative tolerance 1e-6). Records the norm
+    # as a tensor or float depending on whether Megatron's tensor-scale kernel is available (matching
+    # the type Megatron's own norm function returns), runs the store step (must return true), and
+    # computes the eager reference. Asserts for every entry that the main values on disk are bit-equal
+    # to the reference, its gradient attribute is none and its storage is released again; and that the
+    # shared parameter buffer holds the reference cast to bfloat16 at the right offsets. Finally closes
+    # the bucket files.
     store, model_params, entries, param_data = _setup(tmp_path, clip_grad)
 
     (norm,) = store.grads_for_norm()
@@ -126,6 +164,9 @@ def test_streamed_grads_match_eager_fp32_grads(tmp_path, clip_grad):
 
 
 def test_step_without_a_recorded_norm_fails_loudly(tmp_path):
+    # [FUNCTION DOC] With a clip threshold of 1.0 and no gradient norm recorded, asserts stepping the
+    # store raises an assertion error whose message says the norm was not recorded; then closes the
+    # bucket files (skipped if the assertion itself fails).
     store, *_ = _setup(tmp_path, clip_grad=1.0)
     with pytest.raises(AssertionError, match="grad norm was not recorded"):
         store.step()
@@ -134,6 +175,15 @@ def test_step_without_a_recorded_norm_fails_loudly(tmp_path):
 
 
 def test_megatron_norm_and_clip_leave_streamed_mains_to_the_store(tmp_path):
+    # [FUNCTION DOC] Adds a resident fp32 main tensor (zeros of 4 elements, with gradient of ones,
+    # flagged tensor-parallel) next to the streamed mains in the optimizer's single param group, binds
+    # Megatron's real parameter-listing and norm-filtering methods onto the stand-in optimizer, and
+    # binds the store with the plugin's bind function. Asserts the gradient list for the norm has two
+    # items: the resident gradient itself first, and the store's norm (equal to the vector norm of the
+    # streamed entries' bfloat16 main grads, one element, tolerance 1e-6) second. Then calls Megatron's
+    # clip with only streamed mains and a large total norm (tensor or float per kernel availability) and
+    # expects it to return without error (it must not hand an empty list to the kernel, which would
+    # crash). Always closes the bucket files.
     """Outside step() the streamed mains have no .grad: Megatron's norm takes the store's, its clip skips them."""
     from types import MethodType
 

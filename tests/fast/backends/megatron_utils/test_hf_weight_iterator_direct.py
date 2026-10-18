@@ -1,3 +1,9 @@
+# [MODULE DOC] CPU test of the direct hugging-face weight iterator's batching helper, which packs
+# parameter infos into gather batches by size only (atomicity of related parameters is handled by
+# the base template, not here). The iterator module imports heavy dependencies (triton, sglang, ray,
+# megatron), so a fixture swaps stub modules into the module table, imports a fresh copy of the
+# module, and restores the previous module table entries afterwards. Registered as a CPU test on the
+# stage-a-cpu suite.
 import sys
 import types
 from argparse import Namespace
@@ -13,6 +19,15 @@ from miles.utils.types import ParamInfo
 
 
 def _install_import_stubs(monkeypatch):
+    # [FUNCTION DOC] HELPER: Using the monkeypatch fixture (so everything is undone at test end),
+    # registers stub modules in the module table so the iterator module imports without the real
+    # packages: triton (with a pass-through jit decorator and a ceiling-division helper) and its
+    # language module (constexpr as int); the sglang utility, weight-sync and fp8 quantization
+    # modules (serializer and bucket classes as plain object, no-op torch-reduction patch, no-op
+    # quantization helpers, scale transform returning its input); ray and its actor and scheduling
+    # modules (a remote decorator that returns the decorated object, actor handle and node-affinity
+    # strategy as object); and megatron core transformer-layer module with a layer-offset function
+    # returning 0.
     triton = types.ModuleType("triton")
     triton.jit = lambda fn: fn
     triton.cdiv = lambda x, y: (x + y - 1) // y
@@ -65,6 +80,11 @@ def _install_import_stubs(monkeypatch):
 
 @pytest.fixture
 def direct_module(monkeypatch):
+    # [FUNCTION DOC] HELPER: Generator fixture. Saves and removes from the module table seven miles
+    # modules (the sglang helper, megatron-to-hf package and its processors and fp8/mxfp8 quantizers,
+    # named weights, and the direct iterator) so they are imported fresh; installs the import stubs;
+    # imports and yields the direct iterator module. Teardown restores the saved entries (removing
+    # ones that were absent).
     module_names = [
         "miles.backends.megatron_utils.sglang",
         "miles.backends.megatron_utils.megatron_to_hf",
@@ -92,6 +112,8 @@ def direct_module(monkeypatch):
 
 
 def _param(name: str, size: int) -> ParamInfo:
+    # [FUNCTION DOC] HELPER: Builds a parameter info record with the name, float32 dtype, a
+    # one-dimensional shape of the given size, no attributes, the size, and source rank 0.
     return ParamInfo(
         name=name,
         dtype=torch.float32,
@@ -103,6 +125,10 @@ def _param(name: str, size: int) -> ParamInfo:
 
 
 def test_gather_batches_pack_by_size_only(direct_module, monkeypatch):
+    # [FUNCTION DOC] Three parameters of sizes 4, 2, 4; the module's full-size function is replaced
+    # so each parameter's size is its recorded size. With a buffer size of 6 the packing helper must
+    # produce batches [a, b] and [c] (greedy by size). With a size multiplier of 2 (each counts double)
+    # every parameter is alone: [a], [b], [c].
     # Atomicity is the base template's job; gather batches are pure size packing.
     params = [_param("layer.a", 4), _param("layer.b", 2), _param("layer.c", 4)]
     monkeypatch.setattr(direct_module, "_get_param_full_size", lambda info: info.size)

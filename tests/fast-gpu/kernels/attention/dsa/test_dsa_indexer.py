@@ -1,3 +1,8 @@
+# [MODULE DOC] GPU tests for the DSA lightning-indexer kernels (packed and batched indexer logits,
+# top-k score gradients, and the combined indexer plus top-k wrapper) against the float32 reference in
+# the sibling dsa_reference module, which is loaded by file path. Registered for CI on a 2-GPU Hopper
+# suite with the precision label. The module is skipped when tilelang is missing or CUDA is
+# unavailable. Run directly, it invokes pytest on itself.
 import importlib.util
 import pathlib
 
@@ -28,6 +33,10 @@ _spec.loader.exec_module(reference)
 
 
 def _packed_inputs(cu_seqlens, heads, dim):
+    # [FUNCTION DOC] HELPER: Builds random packed indexer inputs on the GPU from a list of cumulative
+    # sequence lengths (last entry is the total token count). Returns queries (total, heads, dim) and
+    # keys (total, dim) in bfloat16, float32 weights (total, heads) scaled by 0.01, and integer
+    # causal start/end key ranges per token from the causal ranges helper. Uses the global random state.
     total = cu_seqlens[-1]
     q = torch.randn(total, heads, dim, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(total, dim, device="cuda", dtype=torch.bfloat16)
@@ -39,6 +48,10 @@ def _packed_inputs(cu_seqlens, heads, dim):
 @pytest.mark.parametrize("cu_seqlens", [[0, 128], [0, 100, 356], [0, 64, 96, 1024]])
 @pytest.mark.parametrize("heads", [8, 64])
 def test_indexer_logits_packed_matches_reference(cu_seqlens, heads):
+    # [FUNCTION DOC] Parametrized over three packings (single, two and three sequences) and head
+    # counts 8 and 64, with dim 128 and seed 0. Asserts the kernel logits have negative infinity in
+    # exactly the same positions as the reference, and that on the finite entries the relative
+    # difference is below 1e-3.
     torch.manual_seed(0)
     q, k, weights, ks, ke = _packed_inputs(cu_seqlens, heads, 128)
     ref = reference.indexer_logits_ref(q, k, weights, ks, ke)
@@ -50,6 +63,11 @@ def test_indexer_logits_packed_matches_reference(cu_seqlens, heads):
 
 @pytest.mark.parametrize("seqlen,batch,compress_ratio", [(128, 1, 4), (512, 2, 4), (2048, 1, 128)])
 def test_indexer_logits_sbhd_matches_reference(seqlen, batch, compress_ratio):
+    # [FUNCTION DOC] Parametrized over (seqlen, batch, compress ratio). Builds sequence-first
+    # batched inputs with 16 heads and dim 128, where keys have seqlen divided by the compression
+    # ratio positions; ranges come from the compressed causal ranges helper. For each batch element,
+    # compares the batched kernel output to the reference: infinity patterns must match exactly and the
+    # relative difference on finite entries must be below 1e-3.
     torch.manual_seed(0)
     heads, dim = 16, 128
     seqlen_kv = seqlen // compress_ratio
@@ -67,6 +85,13 @@ def test_indexer_logits_sbhd_matches_reference(seqlen, batch, compress_ratio):
 
 @pytest.mark.parametrize("topk", [32, 100, 512])
 def test_indexer_topk_scores_backward_matches_autograd(topk):
+    # [FUNCTION DOC] Parametrized over top-k 32, 100, 512. Uses packed inputs with sequences of 300
+    # and 724 tokens, 16 heads. Takes the top-k key positions of the kernel logits (clamped to the key
+    # count), marking entries whose logit is negative infinity as padding (-1). Computes reference
+    # gradients by autograd through the float32 reference logits gathered at those indices, and kernel
+    # gradients through the top-k score function; both losses are the sum of valid scores times the same
+    # random upstream gradient. Asserts the gradients w.r.t. queries, keys and weights agree with
+    # relative difference below 1e-4.
     torch.manual_seed(0)
     q, k, weights, ks, ke = _packed_inputs([0, 300, 1024], 16, 128)
     logits = indexer_logits(q, k, weights, ks, ke)
@@ -92,6 +117,11 @@ def test_indexer_topk_scores_backward_matches_autograd(topk):
 
 
 def test_lighting_indexer_returns_topk_of_its_own_logits():
+    # [FUNCTION DOC] Runs the combined indexer on one 512-token sequence (8 heads, top-k 64, torch
+    # top-k backend). Asserts scores and indices both have shape 512 by 64, that returned scores for
+    # valid indices equal the separately computed logits gathered at those indices exactly, that the
+    # first query (one valid key) has 63 padded slots, and that all padded slots carry negative
+    # infinity scores.
     torch.manual_seed(0)
     q, k, weights, ks, ke = _packed_inputs([0, 512], 8, 128)
     scores, topk_indices = lighting_indexer(q, k, weights, ks, ke, topk=64, topk_fn=get_dsa_topk_fn("torch"))

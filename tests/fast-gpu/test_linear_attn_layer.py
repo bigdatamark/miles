@@ -1,3 +1,12 @@
+# [MODULE DOC] Distributed script-style test (torchrun with N GPUs; self-bootstrapping to 2
+# processes) of the linear-attention layer wrapper using Kimi delta attention (hidden 256, 8 heads
+# of dim 64, bfloat16, two packed sequences of 256 tokens each). Three checks against the sibling
+# linear_attn_reference module (put on the import path by this file): sequence-parallel with tensor
+# parallel size equal to the world size; context-parallel through the zigzag sequence layout with
+# context parallel size equal to the world size; and a tensor-parallel distributed-checkpoint save and
+# load round trip into a layer built from different weights. Relative error tolerance 2e-2 for
+# outputs and input gradients; the checkpoint mismatch count must be exactly zero. Registered for the
+# 2-GPU CUDA suite with the precision label.
 """LinearAttentionLayer's sequence-parallel and context-parallel paths against the replicated KDA reference,
 and a TP-sharded checkpoint round trip of its sharded_state_dict.
 
@@ -30,6 +39,8 @@ TOLERANCE = 2e-2
 
 
 def _config(tp: int, cp: int, sequence_parallel: bool) -> TransformerConfig:
+    # [FUNCTION DOC] HELPER: Builds a one-layer bfloat16 transformer config (hidden 256, 8 heads) with
+    # the given tensor-parallel size, context-parallel size and sequence-parallel flag.
     return TransformerConfig(
         num_layers=1,
         hidden_size=HIDDEN,
@@ -43,12 +54,19 @@ def _config(tp: int, cp: int, sequence_parallel: bool) -> TransformerConfig:
 
 
 def _setup(tp: int, cp: int):
+    # [FUNCTION DOC] HELPER: Destroys any existing Megatron model-parallel state, re-initializes it
+    # with the given tensor- and context-parallel sizes (on the already-initialized default group), and
+    # seeds the model-parallel RNG with 1234.
     parallel_state.destroy_model_parallel()
     parallel_state.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
     model_parallel_cuda_manual_seed(1234)
 
 
 def _reference_and_input(seed: int):
+    # [FUNCTION DOC] HELPER: Seeds the generator, builds a replicated Kimi delta attention reference
+    # (bfloat16, GPU), a random input of shape (1, 512, hidden), a random output gradient of the same
+    # shape, and integer cumulative sequence lengths [0, 256, 512]. Returns (reference, input, grad,
+    # cumulative lengths).
     torch.manual_seed(seed)
     ref = ReplicatedKDA(HIDDEN, HEADS, torch.bfloat16).cuda()
     x = torch.randn(1, sum(SEQLENS), HIDDEN, device="cuda", dtype=torch.bfloat16)
@@ -58,6 +76,9 @@ def _reference_and_input(seed: int):
 
 
 def _reference_out_and_dx(ref, x, grad, cu_seqlens):
+    # [FUNCTION DOC] HELPER: Runs the reference on a gradient-requiring clone of x, backpropagates
+    # grad, and returns the detached output and the input gradient, both with the batch dimension
+    # removed (shape tokens by hidden).
     x_ref = x.clone().requires_grad_()
     out = ref(x_ref, cu_seqlens)
     out.backward(grad)
@@ -65,6 +86,11 @@ def _reference_out_and_dx(ref, x, grad, cu_seqlens):
 
 
 def check_sequence_parallel(world: int) -> dict[str, float]:
+    # [FUNCTION DOC] Sets up tensor parallelism equal to the world size, computes the reference output
+    # and input gradient, builds the sharded layer with sequence parallelism, gives each rank its chunk
+    # of the sequence (sequence-first layout with a singleton batch dimension), runs forward and
+    # backward with the matching chunk of the output gradient, gathers the outputs and input gradients
+    # along the sequence and returns relative errors under the keys sp_out and sp_dx. Collective.
     """TP = world with sequence parallelism: the layer sees this rank's sequence shard and returns one."""
     _setup(tp=world, cp=1)
     ref, x, grad, cu_seqlens = _reference_and_input(seed=7)
@@ -82,6 +108,10 @@ def check_sequence_parallel(world: int) -> dict[str, float]:
 
 
 def _zigzag(full: torch.Tensor, rank: int, size: int) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Selects this context-parallel rank's tokens in the load-balanced zigzag
+    # layout. Each packed sequence (lengths from the module's sequence length list) is split into 2 x
+    # size equal chunks; the rank takes chunk number rank and chunk number (2 x size - 1 - rank) of
+    # each sequence; results are concatenated in sequence order. Sequence lengths must divide evenly.
     parts = []
     for segment in full.split(SEQLENS):
         chunks = segment.chunk(2 * size)
@@ -90,6 +120,10 @@ def _zigzag(full: torch.Tensor, rank: int, size: int) -> torch.Tensor:
 
 
 def check_context_parallel(world: int) -> dict[str, float]:
+    # [FUNCTION DOC] Sets up context parallelism equal to the world size and builds the sharded layer
+    # with the all-gather context-parallel mode off (using the zigzag relayout). Inputs and output
+    # gradients are zigzag-sliced for the rank; the layer's local output and input gradient are
+    # compared with the zigzag slice of the reference's. Returns relative errors under cp_out and cp_dx.
     """CP = world through the zigzag relayout (allgather_cp=False), each sequence split across ranks."""
     _setup(tp=1, cp=world)
     ref, x, grad, cu_seqlens = _reference_and_input(seed=11)
@@ -106,6 +140,12 @@ def check_context_parallel(world: int) -> dict[str, float]:
 
 
 def check_checkpoint_round_trip(world: int, ckpt_dir: str) -> dict[str, float]:
+    # [FUNCTION DOC] Sets up tensor parallelism equal to the world size. Builds a layer from one
+    # random reference (seed 21) and saves its sharded state dict with distributed checkpointing into
+    # the directory; builds a second layer from a different reference (seed 22), loads the checkpoint
+    # into it, and counts parameters that are not exactly equal between the two layers. Returns a
+    # mapping with the single key ckpt_mismatched_params holding that count as a float. Collective;
+    # all ranks must share the directory.
     """Save a TP-sharded layer with dist_checkpointing and load it into one holding other weights."""
     _setup(tp=world, cp=1)
     config = _config(tp=world, cp=1, sequence_parallel=False)
@@ -119,6 +159,14 @@ def check_checkpoint_round_trip(world: int, ckpt_dir: str) -> dict[str, float]:
 
 
 def main():
+    # [FUNCTION DOC] Per-rank entry point. Reads rank info from the environment, selects the GPU,
+    # initializes NCCL (300 second timeout), runs the sequence-parallel and context-parallel checks,
+    # creates a temporary checkpoint directory on rank 0 and broadcasts its path to all ranks, runs the
+    # checkpoint round trip, destroys model-parallel state, and prints (rank 0) all errors. Failures are
+    # any errors above the 2e-2 tolerance, or any checkpoint mismatch (the checkpoint key limit is 0).
+    # After destroying the process group, prints the failures and exits with status 1, else rank 0
+    # prints a success line.
+    # KNOWN ISSUE: the temporary checkpoint directory is never removed.
     rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl", timeout=timedelta(seconds=300))

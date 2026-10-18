@@ -1,3 +1,8 @@
+# [MODULE DOC] GPU test for the NVMe-streamed optimizer state store (plugins optimizer package):
+# that initializing the fp32 main parameters from the model parameters writes them bucket by bucket
+# to the on-disk bucket file with exact bytes, reports the byte count, and frees the in-memory
+# storage of the main parameter tensor. Uses hand-built stand-ins for the distributed optimizer and
+# bypasses the store constructor. Registered for 2-GPU CUDA and ROCm nightly suites (miles-plugin label).
 """Focused GPU coverage for streamed optimizer main-param initialization."""
 
 import os
@@ -18,6 +23,16 @@ register_rocm_ci(est_time=30, suite="nightly-stage-c-2-gpu-mi350", labels=["mile
 
 
 def test_bucketwise_main_initialization_preserves_bytes_and_releases_cuda_storage(tmp_path):
+    # [FUNCTION DOC] Builds a 600,000-element bfloat16 GPU model parameter (values from a float32
+    # arange, so exactly representable up to rounding to bfloat16) and an empty float32 main parameter
+    # whose storage is resized to zero. Creates one bucket file in the temp directory with a single
+    # entry, a 1 MiB staging buffer and float32 segments for main/exp_avg/exp_avg_sq, plus a simple
+    # namespace standing in for the distributed optimizer whose range map covers the whole parameter.
+    # Creates the store without running its constructor and assigns its optimizer and bucket list.
+    # Asserts: initialization returns the main parameter's byte count; the main parameter's storage is
+    # empty afterwards; and the bytes read back from the file at offset 0 equal the model parameter
+    # converted to float32 exactly. Closes the bucket file descriptor at the end (skipped if an
+    # assertion fails earlier).
     model_param = torch.nn.Parameter(torch.arange(600_000, dtype=torch.float32, device="cuda").to(torch.bfloat16))
     main_param = torch.empty_like(model_param, dtype=torch.float32)
     _resize(main_param, 0)

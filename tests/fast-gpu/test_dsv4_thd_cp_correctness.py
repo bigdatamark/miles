@@ -1,3 +1,12 @@
+# [MODULE DOC] Distributed script-style test (torchrun on 2 or 4 GPUs, or self-bootstrapping to 4
+# processes) for DeepSeek-V4's packed variable-length context-parallel layout of the compressor. A
+# synthetic token stream of 4096 rows (document lengths 1500, 2093, 500, 3) where row t holds value
+# t+1 across a width of 8 lets every check be exact. For compression ratios 4 and 128, each rank
+# verifies: the boundary hidden-state exchange from the left neighbour (forward value and backward
+# gradient), the compaction of compressed groups into fixed-capacity slots (group tokens contiguous,
+# padding slots zero, positions correct after context-parallel all-gather, and gradient counts).
+# Results are not reduced across ranks: each rank exits nonzero on its own failure, and only rank 0
+# prints. Registered for CUDA and ROCm 4-GPU suites.
 """Distributed correctness test for the DeepSeek-V4 packed-THD Context Parallel layout.
 
 Run with:
@@ -43,6 +52,8 @@ WIDTH = 8
 
 
 def setup_dist():
+    # [FUNCTION DOC] HELPER: Reads rank, world size and local rank from environment variables,
+    # selects the local GPU, initializes the default NCCL process group and returns (rank, world size).
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
@@ -51,18 +62,29 @@ def setup_dist():
 
 
 def _stream(device):
+    # [FUNCTION DOC] HELPER: Returns a float32 tensor of shape (total tokens, 1, 8) on the device,
+    # where row t is filled with the value t+1 (zero is reserved as an "empty" marker).
     """Row t holds t + 1, leaving 0 free to mean "nothing here"."""
     rows = torch.arange(1, sum(SEGMENTS) + 1, device=device, dtype=torch.float32)
     return rows.view(-1, 1, 1).expand(-1, 1, WIDTH).contiguous()
 
 
 def _group_starts(ratio):
+    # [FUNCTION DOC] HELPER: Returns, as a Python list of integers, the global start token of every
+    # complete compressed group: per document, floor(length / ratio) groups starting at the document
+    # offset plus multiples of the ratio. Trailing partial groups are excluded.
     """First token of every compressed group, in sequence order, one segment at a time."""
     starts = [0] + torch.tensor(SEGMENTS).cumsum(0).tolist()
     return [starts[s] + c * ratio for s, ln in enumerate(SEGMENTS) for c in range(ln // ratio)]
 
 
 def check_boundary_exchange(rank, world_size, ratio, x, l_local):
+    # [FUNCTION DOC] Takes this rank's contiguous slice of the stream (l_local rows) as a leaf
+    # requiring gradient and calls the boundary exchange, which should return the last boundary-width
+    # rows of the left neighbour (zeros on rank 0). Forward check: exact equality with that expected
+    # tail. Backward check: backpropagates the boundary weighted by 1..width per row, all-gathers every
+    # rank's gradient, and requires the concatenation to equal zeros except the last boundary-width rows
+    # of ranks 0..size-2 which hold the weights. Returns (forward ok, backward ok).
     """Forward delivers the left neighbour's tail; backward returns its gradient."""
     d_comp = compressor_boundary_width(ratio)
     start = rank * l_local
@@ -86,6 +108,15 @@ def check_boundary_exchange(rank, world_size, ratio, x, l_local):
 
 
 def check_compaction_and_layout(rank, world_size, ratio, x, l_local):
+    # [FUNCTION DOC] Builds cumulative document lengths, the per-rank group slot capacity, the
+    # boundary rows, and runs the compaction op producing slotted tokens and per-slot compressed ids
+    # (negative means unused). Checks: (1) contiguous_ok: live slots hold ratio consecutive tokens
+    # starting from the slot's first value; (2) padding_ok: unused slots are all zero; (3) layout_ok:
+    # after all-gathering each slot's first row across context-parallel ranks, the rank-layout mapping
+    # locates every expected group start in sequence order; (4) grad_ok: backpropagating a sum through
+    # the compacted tokens gives each token a gradient equal to the number of groups containing it,
+    # (boundary groups are built by two ranks and so count twice), verified on the all-gathered
+    # gradients. Returns (contiguous_ok, padding_ok, layout_ok, grad_ok).
     """Every group is built from its own tokens, and stays reachable after the gather."""
     device = x.device
     cu = torch.tensor([0] + torch.tensor(SEGMENTS).cumsum(0).tolist(), dtype=torch.int32, device=device)
@@ -125,6 +156,11 @@ def check_compaction_and_layout(rank, world_size, ratio, x, l_local):
 
 
 def main():
+    # [FUNCTION DOC] Entry point per rank. Initializes distributed state, asserts the total token
+    # count divides by the world size, builds the stream, and for each compression ratio (4 and 128)
+    # runs the boundary and compaction checks collecting six named boolean results. Rank 0 prints a
+    # pass/fail table per ratio and a final summary. Exits with status 1 if any check failed on this
+    # rank; the process group is always destroyed.
     rank, world_size = setup_dist()
     try:
         assert sum(SEGMENTS) % world_size == 0

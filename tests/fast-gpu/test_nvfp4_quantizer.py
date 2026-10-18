@@ -1,3 +1,14 @@
+# [MODULE DOC] Blackwell GPU tests for NVFP4 (4-bit float with block scales and a global scale)
+# quantization used for weight conversion/updates and fake-quantization-aware training. Covers: exact
+# global scale arithmetic without host scalar reads; processor and conversion-tool quantizers (single
+# and gate/up pair) matching Transformer Engine's reference bit for bit under default and "four over
+# six" modes; the processor's skip rules (incomplete gated pair error, extra high-precision layers,
+# first/last bf16 layers, no static input scale); the HF conversion tool's prefix handling and
+# cross-shard gate/up pairing; a fused quantize-dequantize kernel bit-exact against Transformer
+# Engine across dtypes, shapes, patterns and configurations; the straight-through gradient; mapping
+# of Transformer Engine environment variables to a config and its validation errors; a real grouped
+# linear layer using fake quantization; input validation of the fused op; cross-device behavior; and
+# the fake-QAT adapter. Registered on the 8-GPU Blackwell suite (needs only one GPU for most tests).
 from tests.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
@@ -63,6 +74,11 @@ NVFP4_SHAPES = [
 
 
 def _make_weight(init_data: str, dtype: torch.dtype, shape: tuple[int, int], device: str) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Builds a test weight by pattern name: "random" standard normal;
+    # "boundary" a single row repeated for all rows, a linspace from -12 to 12 (n/2 points) emitted twice
+    # as value minus and plus a small epsilon (1e-3, floored at 1e-4) in even/odd columns; "zeros";
+    # "maxes" (dtype max everywhere). Raises a value error for unknown patterns. Same as the MXFP8 test
+    # helper except the value ranges (normal not scaled by 16; boundary range 12 not 512).
     m, n = shape
     if init_data == "random":
         return torch.randn((m, n), dtype=dtype, device=device)
@@ -86,6 +102,13 @@ def _te_nvfp4_reference(
     global_amax: torch.Tensor,
     row_scaled_nvfp4: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Reference NVFP4 quantization via Transformer Engine's reference
+    # quantizer's blockwise routine, given the weight, a precomputed global amax scalar and a row-scaled
+    # flag. Uses block size of the module's group size, non-power-of-two scales, epsilon 0, the E4M3
+    # max from the weight helper, and "four over six" enabled when the NVTE_NVFP4_4OVER6 environment
+    # variable (case-insensitive) is "weights" or "all", with error mode from NVTE_NVFP4_4OVER6_ERR_MODE
+    # (default MAE, upper-cased). Returns (packed quantized weight, block scales, global decode scale
+    # derived from the amax and E4M3 max).
     weight = weight.contiguous()
     nvfp4_e4m3_max = nvfp4_weight_e4m3_max()
     qweight, block_scale = NVFP4QuantizerRef._quantize_blockwise_reference(
@@ -104,7 +127,12 @@ def _te_nvfp4_reference(
 
 
 class _NoHostScalarRead(TorchDispatchMode):
+    # [CLASS DOC] HELPER: Torch dispatch interception context that fails on operations that read a
+    # device scalar to the host or create a host scalar tensor, used to prove code stays on device.
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC] HELPER: Called for each intercepted tensor operation; raises an assertion
+        # error for the scalar-read and fresh-lifted-scalar operations, otherwise runs the operation
+        # normally and returns its result.
         assert func != torch.ops.aten._local_scalar_dense.default, "Scale conversion read a device scalar"
         assert func != torch.ops.aten.lift_fresh.default, "Scale conversion created a host scalar tensor"
         return func(*args, **(kwargs or {}))
@@ -114,6 +142,14 @@ class _NoHostScalarRead(TorchDispatchMode):
 @pytest.mark.parametrize("e4m3_max", [256, 448])
 @pytest.mark.parametrize("shape", [(), (1,), (8,), (2, 4)])
 def test_nvfp4_global_scale_exact_without_host_scalar_read(device, e4m3_max, shape):
+    # [FUNCTION DOC] Parametrized over cpu/cuda (cuda skipped if unavailable), E4M3 max 256 or 448,
+    # and shapes scalar, 1, 8, 2x4. For a list of eight amax values (zero, one, 3.5, smallest normal,
+    # largest float, plus/minus infinity, NaN) the expected encode scale is computed on the CPU with
+    # frozen legacy arithmetic: E4M3 max times 6 divided by the value, capped at the float max, with a
+    # zero result replaced by one. Values are split into chunks of the case's element count, each
+    # reshaped and moved to the device; under the host-scalar-read guard the encode and decode scale
+    # functions are called. Asserts the encode result keeps device and shape and equals the expected
+    # exactly (NaNs equal), and the decode result equals one over the expected encode exactly.
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
     # Includes overflow clamping, underflow-to-zero repair and NaN propagation.
@@ -149,6 +185,9 @@ def test_nvfp4_global_scale_exact_without_host_scalar_read(device, e4m3_max, sha
 
 
 def test_nvfp4_quantize_params_requires_complete_gated_pair():
+    # [FUNCTION DOC] Passes only a gate projection (no up projection) for a fused first-layer
+    # expert parameter to the processor and asserts it raises a value error stating that gate and up
+    # tensors must be quantized together.
     weight = torch.randn((4, NVFP4_GROUP_SIZE), dtype=torch.float32)
     with pytest.raises(ValueError, match="requires gate/up tensors to be quantized together"):
         quantize_params_nvfp4(
@@ -162,6 +201,8 @@ def test_nvfp4_quantize_params_requires_complete_gated_pair():
 
 
 def test_nvfp4_quantize_params_respects_extra_high_precision_layers_megatron():
+    # [FUNCTION DOC] With a gate/up pair and args listing the first-layer linear name as an extra
+    # high-precision layer, asserts the processor returns the original list object unchanged.
     weight = torch.randn((4, NVFP4_GROUP_SIZE), dtype=torch.bfloat16)
     converted_named_params = [
         ("model.layers.0.mlp.experts.0.gate_proj.weight", weight),
@@ -181,6 +222,8 @@ def test_nvfp4_quantize_params_respects_extra_high_precision_layers_megatron():
 
 @pytest.mark.parametrize("layer_idx", [0, 3])
 def test_nvfp4_quantize_params_respects_first_last_layers_bf16(layer_idx):
+    # [FUNCTION DOC] Parametrized over first (0) and last (3) of 4 layers with first/last bf16 on and
+    # one layer at each end kept in bf16; asserts the processor returns the original list unchanged.
     weight = torch.randn((4, NVFP4_GROUP_SIZE), dtype=torch.bfloat16)
     converted_named_params = [
         ("model.layers.0.mlp.experts.0.gate_proj.weight", weight),
@@ -208,12 +251,18 @@ def test_nvfp4_quantize_params_respects_first_last_layers_bf16(layer_idx):
 
 
 def test_nvfp4_quantize_params_omits_static_input_scale(monkeypatch):
+    # [FUNCTION DOC] Replaces the processor module's pair quantization function with a stub returning
+    # fixed dummy packed weights, block scales and a global scale for both gate and up. Runs the
+    # processor on a gate/up pair and asserts none of the output parameter names is an input scale
+    # entry for gate or up (the processor no longer emits static input scales).
     weight = torch.randn((4, NVFP4_GROUP_SIZE), dtype=torch.bfloat16)
     qweight = torch.empty((4, NVFP4_GROUP_SIZE // 2), dtype=torch.uint8)
     block_scale = torch.empty((4, 1), dtype=torch.float8_e4m3fn)
     global_scale = torch.ones((), dtype=torch.float32)
 
     def fake_quantize_1d_pair(_gate, _up):
+        # [FUNCTION DOC] HELPER: Stub ignoring its inputs; returns the same dummy (packed weight,
+        # block scale, global scale) triple for both the gate and the up projections.
         return (qweight, block_scale, global_scale), (qweight, block_scale, global_scale)
 
     monkeypatch.setattr(
@@ -237,6 +286,8 @@ def test_nvfp4_quantize_params_omits_static_input_scale(monkeypatch):
 
 
 def test_nvfp4_hf_should_quantize_respects_extra_high_precision_layers_hf():
+    # [FUNCTION DOC] Asserts the conversion tool's should-quantize predicate is false when the
+    # parameter name contains a skip substring and true when it does not.
     weight = torch.randn((4, NVFP4_GROUP_SIZE), dtype=torch.bfloat16)
 
     assert not tool_should_quantize_nvfp4(
@@ -252,6 +303,13 @@ def test_nvfp4_hf_should_quantize_respects_extra_high_precision_layers_hf():
 
 
 def test_nvfp4_hf_converter_uses_compact_bf16_moe_prefixes(tmp_path):
+    # [FUNCTION DOC] Writes a tiny one-layer model (config with one hidden layer; 128 experts with
+    # gate, up and down projections of shape 1 by group size in bfloat16; and an input layer norm) to
+    # a temp directory and runs the converter on CPU with the last layer kept in bf16. Asserts the
+    # converted config's quantization ignore list, and the exported quantization config's excluded
+    # modules, both equal the compact list [layer prefix, input layer norm, all experts of the layer]
+    # rather than enumerating each expert; the output file has no weight-scale tensors, and an expert's
+    # down projection stays bfloat16.
     model_dir = tmp_path / "model"
     save_dir = tmp_path / "converted"
     model_dir.mkdir()
@@ -291,6 +349,11 @@ def test_nvfp4_hf_converter_uses_compact_bf16_moe_prefixes(tmp_path):
 
 
 def test_nvfp4_hf_converter_quantizes_cross_shard_gated_pair_together(tmp_path, monkeypatch):
+    # [FUNCTION DOC] Clears the four-over-six environment variable, writes gate (3 rows) and up (5
+    # rows) projections of one expert into two separate shard files with 128 columns, runs the GPU
+    # conversion, then independently quantizes the pair with the library pair function and asserts that
+    # for each shard the stored quantized weight, block scale (as bytes) and second-level global scale
+    # equal the pair function's outputs exactly, i.e. the pair shares a global scale across shards.
     monkeypatch.delenv("NVTE_NVFP4_4OVER6", raising=False)
     model_dir = tmp_path / "model"
     save_dir = tmp_path / "converted"
@@ -344,6 +407,8 @@ def test_nvfp4_hf_converter_quantizes_cross_shard_gated_pair_together(tmp_path, 
 
 
 def test_nvfp4_hf_converter_quantizes_same_shard_gated_pair_together(tmp_path, monkeypatch):
+    # [FUNCTION DOC] Same as the cross-shard test but with gate and up in one shard file; asserts
+    # the stored second-level global scales of gate and up are identical.
     monkeypatch.delenv("NVTE_NVFP4_4OVER6", raising=False)
     model_dir = tmp_path / "model"
     save_dir = tmp_path / "converted"
@@ -372,10 +437,16 @@ def test_nvfp4_hf_converter_quantizes_same_shard_gated_pair_together(tmp_path, m
 
 
 def test_nvfp4_quantize_pair_reuses_adjacent_storage(monkeypatch):
+    # [FUNCTION DOC] Splits a 32 by 64 bfloat16 GPU tensor into two adjacent halves (gate, up) and
+    # patches torch concatenation to raise. Calling the pair quantizer must therefore not concatenate
+    # (it reuses the shared storage). Asserts each half yields packed weights of shape 16 by 32 and
+    # block scales of shape 16 by 4.
     base = torch.randn((32, 64), dtype=torch.bfloat16, device="cuda")
     gate, up = base.chunk(2, dim=0)
 
     def fail_cat(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Replacement for tensor concatenation; always raises an assertion
+        # error saying adjacent gate/up should not be materialized by concatenation.
         raise AssertionError("adjacent gate/up pair should not be materialized with torch.cat")
 
     monkeypatch.setattr(torch, "cat", fail_cat)
@@ -397,6 +468,11 @@ def test_nvfp4_quantize_pair_reuses_adjacent_storage(monkeypatch):
 @pytest.mark.parametrize("init_data", ["random", "boundary", "zeros", "maxes"])
 @pytest.mark.parametrize("use_4over6", [False, True], ids=["default", "4over6"])
 def test_nvfp4_quantize_matches_te_reference_bitwise(quantize_fn, shape, dtype, init_data, use_4over6, monkeypatch):
+    # [FUNCTION DOC] Parametrized over the processor and tool quantizers, 13 shapes, float32 and
+    # bfloat16, four data patterns, and default vs "four over six" mode (the latter sets the
+    # environment to all with mean-squared-error mode; the former removes the variable). Quantizes a
+    # GPU weight and compares packed data, block scales (as bytes) and the global scale to the
+    # Transformer Engine reference computed from the weight's absolute max, with zero tolerance.
     device = "cuda"
     torch.manual_seed(42)
     if use_4over6:
@@ -424,6 +500,11 @@ def test_nvfp4_quantize_matches_te_reference_bitwise(quantize_fn, shape, dtype, 
 @pytest.mark.parametrize("init_data", ["random", "boundary", "zeros", "maxes"])
 @pytest.mark.parametrize("use_4over6", [False, True], ids=["default", "4over6"])
 def test_nvfp4_quantize_pair_matches_te_reference_bitwise(shape, dtype, init_data, use_4over6, monkeypatch):
+    # [FUNCTION DOC] Like the single-tensor test but for the gate/up pair quantizer: builds gate and
+    # up weights of the same pattern, quantizes the pair, and compares with the reference quantization
+    # of their row-wise concatenation (global amax over both). Asserts the gate result equals the first
+    # rows and the up result the remaining rows of the reference (data and block scales as bytes), and
+    # both global scales equal the reference global scale, with zero tolerance.
     device = "cuda"
     torch.manual_seed(42)
     if use_4over6:
@@ -466,6 +547,11 @@ def test_nvfp4_quantize_pair_matches_te_reference_bitwise(shape, dtype, init_dat
 # quantize-dequantize because FlashInfer's per-tensor contract differs.
 @pytest.fixture(scope="module", autouse=True)
 def _select_local_cuda_device() -> None:
+    # [FUNCTION DOC] HELPER: Module-scoped autouse fixture. If CUDA is available and a local rank
+    # environment variable is set, selects that GPU; no collectives are initialized.
+    # KNOWN ISSUE: the comment block just above this fixture (about data modes and the 4over6 matrix
+    # mirroring FlashInfer and Transformer Engine tests) describes the qdq tests that follow, not this
+    # fixture; it appears misplaced.
     """Keep torchrun workers on their assigned GPUs without initializing collectives."""
     if torch.cuda.is_available() and "LOCAL_RANK" in os.environ:
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
@@ -510,6 +596,11 @@ for _error_mode in (NVFP4QDQErrorMode.MAE, NVFP4QDQErrorMode.MSE):
 
 
 def _make_qdq_input(shape: tuple[int, int], dtype: torch.dtype, init_data: str) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Reseeds the CPU and CUDA generators with 42 and builds a GPU input of
+    # the shape and dtype by pattern: "random" (normal, with row 0 zeroed when there are multiple
+    # rows); "boundary" (same epsilon-around-linspace row pattern, range -12 to 12, repeated per row);
+    # "zeros" (alternating negative and positive zero, to exercise the sign bit of zero blocks); "maxes"
+    # (dtype max). Raises a value error for unknown patterns.
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
     m, n = shape
@@ -536,6 +627,10 @@ def _make_qdq_input(shape: tuple[int, int], dtype: torch.dtype, init_data: str) 
 
 
 def _make_te_qdq_quantizer(config: NVFP4QDQConfig):
+    # [FUNCTION DOC] HELPER: Builds a Transformer Engine NVFP4 quantizer with row-wise output only,
+    # no amax reduction, no random Hadamard transform, no 2D quantization, no stochastic rounding, no
+    # row scaling, no random sign mask, and the "four over six" flag, E4M3 max and error mode name
+    # taken from the given config.
     return te.NVFP4Quantizer(
         rowwise=True,
         columnwise=False,
@@ -553,6 +648,10 @@ def _make_te_qdq_quantizer(config: NVFP4QDQConfig):
 
 
 def _te_qdq_reference(x: torch.Tensor, config: NVFP4QDQConfig) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Reference quantize-then-dequantize through the Transformer Engine
+    # quantizer. Pads rows with zeros up to a multiple of 16 when needed, quantizes, dequantizes to the
+    # input dtype, and slices back to the original shape (contiguous). Asserts the quantizer recorded a
+    # row-wise amax. Returns (dequantized tensor, the row-wise amax reshaped to one element).
     m, n = x.shape
     padded_m = ((m + 15) // 16) * 16
     if padded_m == m:
@@ -579,6 +678,14 @@ def test_fused_nvfp4_qdq_is_bit_exact_with_te(
     init_data: str,
     config: NVFP4QDQConfig,
 ) -> None:
+    # [FUNCTION DOC] Parametrized over bf16/fp16, 12 shapes, four data patterns and 9 quantizer
+    # configurations (plain NVFP4 plus four-over-six with mean-absolute or mean-squared error mode,
+    # E4M3 max 448 or 256, and exact or fp16-rounded error computation), run under inference mode. Sets
+    # the environment to disable fast-math quantization and to match the config's error fast-math flag.
+    # Computes the amax with the library, the reference dequantized output and amax via Transformer
+    # Engine, and the fused kernel output. Asserts the amax is bitwise equal and the outputs are equal
+    # as raw 16-bit integers (distinguishing signed zeros), reporting a mismatch count, then also
+    # closeness with zero tolerance.
     """Cover BF16/FP16 x shapes x data patterns x the full supported feature matrix."""
     monkeypatch.setenv("NVTE_USE_FAST_MATH", "0")
     monkeypatch.setenv("NVTE_NVFP4_4OVER6_ERR_USE_FAST_MATH", "1" if config.error_use_fast_math else "0")
@@ -598,6 +705,9 @@ def test_fused_nvfp4_qdq_is_bit_exact_with_te(
 
 
 def test_fused_nvfp4_qdq_uses_straight_through_gradient_and_preserves_main_grad() -> None:
+    # [FUNCTION DOC] Attaches an extra gradient-accumulation buffer attribute to a bfloat16 leaf,
+    # applies the fake-quantization straight-through op with a default config, backpropagates ones, and
+    # asserts the leaf gradient is exactly ones and the output carries the same buffer object.
     x = torch.randn((3, 32), dtype=torch.bfloat16, device="cuda", requires_grad=True)
     main_grad = torch.empty_like(x)
     x.main_grad = main_grad
@@ -636,6 +746,12 @@ def test_current_nvfp4_qdq_config_maps_full_latest_te_env_contract(
     error_mode: str,
     error_use_fast_math: bool,
 ) -> None:
+    # [FUNCTION DOC] Parametrized over all 16 combinations of the four-over-six scope and the
+    # E4M3-256 scope (none, activations, weights, all) times four error-mode/fast-math combinations.
+    # Sets the corresponding environment variables (fast math off), reads the current config, and
+    # asserts: four-over-six is enabled iff the scope is weights or all; E4M3 max is 256 iff both
+    # scopes include weights, else 448; the error mode matches by name; the error fast-math flag is set
+    # only when four-over-six is enabled and the variable requests it.
     monkeypatch.setenv("NVTE_USE_FAST_MATH", "0")
     monkeypatch.setenv("NVTE_NVFP4_4OVER6", four_over_six_scope)
     monkeypatch.setenv("NVTE_NVFP4_4OVER6_E4M3_USE_256", e4m3_256_scope)
@@ -652,6 +768,9 @@ def test_current_nvfp4_qdq_config_maps_full_latest_te_env_contract(
 
 @pytest.mark.parametrize("legacy_scope", ["inputs", "gradients"])
 def test_current_nvfp4_qdq_config_rejects_stale_te_scopes(monkeypatch: pytest.MonkeyPatch, legacy_scope: str) -> None:
+    # [FUNCTION DOC] Parametrized over the legacy scope names "inputs" and "gradients": with fast
+    # math off and the four-over-six variable set to the legacy name, asserts reading the config
+    # raises a value error whose message mentions the new "activations" name.
     monkeypatch.setenv("NVTE_USE_FAST_MATH", "0")
     monkeypatch.setenv("NVTE_NVFP4_4OVER6", legacy_scope)
     with pytest.raises(ValueError, match="activations"):
@@ -659,6 +778,8 @@ def test_current_nvfp4_qdq_config_rejects_stale_te_scopes(monkeypatch: pytest.Mo
 
 
 def test_current_nvfp4_qdq_config_rejects_quant_fast_math(monkeypatch: pytest.MonkeyPatch) -> None:
+    # [FUNCTION DOC] With the quantization fast-math variable set to 1, asserts reading the config
+    # raises a value error whose message says it must be 0.
     monkeypatch.setenv("NVTE_USE_FAST_MATH", "1")
     with pytest.raises(ValueError, match="NVTE_USE_FAST_MATH=0"):
         current_nvfp4_qdq_config()
@@ -671,6 +792,10 @@ def test_current_nvfp4_qdq_config_rejects_quant_fast_math(monkeypatch: pytest.Mo
 def test_current_nvfp4_qdq_config_rejects_non_numeric_bool_flags(
     monkeypatch: pytest.MonkeyPatch, flag_name: str
 ) -> None:
+    # [FUNCTION DOC] Parametrized over the two boolean-flag variables (quantization fast math and
+    # error fast math). Sets the chosen variable to the non-numeric text "true" (with the other flag 0
+    # and four-over-six scope "none") and asserts reading the config raises a value error saying the
+    # flag must be 0 or 1.
     monkeypatch.setenv("NVTE_USE_FAST_MATH", "0")
     monkeypatch.setenv("NVTE_NVFP4_4OVER6", "none")
     monkeypatch.setenv(flag_name, "true")
@@ -681,6 +806,17 @@ def test_current_nvfp4_qdq_config_rejects_non_numeric_bool_flags(
 def test_te_grouped_linear_real_discrete_weight_qdq_and_backward(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # [FUNCTION DOC] Integration test of Megatron's Transformer Engine grouped linear layer with
+    # NVFP4 fake quantization of discrete (one per expert) weights. Environment: fast math off,
+    # four-over-six none, fused grouped GEMM variable cleared, int4 fake QAT off, NVFP4 fake QAT on.
+    # Builds a layer with 3 GEMMs, input 32, output 2, expert mode, no bias. Asserts: no weight-gradient
+    # fusion, no single grouped weight, per-expert weights named weight0..weight2 as the only
+    # parameters. The layer's weight-tensor getter must return 3 gradient-requiring tensors bit-equal
+    # to the reference quantize-dequantize of each weight. Then runs forward on a ones input with row
+    # splits [2, 1, 3] and backward on ones: bias is none, output shape is (6, 2), input gradient is
+    # finite, and each weight's gradient is filled with its split size (straight-through).
+    # KNOWN ISSUE: the zip comparisons use non-strict mode, so a length mismatch would be silently ignored
+    # (the preceding length assertion only covers the actual weights).
     from megatron.core.extensions import transformer_engine as te_extension
     from megatron.core.process_groups_config import ProcessGroupCollection
     from megatron.core.transformer.transformer_config import TransformerConfig
@@ -746,18 +882,25 @@ def test_te_grouped_linear_real_discrete_weight_qdq_and_backward(
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_fused_nvfp4_qdq_rejects_unsupported_input_dtype(dtype: torch.dtype) -> None:
+    # [FUNCTION DOC] Parametrized over float32 and float64 inputs; asserts the fused op raises a
+    # type error stating it supports only bfloat16 and float16.
     x = torch.randn((2, 16), dtype=dtype, device="cuda")
     with pytest.raises(TypeError, match="supports BF16 and FP16"):
         fused_nvfp4_qdq(x, x.abs().amax().float(), NVFP4QDQConfig())
 
 
 def test_fused_nvfp4_qdq_rejects_non_block_aligned_k() -> None:
+    # [FUNCTION DOC] With a bfloat16 input whose last dimension is 17, asserts the fused op raises a
+    # value error saying the last dimension must be divisible by 16.
     x = torch.randn((2, 17), dtype=torch.bfloat16, device="cuda")
     with pytest.raises(ValueError, match="K divisible by 16"):
         fused_nvfp4_qdq(x, compute_nvfp4_amax(x), NVFP4QDQConfig())
 
 
 def test_fused_nvfp4_qdq_rejects_misaligned_contiguous_storage() -> None:
+    # [FUNCTION DOC] Takes a contiguous 2 by 16 bfloat16 view starting one element into a larger
+    # buffer (so its address is not 16-byte aligned; both facts asserted) and asserts the fused op
+    # raises a value error mentioning 16-byte alignment.
     storage = torch.randn(33, dtype=torch.bfloat16, device="cuda")
     x = storage[1:].view(2, 16)
     assert x.is_contiguous()
@@ -768,6 +911,11 @@ def test_fused_nvfp4_qdq_rejects_misaligned_contiguous_storage() -> None:
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
 def test_fused_nvfp4_qdq_uses_and_restores_non_current_device() -> None:
+    # [FUNCTION DOC] Skipped with fewer than two GPUs, and skipped when the world size variable
+    # exceeds 1 (needs a dedicated single process). Makes the primary device current, builds the input,
+    # amax and reference on the secondary device, then (with the primary device current) runs the fused
+    # op on secondary-device tensors. Asserts the current device is still the primary before and after the
+    # call, and that the result equals the reference bit for bit.
     if int(os.getenv("WORLD_SIZE", "1")) > 1:
         pytest.skip("Run the cross-device state test in a dedicated single process")
     primary_device = torch.cuda.current_device()
@@ -786,7 +934,11 @@ def test_fused_nvfp4_qdq_uses_and_restores_non_current_device() -> None:
 
 
 class TestNVFP4FakeQATAdapter:
+    # [CLASS DOC] Tests for the fake-quantization-aware-training adapter function that optionally
+    # replaces a list of weight tensors with fake-quantized versions depending on an environment flag.
     def test_disabled_path_returns_original_list(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # [FUNCTION DOC] With the flag set to 0, asserts the adapter returns the very same list
+        # object it was given.
         weights = [torch.nn.Parameter(torch.empty(4, 16))]
         monkeypatch.setenv(nvfp4_qat.NVFP4_FAKE_QAT_FLAG, "0")
 
@@ -797,6 +949,12 @@ class TestNVFP4FakeQATAdapter:
     def test_enabled_path_resolves_config_once_and_maps_arbitrary_weight_count(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # [FUNCTION DOC] Installs a fake kernel module in the module table (restored by the fixture)
+        # providing a counting config getter and a recording fake-quantization function that returns
+        # preset replacement tensors. With the flag set to 1 and three weights, calls the adapter and
+        # asserts: the config getter was called exactly once; the result has one entry per weight and
+        # each is the corresponding replacement object; every weight was passed to the quantization
+        # function in order along with the one resolved config object.
         weights = [torch.nn.Parameter(torch.empty(4, 16)) for _ in range(3)]
         expected = [torch.empty_like(weight) for weight in weights]
         qdq_config = object()
@@ -805,11 +963,15 @@ class TestNVFP4FakeQATAdapter:
         fake_module = ModuleType("miles.kernels.quant.nvfp4_qdq")
 
         def current_config():
+            # [FUNCTION DOC] HELPER: Fake config getter; increments the call counter and returns the
+            # shared sentinel config object.
             nonlocal config_calls
             config_calls += 1
             return qdq_config
 
         def fake_qdq(weight, config):
+            # [FUNCTION DOC] HELPER: Fake quantization function; records the (weight, config) pair
+            # and returns the preset replacement tensor at the index of this call.
             calls.append((weight, config))
             return expected[len(calls) - 1]
 

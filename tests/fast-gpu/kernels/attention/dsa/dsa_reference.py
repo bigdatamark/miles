@@ -1,9 +1,21 @@
+# [MODULE DOC] HELPER: Test-support module (not a test itself) holding plain-torch float32 reference
+# implementations of the DSA (sparse attention with a learned top-k indexer) kernels, used by the
+# sibling DSA tests as ground truth. It provides a reference for the indexer logits, a reference for
+# sparse attention with optional attention sink, and a relative-difference metric. All references
+# are differentiable through autograd and do no I/O.
 """fp32 torch references for the DSA kernels. Inputs follow miles.kernels.attention.dsa layouts."""
 
 import torch
 
 
 def indexer_logits_ref(q, k, weights, cu_seqlen_ks, cu_seqlen_ke):
+    # [FUNCTION DOC] HELPER: Reference indexer logits for packed sequences. Inputs: queries of shape
+    # tokens x heads x dim, keys of shape kv_tokens x dim (shared across heads), per-head weights of
+    # shape tokens x heads, and per-query integer start (inclusive) and end (exclusive) key positions.
+    # Computes in float32: per-head dot product of query and key, rectified linear unit, multiplied by
+    # the head weight, then summed over heads. Returns a tokens x kv_tokens float matrix where key
+    # positions outside each query's [start, end) range are set to negative infinity. Pure function;
+    # differentiable w.r.t. q, k and weights.
     """Packed: q [T, H, D], k [T_kv, D], weights [T, H] -> [T, T_kv], -inf outside [ks, ke)."""
     scores = torch.einsum("thd,kd->thk", q.float(), k.float())
     scores = torch.relu(scores) * weights.float().unsqueeze(-1)
@@ -14,6 +26,18 @@ def indexer_logits_ref(q, k, weights, cu_seqlen_ks, cu_seqlen_ke):
 
 
 def sparse_attention_ref(q, kv, indices, sm_scale, d_v, attn_sink=None):
+    # [FUNCTION DOC] HELPER: Reference sparse attention over a per-query set of selected keys.
+    # Inputs: q (batch, seq, heads, dim), kv (batch, kv_seq, groups, dim) used as both keys and values,
+    # indices (batch, seq, groups, topk) of selected key positions with -1 meaning padding, softmax
+    # scale, value width d_v (values are the first d_v channels of kv), and an optional per-head
+    # attention sink logit. Heads are split evenly into groups (heads per group = heads / groups).
+    # Per group: builds a boolean selection mask by accumulating hit counts per key (so a padded slot,
+    # clamped to key 0, cannot erase a genuine selection of key 0); computes scaled scores; masks
+    # unselected keys to negative infinity; subtracts a detached row max (including the sink if given;
+    # a non-finite max is replaced by zero); exponentiates; the denominator is the weight sum plus the
+    # exponentiated sink when present; output is weighted values divided by the denominator, with a
+    # zero denominator replaced by one (so rows with nothing selected and no sink give zeros).
+    # Returns float32 output (batch, seq, heads, d_v), concatenated over groups. Differentiable.
     """q [B, S, H, Dq], kv [B, S_kv, G, Dq], indices [B, S, G, topk] (-1 = padding), attn_sink [H] or None.
     Returns out [B, S, H, d_v]."""
     q, kv = q.float(), kv.float()
@@ -47,6 +71,9 @@ def sparse_attention_ref(q, kv, indices, sm_scale, d_v, attn_sink=None):
 
 
 def rel_diff(a, b):
+    # [FUNCTION DOC] HELPER: Returns a Python float: one minus twice the inner product of the two
+    # flattened float32 tensors over the sum of their squared norms (zero for identical tensors).
+    # Returns 0.0 when both tensors are all zeros. Tensors must have equal element counts.
     """Cosine-distance-like metric used by the miles dumper comparator."""
     x, y = a.flatten().float(), b.flatten().float()
     denom = (x * x).sum() + (y * y).sum()

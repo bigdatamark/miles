@@ -1,3 +1,7 @@
+# [MODULE DOC] GPU tests checking the Triton rotary position embedding op against the DeepSeek-V4
+# torch reference implementation from the plugins package, forward and backward, in float32 on
+# the last 64 channels (rotary tail) of a 512-wide head dimension. Registered for a 2-GPU Hopper
+# suite with the miles-plugin label. Note there is no CUDA or Triton skip guard in this file.
 """The DeepSeek-V4.1 triton RoPE must match the torch reference, forward and backward."""
 
 import sys
@@ -17,11 +21,18 @@ HEAD_DIM = 512
 
 
 def _freqs_cis(seqlen: int) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Returns a complex unit-magnitude tensor of shape (seqlen, 32) on the GPU
+    # whose phases are uniform random in [0, 6.28), standing in for rotary frequencies. Consumes the
+    # global random state.
     angles = torch.rand(seqlen, ROPE_DIM // 2, device="cuda") * 6.28
     return torch.polar(torch.ones_like(angles), angles)
 
 
 def _rotate_tail(rope_fn, base: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool, permute: bool):
+    # [FUNCTION DOC] HELPER: Clones the input (keeping autograd history), optionally changes its memory
+    # layout to a non-contiguous one by swapping the sequence and head axes in memory (same logical
+    # shape), then applies the given rotary function in place on a view of the last 64 channels with
+    # the given frequencies and inverse flag. Returns the modified clone.
     x = base.clone()
     if permute:
         x = x.transpose(1, 2).contiguous().transpose(1, 2)
@@ -33,6 +44,11 @@ def _rotate_tail(rope_fn, base: torch.Tensor, freqs_cis: torch.Tensor, inverse: 
 @pytest.mark.parametrize("shape", [(2, 37, 4, HEAD_DIM), (2, 37, HEAD_DIM)])
 @pytest.mark.parametrize("permute", [False, True])
 def test_rope_matches_reference(shape, inverse, permute):
+    # [FUNCTION DOC] Parametrized over a 4-d (batch, seq, heads, dim) and a 3-d (batch, seq, dim)
+    # shape, forward and inverse rotation, and permuted memory layout (skipped for 3-d shapes, which
+    # have no head axis). Both implementations are applied to identical weighted leaf tensors; asserts
+    # outputs match with tolerance 1e-5, then backpropagates one random gradient and asserts the leaf
+    # gradients match with tolerance 1e-5.
     if permute and len(shape) == 3:
         pytest.skip("a 3-d tensor has no head axis to permute")
     torch.manual_seed(0)
@@ -53,6 +69,10 @@ def test_rope_matches_reference(shape, inverse, permute):
 
 
 def test_rope_backward_is_not_identity():
+    # [FUNCTION DOC] Guards against a kernel whose backward passes gradients through unrotated. Applies
+    # the Triton rotation to a leaf tensor, backpropagates a random gradient, and asserts the gradient on
+    # the rotary tail differs from the upstream gradient while the gradient on the untouched leading
+    # channels equals it (tolerance default of the closeness helper).
     torch.manual_seed(0)
     freqs_cis = _freqs_cis(37)
     base = torch.randn(2, 37, 4, HEAD_DIM, device="cuda", requires_grad=True)

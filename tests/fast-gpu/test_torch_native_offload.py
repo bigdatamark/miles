@@ -1,3 +1,7 @@
+# [MODULE DOC] GPU test of the torch-native training offload helper (moves model and optimizer
+# state between GPU and pinned host memory) on a model sharded with FSDP2 (fully_shard) over a
+# single-rank device mesh. Registered for 2-GPU Hopper CUDA and ROCm nightly suites (fsdp and
+# torchtitan labels).
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -13,10 +17,15 @@ register_rocm_ci(est_time=60, suite="nightly-stage-c-2-gpu-mi350", labels=["fsdp
 
 
 def _local(tensor: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Returns the local shard of a distributed tensor, or the tensor itself if
+    # it is an ordinary tensor.
     return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
 
 def _train_state(model: nn.Module, optimizer: torch.optim.Optimizer) -> list[torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Collects the local tensors of all model parameters, followed by every
+    # optimizer state value that is a tensor with at least one dimension (scalar step counters are
+    # skipped), as a list in iteration order.
     tensors = [_local(param) for param in model.parameters()]
     for state in optimizer.state.values():
         tensors += [_local(value) for value in state.values() if isinstance(value, torch.Tensor) and value.dim() > 0]
@@ -24,6 +33,13 @@ def _train_state(model: nn.Module, optimizer: torch.optim.Optimizer) -> list[tor
 
 
 def test_offload_round_trips_fsdp_state_through_pinned_host_memory(monkeypatch):
+    # [FUNCTION DOC] Sets rendezvous variables (localhost, port 29541) and initializes a one-rank
+    # NCCL group (destroyed in a finally block). Builds a two-linear-layer model on the GPU, shards it
+    # with FSDP2 over a one-device mesh, takes one AdamW step on a random input (seed 0), and snapshots
+    # all parameter and optimizer state tensors to the CPU. Offloads to the CPU via the move helper and
+    # asserts every tensor is on the CPU and pinned and the parameters are still distributed tensors.
+    # Moves back to the GPU and asserts all tensors are on CUDA and bit-equal to the snapshot. Finally
+    # runs one more forward, backward and optimizer step to prove the restored state is usable.
     monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
     monkeypatch.setenv("MASTER_PORT", "29541")
     dist.init_process_group("nccl", rank=0, world_size=1)

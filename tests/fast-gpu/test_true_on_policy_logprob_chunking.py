@@ -1,3 +1,13 @@
+# [MODULE DOC] Two-GPU tests (tensor-parallel size 2 via spawned NCCL worker processes) of the
+# chunked log-probability and entropy computation in "true on policy" mode with a vocabulary sharded
+# across tensor-parallel ranks and padded (padding columns hold large logits that must be ignored).
+# Three tests: (1) exact float64 correctness and gradients against a full-vocabulary reference for
+# unchunked and chunked runs, with and without entropy, with a sampling mask; (2) bfloat16/float16
+# reduction-error measurements showing chunking is bitwise identical to unchunked in values and
+# gradients (and finite, zero gradient on padding); (3) peak GPU memory of the full log-prob wrapper
+# for 8192 rows of a 151936-token vocabulary: chunked must save at least half of one full-size bfloat16
+# buffer versus unchunked on every rank. Each test raises a runtime error (not skip) if fewer than two
+# GPUs are visible. Registered for 2-GPU Hopper CUDA and ROCm nightly suites (megatron label).
 from tests.ci.ci_register import register_cuda_ci, register_rocm_ci
 
 register_cuda_ci(est_time=180, suite="stage-b-2-gpu-h200", labels=["megatron"], hardware=["hopper"])
@@ -33,12 +43,17 @@ _MEMORY_LOCAL_PADDED_VOCAB_SIZE = 76032
 
 
 def _free_port() -> int:
+    # [FUNCTION DOC] HELPER: Returns a currently free local TCP port by binding to port 0 on
+    # localhost and reading the assigned number (the socket is closed before returning).
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("localhost", 0))
         return sock.getsockname()[1]
 
 
 def _init_worker(rank: int, world_size: int, port: int) -> torch.device:
+    # [FUNCTION DOC] HELPER: Per-process setup. Sets the rendezvous environment variables to
+    # localhost and the port, binds the GPU equal to the rank, initializes the default NCCL group, and
+    # returns the CUDA device for the rank.
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(port)
     torch.cuda.set_device(rank)
@@ -47,6 +62,10 @@ def _init_worker(rank: int, world_size: int, port: int) -> torch.device:
 
 
 def _correctness_inputs(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Returns hand-written float64 logits (5 rows by 8 padded vocabulary
+    # columns, the last column a large padding value 80 to 120), a boolean sampling mask of the same
+    # shape (padding column always true), and 5 target token ids, all on the given device. The real
+    # vocabulary size is 7, the 8th column is padding.
     full_logits = torch.tensor(
         [
             [0.2, -1.1, 2.0, 0.7, -0.3, 1.4, -2.2, 80.0],
@@ -74,6 +93,17 @@ def _correctness_inputs(device: torch.device) -> tuple[torch.Tensor, torch.Tenso
 
 
 def _assert_correctness_case(rank: int, device: torch.device, *, chunk_size: int, objective: str) -> None:
+    # [FUNCTION DOC] HELPER: Runs one tensor-parallel (size 2, 4 local vocabulary columns each)
+    # correctness case on this rank. Takes the rank's shard of the logits and mask and calls the
+    # log-prob/entropy function with the chunk size (-1 means unchunked), true-on-policy mode, real
+    # vocabulary 7, temperature 1 and entropy only when the objective is "entropy". The reference is
+    # computed in float64 on the unsharded real-vocabulary logits: masked log-softmax gathered at the
+    # target tokens for log probs, and unmasked entropy. Asserts log probs (and entropy) match to 1e-10
+    # relative, including the last row (which is dominated by the padding-like column in the raw data).
+    # For the entropy objective also asserts the masked entropy would differ (so the test is
+    # discriminating). Then differentiates a weighted sum of the chosen quantity (log probs or entropy)
+    # for both, and asserts the local gradient equals the matching slice of the reference gradient with
+    # zeros in padded columns; on the last rank the final padded column's gradient must be zero.
     full_logits, full_sampling_mask, tokens = _correctness_inputs(device)
     shard_start = rank * _LOCAL_PADDED_VOCAB_SIZE
     shard_end = shard_start + _LOCAL_PADDED_VOCAB_SIZE
@@ -135,6 +165,9 @@ def _assert_correctness_case(rank: int, device: torch.device, *, chunk_size: int
 
 
 def _correctness_worker(rank: int, world_size: int, port: int) -> None:
+    # [FUNCTION DOC] HELPER: Spawn entry point. Initializes the process group, runs the correctness
+    # case for chunk sizes -1 and 2, each for the log-prob and entropy objectives, then barriers; the
+    # process group is always destroyed.
     device = _init_worker(rank, world_size, port)
     try:
         for chunk_size in (-1, _CORRECTNESS_CHUNK_SIZE):
@@ -148,6 +181,9 @@ def _correctness_worker(rank: int, world_size: int, port: int) -> None:
 def _values_and_separate_gradients(
     logits: torch.Tensor, log_probs: torch.Tensor, entropy: torch.Tensor, weights: torch.Tensor
 ) -> dict[str, torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Differentiates log probs and entropy separately with respect to the
+    # logits using the given per-row weights as upstream gradients (the first with the graph retained).
+    # Returns a mapping with detached log probs, detached entropy and the two gradients.
     (log_prob_gradient,) = torch.autograd.grad(log_probs, logits, grad_outputs=weights, retain_graph=True)
     (entropy_gradient,) = torch.autograd.grad(entropy, logits, grad_outputs=weights)
     return {
@@ -159,6 +195,9 @@ def _values_and_separate_gradients(
 
 
 def _reduction_error(actual: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Compares in float64 after flattening each row. Returns a two-element
+    # tensor: the maximum absolute difference over all elements, and the maximum over rows of the row's
+    # L2 difference divided by the row's reference L2 norm (floored at the smallest positive float64).
     delta = (actual.double() - reference.double()).reshape(actual.shape[0], -1)
     reference = reference.double().reshape(actual.shape[0], -1)
     # Row-wise L2 avoids dividing each near-zero vocabulary gradient by itself.
@@ -167,6 +206,16 @@ def _reduction_error(actual: torch.Tensor, reference: torch.Tensor) -> torch.Ten
 
 
 def _assert_low_precision_reductions(rank: int, device: torch.device, dtype: torch.dtype, masked: bool) -> None:
+    # [FUNCTION DOC] HELPER: Measures reduction error of chunking in low precision. Builds 17 rows of
+    # random logits (seeded 2825, per-row scale growing from 2 to 6) over the full padded vocabulary
+    # (2 x 76032 columns for 2 ranks; real vocabulary 151936; padding columns set to 100) in the
+    # given dtype, pseudo-random targets, signed weights, and optionally a sampling mask with the
+    # targets forced on. The float64 reference promotes the same quantized inputs. For chunk sizes -1,
+    # 1 and 4 runs the function on this rank's shard, computes values and separate gradients, takes the
+    # unchunked run as baseline, and for each quantity max-reduces the errors across ranks versus the
+    # baseline and versus float64, printed on rank 0. Asserts every quantity is finite and bitwise equal
+    # to the baseline (chunking adds no error), and on the last rank that gradient columns in padding
+    # are exactly zero.
     rows = 17
     real_vocab_size = _MEMORY_REAL_VOCAB_SIZE
     local_vocab_size = _MEMORY_LOCAL_PADDED_VOCAB_SIZE
@@ -235,6 +284,8 @@ def _assert_low_precision_reductions(rank: int, device: torch.device, dtype: tor
 
 
 def _low_precision_worker(rank: int, world_size: int, port: int) -> None:
+    # [FUNCTION DOC] HELPER: Spawn entry point. Initializes the group and runs the low-precision
+    # check for bfloat16 and float16, each unmasked and masked; barriers; always destroys the group.
     device = _init_worker(rank, world_size, port)
     try:
         for dtype in (torch.bfloat16, torch.float16):
@@ -246,6 +297,10 @@ def _low_precision_worker(rank: int, world_size: int, port: int) -> None:
 
 
 def _memory_args(chunk_size: int, vocab_size: int) -> Namespace:
+    # [FUNCTION DOC] HELPER: Builds the minimal training-arguments namespace for the log-prob
+    # wrapper: packed (thd) format, rollout temperature 1, true-on-policy on, bfloat16 on and float16
+    # off, the given log-prob chunk size and vocabulary size, no context-parallel all-gather, and the
+    # fused log-prob debug option off.
     return Namespace(
         qkv_format="thd",
         rollout_temperature=1.0,
@@ -267,6 +322,12 @@ def _run_memory_forward(
     real_vocab_size: int,
     chunk_size: int,
 ) -> tuple[int, torch.Tensor, dict[str, list[torch.Tensor]]]:
+    # [FUNCTION DOC] HELPER: Measures peak extra GPU memory of the log-prob/entropy wrapper for one
+    # sample of rows + 1 tokens (rows response tokens). Collects garbage and empties the CUDA cache,
+    # builds zero bfloat16 logits (1, rows + 1, local padded vocabulary) requiring grad and tokens
+    # counting up modulo the real vocabulary, resets peak statistics, records baseline allocation, calls
+    # the wrapper with entropy and entropy gradients enabled, synchronizes, and returns (peak allocated
+    # minus baseline in bytes, the logits tensor, the result mapping).
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.synchronize(device)
@@ -299,12 +360,17 @@ def _run_memory_forward(
 
 
 def _release_cuda_memory() -> None:
+    # [FUNCTION DOC] HELPER: Runs garbage collection, empties the CUDA allocator cache and
+    # synchronizes the current device.
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
 
 
 def _warm_up_memory_path(device: torch.device) -> None:
+    # [FUNCTION DOC] HELPER: Runs the memory forward on a tiny problem (17 rows, local vocabulary
+    # 128, real vocabulary 255) for chunk sizes -1 and 4, releasing memory after each, so one-time
+    # allocations (kernels, workspace) do not pollute the real measurements.
     for chunk_size in (-1, 4):
         _, logits, result = _run_memory_forward(
             device,
@@ -319,6 +385,10 @@ def _warm_up_memory_path(device: torch.device) -> None:
 
 
 def _measure_memory_case(device: torch.device, chunk_size: int) -> int:
+    # [FUNCTION DOC] HELPER: Runs the memory forward at full size (8192 rows, local vocabulary
+    # 76032, real vocabulary 151936) with the chunk size; asserts the log-prob and entropy outputs
+    # have shape (8192,) and are finite; deletes all references, releases CUDA memory, and returns the
+    # measured peak delta in bytes.
     peak_delta, logits, result = _run_memory_forward(
         device,
         rows=_MEMORY_ROWS,
@@ -341,6 +411,14 @@ def _measure_memory_case(device: torch.device, chunk_size: int) -> int:
 
 
 def _memory_worker(rank: int, world_size: int, port: int) -> None:
+    # [FUNCTION DOC] HELPER: Spawn entry point for the memory test. Initializes the group and
+    # installs a global parallel state with the tensor-parallel group info (rank, size, world group) and
+    # a trivial context-parallel info. Warms up, measures the peak for chunk size 1024 then unchunked,
+    # all-gathers each rank's (unchunked, chunked) peaks, and asserts on every rank that the saving
+    # (unchunked minus chunked) is at least half of one full-size bfloat16 buffer of (8192 - 1024) rows
+    # times the real vocabulary size (message lists peaks and savings). Rank 0 prints a summary.
+    # Barriers and always destroys the group.
+    # KNOWN ISSUE: the global parallel state set here is never restored (harmless in a spawned process).
     device = _init_worker(rank, world_size, port)
     try:
         tp = GroupInfo(rank=rank, size=world_size, group=dist.group.WORLD)
@@ -376,18 +454,22 @@ def _memory_worker(rank: int, world_size: int, port: int) -> None:
 
 
 def test_true_on_policy_chunking_tp2_correctness_and_gradients() -> None:
+    # [FUNCTION DOC] Raises a runtime error if fewer than 2 GPUs are visible; otherwise spawns 2
+    # worker processes running the correctness worker on a free port and joins them.
     if torch.cuda.device_count() < _WORLD_SIZE:
         raise RuntimeError(f"requires {_WORLD_SIZE} GPUs, found {torch.cuda.device_count()}")
     mp.spawn(_correctness_worker, args=(_WORLD_SIZE, _free_port()), nprocs=_WORLD_SIZE, join=True)
 
 
 def test_true_on_policy_chunking_tp2_low_precision_reduction_errors() -> None:
+    # [FUNCTION DOC] Same GPU-count check; spawns 2 processes running the low-precision worker.
     if torch.cuda.device_count() < _WORLD_SIZE:
         raise RuntimeError(f"requires {_WORLD_SIZE} GPUs, found {torch.cuda.device_count()}")
     mp.spawn(_low_precision_worker, args=(_WORLD_SIZE, _free_port()), nprocs=_WORLD_SIZE, join=True)
 
 
 def test_true_on_policy_chunking_reduces_8192_row_peak_memory() -> None:
+    # [FUNCTION DOC] Same GPU-count check; spawns 2 processes running the memory worker.
     if torch.cuda.device_count() < _WORLD_SIZE:
         raise RuntimeError(f"requires {_WORLD_SIZE} GPUs, found {torch.cuda.device_count()}")
     mp.spawn(_memory_worker, args=(_WORLD_SIZE, _free_port()), nprocs=_WORLD_SIZE, join=True)
