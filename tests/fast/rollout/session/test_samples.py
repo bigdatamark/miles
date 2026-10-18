@@ -1,3 +1,16 @@
+# [MODULE DOC] Tests of assembling training samples from session records (one record per chat
+# completion request/response made through the session server) and merging them across turns, the
+# core of the token-in-token-out pipeline. Records are built by a local helper mimicking the
+# inference engine's response format (output token ids with log probabilities in meta info, optional
+# cache statistics, weight versions, routed experts payloads, sampling masks). A mock tokenizer
+# decodes ids to a bracketed text form. Test groups: per-record sample construction (tokens, log
+# probabilities, status from finish reason, weight version spans, native sampling support, abort
+# handling, conversation snapshot recording); multi-turn merge prefix chains and propagation of
+# teacher log probabilities and student top log probabilities; trailing stop token trimming driven
+# by the accumulated token list; additional-mode routed experts (R3) patch assembly; the known
+# thinking-token prefix break; and prefix cache statistics. Module constants: argument namespaces
+# (plain, recording debug trajectories, and with two layers for R3), the stop token id 99, and the
+# R3 top-k width 2.
 """Tests for compute_samples_from_openai_records and TITO multi-turn merge workflow.
 
 Validates the contract between session records, sample construction,
@@ -25,6 +38,8 @@ _ARGS_RECORDING = SimpleNamespace(
 
 
 def _mock_tokenizer():
+    # [FUNCTION DOC] HELPER: Returns a mock tokenizer whose decode joins the ids as bracketed
+    # numbers (for example "[10][11]").
     tok = MagicMock()
     tok.decode = lambda ids: "".join(f"[{i}]" for i in ids)
     return tok
@@ -44,6 +59,15 @@ def _make_record(
     sampling_masks: list[list[int]] | None = None,
     sampling_log_probs: list[float] | None = None,
 ) -> SessionRecord:
+    # [FUNCTION DOC] HELPER: Builds a successful POST chat completion session record. The request
+    # holds one user message, the prompt token ids as input ids, and optionally the routed experts
+    # start length, and (when sampling masks are given) the sampling mask request flag. The
+    # response has one choice with an assistant message, the finish reason (default stop), a
+    # log probability content list and meta info with: output token log probabilities as
+    # (log probability, token id) pairs (default log probabilities are minus 0.1 times the
+    # 1-based position), the completion token count, and optional cached tokens, prompt tokens,
+    # scalar weight version, routed experts payload, per-token weight versions, sampling masks and
+    # sampling log probabilities. Timestamp 0.
     """Build a minimal session record mimicking SGLang's response format.
 
     Token IDs and logprobs are stored in meta_info.output_token_logprobs
@@ -103,7 +127,11 @@ def _make_record(
 
 
 class TestComputeSamplesFromRecords:
+    # [CLASS DOC] Tests of building one sample per record.
     def test_single_record_builds_correct_sample(self):
+        # [FUNCTION DOC] One record with prompt [1,2,3] and output [10,11] with log probabilities
+        # -0.5 and -0.6 yields one sample with tokens prompt plus output, those log probabilities,
+        # response length 2, loss mask [1,1] and completed status.
         tok = _mock_tokenizer()
         record = _make_record(
             prompt_token_ids=[1, 2, 3],
@@ -122,6 +150,8 @@ class TestComputeSamplesFromRecords:
         assert s.status == Sample.Status.COMPLETED
 
     def test_single_record_scalar_weight_version_becomes_span(self):
+        # [FUNCTION DOC] A record with a scalar weight version "v3" gives one call record with a
+        # single span v3 covering the output token positions 3 to 5 (absolute, after the prompt).
         """A scalar weight_version in the record's meta_info synthesizes one span over the output tokens."""
         tok = _mock_tokenizer()
         record = _make_record(prompt_token_ids=[1, 2, 3], output_token_ids=[10, 11], weight_version="v3")
@@ -131,6 +161,9 @@ class TestComputeSamplesFromRecords:
         assert samples[0].weight_versions == [WeightVersionsPerCall(spans=[WeightVersionSpan("v3", 3, 5)])]
 
     def test_single_record_per_token_weight_versions_become_spans(self):
+        # [FUNCTION DOC] A record with per-token weight versions (v1 for output positions 0 to 2,
+        # v2 for 2 to 3) gives one call record with spans v1 at 3 to 5 and v2 at 5 to 6: the
+        # output-relative ranges are shifted by the prompt length 3.
         """Per-token weight_versions in meta_info are shifted by the prompt length."""
         tok = _mock_tokenizer()
         record = _make_record(
@@ -146,6 +179,10 @@ class TestComputeSamplesFromRecords:
         ]
 
     def test_trimmed_trailing_tokens_clip_the_weight_version_span(self):
+        # [FUNCTION DOC] Two records where the first output ends with the stop token that the
+        # second prompt does not contain, with scalar versions v3 and v4 and one trailing token
+        # allowed to be trimmed. Asserts the first sample's tokens drop the stop token and its span
+        # is clipped to end at 4 (3 to 4), and the second sample's span covers 5 to 6.
         """Spans are built over the untrimmed output, so trimming must clip the last span's end."""
         tok = _mock_tokenizer()
         records = [
@@ -166,6 +203,8 @@ class TestComputeSamplesFromRecords:
         assert samples[1].weight_versions == [WeightVersionsPerCall(spans=[WeightVersionSpan("v4", 5, 6)])]
 
     def test_weight_version_span_past_output_tokens_is_rejected(self):
+        # [FUNCTION DOC] A per-token span ending at 3 with only 2 output tokens makes assembly
+        # raise an assertion error saying spans extend past the 2 output tokens.
         """A span reaching beyond the reported output tokens cannot be anchored, so no Sample is built."""
         tok = _mock_tokenizer()
         record = _make_record(
@@ -178,6 +217,9 @@ class TestComputeSamplesFromRecords:
             compute_samples_from_openai_records(_ARGS, [record], tok)
 
     def test_record_without_any_weight_version_still_contributes_a_call(self):
+        # [FUNCTION DOC] A record without any weight version yields a sample whose weight
+        # versions list has one call record with no spans (the number of calls is the list
+        # length).
         """turns is len(weight_versions), so an unstamped call must appear as an empty call."""
         tok = _mock_tokenizer()
         record = _make_record(prompt_token_ids=[1, 2], output_token_ids=[10, 11])
@@ -187,6 +229,10 @@ class TestComputeSamplesFromRecords:
         assert samples[0].weight_versions == [WeightVersionsPerCall(spans=[])]
 
     def test_single_record_uses_native_sampling_support_and_log_probs(self):
+        # [FUNCTION DOC] A record has output log probabilities -2.5 and -2.6 but also native
+        # sampling log probabilities -0.5 and -0.6 with supports [10,4,7] and [11,3]. Asserts the
+        # sample's rollout log probabilities are the sampling ones, its mask has ids
+        # 10,4,7,11,3 with offsets 0,3,5, and the sample passes validation.
         tok = _mock_tokenizer()
         record = _make_record(
             prompt_token_ids=[1, 2, 3],
@@ -205,6 +251,8 @@ class TestComputeSamplesFromRecords:
         sample.validate()
 
     def test_abort_without_sampling_metadata_is_non_trainable(self):
+        # [FUNCTION DOC] An aborted record with no output tokens that requested the sampling mask
+        # but returned none yields an aborted sample with no reward and an empty sampling mask.
         tok = _mock_tokenizer()
         record = _make_record(prompt_token_ids=[1, 2, 3], output_token_ids=[], finish_reason="abort")
         record.request["return_sampling_mask"] = True
@@ -216,6 +264,9 @@ class TestComputeSamplesFromRecords:
         assert len(sample.rollout_sampling_mask) == 0
 
     def test_successful_turn_still_requires_sampling_metadata(self):
+        # [FUNCTION DOC] A successful (stop) record with one output token that requested the
+        # sampling mask but returned none makes assembly raise a value error saying the output
+        # token sampling mask is missing.
         tok = _mock_tokenizer()
         record = _make_record(prompt_token_ids=[1, 2, 3], output_token_ids=[10])
         record.request["return_sampling_mask"] = True
@@ -224,6 +275,10 @@ class TestComputeSamplesFromRecords:
             compute_samples_from_openai_records(_ARGS, [record], tok)
 
     def test_later_abort_preserves_terminal_status(self):
+        # [FUNCTION DOC] Two records: a successful one with a sampling mask and an aborted second
+        # one (no output tokens, mask requested but absent) whose prompt extends the first by one
+        # token. After assembly and merge, asserts the merged status is aborted, the merged tokens
+        # are the second prompt, and the sampling mask length equals the response length (2).
         tok = _mock_tokenizer()
         records = [
             _make_record(
@@ -244,6 +299,8 @@ class TestComputeSamplesFromRecords:
         assert len(merged.rollout_sampling_mask) == merged.response_length == 2
 
     def test_multiple_records_produce_multiple_samples(self):
+        # [FUNCTION DOC] Two records give two samples whose tokens are each record's prompt plus
+        # output (no merging at this stage).
         tok = _mock_tokenizer()
         records = [
             _make_record(prompt_token_ids=[1, 2], output_token_ids=[10]),
@@ -257,6 +314,9 @@ class TestComputeSamplesFromRecords:
         assert samples[1].tokens == [1, 2, 10, 20, 30]
 
     def test_last_sample_carries_raw_conversation(self):
+        # [FUNCTION DOC] With debug trajectory recording enabled in the arguments, two records
+        # give two samples; asserts only the last sample's metadata has the messages entry, equal
+        # to the last request's messages plus the response's assistant message.
         tok = _mock_tokenizer()
         records = [
             _make_record(prompt_token_ids=[1, 2], output_token_ids=[10]),
@@ -271,6 +331,8 @@ class TestComputeSamplesFromRecords:
         ]
 
     def test_merge_keeps_last_conversation_snapshot(self):
+        # [FUNCTION DOC] With recording enabled, merging the two assembled samples gives a merged
+        # sample whose messages metadata equals the last sample's messages.
         tok = _mock_tokenizer()
         records = [
             _make_record(prompt_token_ids=[1, 2, 3], output_token_ids=[10, 11]),
@@ -283,6 +345,7 @@ class TestComputeSamplesFromRecords:
         assert merged.metadata["messages"] == samples[-1].metadata["messages"]
 
     def test_finish_reason_length_gives_truncated(self):
+        # [FUNCTION DOC] A record with finish reason length yields a sample with truncated status.
         tok = _mock_tokenizer()
         record = _make_record(
             prompt_token_ids=[1, 2],
@@ -299,6 +362,8 @@ class TestComputeSamplesFromRecords:
 
 
 class TestMultiTurnPrefixChain:
+    # [CLASS DOC] Tests of merging the samples of a multi-turn conversation, which requires each
+    # record's prompt to start with the previous record's prompt plus output.
     """Validate that session records from a well-behaved multi-turn
     conversation satisfy the prefix chain required by merge_samples.
 
@@ -308,6 +373,10 @@ class TestMultiTurnPrefixChain:
     """
 
     def test_two_turn_merge_succeeds(self):
+        # [FUNCTION DOC] Two records where the second prompt is the first prompt, the first output
+        # and two observation tokens. Asserts the merged tokens are prompt, output 1, observation,
+        # output 2; the response length is 6; the loss mask is 1,1,0,0,1,1; and the status is
+        # completed.
         """Normal two-turn conversation: samples merge without error."""
         tok = _mock_tokenizer()
 
@@ -336,6 +405,9 @@ class TestMultiTurnPrefixChain:
         assert merged.status == Sample.Status.COMPLETED
 
     def test_three_turn_merge_succeeds(self):
+        # [FUNCTION DOC] Three records each extending the previous by one observation token.
+        # Asserts the merged tokens are the full sequence ending in the third output and the
+        # response length is 5 (three outputs plus two observation tokens).
         """Three-turn conversation: prefix chain holds across all turns."""
         tok = _mock_tokenizer()
 
@@ -364,6 +436,9 @@ class TestMultiTurnPrefixChain:
         assert merged.response_length == 1 + 1 + 1 + 1 + 1  # 3 responses + 2 obs
 
     def test_prefix_mismatch_raises(self):
+        # [FUNCTION DOC] The second record's prompt contains tokens (99, 99) that differ from the
+        # first output (10, 11); assembly succeeds but merging raises an assertion error saying
+        # the later tokens must start with the earlier tokens.
         """When the prefix chain is broken, merge_samples must fail."""
         tok = _mock_tokenizer()
 
@@ -385,6 +460,10 @@ class TestMultiTurnPrefixChain:
             merge_samples(samples, tok)
 
     def test_two_turn_merge_propagates_teacher_log_probs(self):
+        # [FUNCTION DOC] Attaches teacher log probabilities to each turn's sample (-1.0,-1.1 and
+        # -1.2,-1.3) after assembly and merges. Asserts the merged teacher log probabilities are
+        # turn 1 values, two zeros for the observation tokens, then turn 2 values; their length
+        # equals the response length; and the merged sample passes validation.
         """OPD teacher_log_probs merge like rollout_log_probs: per-turn values
         concatenated with zeros over the injected observation span."""
         tok = _mock_tokenizer()
@@ -411,6 +490,11 @@ class TestMultiTurnPrefixChain:
         merged.validate()  # the new teacher_log_probs length assertion must hold
 
     def test_two_turn_merge_propagates_opd_student_top_logprobs_metadata(self):
+        # [FUNCTION DOC] Each turn's sample metadata holds a per-token student top log
+        # probabilities list (two entries per turn) and an equal shared entry "same". After merge,
+        # asserts the shared entry is kept, and the student list is turn 1 entries, two empty
+        # entries for the observation tokens, then turn 2 entries, with total length equal to the
+        # response length.
         """Top-k OPD student top-logprobs are per-token metadata, not equal metadata."""
         tok = _mock_tokenizer()
 
@@ -447,6 +531,8 @@ class TestMultiTurnPrefixChain:
         assert len(merged.metadata["opd_student_top_logprobs"]) == merged.response_length
 
     def test_two_turn_merge_teacher_log_probs_none_stays_none(self):
+        # [FUNCTION DOC] Merging two turns that have no teacher log probabilities leaves the merged
+        # teacher log probabilities none.
         """Non-OPD runs leave teacher_log_probs unset; merge must keep it None."""
         tok = _mock_tokenizer()
 
@@ -461,6 +547,8 @@ class TestMultiTurnPrefixChain:
         assert merged.teacher_log_probs is None
 
     def test_merge_raises_on_teacher_log_probs_length_mismatch(self):
+        # [FUNCTION DOC] Gives the first turn one teacher log probability for a response of two
+        # tokens; merging raises an assertion error about the teacher log probabilities length.
         """validate() guards teacher_log_probs length (surfaced via merge_samples)."""
         tok = _mock_tokenizer()
 
@@ -482,6 +570,12 @@ STOP = 99  # stands for <|observation|> stop token
 
 
 class TestTITOTrailingTokenTrim:
+    # [CLASS DOC] Tests of trailing stop-token trimming. Assembly walks the accumulated token
+    # list with a cursor: for each record, the output tokens are matched against the accumulated
+    # tokens from the cursor; a mismatching tail is trimmed (up to the allowed maximum) because the
+    # chat template consumed those stop tokens when rendering the next prompt; the last record never
+    # trims; at the end the cursor must reach the end of the accumulated list. Without an
+    # accumulated list nothing is trimmed.
     """Validate trailing-token trimming via ``accumulated_token_ids``.
 
     Worked example — agentic tool-call retries
@@ -535,6 +629,10 @@ class TestTITOTrailingTokenTrim:
     """
 
     def test_three_turn_trim_trailing_stop_tokens(self):
+        # [FUNCTION DOC] Three records each ending in the stop token, with an accumulated list in
+        # which stop tokens appear only after the last output, and at most one token trimmed.
+        # Asserts the first two samples lose their stop token (response length 1 each, tokens
+        # end at the real output) and the last sample keeps it (response length 2).
         """Three-turn retry: non-final turns have 1 trailing stop token trimmed."""
         tok = _mock_tokenizer()
 
@@ -570,6 +668,8 @@ class TestTITOTrailingTokenTrim:
         assert samples[2].response_length == 2
 
     def test_no_trim_when_no_trailing_stop(self):
+        # [FUNCTION DOC] Two records whose outputs fully match the accumulated list: asserts no
+        # token is trimmed in either sample and both response lengths are 2.
         """When output tokens fully match accumulated, trim_count=0 for all turns."""
         tok = _mock_tokenizer()
 
@@ -598,6 +698,8 @@ class TestTITOTrailingTokenTrim:
         assert samples[1].response_length == 2
 
     def test_single_turn_no_trim(self):
+        # [FUNCTION DOC] A single record ending in the stop token with a matching accumulated
+        # list keeps all tokens (response length 3) because the last turn never trims.
         """Single turn: last turn never trims, even with accumulated_token_ids."""
         tok = _mock_tokenizer()
 
@@ -619,6 +721,8 @@ class TestTITOTrailingTokenTrim:
         assert samples[0].response_length == 3
 
     def test_no_accumulated_skips_trimming(self):
+        # [FUNCTION DOC] Two records both ending in the stop token, assembled without an
+        # accumulated list: asserts both samples keep their stop token (response length 2 each).
         """Without accumulated_token_ids, no trimming is performed at all."""
         tok = _mock_tokenizer()
 
@@ -642,6 +746,9 @@ class TestTITOTrailingTokenTrim:
         assert samples[1].response_length == 2
 
     def test_trim_exceeding_max_raises(self):
+        # [FUNCTION DOC] The first record's output has two trailing stop tokens that do not match
+        # the accumulated list while at most one trim is allowed; asserts an assertion error saying
+        # trim count 2 exceeds the allowed 1.
         """If trailing tokens exceed max_trim_tokens, assert fires."""
         tok = _mock_tokenizer()
 
@@ -662,6 +769,8 @@ class TestTITOTrailingTokenTrim:
             )
 
     def test_cursor_covers_entire_accumulated(self):
+        # [FUNCTION DOC] The accumulated list has one extra trailing token beyond what the records
+        # imply; asserts an assertion error saying the cursor differs from the accumulated length.
         """After processing all records, cursor must equal len(accumulated)."""
         tok = _mock_tokenizer()
 
@@ -690,16 +799,23 @@ _R3_TOPK = 2
 
 
 def _r3_rows(num_rows: int, seed: int) -> np.ndarray:
+    # [FUNCTION DOC] HELPER: Returns a 32-bit integer array shaped (rows, layers, top-k) with
+    # consecutive values starting at the seed, using the module's layer count (2) and top-k (2).
     """`num_rows` distinct rows of shape (num_layers, topk), values seed, seed+1, …"""
     size = num_rows * _ARGS_R3.num_layers * _R3_TOPK
     return np.arange(seed, seed + size, dtype=np.int32).reshape(num_rows, _ARGS_R3.num_layers, _R3_TOPK)
 
 
 def _r3_patch(rows: np.ndarray) -> str:
+    # [FUNCTION DOC] HELPER: Returns the base64 ASCII text of the array's raw bytes (made
+    # contiguous), the format of a routed experts payload.
     return pybase64.b64encode(np.ascontiguousarray(rows).tobytes()).decode("ascii")
 
 
 def _merge_addition(records, accumulated, max_trim_tokens=0):
+    # [FUNCTION DOC] HELPER: Assembles samples from the records with the R3 arguments, the
+    # accumulated token list, the maximum trim (default 0) and additional-mode R3 enabled, then
+    # applies the additional-R3 merge to samples and records and returns the merged sample.
     tok = _mock_tokenizer()
     samples = compute_samples_from_openai_records(
         _ARGS_R3,
@@ -713,6 +829,9 @@ def _merge_addition(records, accumulated, max_trim_tokens=0):
 
 
 class TestAdditionR3Assembly:
+    # [CLASS DOC] Tests of additional-mode routed experts assembly: each record carries only a
+    # patch of rows (from its recorded start row), which must chain without gaps or overlaps and
+    # are concatenated into one tensor; errors are value errors naming the record.
     """Addition-mode records carry an R3 patch of rows [routed_experts_start_len,
     len(input_ids) + len(output) - 1) instead of a full per-turn tensor;
     `merge_samples_with_addition_r3` concatenates the append-only stream into
@@ -720,6 +839,11 @@ class TestAdditionR3Assembly:
     """
 
     def test_two_patches_reconstruct_full_reference(self):
+        # [FUNCTION DOC] Builds a reference tensor of 7 rows. Additional-mode records carry rows
+        # 0 to 4 (start 0) and rows 4 to 7 (start 4); full-mode records carry rows 0 to 4 and the
+        # whole tensor. Merges both ways and asserts equal tokens (the accumulated list), loss
+        # masks and log probabilities, a 32-bit routed experts array, and that both merged routed
+        # experts tensors equal each other and the reference.
         """Patches must rebuild byte-for-byte the tensor full-R3 responses give
         for the same tokens under the same in-place lifecycle."""
         full = _r3_rows(7, seed=0)
@@ -752,6 +876,9 @@ class TestAdditionR3Assembly:
         assert np.array_equal(merged_addition.rollout_routed_experts, full)
 
     def test_overlapping_start_raises(self):
+        # [FUNCTION DOC] The first record's patch has 5 rows (start 0) while the second starts at
+        # row 4 (overlapping); with up to 2 trimmed tokens, asserts a value error saying record 1
+        # starts at row 4 but 5 was expected.
         """Every patch must start exactly after the preceding raw patch."""
         turn1_rows = _r3_rows(5, seed=0)
         turn2_rows = _r3_rows(2, seed=500)
@@ -767,6 +894,10 @@ class TestAdditionR3Assembly:
             _merge_addition(records, accumulated, max_trim_tokens=2)
 
     def test_intermediate_truncated_turn_bounds_materialization(self):
+        # [FUNCTION DOC] Three records where the second finishes with length (truncated) and the
+        # third has no routed experts payload at all. Asserts the merged sample is truncated, its
+        # tokens stop after the second turn (the first 8 accumulated tokens), and its routed
+        # experts are the first two patches concatenated (the third is not needed).
         """A non-COMPLETED turn bounds required rows before later patches."""
         records = [
             _make_record([1, 2, 3], [10, 11], routed_experts=_r3_patch(_r3_rows(4, 0)), routed_experts_start_len=0),
@@ -789,6 +920,9 @@ class TestAdditionR3Assembly:
         assert np.array_equal(merged.rollout_routed_experts, expected)
 
     def test_missing_required_patch_raises(self):
+        # [FUNCTION DOC] Like the truncated case but the second turn is completed, so the third
+        # record's missing payload is required; asserts a value error saying record 2 has no
+        # routed experts payload.
         """A missing patch cannot silently shorten a merged trajectory."""
         records = [
             _make_record([1, 2, 3], [10, 11], routed_experts=_r3_patch(_r3_rows(4, 0)), routed_experts_start_len=0),
@@ -806,6 +940,9 @@ class TestAdditionR3Assembly:
             _merge_addition(records, accumulated)
 
     def test_replay_disabled_records_unaffected(self):
+        # [FUNCTION DOC] Records with no routed experts payload merged in additional mode give a
+        # sample with no routed experts, and tokens and loss mask equal to an ordinary merge of
+        # the same records.
         """use_addition_r3=True is dormant when no record carries R3."""
         records = [
             _make_record([1, 2, 3], [10, 11]),
@@ -824,6 +961,8 @@ class TestAdditionR3Assembly:
         assert merged.loss_mask == reference.loss_mask
 
     def test_empty_delta_keeps_empty_buffer_shape(self):
+        # [FUNCTION DOC] A single record with a one-token prompt, no output and an empty payload
+        # at start row 0 gives routed experts of shape (0, layers, 0) and 32-bit integer type.
         """A trajectory whose only patch is empty keeps the existing
         empty-buffer decode shape instead of inventing a top-k source."""
         records = [_make_record([1], [], routed_experts="", routed_experts_start_len=0)]
@@ -834,18 +973,24 @@ class TestAdditionR3Assembly:
         assert merged.rollout_routed_experts.dtype == np.int32
 
     def test_missing_start_len_raises(self):
+        # [FUNCTION DOC] A record with a payload but no recorded start length raises a value error
+        # saying it carries no routed experts start length.
         records = [_make_record([1, 2, 3], [10, 11], routed_experts=_r3_patch(_r3_rows(4, 0)))]
 
         with pytest.raises(ValueError, match="carries no routed_experts_start_len"):
             _merge_addition(records, [1, 2, 3, 10, 11])
 
     def test_empty_payload_for_nonempty_delta_raises(self):
+        # [FUNCTION DOC] An empty payload for a record that needs 4 rows raises a value error
+        # saying payload presence does not match 4 rows.
         records = [_make_record([1, 2, 3], [10, 11], routed_experts="", routed_experts_start_len=0)]
 
         with pytest.raises(ValueError, match="payload presence does not match 4 rows"):
             _merge_addition(records, [1, 2, 3, 10, 11])
 
     def test_gapped_start_raises(self):
+        # [FUNCTION DOC] A first record whose patch starts at row 1 leaves a gap; raises a value
+        # error saying it starts at row 1 but 0 was expected.
         records = [
             _make_record([1, 2, 3], [10, 11], routed_experts=_r3_patch(_r3_rows(3, 0)), routed_experts_start_len=1)
         ]
@@ -854,6 +999,8 @@ class TestAdditionR3Assembly:
             _merge_addition(records, [1, 2, 3, 10, 11])
 
     def test_wrong_value_count_raises(self):
+        # [FUNCTION DOC] Four rows are implied by the record (start 0, end 4) but only three rows
+        # of values are supplied; assembly raises a value error.
         # 4 rows announced (start=0, end=4) but only 3 rows of values supplied.
         records = [
             _make_record([1, 2, 3], [10, 11], routed_experts=_r3_patch(_r3_rows(3, 0)), routed_experts_start_len=0)
@@ -863,6 +1010,8 @@ class TestAdditionR3Assembly:
             _merge_addition(records, [1, 2, 3, 10, 11])
 
     def test_inconsistent_topk_raises(self):
+        # [FUNCTION DOC] The first turn implies a top-k width of 2 while the second supplies three
+        # rows sized for width 3; assembly raises a value error.
         # Turn 1 infers topk=2; turn 2 supplies 3 rows sized for topk=3.
         bad_rows = np.arange(3 * _ARGS_R3.num_layers * 3, dtype=np.int32).reshape(3, _ARGS_R3.num_layers, 3)
         records = [
@@ -881,6 +1030,9 @@ class TestAdditionR3Assembly:
 
 
 class TestThinkingTokenPrefixBreak:
+    # [CLASS DOC] Documents (as tests) the known failure mode where the model's thinking tokens
+    # are stripped from the agent's conversation history, breaking the prefix chain needed for
+    # merging. Class constants are the Qwen3 token ids for the think start, think end and newline.
     """Documents the known issue where model-generated <think>...</think>
     tokens break the prefix chain.
 
@@ -898,6 +1050,10 @@ class TestThinkingTokenPrefixBreak:
     NEWLINE_TOKEN = 198  # \n
 
     def test_thinking_tokens_break_prefix_chain(self):
+        # [FUNCTION DOC] The first record's output has seven thinking tokens before the two answer
+        # tokens, but the second record's prompt contains only the answer tokens plus observation.
+        # Assembly succeeds; merging raises an assertion error saying the later tokens must start
+        # with the earlier tokens.
         """Demonstrates the failure: model outputs <think>..., but the agent
         strips it from history, so the next prompt doesn't include those tokens."""
         tok = _mock_tokenizer()
@@ -937,6 +1093,8 @@ class TestThinkingTokenPrefixBreak:
             merge_samples(samples, tok)
 
     def test_no_thinking_tokens_prefix_chain_holds(self):
+        # [FUNCTION DOC] The same conversation without thinking tokens merges successfully into
+        # the full token sequence.
         """When thinking is disabled, the same conversation merges fine."""
         tok = _mock_tokenizer()
 
@@ -962,9 +1120,12 @@ class TestThinkingTokenPrefixBreak:
 
 
 class TestPrefixCacheInfo:
+    # [CLASS DOC] Tests of collecting prefix cache statistics from record meta info.
     """Validate that prefix cache statistics from meta_info are collected."""
 
     def test_single_record_with_cache_stats(self):
+        # [FUNCTION DOC] A record with 2 cached tokens and 3 prompt tokens gives a sample whose
+        # prefix cache info has those two counts.
         """cached_tokens and prompt_tokens from meta_info populate prefix_cache_info."""
         tok = _mock_tokenizer()
         record = _make_record(
@@ -979,6 +1140,8 @@ class TestPrefixCacheInfo:
         assert samples[0].prefix_cache_info.total_prompt_tokens == 3
 
     def test_multi_turn_cache_stats_accumulate_after_merge(self):
+        # [FUNCTION DOC] Two records with cached tokens 0 and 5 and prompt tokens 3 and 7 merge
+        # into a sample with cached tokens 5, total prompt tokens 10 and hit rate 0.5.
         """After merge_samples, prefix_cache_info sums across turns."""
         tok = _mock_tokenizer()
         records = [
@@ -1005,6 +1168,8 @@ class TestPrefixCacheInfo:
         assert merged.prefix_cache_info.prefix_cache_hit_rate == 5 / 10
 
     def test_missing_cache_fields_default_to_zero(self):
+        # [FUNCTION DOC] A record without cached or prompt token counts gives a sample whose
+        # prefix cache info has zero for both counts.
         """Records without cached_tokens/prompt_tokens give zero prefix_cache_info (regression)."""
         tok = _mock_tokenizer()
         record = _make_record(

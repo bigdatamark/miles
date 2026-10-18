@@ -1,9 +1,13 @@
+# [MODULE DOC] Table-driven tests of the DeepScaler rule-based reward function, which returns 1
+# or 0 by comparing the boxed answer in the final part of a response (the text after the last
+# thinking-end marker, or after a response header marker) with the label.
 import pytest
 
 from miles.rollout.rm_hub.deepscaler import get_deepscaler_rule_based_reward
 
 
 class TestGetDeepscalerRuleBasedReward:
+    # [CLASS DOC] Tests of the reward function over a table of response and label cases.
     @pytest.mark.parametrize(
         "response,label,expected",
         [
@@ -23,4 +27,10 @@ class TestGetDeepscalerRuleBasedReward:
         ],
     )
     def test_get_deepscaler_rule_based_reward(self, response, label, expected):
+        # [FUNCTION DOC] Asserts the reward equals the expected 1 or 0. Cases: a correct or wrong
+        # boxed answer after a thinking-end marker or a response header marker; no marker at all
+        # gives 0; a marker without a boxed answer gives 0; an empty label gives 0; labels given
+        # as a boxed expression, an integer, a float, a decimal string versus fraction or LaTeX
+        # fraction answers are matched mathematically; with several thinking-end markers the
+        # last one splits the response.
         assert get_deepscaler_rule_based_reward(response, label) == expected

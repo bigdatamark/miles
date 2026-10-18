@@ -1,3 +1,9 @@
+# [MODULE DOC] Integration tests of train and eval rollouts for multi-turn generation, for the
+# engine multi-turn variant and the agentic tool-call variant. The mock inference server follows
+# the two-turn stub conversation (a tool call, then a final answer containing "2008"). A custom
+# reward function from this file (referenced by import path) rewards a sample 1 when its label text
+# occurs in its response. Module constants: a two-turn data row with label "2008", the variant
+# names, and extra command-line arguments for batch size 2 and 2 samples per (eval) prompt.
 from typing import Any
 
 import pytest
@@ -26,6 +32,9 @@ _BASE_EXTRA_ARGV = [
 
 
 def _config_for_variant(variant: str) -> RolloutEnvConfig:
+    # [FUNCTION DOC] HELPER: Builds a rollout environment configuration for the variant from the
+    # base modular rollout arguments, the variant's arguments and the shared extra arguments,
+    # with the two-turn data rows.
     return RolloutEnvConfig(
         extra_argv=MODULAR_ROLLOUT_BASE_ARGV + extra_argv_for_variant(variant) + _BASE_EXTRA_ARGV,
         data_rows=TWO_TURN_DATA_ROWS,
@@ -39,6 +48,10 @@ def _config_for_variant(variant: str) -> RolloutEnvConfig:
 )
 @pytest.mark.parametrize("test_type", ["train", "eval"])
 def test_rollout(rollout_env, variant, test_type):
+    # [FUNCTION DOC] Parametrized over the two variants and over train and eval mode. Makes the
+    # mock server follow the two-turn stub and runs the rollout in the mode. In train mode asserts
+    # the number of groups equals the batch size and verifies the first group's samples; in eval
+    # mode asserts a "toy" dataset entry exists and verifies its samples.
     env = rollout_env
     env.mock_server.process_fn = TwoTurnStub.process_fn
 
@@ -55,6 +68,10 @@ def test_rollout(rollout_env, variant, test_type):
 
 
 def _verify_samples(variant: str, samples: list[Any]):
+    # [FUNCTION DOC] HELPER: Asserts there are exactly 2 entries (the samples per prompt). Each
+    # entry is normalized to a list that must hold exactly one item, which must be a sample; for
+    # the agentic variant its metadata must contain the leaf entry attached by the version-2
+    # session server. Then runs the single-sample checks on it.
     assert len(samples) == 2, f"n_samples_per_prompt=2, so group should have 2 samples, got {len(samples)}"
     for generated in samples:
         [sample] = listify(generated)
@@ -65,6 +82,9 @@ def _verify_samples(variant: str, samples: list[Any]):
 
 
 def _verify_sample(sample: Sample, expected_reward: float = 1.0, expect_answer: bool = True):
+    # [FUNCTION DOC] HELPER: Asserts the sample is completed, its reward equals the expected
+    # reward (default 1.0), and, when an answer is expected (default true), that its response
+    # contains "2008".
     assert sample.status == Sample.Status.COMPLETED
     assert sample.reward == expected_reward, f"Sample should have reward={expected_reward}"
     if expect_answer:
@@ -72,10 +92,17 @@ def _verify_sample(sample: Sample, expected_reward: float = 1.0, expect_answer: 
 
 
 async def _simple_reward_function(args, samples: Sample | list[Sample]) -> float | list[float]:
+    # [FUNCTION DOC] HELPER: Custom reward model loaded by import path. For a list returns the
+    # per-sample rewards, for one sample its reward. The arguments are ignored.
     if isinstance(samples, list):
         return [_check_reward(sample) for sample in samples]
     return _check_reward(samples)
 
 
 def _check_reward(sample: Sample) -> float:
+    # [FUNCTION DOC] HELPER: Returns 1.0 if the sample's label text occurs in its response, else
+    # 0.0, converted to float.
+    # KNOWN ISSUE: when the response is the empty string, the logical-and expression yields the
+    # empty string itself and converting it to a float raises a value error instead of giving 0.0
+    # (a missing response of none would raise a type error).
     return float(sample.response and (str(sample.label) in sample.response))

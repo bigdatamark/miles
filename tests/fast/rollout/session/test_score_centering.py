@@ -1,3 +1,14 @@
+# [MODULE DOC] Tests of score centering (top log probability candidates and sampling support
+# replay) in the session server layer, for both session implementations (v1 and v2 registries and
+# cores). Covered: sessions record whether they are evaluation sessions and prepared chat requests
+# differ accordingly (training requests carry the configured candidate count and temperature and
+# reject a conflicting temperature; evaluation requests keep the client's values); candidate
+# trimming when assembling samples from recorded requests with token-in-token-out token lists;
+# evaluation sessions not collecting training candidates; filtered (top-p/top-k) requests asking
+# for the sampling mask and support-mode log probabilities; the session owning the sampling log
+# probability mode over client-supplied values; validation of the final sampling rules; and
+# explicit defaults for nullable sampling fields. Uses the shared score centering and session
+# fixtures and fake tokenizers.
 """Session configuration must distinguish training calls from evaluation."""
 
 import asyncio
@@ -26,6 +37,14 @@ from miles.rollout.session.v2.session_state import SessionRegistryV2
     "registry_type,core_type", [(SessionRegistry, SessionCore), (SessionRegistryV2, SessionCoreV2)]
 )
 def test_score_centering_training_and_evaluation_sessions(registry_type: type, core_type: type) -> None:
+    # [FUNCTION DOC] Parametrized over the v1 and v2 registry and core types. Config asks for
+    # 128 candidates and temperature 0.7; the tokenizer is a namespace with a no-op comparator
+    # creator, empty chat template kwargs and an identity request resolver. For a training and an
+    # evaluation session (created through the core, each in its own event loop run), looks the
+    # session up from the response's session id and asserts its evaluation flag. For evaluation:
+    # a prepared request with temperature 0 keeps temperature 0 and has no top logprobs. For
+    # training: an empty request gets 128 top logprobs and temperature 0.7, and a request with
+    # temperature 0 raises a message validation error mentioning temperature.
     config = make_session_server_config(rollout_top_logprobs_num=128, rollout_temperature=0.7)
     tokenizer = SimpleNamespace(
         create_comparator=lambda: None,
@@ -55,6 +74,12 @@ def test_score_centering_training_and_evaluation_sessions(registry_type: type, c
 
 
 def test_session_producer_trims_candidates_with_tito_tokens() -> None:
+    # [FUNCTION DOC] Builds two recorded chat requests (prompts [0,1] and [0,1,2,6] with outputs
+    # of two tokens each and candidate metadata) and assembles samples from them with the
+    # accumulated token list [0,1,2,6,4,5] and a maximum trim of 1 token. Asserts the first sample
+    # has response length 1 (one token trimmed) with candidate ids of shape (1, 3); after merging
+    # the samples the loss mask is 1,0,1,1 and the merged sample passes candidate validation for 3
+    # candidates.
     records = []
     for prompt, output, probabilities in (([0, 1], [2, 3], [0.5, 0.25]), ([0, 1, 2, 6], [4, 5], [0.55, 0.2])):
         records.append(
@@ -84,6 +109,10 @@ def test_session_producer_trims_candidates_with_tito_tokens() -> None:
 
 @pytest.mark.parametrize("evaluation", [False, True])
 def test_evaluation_client_top_logprobs_do_not_collect_training_candidates(evaluation: bool) -> None:
+    # [FUNCTION DOC] Parametrized over the evaluation flag. A recorded request that includes a
+    # client-requested top logprobs value is assembled into samples. Asserts exactly one sample,
+    # and that its candidate id and log probability arrays are none exactly when the flag is
+    # evaluation (training collects them, evaluation does not).
     record = SessionRecord(
         timestamp=2.0,
         request_timestamp=1.0,
@@ -105,6 +134,14 @@ def test_evaluation_client_top_logprobs_do_not_collect_training_candidates(evalu
 
 
 def test_filtered_session_request_and_producer() -> None:
+    # [FUNCTION DOC] With 3 candidates, the support log probability mode, temperature 0.7 and
+    # support replay on, prepares a chat request with sampling defaults (temperature 0.7, top-p
+    # 0.6, top-k 3). Asserts the body asks for the sampling mask, sets the support mode and has no
+    # top logprobs. Then builds a recorded response with one token (probability 0.4), a support of
+    # two token ids and post-filter log probabilities (4/7 and 3/7), assembles samples with the
+    # token list [0,1,2] and no trimming, and asserts one sample that passes candidate validation,
+    # has candidate ids [2, 3, -1] and a rollout log probability of log(4/7) (the post-filter
+    # value of the sampled token).
     config = make_session_server_config(
         rollout_top_logprobs_num=3,
         rollout_sampling_logprobs_mode="support",
@@ -154,6 +191,13 @@ def test_filtered_session_request_and_producer() -> None:
 @pytest.mark.parametrize("filtered", [False, True])
 @pytest.mark.parametrize("evaluation", [False, True])
 def test_session_request_owns_sampling_logprobs_mode(candidate_count: int, filtered: bool, evaluation: bool) -> None:
+    # [FUNCTION DOC] Parametrized over candidate count (0, 3), filtered sampling and evaluation.
+    # The client request carries the opposite log probability mode and 5 top logprobs, and the
+    # request resolver merges the client values back in. Asserts the prepared body requests the
+    # sampling mask exactly when filtered and not evaluation. For training with candidates:
+    # filtered gives support mode and removes top logprobs; unfiltered removes the mode field and
+    # sets top logprobs to the candidate count. Otherwise (no candidates or evaluation) the mode
+    # field is absent and the client's 5 top logprobs remain.
     mode = "support" if filtered else "selected"
     client_args = {"sampling_logprobs_mode": "selected" if filtered else "support", "top_logprobs": 5}
     tokenizer = SimpleNamespace(resolve_request_args=lambda request, **kwargs: request | client_args)
@@ -194,6 +238,12 @@ def test_session_request_owns_sampling_logprobs_mode(candidate_count: int, filte
     ],
 )
 def test_final_model_sampling_rules_are_validated(override: dict, match: str) -> None:
+    # [FUNCTION DOC] Parametrized over a changed temperature, a top-p below 1, a min-p and a
+    # logit bias. The request resolver applies the override to the request after client values are
+    # merged, simulating what the final model request would hold. Asserts preparing the request
+    # raises a message validation error whose text matches (top-k log probability rules, or
+    # bounded training-request sampling for top-p), and that the client's argument mapping was not
+    # mutated.
     config = make_session_server_config(rollout_top_logprobs_num=128, rollout_temperature=0.7)
     tokenizer = SimpleNamespace(resolve_request_args=lambda request, **kwargs: request | override)
     client_args = {"messages": [{"role": "user", "content": "Solve the problem."}]}
@@ -203,6 +253,9 @@ def test_final_model_sampling_rules_are_validated(override: dict, match: str) ->
 
 
 def test_nullable_sampling_fields_receive_explicit_defaults() -> None:
+    # [FUNCTION DOC] A client request with temperature, top-p, top-k and min-p all set to none is
+    # prepared with 128 candidates and temperature 0.7. Asserts the body holds explicit defaults:
+    # temperature 0.7, top-p 1.0, top-k -1 and min-p 0.0.
     config = make_session_server_config(rollout_top_logprobs_num=128, rollout_temperature=0.7)
     tokenizer = SimpleNamespace(resolve_request_args=lambda request, **kwargs: request)
     prepared = prepare_chat_request(

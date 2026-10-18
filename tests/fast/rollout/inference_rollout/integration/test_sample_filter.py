@@ -1,3 +1,6 @@
+# [MODULE DOC] Integration test of the sample filter and the all-samples process hooks of the
+# train rollout. Both are replaced by mocks registered temporarily in the function registry; the
+# data has two correct rows among four, so all four must be generated to keep two valid groups.
 from unittest.mock import Mock
 
 import pytest
@@ -44,6 +47,13 @@ _FILTER_TEST_DATA_ROWS = [
     indirect=True,
 )
 def test_sample_filter_and_all_samples_process(rollout_env):
+    # [FUNCTION DOC] Configures batch size 2, over-sampling batch size 4, the reward dynamic
+    # filter, and the sample filter and all-samples process hooks by registry names. Runs a train
+    # rollout with all three registered temporarily (the hooks as mocks). Asserts the sample
+    # filter was called once, with the kept (post-dynamic-filter) groups whose rewards are all 1;
+    # the all-samples process hook was called once with a data source that is not none; and that
+    # it saw strictly more samples than the sample filter (it receives every generated sample,
+    # including the groups the dynamic filter dropped).
     env = rollout_env
     sample_filter_mock = Mock()
     all_samples_process_mock = Mock()

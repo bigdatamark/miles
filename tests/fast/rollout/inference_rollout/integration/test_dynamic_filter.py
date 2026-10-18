@@ -1,3 +1,6 @@
+# [MODULE DOC] Integration tests of the dynamic sampling filter in the train rollout. Uses mixed
+# correct and incorrect data rows and the shared reward-based filter registered temporarily in the
+# function registry under the name "test:filter_by_reward".
 from contextlib import nullcontext
 
 import pytest
@@ -33,6 +36,10 @@ from miles.utils.function_registry import function_registry
     indirect=["rollout_env"],
 )
 def test_filter_effect(rollout_env, use_filter, expect_all_correct):
+    # [FUNCTION DOC] Parametrized: without a filter (batch size 4) incorrect samples must appear;
+    # with the reward filter registered (batch size 3) only correct ones may remain. Runs a train
+    # rollout (inside the temporary registration when filtering) and checks the set of first-sample
+    # rewards of the output groups: exactly {1} when filtering, else it contains 0.
     env = rollout_env
     ctx = function_registry.temporary("test:filter_by_reward", filter_by_reward) if use_filter else nullcontext()
 
@@ -60,6 +67,9 @@ def test_filter_effect(rollout_env, use_filter, expect_all_correct):
     indirect=["rollout_env"],
 )
 def test_unfiltered_raw_reward_still_sees_the_dropped_groups(rollout_env):
+    # [FUNCTION DOC] With the reward filter registered and batch size 3, runs a train rollout and
+    # asserts the kept groups all have reward 1 while the output metric for the unfiltered raw
+    # reward lies strictly between 0 and 1 (so it counts the groups the filter dropped).
     """The accepted-only raw_reward is pinned by the filter; this mean must count what was filtered away."""
     env = rollout_env
 

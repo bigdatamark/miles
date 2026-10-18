@@ -1,3 +1,18 @@
+# [MODULE DOC] Tests of multi-turn generation, run for two variants of the generate function:
+# the engine-level multi-turn function (talks to a mock inference server directly with token
+# ids) and the agentic tool-call function (an agent talks to a session server in front of the mock
+# server using chat messages). The shared generation fixtures supply the environment (arguments,
+# mock server, optional session server); the mock tools module supplies canned two-turn and
+# three-turn conversations with tool calls. The Qwen3 0.6B tokenizer is loaded at import time.
+# Registered as a CPU CI test in the batch-b CPU suite.
+# Verification works by splitting a produced sample's response tokens into consecutive chunks of
+# equal loss mask value (model-generated text has mask 1 and a log probability series, tool
+# response text has mask 0 and zero log probabilities), decoding each chunk and comparing against
+# the expected text, then comparing the rest of the sample with a partial expected sample after
+# clearing fields that vary with the mock setup. Covered: single and multi-turn with tool calls,
+# conversation metadata, weight version spans, partial rollout rejection, abort, length and
+# max-turn exits, maximum context length handling, three turns, routed experts replay, agent
+# metadata merging, session identity forwarding, collection failures, and no-record agents.
 import asyncio
 import logging
 from copy import deepcopy
@@ -24,6 +39,7 @@ _ = generation_env, SAMPLE_TOOLS, TwoTurnStub, ThreeTurnStub
 
 
 def is_agentic_variant(variant: str) -> bool:
+    # [FUNCTION DOC] HELPER: Returns true when the variant name is the agentic tool-call variant.
     return variant == "agentic_tool_call"
 
 
@@ -37,11 +53,16 @@ TOKENIZER = load_tokenizer(MODEL_NAME, trust_remote_code=True)
 
 @pytest.fixture(params=["multi_turn", "agentic_tool_call"])
 def variant(request):
+    # [FUNCTION DOC] HELPER: Fixture parametrized over the two generate variants (engine
+    # multi-turn and agentic tool call); returns the current variant name.
     return request.param
 
 
 @dataclass(frozen=True)
 class SampleParsedChunk:
+    # [CLASS DOC] HELPER: Immutable record of a run of response tokens sharing one loss mask value:
+    # the decoded text, the mask value (1 for model-generated, 0 for tool/environment text), and
+    # the rollout log probabilities of those tokens.
     tokens_decoded_str: str
     loss_mask_value: int
     rollout_log_probs: list[float]
@@ -49,21 +70,34 @@ class SampleParsedChunk:
 
 @dataclass
 class ExpectedSampleInfo:
+    # [CLASS DOC] HELPER: Expected outcome for one output sample: the ordered list of expected
+    # response chunks and a partial sample holding the expected values of all non-token fields.
     chunks: list[SampleParsedChunk]
     partial_sample: Sample
 
 
 def token_len(text: str) -> int:
+    # [FUNCTION DOC] HELPER: Returns the number of tokens the module tokenizer produces for the
+    # text without adding special tokens.
     return len(TOKENIZER(text, add_special_tokens=False)["input_ids"])
 
 
 def expected_chunk(text: str, loss_mask: int) -> SampleParsedChunk:
+    # [FUNCTION DOC] HELPER: Builds the expected chunk for text and a loss mask value. For a
+    # non-zero mask the log probabilities follow the mock server's pattern: for token position i
+    # (from zero) the value is minus i divided by 128; for a zero mask they are all 0.0. The count
+    # equals the text's token length.
     n = token_len(text)
     log_probs = [-1 / 128 * i for i in range(n)] if loss_mask else [0.0] * n
     return SampleParsedChunk(text, loss_mask, log_probs)
 
 
 def parse_sample_into_chunks(sample: Sample, tokenizer) -> list[SampleParsedChunk]:
+    # [FUNCTION DOC] HELPER: Splits a sample's response into chunks. The response tokens are the
+    # sample tokens after the prompt part (total length minus response length). The loss mask and
+    # rollout log probabilities (empty when absent) are walked in groups of consecutive equal mask
+    # values; each group yields a chunk with the decoded tokens of that slice, the mask value and
+    # the matching log probability slice. Returns the chunks in order (empty if no mask).
     prompt_len = len(sample.tokens) - sample.response_length
     response_tokens = sample.tokens[prompt_len:]
     loss_mask = sample.loss_mask or []
@@ -92,6 +126,10 @@ def expected_partial_sample(
     response_length: int,
     status: Sample.Status = Sample.Status.COMPLETED,
 ) -> Sample:
+    # [FUNCTION DOC] HELPER: Builds the expected "partial" sample used for structure comparison:
+    # the given prompt, response, response length and status (default completed), with empty
+    # tokens, loss mask, log probabilities and weight versions, and default speculative-decoding
+    # and prefix-cache info.
     return Sample(
         prompt=prompt,
         response=response,
@@ -107,6 +145,13 @@ def expected_partial_sample(
 
 
 def verify_samples(actual: Sample | list[Sample], expected: list[ExpectedSampleInfo]):
+    # [FUNCTION DOC] HELPER: Normalizes the actual output to a list and asserts it has the same
+    # length as the expected list. For each pair: asserts the parsed chunks equal the expected
+    # chunks; then deep-copies the actual sample, clears index, rollout id, tokens, loss mask, log
+    # probabilities, weight versions and prefix-cache info, removes diagnostic metadata keys that
+    # vary with the mock setup (session mismatch analysis, accumulated token ids, maximum trim
+    # tokens, lifecycle timing, leaf, turn arguments) and asserts equality with the expected
+    # partial sample. The original sample is not mutated.
     actual = listify(actual)
     assert len(actual) == len(expected)
 
@@ -141,6 +186,10 @@ def verify_samples(actual: Sample | list[Sample], expected: list[ExpectedSampleI
 
 
 def _run_generate(variant: str, env: GenerateEnv, sample: Sample, sampling_params: dict | None = None):
+    # [FUNCTION DOC] HELPER: Runs the shared generate runner for the variant. For the agentic
+    # variant, a sample without an index gets index zero first (mutating the sample), because that
+    # variant requires an identity. Returns the runner's result (requests seen by the mock server
+    # and the output sample or samples).
     if is_agentic_variant(variant) and sample.index is None:
         sample.index = 0
     return run_generate(env, sample, sampling_params, variant=variant)
@@ -153,6 +202,10 @@ def expected_request(
     return_routed_experts: bool = False,
     return_indexer_topk: bool = False,
 ) -> dict:
+    # [FUNCTION DOC] HELPER: Builds the request mapping the engine multi-turn variant is expected
+    # to send to the mock server: the prompt token ids, sampling parameters (default: the module
+    # defaults), log probability return on, and the routed experts and indexer top-k return flags
+    # (both default off).
     return {
         "input_ids": input_ids,
         "sampling_params": sampling_params or DEFAULT_SAMPLING_PARAMS,
@@ -163,6 +216,11 @@ def expected_request(
 
 
 def expected_openai_request(messages: list[dict], **extra) -> dict:
+    # [FUNCTION DOC] HELPER: Builds the chat request mapping the agentic variant is expected to
+    # send through the session server: the messages, model "default", the sample tools, the
+    # session-injected flags (log probabilities and meta info on, no stop trimming off), replay
+    # flags off, the default temperature, and a chat template option disabling clearing of
+    # thinking. Extra keyword entries are merged last and may override.
     return {
         "messages": messages,
         "model": "default",
@@ -186,6 +244,8 @@ _SESSION_PRETOKENIZED_KEYS = {"input_ids"}
 
 
 def _strip_pretokenized(requests: list[dict]) -> list[dict]:
+    # [FUNCTION DOC] HELPER: Returns copies of the request mappings without the session-injected
+    # input ids entry so they can be compared deterministically.
     """Strip session-injected pretokenized fields for deterministic comparison."""
     return [{k: v for k, v in r.items() if k not in _SESSION_PRETOKENIZED_KEYS} for r in requests]
 
@@ -203,7 +263,13 @@ SINGLE_TURN_PROMPT_TOKEN_LEN = len(SINGLE_TURN_PROMPT_TOKEN_IDS)
 
 
 class TestBasicMultiTurn:
+    # [CLASS DOC] Tests of ordinary conversations: one turn without tools and two turns with a
+    # tool call between them.
     def test_single_turn_no_tool_call(self, variant, generation_env):
+        # [FUNCTION DOC] The mock server answers with a fixed text and a stop finish reason. Asserts
+        # the request(s) seen by the server match the variant's expected form, and that the single
+        # output sample has one loss-mask-1 chunk with the response text and 6 log probabilities,
+        # and the expected completed partial sample with response length 6.
         generation_env.mock_server.process_fn = lambda _: ProcessResult(
             text=SINGLE_TURN_RESPONSE, finish_reason="stop"
         )
@@ -233,6 +299,11 @@ class TestBasicMultiTurn:
         )
 
     def test_two_turns_with_tool_call(self, variant, generation_env):
+        # [FUNCTION DOC] Uses the two-turn stub conversation (first turn requests tools, second
+        # turn answers). Asserts two requests with the expected messages (agentic) or prompt token
+        # ids (engine), and one sample whose response chunks are: first response (mask 1), tool
+        # response text (mask 0), second response (mask 1), with the response length equal to the
+        # token length of the concatenation.
         generation_env.mock_server.process_fn = TwoTurnStub.process_fn
 
         S = TwoTurnStub
@@ -267,12 +338,21 @@ class TestBasicMultiTurn:
 
 
 class TestExitConditions:
+    # [CLASS DOC] Tests of how generation ends or is bounded: debug conversation recording, weight
+    # version spans, partial rollout rejection, abort, length truncation, the turn limit, and
+    # interplay with these across both variants (some are skipped for the agentic variant).
     @pytest.mark.parametrize(
         "generation_env",
         [{"args_kwargs": {"extra_argv": ["--save-debug-trajectory-data", "/unused/{rollout_id}.jsonl"]}}],
         indirect=True,
     )
     def test_conversation_metadata_records_turns(self, variant, generation_env):
+        # [FUNCTION DOC] Engine variant only (skipped otherwise). Enables debug trajectory saving
+        # through extra command-line arguments (the path is never written to) and runs the two-turn
+        # stub. Asserts the sample metadata's recorded messages have roles user, assistant, tool,
+        # tool, assistant; the first assistant content is the first response; the two tool messages
+        # carry the tool names for year and temperature (as a set); and the last assistant content
+        # is the second response.
         if variant != "multi_turn":
             pytest.skip("conversation recording asserted once, on the engine multi-turn path")
         generation_env.mock_server.process_fn = TwoTurnStub.process_fn
@@ -288,6 +368,13 @@ class TestExitConditions:
         assert messages[4]["content"] == S.SECOND_RESPONSE
 
     def test_weight_version_spans_from_the_engine_are_anchored_per_turn(self, variant, generation_env):
+        # [FUNCTION DOC] Engine variant only (skipped otherwise). The mock server reports, for each
+        # turn, one weight version span covering the whole generated text of that turn (version "7"
+        # for the first response text, "8" for the second). Asserts the sample has two weight
+        # version calls with versions 7 then 8; that each span's absolute length equals the
+        # response's token length; that the first span starts right after the first prompt tokens;
+        # that the first ends before the second starts (the tool text lies between); and that the
+        # second ends at the end of the sample tokens.
         """Spans returned by the engine land as absolute token positions, one call per turn."""
         if variant != "multi_turn":
             pytest.skip("span anchoring asserted once, on the engine multi-turn path")
@@ -295,6 +382,10 @@ class TestExitConditions:
         S = TwoTurnStub
 
         def process_fn(prompt: str) -> ProcessResult:
+            # [FUNCTION DOC] HELPER: Mock server callback. Takes the stub's result for the prompt
+            # and returns a copy whose meta info carries a single weight version span from zero to
+            # the response's token count, with version "7" for the stub's first response text and
+            # "8" for anything else.
             base_result = S.process_fn(prompt)
             num_tokens = len(TOKENIZER.encode(base_result.text, add_special_tokens=False))
             version = "7" if base_result.text == S.FIRST_RESPONSE else "8"
@@ -317,12 +408,18 @@ class TestExitConditions:
         assert second.abs_end == len(sample.tokens)
 
     def test_partial_rollout_not_supported(self, variant, generation_env):
+        # [FUNCTION DOC] Turns on the partial rollout argument and asserts generation raises an
+        # assertion error saying partial rollout is not supported.
         generation_env.args.partial_rollout = True
 
         with pytest.raises(AssertionError, match="Partial rollout is not supported"):
             _run_generate(variant, generation_env, make_sample(prompt=SINGLE_TURN_PROMPT))
 
     def test_abort_preserves_content(self, variant, generation_env):
+        # [FUNCTION DOC] Engine variant only (agentic skipped because it does not handle abort).
+        # The mock server returns text with an abort finish reason. Asserts the single request and
+        # that the sample keeps the generated text and log probabilities (mask 1, 6 tokens) with
+        # status aborted.
         if is_agentic_variant(variant):
             pytest.skip("agentic_tool_call does not handle abort finish_reason")
         generation_env.mock_server.process_fn = lambda _: ProcessResult(
@@ -354,6 +451,9 @@ class TestExitConditions:
         )
 
     def test_finish_reason_length_exits_and_preserves_content(self, variant, generation_env):
+        # [FUNCTION DOC] The mock server answers the first turn with a length finish reason. Asserts
+        # only the first request is made (no second turn) and the sample holds just the first
+        # response chunk with status truncated.
         S = TwoTurnStub
         generation_env.mock_server.process_fn = lambda _: ProcessResult(text=S.FIRST_RESPONSE, finish_reason="length")
 
@@ -380,6 +480,10 @@ class TestExitConditions:
 
     @pytest.mark.parametrize("generation_env", [{"args_kwargs": {"generate_max_turns": 1}}], indirect=True)
     def test_max_turns_reached(self, variant, generation_env):
+        # [FUNCTION DOC] Sets the maximum number of turns to one; the mock server always answers
+        # with the first response and a stop reason. Asserts only one request is made. For the
+        # engine variant the sample contains the first response plus the tool response text (mask 0)
+        # appended after it, completed; for the agentic variant only the first response chunk.
         S = TwoTurnStub
         generation_env.mock_server.process_fn = lambda _: ProcessResult(text=S.FIRST_RESPONSE, finish_reason="stop")
 
@@ -418,10 +522,15 @@ class TestExitConditions:
 
 
 class TestRespectMaxContextLen:
+    # [CLASS DOC] Tests of the rollout maximum context length limit (engine variant only; the
+    # agentic variant is skipped with a to-do note).
     @pytest.mark.parametrize(
         "generation_env", [{"args_kwargs": {"rollout_max_context_len": SINGLE_TURN_PROMPT_TOKEN_LEN}}], indirect=True
     )
     def test_prompt_exceeds_max_context_len_returns_truncated(self, variant, generation_env):
+        # [FUNCTION DOC] Sets the maximum context length equal to the prompt length. Asserts no
+        # request reaches the mock server and the sample is empty (no chunks, empty response) with
+        # status truncated.
         if is_agentic_variant(variant):
             pytest.skip("TODO: implement")
         result = _run_generate(variant, generation_env, make_sample(prompt=SINGLE_TURN_PROMPT))
@@ -450,6 +559,10 @@ class TestRespectMaxContextLen:
         indirect=True,
     )
     def test_second_turn_exceeds_max_context_len_returns_truncated(self, variant, generation_env):
+        # [FUNCTION DOC] The maximum context length equals the first prompt plus first response plus
+        # tool response lengths, leaving no room for a second turn. Asserts only the first request
+        # is sent and the sample holds the first response and tool response chunks with status
+        # truncated.
         if is_agentic_variant(variant):
             pytest.skip("TODO: implement")
         S = TwoTurnStub
@@ -490,6 +603,10 @@ class TestRespectMaxContextLen:
         indirect=["generation_env"],
     )
     def test_second_turn_adjusts_max_new_tokens(self, variant, generation_env, expected_max_new_tokens):
+        # [FUNCTION DOC] Parametrized by the maximum context length: second prompt length plus 10
+        # expects the second request's maximum new tokens to be capped at 10; plus 100 expects the
+        # default of 64 to be kept. Asserts at least two requests were made, the second request's
+        # maximum new tokens equals the expectation, and its temperature is unchanged.
         if is_agentic_variant(variant):
             pytest.skip("TODO: implement")
         S = TwoTurnStub
@@ -506,6 +623,10 @@ class TestThreeTurn:
     """Need to test 3-turn case besides 2-turn, because e.g. merge_samples may behave differently."""
 
     def test_three_turns_with_sequential_tool_calls(self, variant, generation_env):
+        # [FUNCTION DOC] Uses the three-turn stub. Asserts three requests with the expected
+        # messages or prompt token ids, and one sample whose chunks alternate model text (mask 1)
+        # and tool text (mask 0): first response, first tool, second response, second tool, third
+        # response, with response length equal to the token length of the concatenation.
         generation_env.mock_server.process_fn = ThreeTurnStub.process_fn
 
         S = ThreeTurnStub
@@ -546,6 +667,7 @@ class TestThreeTurn:
 
 
 class TestRoutedExpertsMultiTurn:
+    # [CLASS DOC] Tests of routing replay (routed experts) in multi-turn generation.
     @pytest.mark.parametrize(
         "generation_env",
         [
@@ -562,6 +684,17 @@ class TestRoutedExpertsMultiTurn:
         indirect=True,
     )
     def test_two_turns_routed_experts(self, variant, generation_env):
+        # [FUNCTION DOC] Enables rollout routing replay with 2 layers and top-k 4 (set before the
+        # session server starts since decoding happens in its worker). Computes the first and
+        # second prompt token ids (for the agentic variant via the Qwen3 token-in-token-out
+        # tokenizer applying the chat template with the sample tools; for the engine variant from
+        # the stub). The mock server returns, per turn, base64 encoded routed experts: an integer
+        # ramp array shaped (prompt+response tokens minus one) by layers by top-k. Asserts the
+        # request shapes (agentic: messages equal, logprobs/meta info on, no stop trim off, routed
+        # experts return on, input ids present; engine: requests with routed experts return on),
+        # then that the last sample's tail of log probabilities matches the second response's
+        # pattern, its routed experts array has the second turn's shape and values, and its token
+        # count minus one equals the routed experts row count.
         S = TwoTurnStub
         num_layers, moe_router_topk = generation_env.args.num_layers, generation_env.args.moe_router_topk
         if is_agentic_variant(variant):
@@ -587,6 +720,8 @@ class TestRoutedExpertsMultiTurn:
             second_prompt_token_ids = S.SECOND_PROMPT_TOKEN_IDS
 
         def make_routed_experts(prompt_token_ids, response_text):
+            # [FUNCTION DOC] HELPER: Builds a 32-bit integer array of consecutive values with shape
+            # (prompt tokens plus response tokens minus one, number of layers, router top-k).
             total_tokens = len(prompt_token_ids) + token_len(response_text)
             routed_experts_len = total_tokens - 1
             return np.arange(routed_experts_len * num_layers * moe_router_topk, dtype=np.int32).reshape(
@@ -597,6 +732,10 @@ class TestRoutedExpertsMultiTurn:
         second_routed_experts = make_routed_experts(second_prompt_token_ids, S.SECOND_RESPONSE)
 
         def process_fn(prompt: str) -> ProcessResult:
+            # [FUNCTION DOC] HELPER: Mock server callback. Picks the first response and routed
+            # experts for the first prompt, the second for the second prompt, and raises a value
+            # error for any other prompt. Returns a result with a stop finish reason and the
+            # routed experts bytes base64 encoded as ASCII text in the meta info.
             if prompt == S.FIRST_PROMPT:
                 text, routed_experts = S.FIRST_RESPONSE, first_routed_experts
             elif prompt == S.SECOND_PROMPT:
@@ -645,10 +784,15 @@ _AGENT_METADATA = {"reward": 1.0, "exit_status": "Submitted", "eval_report": {"p
 
 
 class TestAgentMetadata:
+    # [CLASS DOC] Tests specific to the agentic variant: merging of the agent function's returned
+    # metadata into the output samples, session mismatch diagnostics, and session identity
+    # forwarding. Overrides the variant fixture to run only the agentic variant.
     """Tests specific to agentic_tool_call: agent function returning dict | None → metadata merge."""
 
     @pytest.fixture(params=_AGENTIC_VARIANTS)
     def variant(self, request):
+        # [FUNCTION DOC] HELPER: Fixture overriding the module-level one; parametrized over the
+        # agentic variants only and returns the current name.
         return request.param
 
     @pytest.mark.parametrize(
@@ -657,6 +801,9 @@ class TestAgentMetadata:
         indirect=True,
     )
     def test_agent_metadata_merged_into_samples(self, variant, generation_env):
+        # [FUNCTION DOC] Configures the mock agent to return a fixed metadata mapping (reward,
+        # exit status, evaluation report) and runs the two-turn stub. Asserts every output sample's
+        # metadata contains each key with the same value.
         generation_env.mock_server.process_fn = TwoTurnStub.process_fn
 
         result = _run_generate(variant, generation_env, make_sample(prompt=TwoTurnStub.PROMPT))
@@ -668,6 +815,9 @@ class TestAgentMetadata:
                 assert s.metadata[key] == value, f"metadata['{key}'] should be {value}, got {s.metadata[key]}"
 
     def test_tito_session_mismatch_present_in_metadata(self, variant, generation_env):
+        # [FUNCTION DOC] Runs the two-turn stub and asserts the last sample's metadata has the
+        # session mismatch entry, a list, in which every item has exactly the keys type, segment
+        # index, expected text, actual text and detail (vacuously true if the list is empty).
         generation_env.mock_server.process_fn = TwoTurnStub.process_fn
 
         result = _run_generate(variant, generation_env, make_sample(prompt=TwoTurnStub.PROMPT))
@@ -680,6 +830,8 @@ class TestAgentMetadata:
             assert {"type", "segment_index", "expected_text", "actual_text", "detail"} == set(m.keys())
 
     def test_agent_returns_none_metadata_unchanged(self, variant, generation_env):
+        # [FUNCTION DOC] The input sample has metadata with an instance id and the agent returns no
+        # metadata. Asserts each output sample keeps the instance id and gains no reward key.
         generation_env.mock_server.process_fn = TwoTurnStub.process_fn
         sample = make_sample(prompt=TwoTurnStub.PROMPT)
         sample.metadata = {"instance_id": "test-123"}
@@ -692,6 +844,11 @@ class TestAgentMetadata:
             assert "reward" not in s.metadata
 
     def test_session_server_identity_forwarded_to_agent_metadata(self, variant, generation_env):
+        # [FUNCTION DOC] Temporarily sets the mock tools module's global agent return metadata
+        # hook (reset to none in a finally block) to a function that echoes the session server id
+        # and instance id keys from the metadata it receives. Runs the two-turn stub and asserts
+        # every output sample's metadata has the server id equal to the local address with the
+        # session server's port, and the instance id equal to the run uuid followed by "-0".
         from miles.utils.test_utils import mock_tools
 
         generation_env.mock_server.process_fn = TwoTurnStub.process_fn
@@ -699,6 +856,8 @@ class TestAgentMetadata:
         _SESSION_KEYS = ("session_server_id", "session_server_instance_id")
 
         def _echo_session(metadata=None):
+            # [FUNCTION DOC] HELPER: Returns a mapping with only the session server id and
+            # instance id entries that are present in the given metadata (none treated as empty).
             metadata = metadata or {}
             return {k: metadata[k] for k in _SESSION_KEYS if k in metadata}
 
@@ -718,8 +877,12 @@ class TestAgentMetadata:
 
 
 class TestAgentCollectionFailure:
+    # [CLASS DOC] Tests of failures while the agentic variant collects samples from the session
+    # server. Overrides the variant fixture to run only the agentic variant.
     @pytest.fixture(params=_AGENTIC_VARIANTS)
     def variant(self, request):
+        # [FUNCTION DOC] HELPER: Fixture overriding the module-level one; parametrized over the
+        # agentic variants only and returns the current name.
         return request.param
 
     @pytest.mark.parametrize(
@@ -735,7 +898,15 @@ class TestAgentCollectionFailure:
     def test_collect_transient_failure_aborts_sample_but_other_errors_propagate(
         self, variant, generation_env, monkeypatch, caplog, collect_error
     ):
+        # [FUNCTION DOC] Parametrized over a timeout and a transport read error. Replaces the
+        # tracer's sample collection with a function raising the current error, runs generation
+        # with warning-level log capture, and asserts the single output sample is aborted, the
+        # input sample stays pending (not mutated), and a "Failed collecting samples" message was
+        # logged. Then rebinds the error variable to a runtime error (which the replacement
+        # function reads at call time) and asserts a second run propagates it as a runtime error.
         async def fail_collect(_tracer, _input_sample, *, max_seq_len, agent_metadata=None):
+            # [FUNCTION DOC] HELPER: Replacement for the tracer's collect method; ignores its
+            # arguments and raises whatever the enclosing test's error variable currently holds.
             raise collect_error
 
         monkeypatch.setattr(
@@ -757,10 +928,17 @@ class TestAgentCollectionFailure:
 
 
 class TestAgentNoRecords:
+    # [CLASS DOC] Tests the agentic variant when the agent makes no model calls.
     """When agent makes no model calls, generate should return an ABORTED sample."""
 
     @pytest.mark.parametrize("agentic_variant", _AGENTIC_VARIANTS)
     def test_no_records_returns_aborted(self, agentic_variant):
+        # [FUNCTION DOC] Builds its own environment instead of the shared fixture: clears the
+        # singleton registry, starts a mock server, picks a free port from 31000, creates arguments
+        # whose agent function is a no-op agent, starts a session server in front of the mock
+        # server, registers it as the only session server instance, and runs generation. Clears the
+        # singleton registry again afterwards (not in a finally block, so a failure inside the
+        # servers leaves it set). Asserts the one output sample is aborted.
         from tests.fast.fixtures.generation_fixtures import (
             GenerateEnv,
             extra_argv_for_variant,

@@ -1,3 +1,7 @@
+# [MODULE DOC] Shared pytest fixtures for the inference rollout tests: a fully parsed arguments
+# object built through the real command-line parser from a fixed fake command line (FSDP backend,
+# CI test mode, tiny rollout, a math reward model, the project's router at a local address, a small
+# Qwen model checkpoint name and a null prompt data path), so tests get realistic defaults.
 from unittest.mock import patch
 
 import pytest
@@ -6,6 +10,11 @@ from miles.utils.arguments import parse_args
 
 
 def _build_mock_args(extra_argv: list[str] | None = None):
+    # [FUNCTION DOC] HELPER: Builds the fixed command line described in the module header, appends
+    # the optional extra arguments (default none), temporarily replaces the process argument vector
+    # with it, and returns the namespace produced by the real argument parser. May raise whatever
+    # the parser raises (including a system exit on invalid options). Nothing is read from the
+    # prompt data path or the checkpoint here.
     argv = [
         "pytest",
         "--train-backend",
@@ -43,4 +52,6 @@ def _build_mock_args(extra_argv: list[str] | None = None):
 
 @pytest.fixture
 def mock_args():
+    # [FUNCTION DOC] HELPER: Fixture returning the parsed default mock arguments (no extra
+    # options); a fresh object per test.
     return _build_mock_args()

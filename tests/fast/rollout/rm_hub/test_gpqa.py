@@ -1,3 +1,8 @@
+# [MODULE DOC] Table-driven tests of the GPQA (multiple-choice) reward helpers: stripping the
+# chain of thought before the thinking-end marker, text normalization, extracting the answer
+# letter from a response against a set of valid letters, and the full reward computation with
+# labels as letters, indices or text and optional metadata (correct letter, choices, valid
+# letters).
 import pytest
 
 from miles.rollout.rm_hub.gpqa import (
@@ -9,6 +14,7 @@ from miles.rollout.rm_hub.gpqa import (
 
 
 class TestStripChainOfThought:
+    # [CLASS DOC] Tests of removing the reasoning part of a response.
     @pytest.mark.parametrize(
         "text,expected",
         [
@@ -19,10 +25,13 @@ class TestStripChainOfThought:
         ],
     )
     def test_strip_chain_of_thought(self, text, expected):
+        # [FUNCTION DOC] Asserts the text after the thinking-end marker is returned; text without
+        # a marker is unchanged; an empty string or a missing value (none) gives an empty string.
         assert _strip_chain_of_thought(text) == expected
 
 
 class TestNormalizeText:
+    # [CLASS DOC] Tests of the text normalization used for matching choice text.
     @pytest.mark.parametrize(
         "input_str,expected",
         [
@@ -33,10 +42,14 @@ class TestNormalizeText:
         ],
     )
     def test_normalize_text(self, input_str, expected):
+        # [FUNCTION DOC] Asserts normalization lower-cases and replaces punctuation (hyphens,
+        # commas) by single spaces so tokens are separated by one space; the empty string stays
+        # empty.
         assert _normalize_text(input_str) == expected
 
 
 class TestExtractLetterFromResponse:
+    # [CLASS DOC] Tests of extracting the chosen letter from free-form response text.
     @pytest.mark.parametrize(
         "response,expected",
         [
@@ -55,10 +68,17 @@ class TestExtractLetterFromResponse:
         ],
     )
     def test_extract_letter(self, response, expected):
+        # [FUNCTION DOC] With valid letters A to D, asserts the extracted letter equals the
+        # expected one. Cases: answer phrases ("The answer is A", "answer: B", "final answer: D",
+        # "my choice is C") and letters in the text after a thinking-end marker; a bare
+        # "I think C is correct" or "Option A is ..." also finds a letter; when several letters
+        # appear separately ("A B C D") the last one wins; text without a valid letter, empty
+        # text, a missing value or an invalid letter (Z) gives none.
         assert _extract_letter_from_response(response, "ABCD") == expected
 
 
 class TestComputeGpqaReward:
+    # [CLASS DOC] Tests of the full GPQA reward computation.
     @pytest.mark.parametrize(
         "response,label,metadata,expected",
         [
@@ -83,4 +103,11 @@ class TestComputeGpqaReward:
         ],
     )
     def test_compute_gpqa_reward(self, response, label, metadata, expected):
+        # [FUNCTION DOC] Asserts the reward (1.0 or 0.0) from the response, label and optional
+        # metadata keyword. Cases: label as letter; missing response gives 0; a correct letter in
+        # the metadata overrides the label; an integer label indexes into the choices (0 is A, 1 is
+        # B); custom valid letters; with an empty label the correct letter in the metadata and the
+        # choices let a response naming the choice text (not a letter) match; choices may be a
+        # mapping from letter to text; a label equal to the choice text works; and the reasoning
+        # part before a thinking-end marker is ignored.
         assert compute_gpqa_reward(response, label, metadata=metadata) == expected

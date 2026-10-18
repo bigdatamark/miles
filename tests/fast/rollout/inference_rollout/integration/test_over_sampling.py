@@ -1,3 +1,7 @@
+# [MODULE DOC] Integration test of over-sampling in the train rollout: groups are generated in
+# rounds of the over-sampling batch size (4) and filtered by the shared reward filter until the
+# rollout batch size is filled. Data has only one correct row among four, so the number of rounds
+# equals the number of correct groups needed; request counts on the mock server verify rounds.
 import pytest
 from tests.fast.rollout.inference_rollout.integration.utils import (
     filter_by_reward,
@@ -23,6 +27,9 @@ _BASE_ARGV = [
 
 
 def _over_sampling_config(rollout_batch_size: int):
+    # [FUNCTION DOC] HELPER: Builds an integration environment configuration with the given
+    # rollout batch size, the over-sampling batch size 4, the registered reward filter, and the
+    # four data rows (one correct).
     return integration_env_config(["--rollout-batch-size", str(rollout_batch_size)] + _BASE_ARGV, data_rows=_DATA_ROWS)
 
 
@@ -35,6 +42,10 @@ def _over_sampling_config(rollout_batch_size: int):
     indirect=["rollout_env"],
 )
 def test_over_sampling_rounds(rollout_env, expected_rounds):
+    # [FUNCTION DOC] Parametrized: batch size 1 expects one round, batch size 2 expects two
+    # rounds. Runs a train rollout with the filter registered temporarily and asserts the number
+    # of groups equals the batch size, all kept groups have reward 1, and the mock server logged
+    # rounds times the over-sampling batch size requests.
     env = rollout_env
 
     with function_registry.temporary("test:filter_by_reward", filter_by_reward):

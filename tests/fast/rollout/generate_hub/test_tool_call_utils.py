@@ -1,3 +1,10 @@
+# [MODULE DOC] Tests of tool-response tokenization for the generate hub. Loads real Hugging Face
+# tokenizers by model name (network or cache access needed; remote code is trusted) and checks that
+# tokenizing tool response messages yields the same text as the incremental difference of rendering
+# a dummy conversation with and without the tool messages through the chat template.
+# Module constants: the list of models under test, a documentation-only list of models known to
+# fail round trips under newer tokenizer library versions (with reasons), a list of models that
+# support only a single tool call (currently empty), and two sample tool response messages.
 import pytest
 
 from miles.rollout.generate_utils.tool_call_utils import _DUMMY_USER, _build_dummy_assistant, tokenize_tool_responses
@@ -60,8 +67,12 @@ SAMPLE_TOOL_RESPONSES = [
 
 
 class TestTokenizeToolResponses:
+    # [CLASS DOC] Tests of the tool-response tokenization function.
     @pytest.mark.parametrize("model_name", ["Qwen/Qwen3-0.6B"])
     def test_snapshot(self, model_name):
+        # [FUNCTION DOC] Tokenizes both sample tool responses with the Qwen3 tokenizer, decodes
+        # them, and asserts the exact expected text: a user turn wrapping each response in tool
+        # response tags, closed by an end-of-turn marker, followed by an opening assistant turn.
         tokenizer = load_tokenizer(model_name, trust_remote_code=True)
         token_ids = tokenize_tool_responses(SAMPLE_TOOL_RESPONSES, tokenizer)
         decoded = tokenizer.decode(token_ids)
@@ -80,6 +91,12 @@ class TestTokenizeToolResponses:
     @pytest.mark.parametrize("num_tools", [1, 2])
     @pytest.mark.parametrize("model_name", TOOL_CALL_TEST_MODELS)
     def test_tokenize_tool_responses(self, model_name, num_tools):
+        # [FUNCTION DOC] Parametrized over every model in the test list and one or two tool
+        # responses. Skips combinations of two responses with single-tool-only models. Tokenizes
+        # the first num_tools responses, decodes them, and computes the expected text as the
+        # suffix added when the responses are appended to the dummy user/assistant conversation
+        # (rendered with the generation prompt) relative to the conversation alone (rendered
+        # without it). Asserts the two strings are equal, reporting the model name on failure.
         if num_tools > 1 and model_name in SINGLE_TOOL_CALL_ONLY_MODELS:
             pytest.skip(f"{model_name} only supports single tool call")
 
@@ -99,6 +116,10 @@ class TestTokenizeToolResponses:
 
     @staticmethod
     def _compute_chat_template_diff(base_messages, extra_messages, tokenizer) -> str:
+        # [FUNCTION DOC] HELPER: Static method. Renders the base plus extra messages as text with
+        # the generation prompt appended, renders the base messages alone without it, and returns
+        # the part of the first string after the length of the second (assumes the second is a
+        # prefix of the first; not checked).
         text_with = tokenizer.apply_chat_template(
             base_messages + extra_messages, tokenize=False, add_generation_prompt=True
         )

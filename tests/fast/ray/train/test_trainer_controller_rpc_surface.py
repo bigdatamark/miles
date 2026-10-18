@@ -1,3 +1,7 @@
+# [MODULE DOC] Synchronous tests that the trainer controller's driven method surface can be
+# exposed over the remote procedure call layer: every driven method is collected into a spec with
+# a serializer, the weight-update argument and the deployment identity round trip through the
+# serializer, and internal properties are not exposed. No Ray or GPU is needed.
 from __future__ import annotations
 
 import pytest
@@ -25,13 +29,20 @@ DRIVEN_METHODS = (
 
 
 class TestTheTrainerControllerSurfaceIsCallableOverRpc:
+    # [CLASS DOC] Tests of the set of controller methods collected for remote calls.
     def test_the_whole_surface_is_accepted(self):
+        # [FUNCTION DOC] Collects the remote method specs of the controller class (which fails if
+        # any parameter lacks the annotation needed for serialization) and asserts the module's
+        # list of driven method names is a subset of the collected specs.
         """A split run reaches this pool only over rpc, and one unannotated parameter makes it unstartable."""
         specs = collect_rpc_method_specs(TrainerController)
 
         assert set(DRIVEN_METHODS) <= set(specs)
 
     def test_the_engines_a_weight_update_names_cross_the_wire(self):
+        # [FUNCTION DOC] Takes the update-weights spec, builds an updatable-engines info with
+        # empty engine lists and an empty snapshot mapping, encodes then decodes the query (info
+        # plus rollout id 3) with the spec's serializer, and asserts the rollout id survives.
         """This parameter was unannotated once, and it took the whole pool down at import rather than at call."""
         spec = collect_rpc_method_specs(TrainerController)["update_weights"]
         info = UpdatableEngines(
@@ -43,6 +54,8 @@ class TestTheTrainerControllerSurfaceIsCallableOverRpc:
         assert decoded["rollout_id"] == 3
 
     def test_no_internal_method_is_exposed(self):
+        # [FUNCTION DOC] Asserts the collected specs contain none of the internal property names
+        # pool id, expected number of cells, cell ids and number of cells.
         """A method that never crosses the wire is one whose types nobody has to keep honest."""
         specs = collect_rpc_method_specs(TrainerController)
 
@@ -50,7 +63,12 @@ class TestTheTrainerControllerSurfaceIsCallableOverRpc:
 
 
 class TestTheHandshakeThatJoinsTwoDeployments:
+    # [CLASS DOC] Tests of serialization of the deployment identity result used to join two
+    # deployments.
     def test_the_identity_crosses_as_the_model_the_caller_compares(self):
+        # [FUNCTION DOC] Encodes then decodes a deployment identity (run uuid and trainer
+        # component) with the get-deployment-identity spec's serializer and asserts the decoded
+        # value equals the original.
         """The driving launch asserts on its fields, so a mapping arriving instead fails at attribute access."""
         spec = collect_rpc_method_specs(TrainerController)["get_deployment_identity"]
         identity = DeploymentIdentity(run_uuid="0123456789abcdef", deploy_component="trainer")
@@ -60,6 +78,8 @@ class TestTheHandshakeThatJoinsTwoDeployments:
         assert restored == identity
 
     def test_an_identity_missing_a_field_is_refused_before_it_crosses(self):
+        # [FUNCTION DOC] Encodes a plain mapping lacking the deployment component field with the
+        # same serializer and asserts a serialization error naming the identity model is raised.
         """A half-built identity would compare unequal for a reason the message would not name."""
         spec = collect_rpc_method_specs(TrainerController)["get_deployment_identity"]
 

@@ -1,3 +1,7 @@
+# [MODULE DOC] Async test of the training rollout's abort procedure: when aborting, the rollout
+# asks the router for its worker list, posts an abort request to each worker, runs the agent abort
+# hook, and collects pending partial groups, tolerating failures of individual workers. The
+# module's get, post and agent abort hook are replaced by fakes.
 import asyncio
 import logging
 from argparse import Namespace
@@ -9,9 +13,19 @@ from miles.rollout.inference_rollout import inference_rollout_train
 
 
 class TestAbort:
+    # [CLASS DOC] Tests of the abort function of the training rollout.
     async def test_one_unresponsive_worker_does_not_stop_abort_cleanup(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
+        # [FUNCTION DOC] Sets up partial rollout arguments with the project's router, a state, one
+        # partial sample, a pending task that finishes only after the agent abort hook has run and
+        # then returns that sample. The router lists two workers; the fake post records each URL
+        # and fails with a connection error for the unresponsive one. Runs abort for rollout id
+        # 17 with warning-level logging captured, and asserts: both workers received an abort
+        # request at their abort endpoint (in order); the hook ran once with the arguments; the
+        # returned groups are the single group holding the sample; the sample's metadata records
+        # start rollout id 17; and a warning "Failed to abort worker at <url>: <error>" was logged
+        # for the unresponsive worker (the failure does not stop cleanup).
         """One failed worker abort still runs the agent hook and returns pending partial groups."""
         args = Namespace(
             partial_rollout=True,
@@ -26,18 +40,26 @@ class TestAbort:
         hook_finished = asyncio.Event()
 
         async def fake_get(url: str) -> dict[str, list[str]]:
+            # [FUNCTION DOC] HELPER: Fake router query; ignores the URL and returns a mapping with
+            # two worker URLs, one healthy and one unresponsive.
             return {"urls": ["http://healthy", "http://unresponsive"]}
 
         async def fake_post(url: str, payload: dict[str, bool]) -> None:
+            # [FUNCTION DOC] HELPER: Fake post; records the URL and raises a connection error when
+            # the URL contains "unresponsive". The payload is ignored.
             posted_urls.append(url)
             if "unresponsive" in url:
                 raise ConnectionError("worker cannot answer")
 
         async def fake_agent_abort_hook(hook_args: Namespace) -> None:
+            # [FUNCTION DOC] HELPER: Fake agent abort hook; records the arguments it was called
+            # with and sets the event that lets the pending group task finish.
             hook_calls.append(hook_args)
             hook_finished.set()
 
         async def finish_group() -> list[SimpleNamespace]:
+            # [FUNCTION DOC] HELPER: Pending group task body; waits until the hook has finished
+            # and then returns a one-element list holding the partial sample.
             await hook_finished.wait()
             return [sample]
 

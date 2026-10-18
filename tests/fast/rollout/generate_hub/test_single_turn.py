@@ -1,3 +1,16 @@
+# [MODULE DOC] Tests of single-turn generation, run against three variants of the generate
+# function: the old sglang rollout function, the single-turn function and the multi-turn function
+# used for a single turn. The shared generation fixtures provide a mock inference server and
+# arguments; a runner returns the requests the mock server saw and the produced sample(s).
+# Module constants describe a fixed prompt ("What is 1+7?", 7 tokens) answered by a fixed response
+# (a boxed 8, 5 tokens) with a predictable log probability ramp; helper builders produce the
+# expected request payload and expected sample for each variant (variants differ in whether
+# replay flags appear in the request and whether a loss mask is set). Registered as a CPU CI test
+# in the batch-b CPU suite. Some tests download tokenizers or a vision-language processor.
+# Covered: basic generation, explicit endpoint routing, resuming an aborted sample, finish reasons,
+# routed experts, meta info (cached tokens, weight versions, speculative info), allowed input
+# statuses, sampling parameter pass-through, context length boundaries, empty responses and
+# multimodal inputs.
 from tests.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=220, suite="stage-b-cpu", labels=[])
@@ -35,6 +48,8 @@ DEFAULT_MAX_NEW_TOKENS = SAMPLING_PARAMS["max_new_tokens"]
 
 @pytest.fixture(params=["old_sglang_rollout", "single_turn", "multi_turn"])
 def variant(request):
+    # [FUNCTION DOC] HELPER: Fixture parametrized over the three generate variants (old sglang
+    # rollout, single turn, multi turn); returns the current variant name.
     return request.param
 
 
@@ -47,6 +62,11 @@ def expected_request(
     return_indexer_topk: bool = False,
     image_data: list[str] | None = None,
 ) -> dict:
+    # [FUNCTION DOC] HELPER: Builds the request payload the mock server is expected to receive:
+    # input ids (default: the fixed prompt tokens), sampling parameters (default: module values)
+    # and log probability return on. The routed experts and indexer top-k flags are included for
+    # the single-turn and multi-turn variants always, and for the old variant only when requested
+    # true. Image data is included only when given.
     result = {
         "input_ids": input_ids or PROMPT_TOKENS,
         "sampling_params": sampling_params or SAMPLING_PARAMS,
@@ -62,6 +82,8 @@ def expected_request(
 
 
 class _Unset:
+    # [CLASS DOC] HELPER: Marker type for the sentinel meaning "argument not provided", needed so
+    # that none can be passed as a real value to the expected sample builder.
     pass
 
 
@@ -86,6 +108,16 @@ def expected_sample(
     multimodal_train_inputs: dict | None = None,
     loss_mask: list[int] | None | _Unset = _UNSET,
 ) -> Sample:
+    # [FUNCTION DOC] HELPER: Builds the full expected output sample. Defaults: the fixed prompt,
+    # response text and log probabilities, response length 5, completed status, zero cached tokens,
+    # 7 prompt tokens, one call with no weight version, no routed experts, default speculative
+    # info, no multimodal data. Unset tokens default to prompt plus response tokens. An unset loss
+    # mask defaults to all ones of the response length for the multi-turn variant and none for
+    # others. Each entry of the weight versions list becomes one per-call record: none means no
+    # spans, a version means one span covering the response part of the tokens (from tokens length
+    # minus response length to tokens length). Group index, index, label, reward are none; the
+    # metadata is empty, the removal flag false, non-generation time zero, and prefix cache info
+    # holds the cached and total prompt token counts.
     actual_response_length = response_length if response_length is not None else len(RESPONSE_TOKENS)
     if isinstance(loss_mask, _Unset):
         loss_mask = [1] * actual_response_length if variant == "multi_turn" else None
@@ -127,6 +159,8 @@ def expected_sample(
 
 
 def _make_sample(tokens=None, response="", response_length=0, status=Sample.Status.PENDING, multimodal_inputs=None):
+    # [FUNCTION DOC] HELPER: Builds an input sample with the fixed prompt via the shared sample
+    # factory; defaults give a fresh pending sample with no tokens and an empty response.
     return make_sample(
         prompt=PROMPT,
         tokens=tokens,
@@ -138,6 +172,9 @@ def _make_sample(tokens=None, response="", response_length=0, status=Sample.Stat
 
 
 def _run_generate(variant: str, env: GenerateEnv, sample: Sample | None = None, sampling_params: dict | None = None):
+    # [FUNCTION DOC] HELPER: Runs the shared generate runner for the variant with the given
+    # sample (default: a fresh pending sample) and sampling parameters (default: module values).
+    # Returns the runner's result with the recorded requests and sample(s).
     return run_generate(env, sample or _make_sample(), sampling_params or SAMPLING_PARAMS, variant=variant)
 
 
@@ -145,23 +182,33 @@ def _run_generate(variant: str, env: GenerateEnv, sample: Sample | None = None, 
 
 
 class TestBasicGeneration:
+    # [CLASS DOC] The baseline generation test.
     def test_basic_generation(self, variant, generation_env):
+        # [FUNCTION DOC] Runs one generation with defaults and asserts exactly one expected request
+        # reached the server and the output equals the default expected sample.
         result = _run_generate(variant, generation_env)
         assert result.requests == [expected_request(variant)]
         assert listify(result.sample) == [expected_sample(variant)]
 
 
 class TestEndpointRouting:
+    # [CLASS DOC] Tests of the single-turn function's optional explicit endpoint argument.
     @pytest.mark.parametrize("variant", ["single_turn"])
     async def test_an_explicit_url_routes_generation_to_that_endpoint(
         self, monkeypatch: pytest.MonkeyPatch, variant: str, generation_env: GenerateEnv
     ) -> None:
+        # [FUNCTION DOC] Single-turn variant only. Replaces the module's HTTP post function with a
+        # fake recording the URL and returning an empty stop response. Builds a generate input from
+        # a fresh generation state and calls generate with an explicit router URL. Asserts the only
+        # URL posted to is that explicit URL, not the router address configured in the arguments.
         """An explicit endpoint overrides the router address configured in the arguments."""
         requested_urls: list[str] = []
 
         async def fake_post(
             url: str, payload: dict[str, object], headers: dict[str, str] | None = None
         ) -> dict[str, object]:
+            # [FUNCTION DOC] HELPER: Replacement post function; records the URL and returns an
+            # empty-text response with a stop finish reason. Payload and headers are ignored.
             requested_urls.append(url)
             return {"text": "", "meta_info": {"finish_reason": {"type": "stop"}}}
 
@@ -181,7 +228,17 @@ class TestEndpointRouting:
 
 
 class TestResumedSingleTurn:
+    # [CLASS DOC] Tests of resuming generation on a sample that was previously aborted.
     def test_two_consecutive_calls_on_same_sample(self, variant, generation_env):
+        # [FUNCTION DOC] Skipped for the multi-turn variant. First call: the server returns the
+        # first part of the response (two tokens) with an abort finish reason; asserts the normal
+        # request and an aborted sample holding the partial text, tokens and log probabilities.
+        # Second call on that returned sample: the server returns the remaining three tokens with
+        # stop; asserts the request now uses the tokens so far as input ids and a maximum new
+        # tokens reduced from 16 to 14 (16 minus the 2 already generated), and the final completed
+        # sample has the concatenated text, tokens and log probabilities, response length 5, two
+        # weight version records without spans, and a total prompt token count of prompt length
+        # plus the length of the tokens after turn one.
         if variant == "multi_turn":
             pytest.skip("not tested yet")
         partial_text = "\\boxed"
@@ -228,6 +285,7 @@ class TestResumedSingleTurn:
 
 
 class TestFinishReason:
+    # [CLASS DOC] Tests of the mapping from the server's finish reason to the sample status.
     @pytest.mark.parametrize(
         "generation_env,expected_status",
         [
@@ -238,12 +296,15 @@ class TestFinishReason:
         indirect=["generation_env"],
     )
     def test_finish_reason_sets_status(self, variant, generation_env, expected_status):
+        # [FUNCTION DOC] Parametrized: stop gives completed, length gives truncated, abort gives
+        # aborted. Asserts the normal request and the default expected sample with that status.
         result = _run_generate(variant, generation_env)
         assert result.requests == [expected_request(variant)]
         assert listify(result.sample) == [expected_sample(variant, status=expected_status)]
 
 
 class TestRoutedExperts:
+    # [CLASS DOC] Tests of routed experts (routing replay) handling.
     @pytest.mark.parametrize(
         "generation_env",
         [
@@ -255,6 +316,10 @@ class TestRoutedExperts:
         indirect=True,
     )
     def test_routed_experts_enabled_and_parsed(self, variant, generation_env):
+        # [FUNCTION DOC] Enables rollout routing replay with 2 layers and router top-k 4. The mock
+        # server returns a base64 encoded 32-bit integer ramp array shaped (total tokens minus one,
+        # layers, top-k). Asserts the request has the routed experts flag on, and that the sample's
+        # routed experts array has that shape and equals the sent array.
         num_layers, moe_router_topk = 2, 4
         num_tokens = len(PROMPT_TOKENS) + len(RESPONSE_TOKENS)
         routed_experts_array = np.arange((num_tokens - 1) * num_layers * moe_router_topk, dtype=np.int32).reshape(
@@ -279,10 +344,13 @@ class TestRoutedExperts:
 
 
 class TestMetaInfo:
+    # [CLASS DOC] Tests that meta information returned by the server is copied into the sample.
     @pytest.mark.parametrize(
         "generation_env", [{"process_fn_kwargs": {"cached_tokens": 3, "weight_version": "v1.0"}}], indirect=True
     )
     def test_meta_info_fields_updated(self, variant, generation_env):
+        # [FUNCTION DOC] The server reports 3 cached tokens and weight version "v1.0". Asserts the
+        # sample carries those in its prefix cache info and a single weight version span.
         result = _run_generate(variant, generation_env)
         assert result.requests == [expected_request(variant)]
         assert listify(result.sample) == [expected_sample(variant, cached_tokens=3, weight_versions=["v1.0"])]
@@ -302,6 +370,9 @@ class TestMetaInfo:
         indirect=True,
     )
     def test_spec_info_updated(self, variant, generation_env):
+        # [FUNCTION DOC] With the EAGLE speculative algorithm configured, the server reports 10
+        # correct drafts, 15 proposed drafts and 3 verifications. Asserts the sample's speculative
+        # info holds those values and a completion token count of 5.
         result = _run_generate(variant, generation_env)
         assert result.requests == [expected_request(variant)]
         assert listify(result.sample) == [
@@ -315,14 +386,19 @@ class TestMetaInfo:
 
 
 class TestInputStatusValidation:
+    # [CLASS DOC] Tests of which input sample statuses generation accepts.
     @pytest.mark.parametrize("status", [Sample.Status.PENDING, Sample.Status.ABORTED])
     def test_allowed_statuses(self, variant, generation_env, status):
+        # [FUNCTION DOC] Input samples with pending or aborted status (no tokens) generate
+        # normally: asserts the normal request and default expected sample.
         result = _run_generate(variant, generation_env, _make_sample(status=status))
         assert result.requests == [expected_request(variant)]
         assert listify(result.sample) == [expected_sample(variant)]
 
     @pytest.mark.parametrize("status", [Sample.Status.COMPLETED, Sample.Status.TRUNCATED])
     def test_rejected_statuses(self, variant, generation_env, status):
+        # [FUNCTION DOC] Skipped for the multi-turn variant. Input samples with completed or
+        # truncated status make generation raise an assertion error.
         if variant == "multi_turn":
             pytest.skip("not tested yet")
         with pytest.raises(AssertionError):
@@ -330,7 +406,11 @@ class TestInputStatusValidation:
 
 
 class TestPayloadStructure:
+    # [CLASS DOC] Tests of the request payload sent to the server.
     def test_sampling_params_passed_through(self, variant, generation_env):
+        # [FUNCTION DOC] Generates with custom sampling parameters (16 new tokens, temperature
+        # 0.5, top-p 1.0) and asserts the request carries them unchanged and the sample is the
+        # default expected one.
         result = _run_generate(
             variant, generation_env, sampling_params={"max_new_tokens": 16, "temperature": 0.5, "top_p": 1.0}
         )
@@ -341,7 +421,14 @@ class TestPayloadStructure:
 
 
 class TestBoundaryConditions:
+    # [CLASS DOC] Tests of limits: exhausted new-token budget and the rollout maximum context
+    # length (not supported by the old variant, whose cases are skipped).
     def test_max_new_tokens_zero_returns_truncated(self, variant, generation_env):
+        # [FUNCTION DOC] Skipped for the multi-turn variant. The input sample already has a
+        # 10-token response (17 tokens in total) and the maximum new tokens is 10, so nothing is
+        # left to generate. Asserts no request is sent and the sample is returned unchanged with
+        # status truncated, no log probabilities, zero total prompt tokens and no weight version
+        # records.
         if variant == "multi_turn":
             pytest.skip("not tested yet")
         existing_tokens = [1, 2, 3, 4, 5, 6, 7] + list(range(100, 110))
@@ -362,6 +449,11 @@ class TestBoundaryConditions:
 
     @pytest.mark.parametrize("generation_env", [{"args_kwargs": {"rollout_max_context_len": 5}}], indirect=True)
     def test_prompt_exceeds_max_context_len_returns_truncated(self, variant, generation_env):
+        # [FUNCTION DOC] Skipped for the old variant. With the maximum context length 5 (shorter
+        # than the 7-token prompt), asserts no request is sent and the sample is truncated with an
+        # empty response, no log probabilities, no weight version records and tokens equal to the
+        # prompt tokens for the multi-turn variant (with no loss mask) or empty for the single-turn
+        # variant.
         if variant == "old_sglang_rollout":
             pytest.skip("old_sglang_rollout does not support rollout_max_context_len")
         result = _run_generate(variant, generation_env)
@@ -391,6 +483,10 @@ class TestBoundaryConditions:
         indirect=["generation_env"],
     )
     def test_moderate_length_input_adjusts_max_new_tokens(self, variant, generation_env, expected_max_new_tokens):
+        # [FUNCTION DOC] Skipped for the old variant. Parametrized by maximum context length: 10
+        # and 8 cap the maximum new tokens at that length minus the prompt length; 100 leaves the
+        # default of 16. Asserts one request with the expected maximum new tokens, the unchanged
+        # temperature, and the default expected sample.
         if variant == "old_sglang_rollout":
             pytest.skip("old_sglang_rollout does not support rollout_max_context_len")
         result = _run_generate(variant, generation_env)
@@ -405,6 +501,10 @@ class TestBoundaryConditions:
         indirect=True,
     )
     def test_adjusted_max_new_tokens_zero_returns_truncated(self, variant, generation_env):
+        # [FUNCTION DOC] Skipped for the old variant. With the maximum context length equal to the
+        # prompt length, the adjusted new-token budget is zero. Asserts no request and the same
+        # truncated empty-response sample as the prompt-too-long case (prompt tokens kept only for
+        # the multi-turn variant).
         if variant == "old_sglang_rollout":
             pytest.skip("old_sglang_rollout does not support rollout_max_context_len")
         result = _run_generate(variant, generation_env)
@@ -426,8 +526,12 @@ class TestBoundaryConditions:
 
 
 class TestEmptyResponse:
+    # [CLASS DOC] Tests of a server response with no text.
     @pytest.mark.parametrize("generation_env", [{"process_fn_kwargs": {"response_text": ""}}], indirect=True)
     def test_empty_response(self, variant, generation_env):
+        # [FUNCTION DOC] The server returns an empty response. Asserts the normal request and a
+        # completed sample with an empty response, zero length, tokens equal to the prompt tokens
+        # and an empty log probability list.
         result = _run_generate(variant, generation_env)
         assert result.requests == [expected_request(variant)]
         assert listify(result.sample) == [
@@ -439,8 +543,17 @@ VLM_MODEL_NAME = "Qwen/Qwen2-VL-2B-Instruct"
 
 
 class TestMultimodal:
+    # [CLASS DOC] Tests of image inputs with a vision-language model (processor loaded from the
+    # Hugging Face hub or cache).
     @pytest.mark.parametrize("generation_env", [{"args_kwargs": {"model_name": VLM_MODEL_NAME}}], indirect=True)
     def test_multimodal_inputs_processed(self, variant, generation_env):
+        # [FUNCTION DOC] Skipped for the multi-turn variant. Uses a 64 by 64 red image as the input
+        # sample's multimodal data and computes the expected training inputs with the model's
+        # processor, dropping input ids, attention mask and token type ids. Asserts the request
+        # carries the prompt tokens and the image encoded for the rollout engine; that the sample's
+        # multimodal training inputs exist, exclude the token type ids and have the same keys as
+        # expected, with equal pixel values and image grid values; and that the whole sample equals
+        # the expected sample with those multimodal fields.
         if variant == "multi_turn":
             pytest.skip("not tested yet")
         test_image = Image.new("RGB", (64, 64), color="red")

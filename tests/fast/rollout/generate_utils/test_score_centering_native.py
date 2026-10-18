@@ -1,3 +1,8 @@
+# [MODULE DOC] Tests of score-centering (top log probability candidates and sampling support
+# information) recorded by the native generate endpoint helpers: building the request payload from
+# arguments and updating a sample from a server response. Fake responses come from the shared score
+# centering fixtures (argument and meta-info builders); the asynchronous update is driven with a
+# fresh event loop per call.
 """Exercise score-centering metadata through native generation."""
 
 import asyncio
@@ -13,6 +18,12 @@ from miles.utils.types import Sample
 
 
 def test_native_generate_producer_appends_each_call() -> None:
+    # [FUNCTION DOC] Builds the request payload for a two-token prompt (max response 20, no
+    # replay features, no speculative decoding) and asserts it has no error status, requests 3 top
+    # log probabilities and enables log probabilities. Then applies two successive responses (two
+    # tokens each, with different probabilities) to one sample and asserts the sample tokens are
+    # the prompt plus all four generated tokens, the top-k token ids' first column is [2, 2, 4, 4]
+    # (appended per call across calls), and the top-k sample validator accepts it for 3 candidates.
     args = _args(
         rollout_max_response_len=20,
         rollout_max_context_len=None,
@@ -36,6 +47,16 @@ def test_native_generate_producer_appends_each_call() -> None:
 
 @pytest.mark.parametrize("candidate_count", [0, 3])
 def test_filtered_native_generation_records_post_filter_distribution(candidate_count: int) -> None:
+    # [FUNCTION DOC] Parametrized by the candidate count (0 or 3). Arguments request top-p 0.6,
+    # top-k 3 and the support sampling log probability mode with support replay on. Asserts the
+    # payload has no error status, requests the sampling mask, includes the support log
+    # probability mode only when candidates are requested, and carries no top log probabilities
+    # number. A response with one token of probability 0.4, a sampling mask of two token ids and
+    # the post-filter log probabilities (3/7 and 4/7; a flat list for the zero-candidate case) is
+    # applied. With candidates, asserts the sample passes top-k validation, its top-k ids are the
+    # mask ids padded with -1, and the exponentiated first two top-k log probabilities are 3/7 and
+    # 4/7. Without candidates, asserts both top-k fields stay none. In both cases the sample's
+    # rollout log probability is the log of 4/7 (the post-filter value, not the raw 0.4).
     args = _args(
         rollout_top_logprobs_num=candidate_count,
         rollout_top_p=0.6,
@@ -73,6 +94,10 @@ def test_filtered_native_generation_records_post_filter_distribution(candidate_c
 
 
 def test_greedy_evaluation_does_not_collect_training_candidates() -> None:
+    # [FUNCTION DOC] Builds an evaluation payload with temperature 0 and asserts the temperature
+    # is kept and no top log probabilities number is requested. Applies a response whose meta info
+    # has the output top log probabilities entry removed (the shared builder normally includes
+    # it), and asserts the sample's top-k token ids stay none.
     args = _args(
         rollout_max_response_len=20,
         rollout_max_context_len=None,

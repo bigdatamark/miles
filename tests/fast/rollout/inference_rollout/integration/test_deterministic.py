@@ -1,3 +1,6 @@
+# [MODULE DOC] Integration test of per-request sampling seeds: with deterministic inference
+# enabled and a base rollout seed, each sample of a group gets a consecutive seed; without it no
+# seed is sent. Checked on the request log of the mock inference server.
 import pytest
 
 from tests.fast.rollout.inference_rollout.integration.utils import integration_env_config, load_and_call_train
@@ -30,6 +33,10 @@ from tests.fast.rollout.inference_rollout.integration.utils import integration_e
     indirect=["rollout_env"],
 )
 def test_sampling_seeds(rollout_env, expected_seeds):
+    # [FUNCTION DOC] Parametrized: "enabled" (deterministic inference, seed 42, 3 samples per
+    # prompt, batch size 1) expects the set of sampling seeds {42, 43, 44}; "disabled" (2 samples
+    # per prompt) expects only the absent seed (none). Runs a train rollout and asserts the set of
+    # sampling seeds found in the mock server's request log equals the expectation.
     env = rollout_env
     load_and_call_train(env.args, env.data_source)
 
