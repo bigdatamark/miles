@@ -3,6 +3,12 @@
 # (the CUDA CI runner's execution model). Scenario logic lives in
 # tests/e2e/ft/conftest_ft/scenario_random_crash.py.
 
+# [MODULE DOC] CI entry running the random-crash soak scenario on the train-kill mode with 2
+# cells, context/tensor/expert parallel 2 each, replayed (fake) rollout, 5-layer MoE model.
+# Registers a CUDA test (estimated 3600 seconds, 8-GPU H200 stage, long-FT label, hopper and
+# blackwell) that is currently disabled (soak tests pending CI infra). When executed as a
+# script it runs the scenario for that mode; importing only registers.
+
 from tests.ci.ci_register import register_cuda_ci
 from tests.e2e.ft.conftest_ft.scenario_random_crash import run_ci
 

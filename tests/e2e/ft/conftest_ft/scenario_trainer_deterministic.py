@@ -1,6 +1,16 @@
 # NOTE: You MUST read tests/e2e/ft/README.md as source-of-truth and documentations
 # WARNING: Do NOT relax any assert logic in this file. All assertions must remain strict.
 
+# [MODULE DOC] Deterministic trainer-healing scenario (comparison test, two phases). Each side
+# trains 3 rollouts per phase (6 total; phase_a ids 0-2, phase_b ids 3-5), saving a checkpoint
+# at the end of phase_a that phase_b loads. The target side has FT enabled and, in each phase,
+# scripted actions stop and restart the last trainer cell at the second rollout of the phase so
+# that it heals from another replica at the third. Everything is deterministic, so the
+# comparison is bitwise for all metrics (except grad norm, which gets a tight relative bound
+# because its summation order depends on distributed-optimizer shard count) and for all dumped
+# tensors; this proves state copied during healing is reconstructed bit for bit. Exposes the
+# comparison app and CI runner.
+
 from pathlib import Path
 
 from tests.e2e.ft.conftest_ft.app import BASELINE_SIDE, TARGET_SIDE, create_comparison_app_and_run_ci
@@ -27,6 +37,10 @@ PHASE_START_ROLLOUT_IDS: dict[str, int] = {"phase_a": 0, "phase_b": NUM_ROLLOUTS
 
 
 def _build_actions(*, phase_start_rollout_id: int, num_cells: int) -> list[dict]:
+    # [FUNCTION DOC] HELPER: Builds the scripted FT actions for one phase: at the phase's second
+    # rollout (start id plus one), at its end, stop the last trainer cell (index cell count minus
+    # one, in the actor trainer pool) and then start it again. Returns two action mappings in
+    # that order.
     heal_trigger_rollout_id: int = phase_start_rollout_id + 1
     target_cell_id: str = compute_cell_id(pool_id=compute_trainer_pool_id("actor"), cell_index=num_cells - 1)
     return [
@@ -36,7 +50,14 @@ def _build_actions(*, phase_start_rollout_id: int, num_cells: int) -> list[dict]
 
 
 def _expected_reconfigures(*, is_target: bool, phase: str, num_cells: int) -> list[ReconfigureInfo]:
+    # [FUNCTION DOC] HELPER: The reconfigure events expected for a side and phase. The baseline
+    # expects none. The target expects one heal in phase_a, and in phase_b the phase_a heal event
+    # again followed by phase_b's (so the phase_b events are expected to include the earlier
+    # phase's heal). Each heal event is at the phase start id plus two, copies
+    # state from cell index 0 into the last cell, and leaves all cells alive. Raises a value
+    # error for an unknown phase name (when the side is target).
     def heal_at(phase_name: str) -> ReconfigureInfo:
+        # [FUNCTION DOC] HELPER: Builds the expected heal event of the named phase.
         return ReconfigureInfo(
             rollout_id=PHASE_START_ROLLOUT_IDS[phase_name] + 2,
             src_cell_index=0,
@@ -54,6 +75,13 @@ def _expected_reconfigures(*, is_target: bool, phase: str, num_cells: int) -> li
 
 
 def _build_phase_args(mode: FTTestMode, dump_dir: str, *, is_target: bool, enable_dumper: bool = True) -> str:
+    # [FUNCTION DOC] HELPER: Train arguments for one side and phase. The phase is the last path
+    # component of the dump directory (assertion error if it is not a known phase name). Starts
+    # from the common args for 6 total rollouts, adds deterministic mode with deterministic env
+    # vars and deterministic collectives; the target also gets FT args. Saves a checkpoint under
+    # the dump dir with interval 3 and exits after 3 rollouts of the run; phases other than
+    # phase_a load the phase_a checkpoint (found by swapping the phase in the path). The target
+    # also gets the scripted FT actions.
     phase_name: str = dump_dir.rsplit("/", 1)[-1]
     assert phase_name in PHASE_START_ROLLOUT_IDS, (
         f"dump dir {dump_dir!r} does not end in a phase name; this multi-phase scenario "
@@ -82,14 +110,23 @@ def _build_phase_args(mode: FTTestMode, dump_dir: str, *, is_target: bool, enabl
 
 
 def _build_baseline_args(mode: FTTestMode, dump_dir: str, enable_dumper: bool = True) -> str:
+    # [FUNCTION DOC] HELPER: Phase arguments for the baseline (no FT).
     return _build_phase_args(mode, dump_dir, is_target=False, enable_dumper=enable_dumper)
 
 
 def _build_target_args(mode: FTTestMode, dump_dir: str, enable_dumper: bool = True) -> str:
+    # [FUNCTION DOC] HELPER: Phase arguments for the target (FT enabled, scripted heal actions).
     return _build_phase_args(mode, dump_dir, is_target=True, enable_dumper=enable_dumper)
 
 
 def _compare(dump_dir: str, mode: FTTestMode) -> None:
+    # [FUNCTION DOC] HELPER: Comparison hook; for each phase: (1) both sides' reconfigure events
+    # must equal the expected ones; (2) train metrics must be exactly equal except grad norm;
+    # (3) grad norm must match within relative tolerance 1e-6; (4) the set of dump leaf folders of
+    # the baseline must equal exactly the phase's three rollouts (so a post-healing rollout is
+    # present); (5) all dumped tensors must match with zero relative difference, allowing the
+    # shared skip/failed patterns for input tensors; (6) when the mode has real rollout, the
+    # inference engine checksums must match. Prints a pass message at the end.
     # Bitwise (zero-tolerance) comparison. The deterministic healing test exists to
     # prove that state pulled from another replica during healing is reconstructed
     # *bit-for-bit*: a state-copy bug is trivial to introduce and an approximate

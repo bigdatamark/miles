@@ -1,3 +1,14 @@
+# [MODULE DOC] Two-GPU distributed test that a multi-LoRA adapter slot checkpoint preserves the
+# full-precision (fp32) master weights and Adam optimizer state and can be restored into a
+# different slot exactly (CUDA: 2-GPU H200 stage-b, estimated 120 seconds, lora label, hopper
+# only; ROCm: nightly 2-GPU MI350, estimated 60 seconds). Run as a script. The launcher mode
+# (no worker option) makes a temporary directory (under an optional checkpoint root) and
+# re-runs this file as two worker processes via the torch distributed launcher in standalone
+# mode, failing if they fail. Worker mode (given a directory) runs the actual scenario described
+# on the worker function. The module defines a tiny model with two multi-LoRA linear layers
+# (16 to 32 and 32 to 16 features, 2 adapter slots, rank 4, alpha 8), and helpers to snapshot and
+# compare slot state and apply deterministic gradient steps.
+
 """A slot checkpoint preserves FP32 Adam state and resumes into another slot exactly."""
 
 import argparse
@@ -33,7 +44,14 @@ ADAM = dict(learning_rate=3e-4, beta1=0.9, beta2=0.95, eps=1e-8, weight_decay=0.
 
 
 class CheckpointModel(MegatronModule):
+    # [CLASS DOC] HELPER: Minimal Megatron module for the test. Holds a list of two frozen
+    # column-parallel linear layers (16 to 32 and 32 to 16, no bias, no output gathering), each
+    # wrapped in a multi-LoRA layer with 2 adapter slots, adapter dimension 4 and alpha 8, named by
+    # layer index.
     def __init__(self, config):
+        # [FUNCTION DOC] HELPER: Builds the layers described on the class from the transformer
+        # config (using its initialization method), freezing the base linear weights before
+        # wrapping.
         super().__init__(config)
         self.layers = torch.nn.ModuleList()
         for index, (input_size, output_size) in enumerate(((16, 32), (32, 16))):
@@ -50,6 +68,9 @@ class CheckpointModel(MegatronModule):
 
 
 def snapshot(model, optimizer):
+    # [FUNCTION DOC] HELPER: Captures the state of one slot: a list of the slot's adapter
+    # parameters and the full state dictionary of the slot optimizer's inner optimizer, then
+    # returns a deep copy where every tensor is detached and moved to host memory.
     state = {
         "weights": [param for param in adapter_slot_parameters(model, optimizer.slot)],
         "optimizer": optimizer._inner.state_dict(),
@@ -58,6 +79,10 @@ def snapshot(model, optimizer):
 
 
 def assert_same_state(actual, expected):
+    # [FUNCTION DOC] HELPER: Asserts two snapshots are exactly equal. Flattens both into leaf values
+    # plus structure; the structures must be equal; tensor leaves must be equal with zero
+    # tolerance (bitwise-level), other leaves must compare equal. Raises an assertion error
+    # otherwise (the test relies on this for its negative controls).
     actual_values, actual_spec = tree_flatten(actual)
     expected_values, expected_spec = tree_flatten(expected)
     assert actual_spec == expected_spec
@@ -69,6 +94,12 @@ def assert_same_state(actual, expected):
 
 
 def apply_step(model, optimizer, step):
+    # [FUNCTION DOC] HELPER: Performs one optimizer step on the optimizer's slot with deterministic
+    # gradients. For each adapter parameter (indexed in order) the main gradient buffer is
+    # overwritten with 0.1 times the sine of a ramp over the parameter's elements shifted by the
+    # parameter index and the step number. Then steps that slot's optimizer with the shared Adam
+    # settings (learning rate 3e-4, betas 0.9/0.95, eps 1e-8, weight decay 0.01, gradient clip norm
+    # 1.0) and asserts the reported gradient norm is positive.
     # Identical post-all-reduce gradients isolate checkpoint/Adam correctness from forward kernels.
     for index, param in enumerate(adapter_slot_parameters(model, optimizer.slot)):
         gradient = torch.arange(param.numel(), device=param.device, dtype=torch.float32).reshape(param.shape)
@@ -78,6 +109,24 @@ def apply_step(model, optimizer, step):
 
 
 def run_worker(checkpoint_dir):
+    # [FUNCTION DOC] One of two cooperating distributed processes (nccl, 120 second timeout; asserts
+    # world size 2, so data parallel size 2). Setup: bind the GPU from the local rank
+    # environment variable, initialize model parallel state and the gloo group, seed the model
+    # parallel generator, build a one-layer bf16 transformer config and wrap the test model in
+    # distributed data parallel with fp32 gradient reduction and no overlap; initialize adapter
+    # slots 0 and 1 with rank 4, alpha 8; create a slot optimizer for slot 0 (the source).
+    # Scenario: (1) apply Adam steps 1-3 to the source and snapshot it; assert that this rank owns
+    # 192 master parameters (half of the slot's 384), that some masters hold precision finer than
+    # bf16, all masters are fp32, and every inner optimizer has state with step count 3 and
+    # nonzero fp32 first/second moments. (2) Save the slot checkpoint, create a slot-1 optimizer
+    # and load the checkpoint into it with optimizer state; assert both slots' snapshots equal
+    # the saved snapshot. (3) Apply step 4 to the source, snapshot (uninterrupted), apply step 4 to
+    # the resumed slot; assert both equal the uninterrupted snapshot and the resumed step count is
+    # 4. (4) Negative control: reload, round the masters through the lower precision (via the
+    # reload-masters call) and assert the state no longer matches the saved one. (5) Negative
+    # control: a fresh slot-1 optimizer loaded weights-only then stepped must diverge from the
+    # uninterrupted snapshot. Each stage prints a rank-tagged progress line. Ends with a barrier,
+    # destroying model parallel state and the process group.
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl", timeout=timedelta(seconds=120))
     assert dist.get_world_size() == 2

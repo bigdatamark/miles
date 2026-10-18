@@ -1,3 +1,13 @@
+# [MODULE DOC] GLM-4.7-Flash case: distributed Muon optimizer, rollout routing replay and DeepEP
+# on both sides, bf16, without speculative decoding; colocated on 4 GPUs with Megatron tensor
+# parallel 2, context parallel 2 and expert parallel 4, and one SGLang engine of 4 GPUs using
+# data-parallel attention (DP size 2, attention tensor parallel 2) with expert parallel 4 and
+# bf16 DeepEP dispatch. Registers a CUDA test (4-GPU H200 stage, estimated 1500 seconds, labels
+# megatron and replay, hopper only; 4 GPUs because 8-GPU runners cannot bring NVSHMEM up over IB)
+# and metric history gates on grad norm, PPO KL, train/rollout logprob absolute difference,
+# train/rollout KL and raw reward. Run as a script: strip all proxy environment variables (both
+# cases), prepare, execute.
+
 """GLM-4.7-Flash with distributed Muon, R3 and DeepEP on both sides, without speculative decoding.
 
 Colocated on 4 GPUs: Megatron trains at TP2 x CP2 with EP4 over DeepEP, and one BF16 SGLang engine

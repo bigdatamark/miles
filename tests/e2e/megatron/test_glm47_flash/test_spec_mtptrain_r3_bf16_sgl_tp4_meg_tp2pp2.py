@@ -1,3 +1,12 @@
+# [MODULE DOC] GLM-4.7-Flash case: colocated on 4 GPUs with Megatron tensor parallel 2, pipeline
+# parallel 2, context parallel 1, expert parallel 2, and one SGLang engine of 4 GPUs (tensor
+# parallel 4); speculative decoding with MTP training and rollout routing replay on (case
+# defaults), bf16. Same shape as the AMD standalone variant. Registers a CUDA test (4-GPU H200
+# stage, estimated 1200 seconds, label megatron, hopper and blackwell) and an AMD ROCm nightly
+# test (4-GPU MI350, estimated 1500 seconds), plus metric history gates on grad norm, PPO KL,
+# train/rollout logprob absolute difference, train/rollout KL and raw reward. Run as a script:
+# strip all proxy environment variables (both cases), prepare, execute.
+
 import os
 
 from tests.ci.ci_register import register_cuda_ci, register_rocm_ci

@@ -1,6 +1,16 @@
 # NOTE: You MUST read tests/e2e/ft/README.md as source-of-truth and documentations
 # WARNING: Do NOT relax any assert logic in this file. All assertions must remain strict.
 
+# [MODULE DOC] Rollout-engine deterministic fault-tolerance scenario (comparison test). Baseline
+# and target both train 8 rollouts with deterministic inference and collectives, FT on the
+# rollout component only, a mini FT controller, radix cache disabled, zero weight decay, and
+# (when colocated) static memory fraction 0.4. The target side additionally runs a fault
+# injector that crashes rollout engines (seed 42, mean 30 seconds) only after the first rollout
+# completes and only while at least two final rollouts remain fault-free. After the run the two
+# sides must be bit-identical (shared deterministic comparison, at least 2 trained rollouts),
+# enough injections must have occurred, crashed engines must have served again, and injections
+# must have landed in at least two distinct rollouts. Exposes the comparison app and the CI runner.
+
 import contextlib
 import shutil
 import threading
@@ -52,6 +62,13 @@ DETERMINISTIC_INFERENCE_ENV_VARS: dict[str, str] = {"SGLANG_BATCH_INVARIANT_OPS_
 
 
 def _build_args(mode: FTTestMode, dump_dir: str, enable_dumper: bool = True) -> str:
+    # [FUNCTION DOC] HELPER: Train arguments used identically for both sides. Asserts the mode has
+    # real rollout engines and enables FT on the rollout component alone. Starts from the common
+    # args for 8 rollouts, then appends FT args, API server args (default config), the mini FT
+    # controller flag, deterministic collectives, radix cache disabled, the static memory
+    # fraction (only when colocated), a 1 second rollout health check interval, zero weight
+    # decay, and the train environment variables (deterministic set plus the batch-invariant
+    # multimodal fallback variant switched off).
     assert mode.has_real_rollout, f"{TEST_NAME} needs engines to crash, but mode {mode.model_name} has none"
     assert tuple(mode.ft_components) == ("rollout",), (
         f"{TEST_NAME} injects into rollout cells only, so the mode must enable ft on rollout alone, "
@@ -80,6 +97,17 @@ def _build_args(mode: FTTestMode, dump_dir: str, enable_dumper: bool = True) -> 
 def _inject_rollout_faults(
     mode: FTTestMode, dump_dir: str, config: command_utils.ExecuteTrainConfig
 ) -> Iterator[None]:
+    # [FUNCTION DOC] HELPER: Context manager wrapped around the target side's run. On entry:
+    # compute the API server base url, print the injection settings, delete the side's dump
+    # directory, and start a daemon thread that waits for the first rollout to finish and then
+    # starts a rollout-only fault injector (seed 42, mean 30 seconds, 0.2 second polls, quiescent
+    # polls per backend, injection allowed only while enabled by the rollout-progress predicate).
+    # The body then runs (training). On exit: join the arming thread (bounded by the poll
+    # seconds), stop the injector if it was armed. Afterwards asserts that an injector was armed
+    # (otherwise the comparison would be vacuous), that the minimum soak injections happened on
+    # rollout cells, that injected rollout cells were seen serving again, and that injections
+    # spread over at least two rollouts. The assertions only run if the body exits without
+    # raising.
     base_url: str = f"http://{config.create_backend().api_server_host(config)}:{API_SERVER_PORT}"
     print(f"Injecting into {ROLLOUT_CELL_TYPE} cells only, mean interval {CRASH_INTERVAL_SECONDS:.1f}s, seed {SEED}")
 
@@ -88,6 +116,9 @@ def _inject_rollout_faults(
     armed: MutableBox[FaultInjectorHandle | None] = MutableBox(value=None)
 
     def arm_on_generation_start() -> None:
+        # [FUNCTION DOC] HELPER: Thread body. Waits up to an hour for the first completed rollout;
+        # if none appears, returns without arming. Otherwise spawns the injector and stores its
+        # handle in the shared box.
         if not _wait_for_first_rollout(dump_dir):
             return
         armed.value = spawn_fault_injector(
@@ -123,12 +154,17 @@ def _inject_rollout_faults(
 
 
 def _compute_quiescent_polls_required(config: command_utils.ExecuteTrainConfig) -> int:
+    # [FUNCTION DOC] HELPER: One quiescent poll under the Ray backend, the injector's default (60)
+    # under any other backend.
     if config.cluster_backend is ClusterBackend.RAY:
         return RAY_QUIESCENT_POLLS_REQUIRED
     return QUIESCENT_POLLS_REQUIRED
 
 
 def _wait_for_first_rollout(dump_dir: str) -> bool:
+    # [FUNCTION DOC] HELPER: Polls every 5 seconds, for up to 3600 seconds, until the dump
+    # directory records at least one rollout completion time. Returns true when found, false on
+    # timeout.
     deadline = time.monotonic() + FIRST_ROLLOUT_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         if read_rollout_completion_times(dump_dir):
@@ -138,12 +174,18 @@ def _wait_for_first_rollout(dump_dir: str) -> bool:
 
 
 def _rollout_fault_injection_enabled(dump_dir: str) -> bool:
+    # [FUNCTION DOC] HELPER: Injection gate. Reads completed rollout ids from the dump directory;
+    # the next rollout id is one past the highest completed (zero if none). Returns true while the
+    # next rollout id is below the total rollouts minus the two terminal fault-free rollouts.
     completed_rollout_ids: set[int] = {rollout_id for rollout_id, _ in read_rollout_completion_times(dump_dir)}
     next_rollout_id = max(completed_rollout_ids, default=-1) + 1
     return next_rollout_id < NUM_ROLLOUTS - TERMINAL_FAULT_FREE_ROLLOUTS
 
 
 def _assert_injections_spread_over_rollouts(injector: FaultInjectorHandle, *, dump_dir: str) -> None:
+    # [FUNCTION DOC] HELPER: Maps each successful rollout-cell injection time to the rollout it
+    # landed in and asserts that at least two distinct rollouts were hit, so the run shows crashes
+    # across the run and not just one surviving rollout. Prints the rollouts hit.
     crashed_rollouts = _compute_crashed_rollouts(
         injected_at=compute_injection_times(injector.event_log.events, cell_type=ROLLOUT_CELL_TYPE),
         rollout_completions=read_rollout_completion_times(dump_dir),
@@ -160,6 +202,9 @@ def _assert_injections_spread_over_rollouts(injector: FaultInjectorHandle, *, du
 def _compute_crashed_rollouts(
     *, injected_at: list[datetime], rollout_completions: list[tuple[int, datetime]]
 ) -> set[int]:
+    # [FUNCTION DOC] HELPER: For each injection time, finds the rollout in progress: one more than
+    # the highest rollout id whose completion time is at or before the injection (zero when none
+    # had completed). Returns the set of those rollout ids.
     return {
         max((rollout_id for rollout_id, finished_at in rollout_completions if finished_at <= at), default=-1) + 1
         for at in injected_at
@@ -167,6 +212,9 @@ def _compute_crashed_rollouts(
 
 
 def _compare(dump_dir: str, mode: FTTestMode) -> None:
+    # [FUNCTION DOC] HELPER: Comparison hook. Runs the shared exact comparison of the baseline and
+    # target directories under the dump directory, requiring at least 2 trained rollouts, then
+    # prints a pass message. The mode argument is unused.
     compare_deterministic_sides(
         baseline_dir=f"{dump_dir}/{BASELINE_SIDE}",
         target_dir=f"{dump_dir}/{TARGET_SIDE}",

@@ -1,3 +1,10 @@
+# [MODULE DOC] CI smoke test of the Qwen3.8 Flash Next launcher on a 4-layer slice, on one node of
+# 8 GPUs with rollout routing replay (CUDA: 8-GPU H200 stage, estimated 1800 seconds, hopper and
+# blackwell; ROCm: nightly 8-GPU MI350, estimated 600 seconds; labels megatron and model-scripts).
+# Metric history gates on grad norm, PPO KL, train/rollout logprob absolute difference,
+# train/rollout KL and raw reward. Preparation is inline rather than from the launcher. Run as a
+# script: build args, prepare, strip all proxy environment variables (both cases), train.
+
 import os
 
 from scripts.run_qwen3_8_next import _MODEL_REGISTRY, ScriptArgs, _train
@@ -28,6 +35,11 @@ _MODEL_ORG = "CharyZeng"
 
 
 def _args() -> ScriptArgs:
+    # [FUNCTION DOC] HELPER: Builds launcher arguments from the environment with overrides: model
+    # Qwen3.8-Flash-Next-4layer, 1 node of 8 GPUs, 5 rollouts, response length 512, rollout routing
+    # replay on, no saving. Extra flags: CI test mode, KL and logprobs checkers disabled, offload
+    # the train target to CPU; on ROCm additionally the fla linear-attention backend for training
+    # and the Triton linear-attention prefill backend in SGLang.
     return ScriptArgs.from_env(
         model_name="Qwen3.8-Flash-Next-4layer",
         num_nodes=1,
@@ -48,6 +60,13 @@ def _args() -> ScriptArgs:
 
 
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Prepares inputs. Sets, in this process, the environment variable asking the
+    # converter to keep pipeline parallel size 1 and the one limiting CUDA device connections to 1.
+    # Creates the model, checkpoint and data directories; downloads the model (from the fixed
+    # model organization) into the arguments' HF checkpoint path; downloads the dapo-math-17k
+    # dataset; converts the checkpoint to Megatron format with tensor parallel 2 and pipeline
+    # parallel 1, using the launcher's model registry entry for the model name as both the model
+    # name and Megatron model type.
     U = args.create_backend()
     os.environ["CONVERT_KEEP_PP1"] = "1"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
@@ -66,6 +85,7 @@ def prepare(args: ScriptArgs):
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Launches training through the launcher's train step.
     _train(args)
 
 

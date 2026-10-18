@@ -1,3 +1,7 @@
+# [MODULE DOC] Comparison routine shared by FT tests that expect baseline and target runs to be
+# bit-identical. Defines the metric key prefixes that are compared (train and rollout) and those
+# deliberately ignored (perf).
+
 from pathlib import Path
 
 from tests.e2e.ft.conftest_ft.app import BASELINE_SIDE, TARGET_SIDE
@@ -30,6 +34,17 @@ def compare_deterministic_sides(
     min_trained_rollouts: int,
     exclude_keys: list[str] | None = None,
 ) -> None:
+    # [FUNCTION DOC] Asserts the baseline and target dump directories are exactly equal. Inputs:
+    # the two side directories, the minimum number of trained rollouts required for the gradient
+    # check, and optional metric keys to exclude from comparison. Steps in order: (1) both sides
+    # must have recorded no reconfigure events in their events sub-directory; (2) every metric in
+    # each side must be classified as compared or ignored by prefix; (3) metrics with the compared
+    # prefixes are compared with zero relative and absolute tolerance, minus excluded keys;
+    # (4) tensor dumps are compared with a threshold requiring zero relative difference for every
+    # name, tolerating skipped or failed input tensors matching the shared allow patterns;
+    # (5) inference engine weight checksums of the two sides are compared; (6) for each side,
+    # engine weights must have changed during training and gradients must be nonzero for at
+    # least the minimum number of trained rollouts. Raises assertion errors from any check.
     for side_dir in (baseline_dir, target_dir):
         assert_reconfigure_events(Path(side_dir) / EVENTS_DIRNAME, expected=[])
 

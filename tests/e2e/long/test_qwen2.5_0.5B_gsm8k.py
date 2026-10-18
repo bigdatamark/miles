@@ -1,3 +1,13 @@
+# [MODULE DOC] Long end-to-end GRPO training test on gsm8k with Qwen2.5-0.5B-Instruct, colocated
+# training and rollout on 2 GPUs, using the Megatron-to-HF bridge mode (CUDA: 2-GPU H200 stage,
+# estimated 7000 seconds, long label, hopper and blackwell; ROCm: nightly 2-GPU MI350 suite,
+# estimated 6800 seconds). Run as a script: prepare downloads model and data, strips all proxy
+# environment variables (both cases) from the process, then execute launches training. The run
+# passes only if the built-in CI metric checker finds eval accuracy on gsm8k at least 0.55 (a
+# loose threshold at 250 rollouts; the fault-tolerance gsm8k scenario must keep the same
+# threshold). The checkpoint is loaded straight from the Hugging Face directory (no
+# pre-conversion).
+
 import os
 
 from tests.ci.ci_register import register_cuda_ci, register_rocm_ci
@@ -16,6 +26,9 @@ NUM_GPUS = 2
 
 
 def prepare():
+    # [FUNCTION DOC] Creates the model and data directories, downloads the Qwen2.5-0.5B-Instruct
+    # model from Hugging Face into the model directory, and downloads the gsm8k dataset into the
+    # data directory, all through the default config's backend.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu(f"mkdir -p {MODEL_DIR} {DATA_DIR}")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir {MODEL_DIR}/{MODEL_NAME}")
@@ -23,6 +36,19 @@ def prepare():
 
 
 def execute():
+    # [FUNCTION DOC] Builds the training arguments and launches training on 2 GPUs through the
+    # default backend. Groups: checkpoint (the HF directory is both the model and the reference
+    # load); rollout (gsm8k train data, chat template, shuffling, math reward model, 250 rollouts
+    # or 3000 when the infinite-run environment switch is on, 32 prompts times 8 samples, response
+    # length 1024, temperature 1, oversampling batch 64 with a filter dropping groups whose reward
+    # has zero standard deviation, global batch 256); eval every 20 rollouts on the gsm8k test
+    # set (1 sample, length 1024, top-k 1); parallelism all 1 with sequence parallel, dynamic
+    # batch size and 9216 tokens per GPU; GRPO with a KL loss of coefficient 0, zero entropy
+    # coefficient and clip 0.2/0.28; Adam with learning rate 1e-6 constant, weight decay 0.1;
+    # SGLang with one GPU per engine, static memory fraction 0.7, metrics enabled; CI checks (KL
+    # checker disabled, gsm8k eval accuracy at least 0.55); and misc (zero dropout, fp32 gradient
+    # accumulation and softmax, flash attention, one actor node of 2 GPUs, colocated, bridge mode,
+    # rematerialize parameters from master weights). Wandb args are named after this file.
     U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint {MODEL_DIR}/{MODEL_NAME}/ " f"--ref-load {MODEL_DIR}/{MODEL_NAME}/ "
 

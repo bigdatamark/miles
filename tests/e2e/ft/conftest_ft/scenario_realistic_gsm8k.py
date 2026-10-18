@@ -1,6 +1,16 @@
 # NOTE: You MUST read tests/e2e/ft/README.md as source-of-truth and documentations
 # WARNING: Do NOT relax any assert logic in this file. All assertions must remain strict.
 
+# [MODULE DOC] Realistic gsm8k fault-recovery scenario. Trains Qwen2.5-0.5B-Instruct on gsm8k with
+# a disaggregated layout (4 training GPUs as 2 cells with context parallel 2, plus 4 single-GPU
+# rollout engines) while a background injector crashes trainer cells and rollout engines. The
+# run's built-in CI metric checker requires eval accuracy on gsm8k at or above a threshold
+# (default 0.55, which must stay identical to the no-fault baseline test), and healing is then
+# asserted with the shared random-crash witnesses. Defaults: seed 42, 250 rollouts, mean 600
+# seconds between trainer injections and 1200 seconds between rollout injections. The module
+# also exposes reusable pieces (prepare, train-arg builder, run orchestration) for other
+# scenarios, which inject their own fault forms, extra args and virtual cells.
+
 import os
 import shutil
 from collections.abc import Callable
@@ -65,6 +75,9 @@ DEFAULT_METRIC_THRESHOLD: float = 0.55
 
 @dataclass(frozen=True)
 class Gsm8kRun:
+    # [CLASS DOC] Immutable description of a prepared gsm8k run: API server base url, execution
+    # config, dump directory, the full train argument string, and a launcher callable that
+    # takes a config and starts training (blocking until it ends).
     base_url: str
     config: command_utils.ExecuteTrainConfig
     dump_dir: str
@@ -73,11 +86,14 @@ class Gsm8kRun:
 
     @property
     def events_dir(self) -> Path:
+        # [FUNCTION DOC] The events sub-directory of the dump directory.
         return Path(self.dump_dir) / EVENTS_DIRNAME
 
 
 @dataclass(frozen=True)
 class Gsm8kOutcome:
+    # [CLASS DOC] Immutable result of a finished run: the run description and the (already
+    # stopped) fault injector handle holding the event log.
     run: Gsm8kRun
     injector: FaultInjectorHandle
 
@@ -94,6 +110,11 @@ def run_ci(
     metric_threshold: MetricThresholdOption = DEFAULT_METRIC_THRESHOLD,
     fully_async: FullyAsyncOption = False,
 ) -> None:
+    # [FUNCTION DOC] Command and CI entry point. Runs the scenario with the default config, a test
+    # name suffixed for fully async, train and rollout FT components, per-cell-type mean intervals
+    # from the two crash interval options, standard fault forms for the backend, and no extra
+    # train args; then asserts healing with the shared random-crash witnesses and prints a pass
+    # message. Training fails (inside the run) if the eval accuracy metric is below threshold.
     test_name: str = f"{TEST_NAME}_fully_async" if fully_async else TEST_NAME
     outcome = run_realistic_gsm8k(
         config=command_utils.default_config(),
@@ -130,6 +151,17 @@ def run_realistic_gsm8k(
     get_virtual_cells: Callable[[], list[dict]] | None = None,
     enable_fault_tolerance: bool = True,
 ) -> Gsm8kOutcome:
+    # [FUNCTION DOC] Orchestrates one gsm8k run with fault injection and returns the outcome.
+    # Parameters: config; test name; seed; rollout count; accuracy threshold; fully-async flag;
+    # mean injection seconds per cell type; a factory building fault forms from the run; a
+    # function mapping the dump directory to extra train args; optional supplier of virtual
+    # cells; flag to enable fault tolerance (default true). Steps: create the backend; print
+    # settings; prepare model and data; remove all four proxy environment variables from the
+    # process (both cases); create the dump directory fresh (deleting any previous one so stale
+    # events are never read); build train args and append the debug event data location and the
+    # extra args; build the run (base url from backend host and fixed port; launcher bound to the
+    # train args); start the injector; launch training; always stop and join the injector.
+    # Exceptions from training propagate after the injector is stopped.
     U = create_backend_for_run(config)
     print(f"Seed: {seed}, Rollouts: {num_rollout}, Mean injection intervals: {mean_interval_seconds_of_cell_type}")
     print(f"Test: {test_name}, train script: {get_train_script(fully_async=fully_async)}")
@@ -181,6 +213,10 @@ def run_realistic_gsm8k(
 
 
 def prepare_gsm8k(U: BaseCommandBackend) -> None:
+    # [FUNCTION DOC] Prepares inputs through the given backend: creates model and data
+    # directories, downloads the Qwen2.5-0.5B-Instruct model, converts it to a Megatron
+    # checkpoint using 4 GPUs (Megatron path from an environment variable, default the root-home
+    # checkout), and downloads the gsm8k dataset.
     U.exec_command_cpu(f"mkdir -p {MODEL_DIR} {DATA_DIR}")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir {MODEL_DIR}/{MODEL_NAME}")
     U.convert_checkpoint(
@@ -204,6 +240,19 @@ def get_gsm8k_train_args(
     test_name: str,
     enable_fault_tolerance: bool = True,
 ) -> str:
+    # [FUNCTION DOC] Builds the full train argument string. Groups: checkpoint (HF checkpoint and
+    # torch-dist reference load); rollout (gsm8k train data, chat template, shuffling, math reward,
+    # the rollout count, batch 32 prompts times 8 samples, response length 1024, temperature 1,
+    # oversampling batch 64 with a non-zero reward standard deviation dynamic filter, global batch
+    # 256, plus fully-async args when requested); Adam optimizer (learning rate 1e-6, constant,
+    # weight decay 0.1); GRPO with clip 0.2/0.28 and zero entropy coefficient; wandb args named by
+    # test name with a seed-based run name prefix; performance (context parallel 2, dynamic batch
+    # size, 9216 tokens per GPU); eval every 20 rollouts on the gsm8k test set, 1 sample, length
+    # 1024, top-k 1; SGLang (4 rollout GPUs, 1 per engine, static memory fraction 0.7, metrics on);
+    # API server args and, when fault tolerance is enabled, the FT flags for train and rollout
+    # components and the mini FT controller; CI checks (KL checker disabled, accuracy key eval/gsm8k
+    # with the given threshold); and miscellaneous (zero dropout, fp32 grad accumulation and
+    # softmax, flash attention, one actor node with 4 GPUs).
     ckpt_args = f"--hf-checkpoint {MODEL_DIR}/{MODEL_NAME}/ " f"--ref-load {MODEL_DIR}/{MODEL_NAME}_torch_dist "
 
     rollout_args = (
@@ -299,6 +348,10 @@ def get_gsm8k_train_args(
 
 
 def _launch_gsm8k(config: command_utils.ExecuteTrainConfig, *, train_args: str, fully_async: bool) -> None:
+    # [FUNCTION DOC] HELPER: Starts training through the config's backend with the given
+    # arguments, 8 GPUs per node (train plus rollout GPUs), the scenario's Megatron model type, the
+    # chosen train script, and env vars that disable torch compile (avoiding slow, memory-heavy
+    # recompiles in respawned cells), turn off ray log dedup, and enable SGLang millisecond logs.
     create_backend_for_run(config).execute_train(
         train_args=train_args,
         num_gpus_per_node=TRAIN_GPUS + ROLLOUT_GPUS,

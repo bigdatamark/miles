@@ -1,5 +1,11 @@
 # NOTE: You MUST read tests/e2e/ft/README.md as source-of-truth and documentations
 
+# [MODULE DOC] Execution helpers for FT end-to-end tests: model/data preparation, assembly of the
+# training argument string, environment variables for deterministic runs, and the training
+# launcher. At import time it creates a unique temporary run directory holding the Megatron
+# source patcher config path, reads the Megatron path from an environment variable (default a
+# root-home Megatron-LM checkout), and resolves the model and data directories.
+
 import json
 import os
 import shutil
@@ -25,6 +31,11 @@ _DEBUG_ROLLOUT_DATA_DIR: str = f"{DATA_DIR}/{DEBUG_ROLLOUT_DATA_HF_REPO.split('/
 
 
 def materialize_cyclic_debug_rollout_data(count: int) -> str:
+    # [FUNCTION DOC] Builds a directory of count rollout files by symlinking, cyclically, to the
+    # downloaded debug rollout data files (those with all-digit stems, sorted numerically). File i
+    # links to the available file at index i modulo the number available. Creates a fresh temp
+    # directory inside the data directory with permissions 755 and returns its path. Raises a
+    # file-not-found error if no numbered rollout files exist.
     src = Path(_DEBUG_ROLLOUT_DATA_DIR)
     available = sorted(int(p.stem) for p in src.glob("*.pt") if p.stem.isdigit())
     if not available:
@@ -37,11 +48,20 @@ def materialize_cyclic_debug_rollout_data(count: int) -> str:
 
 
 def _get_hf_num_layers(model_path: str) -> int:
+    # [FUNCTION DOC] HELPER: Reads the config file in the model directory and returns its hidden
+    # layer count. Raises if the file or key is missing.
     with open(f"{model_path}/config.json") as f:
         return json.load(f)["num_hidden_layers"]
 
 
 def prepare(mode: FTTestMode, *, config: command_utils.ExecuteTrainConfig | None = None) -> None:
+    # [FUNCTION DOC] Prepares everything a run needs, using the backend for the given (or default)
+    # config. Steps: create the model and data directories; download the mode's Hugging Face model
+    # into the model directory; convert it to a Megatron checkpoint using the smaller of the
+    # train GPUs per node and the model layer count as the conversion GPU count; when the mode has
+    # no real rollout, download the debug rollout dataset; download the gsm8k dataset; finally
+    # write the thd-variant Megatron source patcher YAML to the run directory file.
+    # Side effects: network downloads, subprocess commands, GPU conversion, file writes.
     config = _resolve_config(config)
 
     U = create_backend_for_run(config)
@@ -69,6 +89,7 @@ def prepare(mode: FTTestMode, *, config: command_utils.ExecuteTrainConfig | None
 
 
 def _resolve_config(config: command_utils.ExecuteTrainConfig | None) -> command_utils.ExecuteTrainConfig:
+    # [FUNCTION DOC] HELPER: Returns the given config if truthy, otherwise the default config.
     return config or command_utils.default_config()
 
 
@@ -80,6 +101,21 @@ def get_common_train_args(
     enable_dumper: bool = True,
     debug_rollout_data_dir: str | None = None,
 ) -> str:
+    # [FUNCTION DOC] Builds the full space-separated training argument string for a mode.
+    # Inputs: mode, dump directory, optional step count (defaults to the mode's own count),
+    # dumper flag, optional debug rollout data directory (defaults to the downloaded one).
+    # Composition: checkpoint args (HF checkpoint and reference load of the torch-dist converted
+    # model); Adam optimizer with constant learning rate 1e-6, weight decay 0.1, betas 0.9/0.98,
+    # no warmup, fp32 gradient accumulation; rollout args; debug dump args; the mode's parallel
+    # args; misc args (zero dropout, flash attention, actor nodes and GPUs from the mode, global
+    # batch 256, dynamic batch size with 32768 max tokens per GPU, alltoall MoE dispatcher, GRPO
+    # advantage estimator, clip 0.2, number of rollouts); default wandb args for this file.
+    # Rollout args: without real rollout, loads debug rollout data files templated by rollout id
+    # with train-only debugging, batch 32 prompts times 8 samples. With real rollout, uses chat
+    # template messages, label key, shuffling, a deterministic random reward model, max response
+    # length 200, temperature 0.8, the same batch shape, the deterministic rollout flags, saves
+    # rollout data under the dump directory, and sets rollout GPUs total and per engine, plus
+    # colocation when the mode is colocated.
     ckpt_args = f"--hf-checkpoint {MODEL_DIR}/{mode.model_name} --ref-load {MODEL_DIR}/{mode.model_name}_torch_dist "
 
     optimizer_args = (
@@ -152,6 +188,10 @@ def get_common_train_args(
 
 
 def get_debug_dump_args(*, dump_dir: str, enable_dumper: bool) -> str:
+    # [FUNCTION DOC] Returns argument text that always saves debug event data under the dump
+    # directory's events folder, and, when the dumper is enabled, also sets the dumper directory
+    # (dump dir / dumps), enables forward/backward dumping with model values and grads and the
+    # parallel rank in file names, and points the train source patcher at the generated YAML.
     dumper_args: str = ""
     if enable_dumper:
         dumper_args = (
@@ -164,10 +204,15 @@ def get_debug_dump_args(*, dump_dir: str, enable_dumper: bool) -> str:
 
 
 def get_ft_args(mode: FTTestMode) -> str:
+    # [FUNCTION DOC] Returns arguments enabling fault tolerance for the mode's FT components, with
+    # the API server port set to 0 (let the system pick).
     return f"--use-fault-tolerance --ft-components {' '.join(mode.ft_components)} --api-server-port 0 "
 
 
 def get_api_server_args(config: command_utils.ExecuteTrainConfig | None = None) -> str:
+    # [FUNCTION DOC] Returns API server arguments with the fixed entrypoint port. For the
+    # Kubernetes cluster backend it also binds the host to all interfaces (0.0.0.0); otherwise
+    # only the port is set. Uses the default config when none is given.
     resolved = config if config is not None else command_utils.default_config()
     if resolved.cluster_backend is not ClusterBackend.KUBERNETES:
         return f"--api-server-port {API_SERVER_PORT} "
@@ -179,10 +224,14 @@ FULLY_ASYNC_TRAIN_SCRIPT: str = "train_async.py"
 
 
 def get_train_script(*, fully_async: bool) -> str:
+    # [FUNCTION DOC] Returns the async train script name when fully asynchronous, else the default
+    # train script name.
     return FULLY_ASYNC_TRAIN_SCRIPT if fully_async else DEFAULT_TRAIN_SCRIPT
 
 
 def get_fully_async_args(*, fully_async: bool) -> str:
+    # [FUNCTION DOC] Returns an empty string when not fully async; otherwise arguments enabling
+    # fully-async mode with in-place generation pausing.
     if not fully_async:
         return ""
     return "--fully-async --pause-generation-mode in_place "
@@ -206,6 +255,12 @@ _DETERMINISTIC_ENV_VARS: dict[str, str] = {
 def get_train_env_vars_arg(
     mode: FTTestMode, *, deterministic: bool, extra_env_vars: dict[str, str] | None = None
 ) -> str:
+    # [FUNCTION DOC] Builds the train environment-variables argument. Starts from an empty mapping;
+    # when deterministic, adds the deterministic variables (ring NCCL algorithm, disallow
+    # nondeterministic transformer-engine algorithms, cuBLAS workspace config, FlashInfer
+    # prefill split tile size 8192); when the mode has a real non-colocated rollout, enables
+    # expandable CUDA allocator segments; then merges extras (which win). Returns an empty string
+    # if the mapping is empty, otherwise an argument carrying the mapping as quoted JSON text.
     env_vars: dict[str, str] = {}
     if deterministic:
         env_vars.update(_DETERMINISTIC_ENV_VARS)
@@ -227,6 +282,12 @@ def run_training(
     config: command_utils.ExecuteTrainConfig | None = None,
     train_script: str = DEFAULT_TRAIN_SCRIPT,
 ) -> None:
+    # [FUNCTION DOC] Launches training through the config's backend. If a dump directory is given
+    # and exists, it is deleted first. Environment variables passed to the run are the
+    # deterministic set (always applied here, regardless of mode), eager mode (torch compile
+    # disabled, to avoid slow recompiles after crash respawns), ray log dedup off, SGLang
+    # millisecond logging, then caller extras (which win). Executes the train script with the
+    # arguments, node GPU count and Megatron model type from the mode, and the Megatron path.
     U = _resolve_config(config).create_backend()
     if dump_dir is not None and os.path.exists(dump_dir):
         shutil.rmtree(dump_dir)

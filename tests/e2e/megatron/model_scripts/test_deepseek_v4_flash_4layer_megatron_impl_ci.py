@@ -1,3 +1,11 @@
+# [MODULE DOC] CI smoke test of a 4-layer FP8 slice of DeepSeek V4 Flash on gsm8k using the
+# Megatron-native implementation (cuDNN sparse-attention kernel backend on CUDA), on one node of
+# 4 GPUs, driven through the V4 launcher script. Registrations: CUDA 4-GPU H200 stage (estimated
+# 1100 seconds, hopper and blackwell) and AMD ROCm nightly 4-GPU MI350 (estimated 900 seconds),
+# labels megatron and model-scripts, with metric history gates on grad norm, PPO KL, train/rollout
+# logprob absolute difference, train/rollout KL and raw reward. Run as a script: build args,
+# prepare, strip all proxy environment variables (both cases), train.
+
 import os
 
 from scripts.run_deepseek_v4 import ScriptArgs, _prepare_download, _prepare_single, _prepare_spmd, _train
@@ -24,6 +32,13 @@ register_ci_gate(metric_key="rollout/raw_reward")
 
 
 def _args() -> ScriptArgs:
+    # [FUNCTION DOC] HELPER: Builds launcher arguments directly (not from the environment): model
+    # DeepSeek-V4-Flash-FP8-4layer, gsm8k, evaluation off, 1 node of 4 GPUs, H200 hardware, no
+    # saving, no fault tolerance, rollout batch 4 with 4 samples per prompt, the Megatron
+    # implementation with the cuDNN kernel backend; extra flags: CI test mode, allow quantization
+    # error in the weight-update check, disable the logprobs checker, 2 rollouts. When the hardware
+    # platform environment variable says ROCm, the kernel backend is set to none and an extra
+    # training environment variable disabling FP32 scales for FP8 block scaling is appended.
     args = ScriptArgs(
         model_name="DeepSeek-V4-Flash-FP8-4layer",
         task="gsm8k",
@@ -48,6 +63,9 @@ def _args() -> ScriptArgs:
 
 
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Runs the launcher's download, single-node conversion and SPMD conversion
+    # steps in order (no file lock, unlike the Miles-implementation variant); then, if the
+    # arguments have no HF checkpoint path, sets it to the model's local directory plus model name.
     _prepare_download(args)
     _prepare_single(args)
     _prepare_spmd(args)
@@ -56,6 +74,7 @@ def prepare(args: ScriptArgs):
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Launches training through the launcher's train step.
     _train(args)
 
 

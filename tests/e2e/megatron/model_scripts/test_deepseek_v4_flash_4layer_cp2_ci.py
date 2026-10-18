@@ -1,3 +1,10 @@
+# [MODULE DOC] CI variant of the V4 Flash 4-layer base test that sets context parallel size to 2.
+# Registrations: CUDA 4-GPU H200 stage (estimated 1000 seconds, hopper and blackwell) and AMD
+# ROCm nightly 4-GPU MI350 (estimated 700 seconds), labels megatron and model-scripts, with the
+# same five metric history gates as the base. The preparation and execution functions are the
+# base module's own; only the arguments differ. Run as a script: build args, prepare, strip all
+# proxy environment variables (both cases), train.
+
 """Smoke run of DeepSeek-V4-Flash's CP path: the 4-layer RL case on four GPUs (miles impl).
 
 The base case (test_deepseek_v4_flash_4layer_ci.py) at TP2 with sequence parallelism, CP2 with the
@@ -30,6 +37,7 @@ execute = base.execute
 
 
 def _args():
+    # [FUNCTION DOC] HELPER: The base test's arguments with the context-parallel size replaced by 2.
     return dataclasses.replace(base._args(), cp_size=2)
 
 

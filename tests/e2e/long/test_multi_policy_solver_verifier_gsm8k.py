@@ -1,3 +1,15 @@
+# [MODULE DOC] Long end-to-end test of the multi-policy solver/verifier gsm8k example recipe
+# (CUDA: 4-GPU H200 stage, estimated 21600 seconds, long label, hopper and blackwell; ROCm:
+# nightly 4-GPU MI350 suite, estimated 24000 seconds). Run as a script: takes the example's
+# default script arguments from the default config, overrides the rollout count with an
+# environment variable (default 250), runs the example's prepare step, removes all proxy
+# environment variables (both cases) from the process, and runs the shared multi-policy execute
+# helper with default wandb args and per-model evaluation score bounds. The bounds (calibrated
+# from a full 250-rollout run, set at about a third of the observed growth) require, for the
+# solver, an initial score at most 0.52, a peak at least 0.53 and growth at least 0.03, and for
+# the verifier an initial score at most 0.65, a peak at least 0.70 and growth at least 0.08.
+# Importing only registers the test and defines the constants.
+
 import dataclasses
 import os
 

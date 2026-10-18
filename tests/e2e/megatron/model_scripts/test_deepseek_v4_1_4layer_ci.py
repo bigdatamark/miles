@@ -1,3 +1,10 @@
+# [MODULE DOC] CI smoke test of a 4-layer slice of DeepSeek V4.1 on gsm8k, on one node of 8 GPUs,
+# driven through the V4.1 launcher script (CUDA: 8-GPU H200 stage, estimated 1900 seconds, labels
+# megatron and model-scripts, hopper and blackwell). Registers metric history gates on grad
+# norm, PPO KL, train/rollout logprob absolute difference, train/rollout KL and raw reward.
+# Run as a script: build args, prepare, strip all proxy environment variables (both cases),
+# train.
+
 import fcntl
 import os
 from pathlib import Path
@@ -21,6 +28,11 @@ register_ci_gate(metric_key="rollout/raw_reward")
 
 
 def _args() -> ScriptArgs:
+    # [FUNCTION DOC] HELPER: Builds the launcher arguments from the environment with overrides:
+    # model DeepSeek-V4.1-4layer, gsm8k task, evaluation off, 1 node of 8 GPUs, H200 hardware,
+    # load directly from the Hugging Face checkpoint, no saving, no fault tolerance, optimizer
+    # offload, full recompute. Extra flags: CI test mode, KL checker disabled, allow quantization
+    # error in the weight-update check, 2 rollouts, and no pinned CPU gradient/parameter memory.
     return ScriptArgs.from_env(
         model_name="DeepSeek-V4.1-4layer",
         task="gsm8k",
@@ -45,6 +57,11 @@ def _args() -> ScriptArgs:
 
 
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Ensures the model is downloaded once even if several jobs share the model
+    # directory: creates the directory, opens a hidden per-model lock file in it (appending) and
+    # takes an exclusive blocking file lock, then runs the launcher's download step under the lock
+    # (the lock is released when the file closes). Afterwards, if the arguments have no HF
+    # checkpoint path, sets it to the model directory plus model name.
     model_dir = Path(args.model_dir)
     model_dir.mkdir(parents=True, exist_ok=True)
     lock_path = model_dir / f".{args.model_name}.ci-prepare.lock"
@@ -56,6 +73,7 @@ def prepare(args: ScriptArgs):
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Launches training through the launcher's train step.
     _train(args)
 
 

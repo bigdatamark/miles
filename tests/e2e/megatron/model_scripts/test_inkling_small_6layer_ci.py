@@ -1,3 +1,12 @@
+# [MODULE DOC] CI smoke test of a 6-layer slice of Inkling Small with full-parameter training
+# on dapo-math, on one node of 4 GPUs (one rollout engine across all 4). The AMD variant of the
+# launcher is imported when the hardware platform environment variable says ROCm. Registrations:
+# CUDA 4-GPU H200 stage (estimated 900 seconds, hopper and blackwell) and AMD ROCm 4-GPU MI350
+# stage (estimated 1800 seconds); labels megatron and model-scripts (plus amd on ROCm). Metric
+# history gates on grad norm, PPO KL, train/rollout logprob absolute difference, train/rollout
+# KL and raw reward. Run as a script: build args, prepare, strip all proxy environment variables
+# (both cases), train.
+
 import os
 
 if os.getenv("MILES_HARDWARE_PLATFORM") == "rocm":
@@ -31,6 +40,12 @@ _MODEL_ORG = "pb09204048"
 
 
 def _args() -> ScriptArgs:
+    # [FUNCTION DOC] HELPER: Builds launcher arguments from the environment with overrides: model
+    # Inkling-Small-6layer, full train mode, dapo-math task, 1 node of 4 GPUs with 4 GPUs per
+    # rollout engine, 2 rollouts of 4 prompts times 4 samples, global batch 16, response length
+    # 512, SGLang context length 1024. Extra flags: CI test mode, KL and logprobs checkers
+    # disabled, skip visual and audio parameters in the weight-update check, offload the train
+    # target to CPU.
     return ScriptArgs.from_env(
         model_name="Inkling-Small-6layer",
         train_mode="full",
@@ -55,6 +70,10 @@ def _args() -> ScriptArgs:
 
 
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Creates the model and data directories; downloads the model (from the fixed
+    # model organization) into the arguments' HF checkpoint path; downloads the dapo-math-17k
+    # dataset into the data directory; converts the checkpoint to Megatron format on the node's
+    # GPUs, looking the Megatron model type up in the launcher's model registry by model name.
     U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.model_dir} {args.data_dir}")
     U.exec_command_cpu(f"hf download {_MODEL_ORG}/{args.model_name} --local-dir {args.hf_checkpoint}")
@@ -70,6 +89,7 @@ def prepare(args: ScriptArgs):
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Launches training through the launcher's train step.
     _train(args)
 
 

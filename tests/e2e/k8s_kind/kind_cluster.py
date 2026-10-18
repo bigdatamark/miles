@@ -1,4 +1,11 @@
 # doc-dev: docs/developer/reconcile-loop.md
+# [MODULE DOC] HELPER: Creates and deletes kind clusters, locating or downloading a pinned kind
+# binary. A kind on the search path is used only when its reported version equals the pinned one
+# (v0.32.0); otherwise a copy is cached under the user's cache directory, downloaded once from the
+# kind release site for the host operating system (linux or darwin) and architecture (amd64 or
+# arm64) and verified against a pinned SHA-256 digest before being made executable and moved into
+# place. Cluster creation waits up to 180 seconds for readiness.
+
 from __future__ import annotations
 
 import hashlib
@@ -28,24 +35,37 @@ _KIND_SHA256 = {
 
 @dataclass(frozen=True)
 class KindCluster:
+    # [CLASS DOC] HELPER: Immutable handle of a cluster: its kind cluster name and the path of the
+    # kubeconfig file that reaches it.
     name: str
     kubeconfig: Path
 
 
 def create_cluster(*, run_id: str, kubeconfig: Path) -> KindCluster:
+    # [FUNCTION DOC] HELPER: Runs the kind create command for a cluster named by the run id, writing
+    # its kubeconfig to the given path and waiting up to 180 seconds for readiness. Raises on a
+    # failing command. Returns the cluster handle.
     _run_kind("create", "cluster", "--name", run_id, "--kubeconfig", str(kubeconfig), "--wait", _READY_TIMEOUT)
     return KindCluster(name=run_id, kubeconfig=kubeconfig)
 
 
 def delete_cluster(cluster: KindCluster) -> None:
+    # [FUNCTION DOC] HELPER: Runs the kind delete command for the cluster and its kubeconfig; raises
+    # on a failing command.
     _run_kind("delete", "cluster", "--name", cluster.name, "--kubeconfig", str(cluster.kubeconfig))
 
 
 def _run_kind(*args: str) -> None:
+    # [FUNCTION DOC] HELPER: Runs the resolved kind binary with the arguments, output not captured
+    # (streams to the console), raising on a non-zero exit.
     run_process([_resolve_kind_binary(), *args], capture_output=False, check=True)
 
 
 def _resolve_kind_binary() -> str:
+    # [FUNCTION DOC] HELPER: Returns the path of a kind binary of the pinned version. Prefers the
+    # one on the search path when its version matches; if it does not match, logs a warning and
+    # ignores it. Otherwise uses the cached binary named with the pinned version, downloading it
+    # first if absent.
     installed = shutil.which("kind")
     if installed is not None:
         if (installed_version := _installed_kind_version(installed)) == _KIND_VERSION:
@@ -62,6 +82,9 @@ def _resolve_kind_binary() -> str:
 
 
 def _installed_kind_version(binary: str) -> str | None:
+    # [FUNCTION DOC] HELPER: Runs the binary's version command; returns none on a non-zero exit,
+    # else the second whitespace-separated word of its output (the version) or none if there is
+    # no second word.
     result = run_process([binary, "version"], capture_output=True, check=False)
     if result.returncode != 0:
         return None
@@ -70,6 +93,12 @@ def _installed_kind_version(binary: str) -> str | None:
 
 
 def _download_kind(destination: Path) -> None:
+    # [FUNCTION DOC] HELPER: Downloads the pinned kind release for the host platform to the
+    # destination. Looks up the pinned digest (key error for an unsupported OS/arch combination),
+    # logs a warning, creates the parent directory, downloads over the network to a sibling file
+    # with a partial suffix, asserts its SHA-256 equals the pinned digest, makes it executable
+    # (mode 755), and atomically moves it to the destination. Side effects: network download and
+    # file writes; the partial file is left behind if the digest check fails.
     platform_key = f"{_host_os()}-{_host_arch()}"
     expected_digest = _KIND_SHA256[platform_key]
     url = f"https://kind.sigs.k8s.io/dl/{_KIND_VERSION}/kind-{platform_key}"
@@ -87,11 +116,15 @@ def _download_kind(destination: Path) -> None:
 
 
 def _host_os() -> str:
+    # [FUNCTION DOC] HELPER: Returns the platform name (linux or darwin); asserts no other
+    # platform is in use.
     assert sys.platform in ("linux", "darwin"), f"kind is only wired up for linux and darwin, got {sys.platform=}"
     return sys.platform
 
 
 def _host_arch() -> str:
+    # [FUNCTION DOC] HELPER: Maps the machine type to amd64 (x86_64 or amd64) or arm64 (arm64 or
+    # aarch64); asserts the machine is one of those.
     machine = platform.machine()
     arch = {"x86_64": "amd64", "amd64": "amd64", "arm64": "arm64", "aarch64": "arm64"}.get(machine)
     assert arch is not None, f"unsupported machine for a kind download {machine=}"

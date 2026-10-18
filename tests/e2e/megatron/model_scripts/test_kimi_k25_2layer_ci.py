@@ -1,3 +1,11 @@
+# [MODULE DOC] CI smoke test of the Kimi K2.5 launcher (mixture-of-experts with multi-head latent
+# attention, INT4 rollout and bf16 Megatron bridge training) on a 2-layer pruned model on one
+# node of 4 H200 GPUs (CUDA: 4-GPU H200 stage, estimated 1000 seconds, labels megatron and
+# model-scripts, hopper and blackwell). Only checks the script works, not accuracy. Metric
+# history gates on grad norm, PPO KL, train/rollout logprob absolute difference, train/rollout
+# KL and raw reward. Run as a script: build args, prepare, strip all proxy environment variables
+# (both cases), train.
+
 import os
 
 from scripts.run_kimi_k25 import ScriptArgs, _convert_to_bf16, _execute_train, _prepare_download
@@ -22,6 +30,10 @@ register_ci_gate(metric_key="rollout/raw_reward")
 
 
 def _args() -> ScriptArgs:
+    # [FUNCTION DOC] HELPER: Builds launcher arguments from the environment with overrides: H200
+    # hardware, model Kimi-K2.5-2layer, 1 node of 4 GPUs, 2 rollouts of 4 prompts times 4 samples,
+    # global batch 16, extra flags enabling CI test mode, disabling the logprobs checker and
+    # skipping the actor forward-only pass.
     return ScriptArgs.from_env(
         hardware="H200",
         model_name="Kimi-K2.5-2layer",
@@ -36,6 +48,8 @@ def _args() -> ScriptArgs:
 
 
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Creates the output directory through the arguments' backend, runs the
+    # launcher's download step, then converts the checkpoint to bf16.
     U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.output_dir}")
     _prepare_download(args)
@@ -43,6 +57,7 @@ def prepare(args: ScriptArgs):
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Launches training through the launcher's train step.
     _execute_train(args)
 
 

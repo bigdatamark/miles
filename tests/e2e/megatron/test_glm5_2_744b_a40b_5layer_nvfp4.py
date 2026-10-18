@@ -1,3 +1,15 @@
+# [MODULE DOC] Self-contained CI test of a 5-layer slice of GLM-5.2 with NVFP4 (4-bit float)
+# expert training and rollout on 8 GPUs (4 actor GPUs, 4 rollout GPUs in engines of 2), for
+# Blackwell hardware (CUDA: 8-GPU B200 stage, estimated 1500 seconds, labels megatron and
+# model-scripts). Defines model and path constants, a dictionary of NVFP4-related environment
+# variables (transformer engine and flashinfer settings: disabled 2D quantization, random
+# Hadamard transform and stochastic rounding, row-scaled activations, dequantized backward
+# override, "4over6" scale selection with MSE error mode, per-token activation in SGLang), a
+# dictionary of GLM-5 sparse-attention and DeepEP variables, a transformer-engine precision config
+# text (routed expert projections in NVFP4, everything else bf16), a checkpoint validator, a
+# prepare step and an execute step. Run as a script: prepare, strip all proxy environment
+# variables (both cases), execute.
+
 import json
 import os
 from pathlib import Path
@@ -85,6 +97,12 @@ matchers:
 
 
 def _validate_glm_checkpoint():
+    # [FUNCTION DOC] HELPER: Checks the downloaded model's config file. Raises a file-not-found
+    # error if it does not exist. Raises a runtime error if the model type is not the native GLM
+    # mixture-of-experts sparse-attention type, the architecture list is not exactly the native
+    # causal LM class, or the hidden layer count is not 5; and raises a runtime error if the
+    # config contains an auto-map entry (a custom-code remote class mapping, meaning an outdated
+    # checkpoint).
     config_path = Path(MODEL_DIR) / MODEL_NAME / "config.json"
     if not config_path.exists():
         raise FileNotFoundError(f"{config_path} not found")
@@ -107,6 +125,14 @@ def _validate_glm_checkpoint():
 
 
 def prepare():
+    # [FUNCTION DOC] Prepares model and data through the default backend. Steps: add the NVFP4
+    # environment variables to this process; create the model and dataset directories; download
+    # the Pinaster GLM-5.2 5-layer checkpoint and the dapo-math-17k dataset; validate the
+    # checkpoint config; delete any earlier NVFP4 output directory and Megatron checkpoint
+    # directory; run the NVFP4 conversion tool on GPUs, keeping the first and last layer in bf16;
+    # convert the original checkpoint to a Megatron checkpoint on a single GPU with all
+    # parallel sizes 1, using the TransformerEngine-plus-Megatron path list. Side effects:
+    # deletions, downloads, subprocesses, environment mutation.
     U = command_utils.default_config().create_backend()
     os.environ.update(NVFP4_ENV)
     U.exec_command_cpu(f"mkdir -p {MODEL_DIR} {DATA_DIR}")
@@ -141,6 +167,25 @@ def prepare():
 
 
 def execute():
+    # [FUNCTION DOC] Launches training on 8 GPUs. Adds the NVFP4 and GLM-5 environment variables to
+    # this process, sets the ray temporary directory variable to a default if unset, and
+    # registers the precision config text as a pseudo-file. Arguments: HF checkpoint is the NVFP4
+    # directory, reference load is the Megatron checkpoint; rollout (dapo-math-17k, deepscaler
+    # reward, 2 rollouts of 4 prompts times 4 samples, response length only 100, temperature 1,
+    # global batch 16); parallelism (tensor and expert parallel 4, sequence parallel, full
+    # uniform recompute, dynamic batch size at 2048 tokens per GPU, padding multiple 1024,
+    # log-prob chunk 16384); GRPO with KL loss and coefficients 0 and truncated importance
+    # sampling (clip 0.5 to 2.0); Adam with CPU offload; SGLang with data-parallel attention, the
+    # sparse-attention backend with flash MLA KV decode and sparse prefill, flashinfer top-k, fp8
+    # KV cache, page size 64, engines of 2 GPUs with expert and data parallel 2, flashinfer
+    # TRT-LLM routed MoE runner, CUDA graph batch 256, up to 512 running requests, chunked prefill
+    # of 4096, watchdog 3600 seconds; CI flags (KL, logprobs and weight-update checkers all
+    # disabled); mixed precision (NVFP4 e2m1 recipe, first/last layer bf16, precision config
+    # file); misc (routing replay, Miles router, no shared expert fusion, zero dropout, flash
+    # attention, all-gather context parallel, broadcast-packed weight updates with 2 GiB buffer, 4
+    # actor GPUs, 4 rollout GPUs, fault tolerance, DeepEP flex dispatcher, detail dumps under a
+    # shared directory named by the run id). Environment variables from both dictionaries are
+    # passed to the training process.
     U = command_utils.default_config().create_backend()
     os.environ.update(NVFP4_ENV)
     os.environ.update(GLM5_ENV)

@@ -1,3 +1,11 @@
+# [MODULE DOC] AMD 4-GPU case of GLM-4.7-Flash: speculative decoding with MTP training, rollout
+# routing replay, bf16, one SGLang engine of 4 GPUs (tensor parallel 4), Megatron tensor parallel
+# 2 and pipeline parallel 2 with context parallel 1 and expert parallel 2, colocated (the case
+# defaults). Registers only an AMD ROCm test (4-GPU MI350 stage, estimated 1100 seconds, labels
+# megatron and amd) that is currently disabled with a FIXME reason, plus metric history gates on
+# grad norm, PPO KL, train/rollout logprob absolute difference, train/rollout KL and raw reward.
+# Run as a script: strip all proxy environment variables (both cases), prepare the case, execute.
+
 """AMD 4-GPU variant of test_spec_mtptrain_r3_bf16_sgl_tp4_meg_tp2pp2.py.
 
 Standalone rather than an IS_HIP branch in the original: the MI300X fleet is

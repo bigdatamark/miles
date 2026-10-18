@@ -1,3 +1,16 @@
+# [MODULE DOC] Self-contained CI test of a 5-layer slice of DeepSeek V3.2 with MXFP8 (block-scaled
+# 8-bit float) training and rollout on 8 GPUs (4 actor GPUs, 4 rollout GPUs in engines of 2), for
+# Blackwell hardware (CUDA: 8-GPU B200 stage, estimated 3600 seconds, labels megatron and
+# model-scripts). The registration is currently disabled. Defines the model and path constants,
+# a transformer-engine precision config text keeping selected attention, shared expert and
+# indexer projections in bf16, a prepare step (download, convert to bf16, quantize to MXFP8
+# keeping the first and last layer and selected projections in bf16, convert to Megatron) and an
+# execute step. Run as a script: prepare, strip all proxy environment variables (both cases),
+# execute.
+# KNOWN ISSUE: the disabled reason refers to a test named after the V3.2 5-layer CI on H100, but
+# the sibling V3.2 5-layer test in this folder is the fp8 one registered on H200.
+# KNOWN ISSUE: the run id constant is created but never used.
+
 import os
 
 from tests.ci.ci_register import register_cuda_ci
@@ -77,6 +90,13 @@ matchers:
 
 
 def prepare():
+    # [FUNCTION DOC] Prepares model and data through the default backend. Steps: create the model
+    # and dataset directories; download the Pinaster DeepSeek-V3.2-5layer checkpoint and the
+    # dapo-math-17k dataset; cast the FP8 checkpoint to bf16 into a sibling directory with a bf16
+    # suffix; run the MXFP8 conversion tool on GPUs from the bf16 copy into a directory with an
+    # MXFP8 suffix, keeping the first and last layer in bf16 and additionally keeping the kv up
+    # projection, shared experts, and the indexer query-b, key and weights projections in higher
+    # precision; convert the bf16 checkpoint to a Megatron checkpoint using the 4 actor GPUs.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu(f"mkdir -p {MODEL_DIR} {DATA_DIR}")
     U.exec_command_cpu(f"hf download {MODEL_ORG}/{MODEL_NAME} --local-dir {MODEL_DIR}/{MODEL_NAME}")
@@ -112,6 +132,22 @@ def prepare():
 
 
 def execute():
+    # [FUNCTION DOC] Launches training on 8 GPUs. Sets the ray temporary directory environment
+    # variable to a default if unset and registers the precision config text as a pseudo-file.
+    # Arguments: HF checkpoint is the MXFP8 directory, reference load is the Megatron checkpoint;
+    # rollout (dapo-math-17k, deepscaler reward, 2 rollouts of 4 prompts times 4 samples, response
+    # length 8192, temperature 1, global batch 16, data balancing); parallelism (tensor and expert
+    # parallel 4, sequence parallel, full uniform recompute of 1 layer, dynamic batch size with
+    # 32768 tokens per GPU, padding multiple 4096, log-prob chunk 1024); GRPO with KL loss
+    # coefficient 0; Adam learning rate 1e-6 with CPU optimizer offload and precision-aware
+    # optimizer; SGLang with the sparse-attention backend and flash MLA sparse decode/prefill,
+    # flashinfer top-k, bf16 KV cache, page size 64, engines of 2 GPUs with data-parallel
+    # attention, flashinfer TRT-LLM FP8 GEMM and routed MoE runner, CUDA graph batch 256; mixed
+    # precision (MXFP8 recipe, e4m3 format, first/last layer bf16, high-precision layer lists for
+    # HF and Megatron names, the TE precision config file); routing replay, no shared expert
+    # fusion, zero dropout, flash attention, all-gather context parallel, update-weight buffer of
+    # 2 GiB, 4 actor GPUs and 4 rollout GPUs, fault tolerance enabled. Extra environment variables
+    # control the sparse-attention top-k fusion and tie-breaking and disable NCCL use by NVSHMEM.
     U = command_utils.default_config().create_backend()
     os.environ.setdefault("RAY_TMPDIR", "/tmp/ray")
     te_precision_config_path = command_utils.encode_pseudo_file(TE_PRECISION_CONFIG)

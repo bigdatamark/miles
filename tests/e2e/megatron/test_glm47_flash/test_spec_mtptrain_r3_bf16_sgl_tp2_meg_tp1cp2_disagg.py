@@ -1,3 +1,12 @@
+# [MODULE DOC] GLM-4.7-Flash case: disaggregated (not colocated) training on 2 GPUs (context
+# parallel 2, expert parallel 2 folded onto the CP ranks, tensor and pipeline parallel 1) with
+# one rollout engine of 2 GPUs (tensor parallel 2), weights broadcast over NCCL, speculative
+# decoding with MTP training and rollout routing replay on (case defaults), bf16, responses up to
+# 4096 tokens and 2048 tokens per GPU. Registers a CUDA test (4-GPU H200 stage, estimated 1700
+# seconds, labels megatron, weight-update and replay, hopper and blackwell) and metric history
+# gates on grad norm, PPO KL, train/rollout logprob absolute difference, train/rollout KL and raw
+# reward. Run as a script: strip all proxy environment variables (both cases), prepare, execute.
+
 import os
 
 from tests.ci.ci_register import register_cuda_ci

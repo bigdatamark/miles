@@ -1,3 +1,10 @@
+# [MODULE DOC] GPU acceptance test of multi-tenant LoRA serving through a real Tinker-compatible
+# gateway: runs the multi-tenant example client script in multi mode with 4 concurrent clients,
+# rank-8 adapters, 12 steps, learning rate 1e-3 and 24 max sampled tokens, which has the tenants
+# learn distinct markers and sample their own adapter snapshots. Registers a CUDA test (8-GPU
+# H100 stage, estimated 400 seconds, multi-lora label, hopper only). Run as a script: prepare
+# the model, then execute.
+
 """Concurrent tenants learn distinct markers and sample their own adapter snapshots."""
 
 from tests.ci.ci_register import register_cuda_ci
@@ -14,6 +21,9 @@ register_cuda_ci(
 
 
 def execute():
+    # [FUNCTION DOC] Starts the gateway (waiting until healthy), runs the multi-tenant example
+    # client as a subprocess with the gateway url and base model, and stops the gateway
+    # afterwards. Raises if the gateway fails to start or the client command fails.
     U = command_utils.default_config().create_backend()
     with running_gateway() as base_url:
         U.exec_command_cpu(

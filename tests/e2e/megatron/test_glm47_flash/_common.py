@@ -1,3 +1,13 @@
+# [MODULE DOC] HELPER: Shared case description and driver for the GLM-4.7-Flash end-to-end tests.
+# A case config dataclass captures one topology and feature combination (parallel sizes, SGLang
+# engine layout and DP attention, DeepEP, FP8 or INT4 rollout, bridge, speculative decoding with
+# MTP training, rollout routing replay, BSHD vs THD layout, colocation, fully async, optimizer),
+# with validation of mutually dependent fields. Provides model/checkpoint preparation, a builder
+# of the full training argument string for a case, and an executor. Constants: model name and
+# Megatron type, a global batch size of 32, the DeepEP low-latency dispatch limit of 128 tokens
+# per rank, and a tight-host-memory switch (environment variable, default on) that stores optimizer
+# state in half precision for Adam.
+
 import os
 from dataclasses import dataclass
 from typing import Literal
@@ -18,6 +28,19 @@ DEEPEP_LOW_LATENCY_MAX_TOKENS_PER_RANK = 128
 
 @dataclass
 class CaseConfig:
+    # [CLASS DOC] HELPER: One test case. Required fields: GPUs per node, context-parallel size,
+    # pipeline-parallel size, GPUs per SGLang engine, tensor-parallel size, expert-parallel size.
+    # Optional fields (defaults): SGLang expert-parallel size and data-parallel size (none),
+    # SGLang DP attention (false), DeepEP use (false) with its mode ("auto") and dispatcher output
+    # dtype (none, meaning the auto setting that dispatches FP8 even for a bf16 model on the
+    # DeepGEMM runner), FP8 rollout (false; serves a blockwise FP8 checkpoint against bf16
+    # training, re-quantizing on weight updates), INT4 rollout (false), bridge (false),
+    # speculative decoding from the checkpoint's MTP layer with MTP training (true), rollout
+    # routing replay (true), qkv format ("thd" dynamic batches or "bshd" fixed micro-batches),
+    # micro batch size (none), max tokens per GPU (8192), rollout response length (8192),
+    # colocation (true), rollout GPUs (none), weight update transfer mode (none), rollout count
+    # (2), fully async (false), optimizer (adam or dist_muon), extra raw args (empty).
+    # KNOWN ISSUE: the INT4 rollout and bridge fields are not read anywhere in this module.
     num_gpus_per_node: int
     cp_size: int
     pp_size: int
@@ -54,6 +77,18 @@ class CaseConfig:
     extra_args: str = ""
 
     def __post_init__(self):
+        # [FUNCTION DOC] Validates the case, raising a value error (or an assertion error for the
+        # transfer mode) when: the optimizer is not adam or dist_muon; fully async is combined with
+        # colocation; GPUs per node is not divisible by context-parallel times pipeline-parallel
+        # size; non-colocated without a rollout GPU count; the rollout pool (node GPUs if colocated
+        # else rollout GPUs) is not divisible by GPUs per engine; the transfer mode is set but is
+        # not broadcast; DP attention is on without a DP size dividing the engine size; FP8
+        # rollout is combined with SGLang attention tensor-parallel above 2 (kv projection shard
+        # would not be a multiple of the 128-row FP8 block); a dispatcher output dtype is set
+        # without DeepEP; the BSHD layout is mismatched with the micro batch size being set; or, for
+        # BSHD, the micro batch size is below 2 or exceeds the samples per data-parallel rank per
+        # step (global batch 32 over the data-parallel size from node GPUs divided by tensor,
+        # context and pipeline sizes).
         if self.optimizer not in ("adam", "dist_muon"):
             raise ValueError(f"unsupported optimizer: {self.optimizer}")
         # Validation only — topology values are passed explicitly, not inferred.
@@ -103,10 +138,19 @@ class CaseConfig:
 
     @property
     def sglang_attn_tp_size(self) -> int:
+        # [FUNCTION DOC] SGLang attention tensor-parallel size: GPUs per engine divided by the DP
+        # size when DP attention is on, else the GPUs per engine (integer division). Fails with a
+        # type error if DP attention is on and the DP size is none (the validation step checks
+        # the DP size before it reads this property).
         return self.rollout_num_gpus_per_engine // (self.sglang_dp_size if self.sglang_enable_dp_attention else 1)
 
 
 def prepare(case: CaseConfig) -> None:
+    # [FUNCTION DOC] Prepares model and data through the default backend: creates fixed root-level
+    # model and dataset directories; downloads GLM-4.7-Flash; when the case uses FP8 rollout also
+    # downloads the blockwise FP8 checkpoint into a sibling directory with an FP8 suffix; downloads
+    # the dapo-math-17k and aime-2024 datasets (default locations); converts the base checkpoint
+    # to a Megatron checkpoint using the case's GPUs per node.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download zai-org/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -123,6 +167,31 @@ def prepare(case: CaseConfig) -> None:
 
 
 def build_train_args(case: CaseConfig, *, wandb_file: str) -> str:
+    # [FUNCTION DOC] Builds the space-separated training argument string for a case; the wandb file
+    # name is used for default wandb args. Reads the eval-enable environment variable (default
+    # off). Sections: checkpoint (the FP8 directory as HF checkpoint when FP8 rollout, else the base
+    # model; reference load is the converted bf16 Megatron checkpoint); rollout (dapo-math-17k,
+    # deepscaler reward, case rollout count, 8 prompts times 8 samples, case response length,
+    # temperature 1, global batch 32); eval args (aime24, 1 sample, length 16384, top-k 1, with an
+    # interval of 20 only when eval is enabled; the eval data args are included regardless);
+    # parallelism (case sizes, sequence parallel, expert tensor parallel 1, full uniform recompute
+    # of 1 layer, a last-pipeline-stage layer count of 23 when pipeline size is 2, and either the
+    # BSHD layout with the micro batch size or dynamic batching with max tokens per GPU); when
+    # tight host memory is on and the optimizer is Adam, fp16 for the first and second moments and
+    # main parameters; GRPO with zero-coefficient KL loss and the routing replay flag when
+    # enabled; optimizer (case type, learning rate 1e-6, with chunked state offload for the
+    # distributed Muon optimizer, or CPU offload with overlapped transfers and precision-aware
+    # optimizer for Adam); SGLang (engine size, static memory fraction 0.7, EAGLE speculation with
+    # 2 steps, top-k 1 and 3 draft tokens when speculation is on, DP size, DP attention, DeepEP
+    # with mode, the DeepGEMM MoE runner for non-FP8 rollout, dispatcher dtype, and for non-normal
+    # DeepEP modes a max running requests and decode CUDA graph batch derived from the 128 token
+    # limit divided by tokens verified per request, times the DP size for the running requests;
+    # SGLang expert-parallel size); MTP (training with loss scaling 0.2 when speculating, else
+    # forced zero MTP layers); CI flags (CI test mode, weight check against the target only when
+    # not speculating, allow quantization error for FP8); misc (zero dropout, fp32 gradient
+    # accumulation and softmax, flash attention, 1 actor node, colocation or rollout GPU count,
+    # transfer mode, fully async, DeepEP flex dispatcher or all-to-all dispatcher); finally the
+    # case's extra raw args.
     """Build the train_args string for `case`.
 
     Speculative decoding (EAGLE + MTP training), R3 (`--use-rollout-routing-replay`), FP8
@@ -306,6 +375,11 @@ def build_train_args(case: CaseConfig, *, wandb_file: str) -> str:
 
 
 def execute(case: CaseConfig, *, wandb_file: str) -> None:
+    # [FUNCTION DOC] Launches training for a case through the default backend. When routing replay
+    # is on, sets in this process the replay mismatch threshold environment variable to 0.05
+    # (looser for this model). Builds the argument string and executes training with GPUs per node
+    # equal to the case's GPUs per node, plus the rollout GPUs when not colocated, the model's
+    # Megatron type, and the async train script when fully async (else the default one).
     U = command_utils.default_config().create_backend()
     if case.use_r3:
         # Loosen replay mismatch threshold for GLM-4.7-Flash

@@ -1,3 +1,13 @@
+# [MODULE DOC] Nightly CI smoke test of the MiMo V2.6 Flash launcher on a 4-layer partial model
+# (source layers 0, 1, 5, 6; all 256 experts), on one node of 8 GPUs, in RL mode (CUDA: 8-GPU
+# H200 stage, estimated 500 seconds, labels megatron and model-scripts, hopper only, nightly
+# cadence only). It runs two rollout/train/weight-sync cycles with routing replay and the
+# post-update weight equality check. Registers metric history gates on grad norm, train/rollout
+# logprob absolute difference and train/rollout KL. The partial model is not a language model, so
+# the logprob, entropy and KL checkers of the generic CI test flag are not applicable. The
+# launcher's own prepare and execute functions are imported and used directly. Run as a script:
+# build args, prepare, strip all proxy environment variables (both cases), execute.
+
 import os
 
 from scripts.run_mimo_v2_6_flash import ScriptArgs, execute, prepare
@@ -26,6 +36,13 @@ _FROZEN_TOWERS = "visual. audio_tokenizer. input_local_transformer. speech_embed
 
 
 def _args() -> ScriptArgs:
+    # [FUNCTION DOC] HELPER: Builds launcher arguments directly: RL mode, model mimo26-p4-bf16,
+    # 2 rollouts, rollout batch 4. Extra flags: CI test mode with the logprobs and KL checkers
+    # disabled (the eval-mode and train-mode log-prob passes differ at bf16 level on this model, so
+    # step-0 PPO KL is about 1e-5 rather than exactly zero), rollout routing replay, weight-update
+    # equality check against the target selector skipping the vision, audio and speech towers the
+    # text-only trainer never sends, 2 samples per prompt, global batch 8, response length 2048,
+    # and at most 8 running requests in SGLang.
     return ScriptArgs(
         mode="rl",
         model_name="mimo26-p4-bf16",

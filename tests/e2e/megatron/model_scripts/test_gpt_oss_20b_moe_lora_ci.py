@@ -1,3 +1,13 @@
+# [MODULE DOC] Self-contained CI smoke test of mixture-of-experts LoRA training on gpt-oss-20b
+# (bf16 weights), with adapters only on the expert projections, through the bridge conversion
+# mode, colocated on 4 GPUs with tensor parallel 4 (CUDA: 4-GPU H200 stage, estimated 1600
+# seconds, labels megatron, model-scripts and lora, hopper and blackwell; ROCm: nightly 4-GPU
+# MI350 suite, estimated 1600 seconds). Run as a script: prepare, strip all proxy environment
+# variables (both cases), then run each serving combination in sequence: "shared outer adapters +
+# virtual-expert serving" and "per-expert adapters + no virtual-expert serving". Before each
+# combination ray and SGLang processes are killed and the script sleeps 10 seconds. Each
+# combination is a 1-rollout run and must complete; the check is functional, not accuracy.
+
 import os
 
 from tests.ci.ci_register import register_cuda_ci, register_rocm_ci
@@ -30,6 +40,9 @@ _CONFIGS = [
 
 
 def prepare():
+    # [FUNCTION DOC] Creates fixed root-level model and dataset directories, downloads the bf16
+    # gpt-oss-20b model repository and the dapo-math-17k dataset repository (as a dataset repo)
+    # into them, through the default config's backend.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download lmsys/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -39,6 +52,17 @@ def prepare():
 
 
 def execute(shared_outer: bool, virtual_experts: bool):
+    # [FUNCTION DOC] Launches one LoRA training run on 4 GPUs for one serving combination. Groups:
+    # checkpoint (HF directory, bridge mode); LoRA (rank 32, alpha 32, dropout 0, targets the
+    # gate-up and down projections only, Triton LoRA backend in SGLang, the shared-outer-adapters
+    # flag when requested, and a flag disabling virtual-expert serving when not requested);
+    # rollout (dapo-math-17k, math reward, 1 rollout of 8 prompts times 8 samples, response length
+    # 1024, temperature 1.0, global batch 32); parallelism (tensor parallel 4 with sequence
+    # parallel, everything else 1, full uniform recompute of 1 layer, micro batch 1, 4096 tokens
+    # per GPU); Adam learning rate 1e-5; GRPO with zero entropy coefficient and clip 0.2/0.28;
+    # SGLang (one engine across all 4 GPUs, bf16, static memory fraction 0.2, Triton MoE runner);
+    # misc (zero dropout, bshd format, auto attention backend, 512 MiB weight update buffer, one
+    # actor node, colocated, CI test mode, logprobs checker disabled).
     U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " "--megatron-to-hf-mode bridge "
 

@@ -1,3 +1,17 @@
+# [MODULE DOC] CI smoke test of the GLM-5.1 LoRA launcher script on a 6-layer slice, on one node
+# of 8 GPUs (CUDA: 8-GPU H200 stage, estimated 1300 seconds, labels megatron, model-scripts and
+# lora, hopper and blackwell). The registration is currently disabled because the pinned
+# Megatron-Bridge lacks a property the sparse-attention variant reads, pending a bridge bump.
+# Run as a script: strips all proxy environment variables (both cases), prepares once, then runs
+# each configuration in the list in sequence. Each configuration is a combination of the sparse
+# attention backend, whether expert LoRA adapters share their outer matrices, and whether SGLang
+# serves LoRA experts virtually; this file runs the "tilelang + shared outer + virtual experts"
+# and the "megatron + per-expert + no virtual experts" combinations (the GLM-5.2 sibling runs the
+# complementary pair). Before each combination ray and SGLang processes are killed and the
+# script sleeps 10 seconds for a clean start; the run is one rollout with wandb off. Every
+# combination must complete. The common extra flags enable CI test mode, disable the logprobs
+# checker and skip two engine-side stacked parameter groups in the weight-update check.
+
 import os
 
 from scripts.run_glm5_1_744b_a40b_lora import ScriptArgs, _prepare_download, _train
@@ -39,6 +53,10 @@ _CONFIGS = [
 
 
 def _args(dsa: str, shared_outer: bool, virtual_experts: bool) -> ScriptArgs:
+    # [FUNCTION DOC] HELPER: Builds launcher arguments from the environment for one combination:
+    # model GLM-5.1-6layer, 1 node of 8 GPUs, 1 rollout, wandb off, the given sparse attention
+    # backend, the given shared-outer LoRA flag, and extra flags equal to the common set plus, if
+    # virtual experts are off, a flag turning off virtual-expert LoRA serving in SGLang.
     return ScriptArgs.from_env(
         model_name="GLM-5.1-6layer",
         num_nodes=1,
@@ -52,12 +70,15 @@ def _args(dsa: str, shared_outer: bool, virtual_experts: bool) -> ScriptArgs:
 
 
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Creates the output directory through the arguments' backend and runs the
+    # launcher's download step.
     U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.output_dir}")
     _prepare_download(args)
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Launches training through the launcher's train step.
     _train(args)
 
 

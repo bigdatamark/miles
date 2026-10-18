@@ -1,3 +1,9 @@
+# [MODULE DOC] GPU acceptance test that runs the client-side cookbook supervised and RL recipes
+# (the multi-LoRA example client script in "both" mode, 2 steps) against a real Tinker-compatible
+# gateway started locally. Registers a CUDA test (8-GPU H100 stage, estimated 400 seconds, labels
+# lora, weight-update and multi-lora, hopper only). Run as a script: prepare the model, then
+# execute.
+
 """Run the official cookbook SFT and RL recipes against a real Tinker gateway."""
 
 from tests.ci.ci_register import register_cuda_ci
@@ -14,6 +20,9 @@ register_cuda_ci(
 
 
 def execute():
+    # [FUNCTION DOC] Starts the gateway (waiting until healthy), runs the client recipes script as
+    # a subprocess with the gateway url, the base model and "both" mode for 2 steps, and stops the
+    # gateway afterwards. Raises if the gateway fails to start or the client command fails.
     U = command_utils.default_config().create_backend()
     with running_gateway() as base_url:
         U.exec_command_cpu(

@@ -1,3 +1,14 @@
+# [MODULE DOC] CI smoke test of the Inkling launcher in LoRA train mode on the 6-layer slice:
+# shared-outer grouped-expert LoRA served through SGLang's virtual-experts path with one 4-GPU
+# engine, with the adapter sync verified by checksum; one node of 4 GPUs. Registrations: CUDA
+# 4-GPU H200 stage (estimated 1100 seconds, hopper and blackwell) and AMD ROCm nightly 4-GPU
+# MI350 (estimated 500 seconds); labels megatron, model-scripts and lora. Metric history gates on
+# grad norm, PPO KL, train/rollout logprob absolute difference, train/rollout KL and raw reward.
+# Run as a script: build args, prepare, strip all proxy environment variables (both cases), train.
+# KNOWN ISSUE: the launcher is imported only from the non-AMD location, although the arguments
+# add a ROCm-specific attention backend and the test is registered on ROCm, whereas the
+# full-parameter sibling switches to the AMD launcher on ROCm.
+
 import os
 
 from scripts.run_inkling import _MODEL_REGISTRY, ScriptArgs, _train
@@ -32,6 +43,13 @@ _MODEL_ORG = "pb09204048"
 
 
 def _args() -> ScriptArgs:
+    # [FUNCTION DOC] HELPER: Builds launcher arguments from the environment with overrides: model
+    # Inkling-Small-6layer, LoRA train mode, dapo-math task, 1 node of 4 GPUs with 4 GPUs per
+    # rollout engine, 2 rollouts of 4 prompts times 4 samples, global batch 16, response length
+    # 512, SGLang context length 1024. Extra flags: CI test mode, KL and logprobs checkers
+    # disabled, skip visual and audio parameters and two engine-derived adapter buffer names in
+    # the weight-update check (frozen towers and derived buffers never match the snapshot), check
+    # LoRA weight equality; on ROCm also the Triton attention backend in SGLang.
     return ScriptArgs.from_env(
         model_name="Inkling-Small-6layer",
         train_mode="lora",
@@ -58,6 +76,10 @@ def _args() -> ScriptArgs:
 
 
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Creates the model and data directories; downloads the model (from the fixed
+    # model organization) into the arguments' HF checkpoint path; downloads the dapo-math-17k
+    # dataset; converts the checkpoint to Megatron format on the node's GPUs, looking the Megatron
+    # model type up in the launcher's model registry by model name.
     U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.model_dir} {args.data_dir}")
     U.exec_command_cpu(f"hf download {_MODEL_ORG}/{args.model_name} --local-dir {args.hf_checkpoint}")
@@ -73,6 +95,7 @@ def prepare(args: ScriptArgs):
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Launches training through the launcher's train step.
     _train(args)
 
 

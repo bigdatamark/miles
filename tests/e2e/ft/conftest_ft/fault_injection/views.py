@@ -1,5 +1,11 @@
 # NOTE: You MUST read tests/e2e/ft/README.md as source-of-truth and documentations
 
+# [MODULE DOC] Pure read-only views over a list of fault injector events, used by the injector's
+# form selection and by test assertions: counts and lists of injections, cells that never
+# recovered to serving after being harmed, forms drawn without ever succeeding, injection times
+# and the distinct sequence of states each cell passed through. Cell types of cell names are
+# learned from the observation events. The stale-status grace period is 120 seconds.
+
 import dataclasses
 from datetime import datetime
 from typing import Literal
@@ -10,12 +16,17 @@ STALE_STATUS_GRACE_SECONDS: float = 120.0
 
 
 def compute_num_injections(events: list[Event], *, cell_type: str | None = None, harmed_only: bool = True) -> int:
+    # [FUNCTION DOC] Number of successful injections (counting only harmful forms by default),
+    # optionally restricted to one cell type; equals the length of the injected cell names list.
     return len(compute_injected_cell_names(events, cell_type=cell_type, harmed_only=harmed_only))
 
 
 def compute_injected_cell_names(
     events: list[Event], *, cell_type: str | None = None, harmed_only: bool = True
 ) -> list[str]:
+    # [FUNCTION DOC] One cell name per successful injection (so a cell hit twice appears twice),
+    # grouped by cell in first-seen order, optionally restricted to a cell type and, by default,
+    # only to injections of harmful forms.
     return [
         name
         for name, cell_events in _compute_matching_cell_events(
@@ -27,6 +38,8 @@ def compute_injected_cell_names(
 
 
 def compute_num_successful_injections_of_form(events: list[Event], *, form_name: str) -> int:
+    # [FUNCTION DOC] Count of successful injection events whose form name equals the given name,
+    # across all cell types.
     return len(
         [
             event
@@ -39,6 +52,12 @@ def compute_num_successful_injections_of_form(events: list[Event], *, form_name:
 def compute_cells_not_serving_after_injection(
     events: list[Event], *, cell_type: str, grace_seconds: float | None = None
 ) -> dict[str, list[str]]:
+    # [FUNCTION DOC] Finds cells of the given type that were harmed and never observed serving
+    # again. For each cell, the last successful harmful injection time is taken. A cell counts as
+    # recovered once some later observation shows it alive and serving at least the grace seconds
+    # after that injection (default 120 seconds; the grace guards against stale status readings
+    # right after a kill). Returns a mapping, sorted by cell name, from each non-recovered cell to
+    # the ordered list of distinct state values it was observed in (empty list if never observed).
     if grace_seconds is None:
         grace_seconds = STALE_STATUS_GRACE_SECONDS
 
@@ -75,6 +94,8 @@ def compute_cells_not_serving_after_injection(
 
 
 def compute_successful_form_names(events: list[Event], *, cell_type: str) -> set[str]:
+    # [FUNCTION DOC] Names of fault forms with at least one successful injection into a cell of the
+    # given type (harmful or not).
     cell_type_of_name = _compute_cell_type_of_name(events)
     return {
         event.form_name
@@ -86,6 +107,8 @@ def compute_successful_form_names(events: list[Event], *, cell_type: str) -> set
 
 
 def compute_forms_drawn_without_success(events: list[Event]) -> list[tuple[str, str]]:
+    # [FUNCTION DOC] Sorted list of (cell type, form name) pairs for which an injection was attempted
+    # but none ever succeeded. Cells never observed get an empty cell type string.
     cell_type_of_name = _compute_cell_type_of_name(events)
     drawn: set[tuple[str, str]] = set()
     worked: set[tuple[str, str]] = set()
@@ -100,6 +123,8 @@ def compute_forms_drawn_without_success(events: list[Event]) -> list[tuple[str, 
 
 
 def compute_injection_times(events: list[Event], *, cell_type: str | None = None) -> list[datetime]:
+    # [FUNCTION DOC] Timestamps of successful injections (harmful or not), in event order,
+    # optionally restricted to cells of one type.
     cell_type_of_name = _compute_cell_type_of_name(events)
     return [
         event.timestamp
@@ -111,6 +136,8 @@ def compute_injection_times(events: list[Event], *, cell_type: str | None = None
 
 
 def compute_states_of_cell_name(events: list[Event]) -> dict[str, list[ObservedCellState]]:
+    # [FUNCTION DOC] For each cell with any observation, the sequence of distinct consecutive
+    # observed states (repeats collapsed). Cells with no observed states are omitted.
     return {
         name: states
         for name, cell_events in _compute_cell_events(events).items()
@@ -120,11 +147,16 @@ def compute_states_of_cell_name(events: list[Event]) -> dict[str, list[ObservedC
 
 @dataclasses.dataclass(frozen=True)
 class _CellEvent:
+    # [CLASS DOC] HELPER: Immutable per-cell timeline entry: kind is either injected or observed;
+    # observed entries carry the observed state, injected entries carry none.
     kind: Literal["injected", "observed"]
     state: ObservedCellState | None = None
 
 
 def _compute_cell_events(events: list[Event], *, harmed_only: bool = True) -> dict[str, list[_CellEvent]]:
+    # [FUNCTION DOC] HELPER: Builds, per cell name, a time-ordered timeline. Successful injections
+    # become injected entries (only harmful ones when harmed-only, the default); failed ones are
+    # dropped. Every cell in every poll becomes an observed entry with its state.
     cell_events_of_name: dict[str, list[_CellEvent]] = {}
     for event in events:
         if isinstance(event, InjectionEvent):
@@ -139,6 +171,8 @@ def _compute_cell_events(events: list[Event], *, harmed_only: bool = True) -> di
 def _compute_matching_cell_events(
     events: list[Event], *, cell_type: str | None, harmed_only: bool
 ) -> dict[str, list[_CellEvent]]:
+    # [FUNCTION DOC] HELPER: The per-cell timelines, filtered to cells of the given type when one is
+    # given (type known from observations; cells never observed are dropped when filtering).
     cell_events_of_name = _compute_cell_events(events, harmed_only=harmed_only)
     if cell_type is None:
         return cell_events_of_name
@@ -151,6 +185,8 @@ def _compute_matching_cell_events(
 
 
 def _compute_cell_type_of_name(events: list[Event]) -> dict[str, str]:
+    # [FUNCTION DOC] HELPER: Mapping from cell name to cell type learned from all observation
+    # events (later observations overwrite earlier ones).
     cell_type_of_name: dict[str, str] = {}
     for event in events:
         if isinstance(event, ObservationsEvent):
@@ -159,6 +195,8 @@ def _compute_cell_type_of_name(events: list[Event]) -> dict[str, str]:
 
 
 def _compute_distinct_states(events: list[_CellEvent]) -> list[ObservedCellState]:
+    # [FUNCTION DOC] HELPER: Collapses a cell timeline to its observed states, dropping injected
+    # entries and consecutive duplicates.
     states: list[ObservedCellState] = []
     for event in events:
         if event.kind == "observed" and event.state is not None and (not states or states[-1] != event.state):

@@ -2,6 +2,13 @@
 # WARNING: Do NOT relax any assert logic in this file. All assertions must remain strict.
 
 
+# [MODULE DOC] Random-crash soak scenario. A background injector crashes trainer cells and/or
+# rollout engines (whichever the mode enables FT on) at random exponential intervals while
+# training runs with the mini FT controller; the scenario passes if training completes and
+# recovery witnesses confirm every accepted injection healed. Defaults: seed 42, 60 steps, mean
+# 120 seconds between trainer injections, mean 240 seconds between rollout injections. Exposes a
+# typer app with one run command; the same function is the entry point of per-mode CI files.
+
 from collections import Counter
 from pathlib import Path
 
@@ -75,6 +82,17 @@ def run_ci(
     rollout_crash_interval_seconds: RolloutCrashIntervalSecondsOption = DEFAULT_ROLLOUT_CRASH_INTERVAL_SECONDS,
     fully_async: FullyAsyncOption = False,
 ) -> None:
+    # [FUNCTION DOC] Runs the soak for a mode. Steps: resolve the mode; if fully async, assert the
+    # mode supports it; take the default config; build the test name (suffixed for fully async)
+    # and a dump directory named by test name and mode; compute per-cell-type mean injection
+    # intervals from the mode's FT components; print settings; prepare models and data; for a
+    # mode without real rollout, materialize cyclic recorded rollout data with one file per step;
+    # assemble train args (common args, FT args, fully-async args, API server args, and the mini
+    # FT controller flag); derive the API server base url from the backend host and fixed port;
+    # start the fault injector with forms for the backend; run training with no extra env vars
+    # and the proper train script; always stop and join the injector afterwards; finally assert
+    # healing against the injector log and the reconfigure events in the dump directory.
+    # Raises assertion errors on any failed check; does not delete the dump directory.
     """Random failure soak test, for whichever components the mode enables ft on.
 
     Starts a background thread that injects faults at random intervals via the
@@ -145,6 +163,8 @@ def run_ci(
 
 
 def assert_mode_supports_fully_async(ft_mode: FTTestMode, *, mode: str) -> None:
+    # [FUNCTION DOC] Asserts a mode can run fully asynchronously: it must have real rollout
+    # engines and must not be colocated (the async train script rejects colocation).
     assert ft_mode.has_real_rollout, (
         f"Mode {mode!r} has no rollout engines, so a fully-async soak would train off pre-recorded debug rollout "
         f"data and would prove nothing about generating while training"
@@ -157,6 +177,13 @@ def assert_mode_supports_fully_async(ft_mode: FTTestMode, *, mode: str) -> None:
 def assert_healing(
     ft_components: tuple[str, ...], *, injector: FaultInjectorHandle, event_dir: Path, context: str
 ) -> None:
+    # [FUNCTION DOC] Post-run assertions on the soak. First, every fault form that was drawn must
+    # have succeeded at least once. If train FT is enabled: the reconfigure events must match the
+    # number of successful trainer-cell injections, and every trainer injection must be paired
+    # with a healing. If rollout FT is enabled: at least the minimum number of soak injections
+    # must have occurred on rollout cells (context string used in messages), and every injected
+    # rollout cell must have been seen serving afterwards. Finally every fault form enabled for
+    # the enabled components must have succeeded at least once.
     events = injector.event_log.events
 
     _assert_drawn_fault_forms_worked(injector)
@@ -177,11 +204,16 @@ def assert_healing(
 
 
 def _assert_drawn_fault_forms_worked(injector: FaultInjectorHandle) -> None:
+    # [FUNCTION DOC] HELPER: Asserts no (cell type, form) pair was attempted without ever
+    # succeeding.
     never_worked = compute_forms_drawn_without_success(injector.event_log.events)
     assert not never_worked, f"Fault forms drawn but never once successful: {never_worked}"
 
 
 def _assert_enabled_fault_forms_worked(injector: FaultInjectorHandle, *, ft_components: tuple[str, ...]) -> None:
+    # [FUNCTION DOC] HELPER: For each enabled FT component's cell type with configured forms,
+    # asserts every configured form succeeded at least once; the failure message lists the
+    # sorted (cell type, form name) pairs that never did.
     events = injector.event_log.events
     never_worked: list[tuple[str, str]] = []
     for component in ft_components:
@@ -195,6 +227,11 @@ def _assert_enabled_fault_forms_worked(injector: FaultInjectorHandle, *, ft_comp
 
 
 def assert_trainer_injections_healed(injector: FaultInjectorHandle, *, event_dir: Path) -> None:
+    # [FUNCTION DOC] Trainer recovery witness. Counts, per cell index, the accepted injections
+    # into trainer cells (cell index parsed from the cell name) and the healings recorded in the
+    # reconfigure events of the event directory; asserts that the injection counts minus the
+    # healing counts (clamped at zero per index) leave no debt, i.e. each injection was paired
+    # with a healing of the same cell. Prints a confirmation.
     injected: Counter[int] = Counter(
         parse_cell_id(name).cell_index
         for name in compute_injected_cell_names(injector.event_log.events, cell_type=ACTOR_CELL_TYPE)
@@ -216,6 +253,10 @@ def assert_trainer_injections_healed(injector: FaultInjectorHandle, *, event_dir
 
 
 def assert_rollout_cells_served_after_injection(injector: FaultInjectorHandle) -> None:
+    # [FUNCTION DOC] Rollout recovery witness. Asserts that every rollout cell hit by an accepted
+    # harmful injection was later observed alive and serving on a reading old enough to outlast
+    # the stale-status grace window; the failure message lists offenders and the observed state
+    # sequences of all cells. Prints a confirmation.
     events = injector.event_log.events
     num_injections: int = compute_num_injections(events, cell_type=ROLLOUT_CELL_TYPE)
     offenders: dict[str, list[str]] = compute_cells_not_serving_after_injection(events, cell_type=ROLLOUT_CELL_TYPE)

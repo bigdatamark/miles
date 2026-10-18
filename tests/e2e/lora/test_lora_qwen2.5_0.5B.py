@@ -1,3 +1,13 @@
+# [MODULE DOC] End-to-end LoRA training smoke test: a 2-rollout GRPO run on gsm8k with
+# Qwen2.5-0.5B-Instruct using LoRA (rank 32, alpha 32, no dropout, all linear layers) through the
+# Megatron-to-HF bridge on 4 colocated GPUs (CUDA: 4-GPU H200 stage, estimated 400 seconds, lora
+# label, hopper and blackwell; ROCm: nightly 4-GPU MI350 suite, estimated 500 seconds). Run as a
+# script: prepare, strip all proxy environment variables (both cases) from the process, execute.
+# The only pass criterion is that training finishes (the generic CI test flag is set; no metric
+# threshold). Evaluation every 2 rollouts is on unless the environment variable for enabling
+# eval is set to 0. Checkpoints are saved every 2 rollouts to a fixed root-level directory.
+# KNOWN ISSUE: the existing docstring below says 8 GPUs are required, but the test uses 4 GPUs
+# and is registered on a 4-GPU stage.
 """E2E test for LoRA training with Qwen2.5-0.5B on GSM8K.
 
 Uses the Megatron backend with bridge mode.  Runs a short GRPO training loop
@@ -29,6 +39,9 @@ NUM_GPUS = 4
 
 
 def prepare():
+    # [FUNCTION DOC] Creates fixed root-level model and dataset directories, downloads the
+    # Qwen2.5-0.5B-Instruct model, and downloads the gsm8k dataset repository (as a dataset repo)
+    # into the dataset directory, through the default config's backend.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -36,6 +49,17 @@ def prepare():
 
 
 def execute():
+    # [FUNCTION DOC] Builds the training arguments and launches training on 4 GPUs. Groups:
+    # checkpoint (HF directory with the bridge conversion mode); LoRA (rank 32, alpha 32, dropout
+    # 0, all-linear target modules); rollout (gsm8k train data, chat template, shuffling, math
+    # reward, 2 rollouts, 8 prompts times 8 samples, response length 1024, temperature 1.0, global
+    # batch 32); eval (gsm8k test set, 1 sample, length 1024, top-k 1, plus an eval interval of 2
+    # when eval is enabled); parallelism all 1 with sequence parallel, dynamic batch size, 4096
+    # tokens per GPU; GRPO with zero KL and entropy coefficients and clip 0.2/0.28; Adam with
+    # learning rate 1e-5 constant, weight decay 0.1; SGLang one GPU per engine with static memory
+    # fraction 0.4; the CI test flag; saving every 2 rollouts to a fixed checkpoint directory;
+    # misc (zero dropout, fp32 gradient accumulation and softmax, flash attention, per-token loss,
+    # the Miles router, one actor node of 4 GPUs, colocated). Wandb args are named after this file.
     U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " "--megatron-to-hf-mode bridge "
 

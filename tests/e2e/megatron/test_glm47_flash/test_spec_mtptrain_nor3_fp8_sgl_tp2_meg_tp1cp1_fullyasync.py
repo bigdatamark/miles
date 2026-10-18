@@ -1,3 +1,12 @@
+# [MODULE DOC] GLM-4.7-Flash case: fully asynchronous training and rollout (not colocated) with
+# EAGLE speculation, MTP training and an FP8 rollout, without routing replay: 4 training GPUs
+# (tensor parallel 1, expert parallel 4) and 4 rollout GPUs as two engines of 2 GPUs, weights
+# broadcast over NCCL, generation paused in place, 4096-token responses and 8192 tokens per GPU.
+# Registers a CUDA test (8-GPU H200 stage, estimated 1500 seconds, labels megatron,
+# weight-update and fully-async, hopper only) and metric history gates on grad norm, PPO KL,
+# train/rollout logprob absolute difference, train/rollout KL and raw reward. Run as a script:
+# strip all proxy environment variables (both cases), prepare, execute.
+
 """GLM-4.7-Flash fully-async rollout with EAGLE, MTP training and an FP8 rollout, without R3.
 
 4 train GPUs (TP1, DP4, EP4) + two TP2 engines (TP only) serving RadixArk/glm47-flash-blockwise-fp8.

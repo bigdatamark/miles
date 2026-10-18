@@ -1,3 +1,13 @@
+# [MODULE DOC] GLM-4.7-Flash case: fixed micro-batch (BSHD) training with DeepEP on both training
+# and rollout sides, FP8 rollout, without speculative decoding or routing replay; colocated on 4
+# GPUs with Megatron tensor parallel 2 and expert parallel 4 (context and pipeline parallel 1),
+# micro batch size 2, and one SGLang engine of 4 GPUs using data-parallel attention (DP size 4)
+# with expert parallel 4. Registers a CUDA test (4-GPU H200 stage, estimated 1400 seconds, label
+# megatron, hopper only; 4 GPUs because 8-GPU runners cannot bring NVSHMEM up over IB, which
+# DeepEP low-latency mode needs) and metric history gates on grad norm, PPO KL, train/rollout
+# logprob absolute difference, train/rollout KL and raw reward. Run as a script: strip all proxy
+# environment variables (both cases), prepare, execute.
+
 """GLM-4.7-Flash in the BSHD layout with DeepEP on both sides and an FP8 rollout, without spec or R3.
 
 Colocated on 4 GPUs: Megatron trains fixed micro-batches of 2 samples, each padded to the longest

@@ -1,3 +1,13 @@
+# [MODULE DOC] CI smoke test of the GLM-5.2 launcher script on a 5-layer slice (3 dense layers and
+# 2 mixture-of-experts layers) that exercises the sparse-attention cross-layer index sharing
+# path, on one node of 4 GPUs with optimizer offload. Tests that the script works, not accuracy.
+# The AMD variant of the launcher is imported when the hardware platform environment variable
+# says ROCm. Registrations: CUDA 4-GPU H200 stage (estimated 900 seconds, hopper and blackwell),
+# AMD ROCm 4-GPU MI350 stage and nightly suite (estimated 900 seconds each), labels megatron and
+# model-scripts (plus amd on ROCm); metric history gates on grad norm, PPO KL, train/rollout
+# logprob absolute difference, train/rollout KL and raw reward. Run as a script: build args,
+# prepare, strip all proxy environment variables (both cases), train.
+
 import os
 
 if os.getenv("MILES_HARDWARE_PLATFORM") == "rocm":
@@ -46,6 +56,10 @@ register_ci_gate(metric_key="rollout/raw_reward")
 
 
 def _args() -> ScriptArgs:
+    # [FUNCTION DOC] HELPER: Builds launcher arguments from the environment with overrides: model
+    # GLM-5.2_5layer, 1 node of 4 GPUs, 2 rollouts of 4 prompts times 4 samples, global batch 16,
+    # optimizer offload on, and extra flags enabling CI test mode and disabling the logprobs
+    # checker.
     return ScriptArgs.from_env(
         model_name="GLM-5.2_5layer",
         num_nodes=1,
@@ -60,6 +74,9 @@ def _args() -> ScriptArgs:
 
 
 def prepare(args: ScriptArgs):
+    # [FUNCTION DOC] Creates the output directory through the arguments' backend; runs the
+    # launcher's download step and checkpoint validation; converts to FP8 only if the arguments
+    # request FP8 rollout; then produces the Megatron checkpoint.
     U = args.create_backend()
     U.exec_command_cpu(f"mkdir -p {args.output_dir}")
     _prepare_download(args)
@@ -70,6 +87,7 @@ def prepare(args: ScriptArgs):
 
 
 def execute(args: ScriptArgs):
+    # [FUNCTION DOC] Launches training through the launcher's train step.
     _execute_train(args)
 
 

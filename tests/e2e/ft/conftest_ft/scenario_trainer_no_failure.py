@@ -2,6 +2,13 @@
 # WARNING: Do NOT relax any assert logic in this file. All assertions must remain strict.
 
 
+# [MODULE DOC] Trainer no-failure scenario (comparison test, single phase). Baseline trains 2
+# steps normally; target trains the same 2 steps with FT enabled but no faults injected. Neither
+# side is deterministic, so metrics are compared with tolerances (relative 1e-2, absolute 1e-8,
+# train metrics only) and dumped tensors with relative difference up to 0.0085, matched by
+# parallel identity rather than global rank because the two sides have different world sizes
+# and data-parallel layouts. Exposes the comparison app and CI runner.
+
 from tests.e2e.ft.conftest_ft.app import BASELINE_SIDE, TARGET_SIDE, create_comparison_app_and_run_ci
 from tests.e2e.ft.conftest_ft.execution import get_common_train_args, get_ft_args, get_train_env_vars_arg
 from tests.e2e.ft.conftest_ft.modes import FTTestMode
@@ -17,12 +24,14 @@ NUM_STEPS: int = 2
 
 
 def _build_baseline_args(mode: FTTestMode, dump_dir: str, enable_dumper: bool = True) -> str:
+    # [FUNCTION DOC] HELPER: Common train args for 2 steps plus the non-deterministic env vars.
     return get_common_train_args(
         mode, dump_dir=dump_dir, num_steps=NUM_STEPS, enable_dumper=enable_dumper
     ) + get_train_env_vars_arg(mode, deterministic=False)
 
 
 def _build_target_args(mode: FTTestMode, dump_dir: str, enable_dumper: bool = True) -> str:
+    # [FUNCTION DOC] HELPER: The baseline arguments plus the FT arguments.
     return (
         get_common_train_args(mode, dump_dir=dump_dir, num_steps=NUM_STEPS, enable_dumper=enable_dumper)
         + get_ft_args(mode)
@@ -31,6 +40,11 @@ def _build_target_args(mode: FTTestMode, dump_dir: str, enable_dumper: bool = Tr
 
 
 def _compare(dump_dir: str, mode: FTTestMode) -> None:
+    # [FUNCTION DOC] HELPER: Comparison hook. Compares train metrics of the two sides with relative
+    # tolerance 1e-2 and absolute 1e-8, then compares dumps (relative difference at most 0.0085
+    # for every tensor, shared allow patterns for input tensors, grouping that ignores rank and
+    # the data-parallel and expert-data-parallel indices). Prints a pass message. The mode is
+    # unused.
     compare_metrics(
         baseline_dir=f"{dump_dir}/{BASELINE_SIDE}",
         target_dir=f"{dump_dir}/{TARGET_SIDE}",

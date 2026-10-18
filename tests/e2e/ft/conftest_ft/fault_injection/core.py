@@ -1,5 +1,11 @@
 # NOTE: You MUST read tests/e2e/ft/README.md as source-of-truth and documentations
 
+# [MODULE DOC] The random fault injection loop. Polls the cluster API server for cells, records
+# every poll in an event log, and at randomized exponentially-distributed times injects a fault
+# into a randomly chosen cell of a cell type, but only when that cell type is quiescent (all its
+# replicas present, alive and able to serve for a number of consecutive polls) and has a spare
+# replica. Defaults: poll every 2 seconds; require 60 consecutive quiescent polls.
+
 import logging
 import random
 import threading
@@ -25,6 +31,9 @@ QUIESCENT_POLLS_REQUIRED: int = 60
 
 
 def _compute_next_injection_time(rng: random.Random, mean_interval_seconds: float) -> float:
+    # [FUNCTION DOC] HELPER: Returns the monotonic-clock time of the next injection: now plus a
+    # sample from an exponential distribution whose mean is the given interval, drawn from the
+    # given random generator (advancing it).
     return time.monotonic() + rng.expovariate(1.0 / mean_interval_seconds)
 
 
@@ -41,6 +50,28 @@ def run_fault_injection_loop(
     poll_interval_seconds: float = POLL_INTERVAL_SECONDS,
     quiescent_polls_required: int = QUIESCENT_POLLS_REQUIRED,
 ) -> None:
+    # [FUNCTION DOC] Runs until the stop event is set; intended to run on a worker thread.
+    # Inputs: API server base url; seed for a private random generator (all random choices, so
+    # runs are reproducible in choice order); mapping from cell type to mean seconds between
+    # injections; stop event; event log to record into; mapping from cell type to its list of
+    # fault forms; optional supplier of extra "virtual" cells appended to each poll; optional
+    # predicate that can veto an injection; poll interval; consecutive quiescent polls required.
+    # Setup: for each configured cell type (iterated in sorted order, so random draws are
+    # deterministic) schedule a first injection time; track per-type quiescent poll counts and the
+    # maximum number of cells ever seen.
+    # Each iteration: wait one poll interval (exit if stopped); list cells (skip the iteration if
+    # listing failed); append virtual cells; record the poll in the event log; exit if stopped;
+    # group cells by type; update the per-type maximum cell count; a type is quiescent when it has
+    # at least that maximum number of cells, all alive and able to serve; increment its quiescent
+    # counter, else reset it to zero. Find types whose scheduled time has passed (due). Among due
+    # types choose those with enough quiescent polls and more than one cell (a spare replica to
+    # survive the kill); if none, log deferral and continue. Pick a random ready type, a random
+    # cell of it, and draw a fault form (preferring forms not yet proven successful for the type).
+    # If the injection-enabled predicate says no, skip without rescheduling. Inject the fault:
+    # on any exception record a failed attempt, reset that type's quiescent counter, log, and
+    # continue (the due time stays, so it retries); on success record a successful attempt,
+    # reset the quiescent counter, and schedule the next injection time. Records whether the form
+    # harms the cell in the attempt note. Exceptions from injection are swallowed.
     rng = random.Random(seed)
     next_injection_time_of_cell_type: dict[str, float] = {
         cell_type: _compute_next_injection_time(rng, mean_interval_seconds)
@@ -125,12 +156,16 @@ def run_fault_injection_loop(
 
 
 def _kind_is_quiescent(kind_cells: list[dict], *, expected_num_cells: int) -> bool:
+    # [FUNCTION DOC] HELPER: True only if the list is non-empty, has at least the expected number
+    # of cells, and every cell is alive and able to serve.
     if not kind_cells or len(kind_cells) < expected_num_cells:
         return False
     return all(cell_is_alive(cell) and _cell_can_serve(cell) for cell in kind_cells)
 
 
 def _cell_can_serve(cell: dict) -> bool:
+    # [FUNCTION DOC] HELPER: Non-rollout cells always count as able to serve; a rollout cell
+    # counts only when its observed state is serving.
     if cell_type_of(cell) != ROLLOUT_CELL_TYPE:
         return True
     return compute_observed_cell_state(cell) is ObservedCellState.SERVING
@@ -139,12 +174,18 @@ def _cell_can_serve(cell: dict) -> bool:
 def _draw_form(
     forms: list[BaseFaultForm], *, events: list[Event], cell_type: str, rng: random.Random
 ) -> BaseFaultForm:
+    # [FUNCTION DOC] HELPER: Picks a fault form at random from those whose names have not yet been
+    # seen to succeed for this cell type in the event history; if every form has already succeeded,
+    # picks from all forms. Advances the random generator.
     worked = compute_successful_form_names(events, cell_type=cell_type)
     unproven = [form for form in forms if form.name not in worked]
     return rng.choice(unproven or forms)
 
 
 def list_cells(*, base_url: str, cell_types: set[str]) -> list[dict] | None:
+    # [FUNCTION DOC] Fetches the cell list from the API server cells endpoint (5 second timeout)
+    # and returns the items whose cell type is in the given set. Returns none (after logging with
+    # the traceback) on any failure, including network errors and bad status codes; never raises.
     try:
         resp = requests.get(f"{base_url}/api/v1/cells", timeout=5)
         resp.raise_for_status()

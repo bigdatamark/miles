@@ -1,3 +1,11 @@
+# [MODULE DOC] Long end-to-end GRPO training test on gsm8k with Qwen2.5-0.5B-Instruct using the
+# asynchronous train script with separate (non-colocated) training and rollout GPUs on 2 GPUs
+# (CUDA: 2-GPU H200 stage, estimated 5400 seconds, long label, hopper and blackwell; ROCm:
+# nightly 2-GPU MI350 suite, estimated 5400 seconds). Run as a script: prepare downloads model
+# and data into fixed root-level directories, strips all proxy environment variables (both
+# cases), then execute launches training. The run passes only if the built-in CI metric checker
+# finds eval accuracy on gsm8k at least 0.55.
+
 import os
 
 from tests.ci.ci_register import register_cuda_ci, register_rocm_ci
@@ -13,6 +21,9 @@ NUM_GPUS = 2
 
 
 def prepare():
+    # [FUNCTION DOC] Creates fixed model and dataset directories under the filesystem root,
+    # downloads the Qwen2.5-0.5B-Instruct model into the model directory, and downloads the gsm8k
+    # dataset (default location) through the default config's backend.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu("mkdir -p /root/models /root/datasets")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
@@ -20,6 +31,16 @@ def prepare():
 
 
 def execute():
+    # [FUNCTION DOC] Builds the training arguments and launches the asynchronous train script on
+    # 2 GPUs. Same recipe as the synchronous gsm8k test (math reward, 250 rollouts or 3000 under
+    # the infinite-run switch, batch 32 times 8, response length 1024, temperature 1, GRPO with
+    # zero-coefficient KL loss, Adam learning rate 1e-6, eval every 20 rollouts, gsm8k accuracy
+    # threshold 0.55, SGLang one GPU per engine, bridge mode) except: model and data paths are
+    # fixed root-level directories, there is no colocation, and GPUs are split: the actor gets
+    # one GPU (the larger of 1 and a quarter of the GPUs) and rollout gets one GPU (the larger of
+    # 1 and three quarters of the GPUs, rounded down).
+    # KNOWN ISSUE: with 2 GPUs the formulas give 1 actor plus 1 rollout GPU; the "quarter/three
+    # quarters" intent only holds for larger GPU counts.
     U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/models/{MODEL_NAME}/ "
 

@@ -1,3 +1,13 @@
+# [MODULE DOC] End-to-end test of the experimental "verifiers" rollout integration with
+# Qwen3-0.6B on 2 colocated GPUs, running a single tiny rollout of the code-golf environment
+# (CUDA: 2-GPU H200 stage, estimated 300 seconds, short label, hopper and blackwell; ROCm:
+# nightly 2-GPU MI350 suite, estimated 900 seconds). Paths come from environment variables with
+# defaults: model directory, Megatron path, and a run directory holding a dedicated virtual
+# environment for the verifiers package and the environment checkout. prepare builds that
+# environment and installs the environment package, execute trains for one rollout and then
+# verifies the dumped rollout data, and verify holds the assertions. Run as a script: prepare,
+# strip all proxy environment variables (both cases), execute.
+
 import math
 import os
 import shutil
@@ -31,6 +41,17 @@ CODE_GOLF_DIR = RUN_DIR / "environments" / "code_golf_v1"
 
 
 def prepare():
+    # [FUNCTION DOC] Sets up everything the run needs through the default backend. Steps: create
+    # the model and run directories; download Qwen3-0.6B; create a fresh virtual environment (with
+    # seed packages and system site packages, using the current interpreter) and write a path file
+    # into its site-packages exposing the launcher's site-packages; install the verifiers adapter
+    # requirements into that environment; install the pinned prime command-line tool (version
+    # 0.6.19) with its sandboxes dependency capped below 0.3 (0.3.0 dropped a class the pinned
+    # prime imports); shallow-clone the verifiers repository at tag v0.2.0 unless the clone
+    # directory already exists; copy its code-golf environment folder into the run directory
+    # (merging into an existing one); install that environment with the prime tool from the run
+    # directory; convert the checkpoint to Megatron format on 2 GPUs. Side effects: network,
+    # subprocesses, filesystem writes.
     U = command_utils.default_config().create_backend()
     U.exec_command_cpu(f"mkdir -p {MODEL_DIR} {RUN_DIR}")
     U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir {MODEL_DIR}/{MODEL_NAME}")
@@ -65,6 +86,18 @@ def prepare():
 
 
 def execute():
+    # [FUNCTION DOC] Writes a verifiers config file into the run directory (task set code-golf-v1,
+    # 300 second rollout timeout), builds the training arguments, runs training, and then calls
+    # verify on the dump directory. Arguments: the verifiers rollout function replaces the default
+    # rollout; no global dataset; 1 rollout of 3 prompts times 4 samples (oversampling batch 3);
+    # response length 512, context length 2048, temperature 0.8; global batch 12 with data
+    # balancing; GRPO with clip 0.2/0.28; Adam learning rate 1e-6; no gradient accumulation
+    # fusion; one GPU per rollout engine with static memory fraction 0.6; parallelism all 1;
+    # dynamic batch size 4096 tokens per GPU; flash attention; one actor node of 2 GPUs,
+    # colocated; detailed dumps into the run's dump directory. The run's environment sets the
+    # legacy rollout v1 switch, info-level verifiers logging, a Python path combining the
+    # verifiers environment, the environment folder, Megatron, the adapter and the repository,
+    # and the config path.
     U = command_utils.default_config().create_backend()
     config_path = RUN_DIR / "code-golf.toml"
     config_path.write_text('[taskset]\nid = "code-golf-v1"\n\n[timeout]\nrollout = 300\n')
@@ -132,6 +165,13 @@ def execute():
 
 
 def verify(dump_dir: Path):
+    # [FUNCTION DOC] Loads the dumped samples of rollout 0 and asserts: exactly 12 samples, in 3
+    # groups (indices 0-2) of 4 each; every status is completed or truncated and at least one is
+    # completed; all rewards are finite; for each sample the rollout log-prob count, loss mask
+    # length and response length are equal and all log-probs are finite; each sample's verifiers
+    # metadata has exactly the rewards correct, fastest and most_concise, a passed metric of 0 or
+    # 1, a finite latency metric, and no error entry; at least one sample passed; and within each
+    # group the "fastest" rewards sum to about 0.5.
     samples = torch.load(dump_dir / "rollout_data" / "0.pt", weights_only=False)["samples"]
 
     assert len(samples) == 12

@@ -1,3 +1,12 @@
+# [MODULE DOC] Tests of the launcher observability tools against a real kind cluster (CPU stage,
+# estimated 600 seconds, no labels): the log follower streams a pod's lines with a pod/container
+# prefix, the cluster info watcher reports pod lifecycle and kubelet warning events, and the
+# diagnosis collector captures logs, descriptions and events of a failing pod, degrades to an
+# incomplete diagnosis when nothing matches or the namespace is absent, and its command line
+# entry fails and names a missing verdict file. Tests set the kubectl kubeconfig environment
+# variable to the cluster's kubeconfig through a fixture and read log output through the pytest
+# log capture. Timeouts: poll 60 seconds, startup 180 seconds, lifecycle 240 seconds.
+
 from __future__ import annotations
 
 import asyncio
@@ -30,10 +39,13 @@ _LIFECYCLE_TIMEOUT = 240.0
 
 @pytest.fixture
 def kubectl_kubeconfig(kind_cluster: KindCluster, monkeypatch: pytest.MonkeyPatch) -> None:
+    # [FUNCTION DOC] HELPER: Fixture. Sets the kubeconfig environment variable (restored after the
+    # test) to the cluster's kubeconfig path so the kubectl-based tools under test reach it.
     monkeypatch.setenv("KUBECONFIG", str(kind_cluster.kubeconfig))
 
 
 class TestLogFollowing:
+    # [CLASS DOC] Tests of the log follower.
     async def test_the_follower_streams_the_lines_a_pod_prints(
         self,
         cluster_core_v1: kubernetes_client.CoreV1Api,
@@ -41,6 +53,11 @@ class TestLogFollowing:
         kubectl_kubeconfig: None,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
+        # [FUNCTION DOC] Creates a pod printing an incrementing numbered line each second; waits for
+        # it to run. With info-level log capture, runs the log follower for the pod's label
+        # selector until at least three followed lines were captured (up to 180 seconds). Followed
+        # lines are log messages prefixed with the pod name and container. Asserts the captured
+        # numbers are exactly 1, 2, 3, ... without gaps, i.e. following starts from the first line.
         """Following a running pod logs the lines it printed, from the first, under a pod and container prefix."""
         await cluster_core_v1.create_namespaced_pod(
             namespace=cluster_namespace,
@@ -67,6 +84,7 @@ class TestLogFollowing:
 
 
 class TestClusterInfo:
+    # [CLASS DOC] Tests of the cluster info watcher.
     async def test_it_reports_a_pod_from_its_appearance_to_its_completion(
         self,
         cluster_core_v1: kubernetes_client.CoreV1Api,
@@ -74,6 +92,11 @@ class TestClusterInfo:
         kubectl_kubeconfig: None,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
+        # [FUNCTION DOC] Starts the watcher for a label selector before any pod exists and waits
+        # (60 seconds) for its "no pods yet" message. Then creates a pod sleeping 25 seconds and
+        # waits (240 seconds) until the last reported state of that pod is succeeded. Asserts that
+        # some reported state started with running and that a pod summary of one pod, one running,
+        # was logged.
         """The watcher logs the status changes and the pod summary of a pod that runs and then succeeds."""
         with caplog.at_level(logging.INFO):
             with with_cluster_info(namespace=cluster_namespace, selector=f"{CELL_LABEL}=cell-phases"):
@@ -110,6 +133,10 @@ class TestClusterInfo:
         kubectl_kubeconfig: None,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
+        # [FUNCTION DOC] Creates a pod using a nonexistent image on an invalid registry host; runs the
+        # watcher and waits (240 seconds) for a warning-level log record starting with the pod
+        # name; asserts at least one such warning mentions an image pull error, a pull back-off,
+        # or the missing image name.
         """A pod whose image cannot be pulled has its kubelet warning events surfaced as warnings."""
         await cluster_core_v1.create_namespaced_pod(
             namespace=cluster_namespace,
@@ -132,6 +159,7 @@ class TestClusterInfo:
 
 
 class TestCollectDiagnosis:
+    # [CLASS DOC] Tests of the diagnosis collector, its completeness reporting and command line entry.
     async def test_it_captures_the_output_and_the_exit_code_of_a_failing_pod(
         self,
         cluster_core_v1: kubernetes_client.CoreV1Api,
@@ -139,6 +167,10 @@ class TestCollectDiagnosis:
         kubectl_kubeconfig: None,
         tmp_path: Path,
     ) -> None:
+        # [FUNCTION DOC] Creates a pod printing a random marker and exiting with status 3; waits for
+        # the failed phase; collects the diagnosis into a temp directory. Asserts the diagnosis is
+        # complete, the pod's log file contains the marker, its description file shows exit code
+        # 3, and the namespace events file is non-empty.
         """The diagnosis of a pod that ran a bad script holds its output, its exit code and the namespace events."""
         marker = f"BOOM-{uuid.uuid4().hex}"
         await cluster_core_v1.create_namespaced_pod(
@@ -169,6 +201,11 @@ class TestCollectDiagnosis:
         tmp_path: Path,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
+        # [FUNCTION DOC] Creates a failing pod and waits for the failed phase; creates an empty run
+        # directory. Invokes the workbench collect-diagnosis command with the namespace, output
+        # directory and run directory. Asserts exit code 1; that exactly one log message about an
+        # incomplete diagnosis exists and it names only a missing verdict under the run directory;
+        # and that the last output line is an existing directory (the diagnosis directory).
         """The CLI fails and names the missing verdict when the run directory it is pointed at holds none."""
         await cluster_core_v1.create_namespaced_pod(
             namespace=cluster_namespace,
@@ -207,6 +244,9 @@ class TestCollectDiagnosis:
     async def test_it_says_which_pods_were_missing_when_the_selector_matches_none(
         self, cluster_namespace: str, kubectl_kubeconfig: None, tmp_path: Path
     ) -> None:
+        # [FUNCTION DOC] Collects a diagnosis with a selector matching no pod; asserts the only
+        # missing item is the pods of the run in the namespace, and that the events file was still
+        # written.
         """A selector that matches nothing degrades to an incomplete diagnosis naming the namespace."""
         diagnosis = collect_diagnosis(
             namespace=cluster_namespace, output_dir=tmp_path, selector=f"{CELL_LABEL}=cell-nothing-matches"
@@ -218,6 +258,8 @@ class TestCollectDiagnosis:
     async def test_it_says_which_pods_were_missing_when_the_namespace_does_not_exist(
         self, kubectl_kubeconfig: None, tmp_path: Path
     ) -> None:
+        # [FUNCTION DOC] Collects a diagnosis for a random nonexistent namespace; asserts it does not
+        # raise and reports the pods of the run in that namespace as the only missing item.
         """A namespace that does not exist degrades to an incomplete diagnosis instead of raising."""
         namespace = f"miles-absent-{uuid.uuid4().hex[:8]}"
 
@@ -234,6 +276,9 @@ async def _wait_for_phase(
     phase: str,
     timeout: float = _STARTUP_TIMEOUT,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Polls the pod every second (reading it from the cluster) until its
+    # phase equals the wanted one; after the timeout (default 180 seconds) fails an assertion
+    # naming the pod and phase.
     deadline = time.monotonic() + timeout
     while True:
         pod = await core_v1_api.read_namespaced_pod(namespace=namespace, name=name)
@@ -244,15 +289,22 @@ async def _wait_for_phase(
 
 
 def _messages(caplog: pytest.LogCaptureFixture) -> list[str]:
+    # [FUNCTION DOC] HELPER: The formatted message of every captured log record, in order (copies the
+    # record list first because other threads may append).
     return [record.getMessage() for record in list(caplog.records)]
 
 
 def _followed_line_numbers(caplog: pytest.LogCaptureFixture) -> list[int]:
+    # [FUNCTION DOC] HELPER: From captured messages starting with the prefix for the log test pod's
+    # main container followed by "line-", returns the integer after the prefix, in order. Raises a
+    # value error if the remainder is not an integer.
     prefix = "[pod-logs/main] line-"
     return [int(message.removeprefix(prefix)) for message in _messages(caplog) if message.startswith(prefix)]
 
 
 def _reported_states(caplog: pytest.LogCaptureFixture, *, pod: str) -> list[str]:
+    # [FUNCTION DOC] HELPER: For captured messages announcing that the pod appeared or is now in a
+    # state, returns the state text after the announcement prefix, in order.
     states = []
     for message in _messages(caplog):
         for opening in (f"pod {pod} appeared: ", f"pod {pod} is now "):
@@ -262,6 +314,8 @@ def _reported_states(caplog: pytest.LogCaptureFixture, *, pod: str) -> list[str]
 
 
 def _warnings_about(caplog: pytest.LogCaptureFixture, *, pod: str) -> list[str]:
+    # [FUNCTION DOC] HELPER: Messages of captured warning-level records that start with the pod name
+    # followed by a colon and a space.
     return [
         record.getMessage()
         for record in list(caplog.records)

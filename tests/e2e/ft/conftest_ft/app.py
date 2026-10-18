@@ -1,5 +1,16 @@
 # NOTE: You MUST read tests/e2e/ft/README.md as source-of-truth and documentations
 
+# [MODULE DOC] Builds the command-line apps and the CI runner for fault-tolerance (FT) end-to-end
+# tests. Two shapes are supported: a "comparison" test that trains a baseline side and a target
+# side (optionally in several named phases) and then compares their dump directories, and a
+# "non-comparison" test that trains once and optionally verifies the dumps.
+# Dump directories live under a root taken from the environment variable for the dumps root
+# (default: a public node directory) plus the run id and test name. For the Kubernetes cluster
+# backend, each comparison side's helm release is removed and waited on after the side finishes.
+# Public constants: the side names for baseline and target. Callers inject argument builders,
+# a comparison function, and optional hooks (config per side, a context manager around the
+# target side, a custom side runner, a mode resolver).
+
 import contextlib
 import os
 import shutil
@@ -46,6 +57,10 @@ TargetSideContextFn = Callable[
 
 @dataclass(frozen=True)
 class RunSideRequest:
+    # [CLASS DOC] Immutable bundle describing one training run of one side. Fields: the side name
+    # (baseline or target), the resolved FT test mode, the full training argument string, the
+    # side-specific dump directory, the execution config for this side, and whether the dumper
+    # is enabled.
     side: str
     mode: FTTestMode
     train_args: str
@@ -60,10 +75,17 @@ ResolveModeFn = Callable[[str | None], FTTestMode]
 
 
 def run_one_release(request: RunSideRequest) -> None:
+    # [FUNCTION DOC] Default side runner: launches one training run using the request's train
+    # arguments, mode, dump directory and config. Returns nothing; side effects are those of
+    # the training run (it removes the dump directory first if it exists).
     run_training(train_args=request.train_args, mode=request.mode, dump_dir=request.dump_dir, config=request.config)
 
 
 def resolve_dump_dir(test_name: str, *, run_id: str) -> str:
+    # [FUNCTION DOC] Computes and creates the dump directory for a test. The root is the value of
+    # the dumps-root environment variable when set and non-empty, otherwise the default public
+    # node dumps directory; the result is root / run id / test name. Creates the directory
+    # (and parents) if missing. Returns the path as a string.
     root = os.environ.get(_DUMPS_ROOT_ENV) or _DEFAULT_DUMPS_ROOT
     dump_dir = Path(root) / run_id / test_name
     os.makedirs(dump_dir, exist_ok=True)
@@ -71,10 +93,17 @@ def resolve_dump_dir(test_name: str, *, run_id: str) -> str:
 
 
 def _dump_subdir(side: str, phase: str) -> str:
+    # [FUNCTION DOC] HELPER: Returns the relative sub-directory for a side: "side/phase" when the
+    # phase is non-empty, otherwise just the side name.
     return f"{side}/{phase}" if phase else side
 
 
 def _release_comparison_side(request: RunSideRequest) -> None:
+    # [FUNCTION DOC] HELPER: Default post-side cleanup. Does nothing unless the request's config
+    # uses the Kubernetes cluster backend. For Kubernetes, asserts that a namespace is set, builds
+    # the serialized release name from run id, deploy component and deploy instance id, and
+    # removes that release and waits until it and its pods are gone. May raise an assertion error
+    # (no namespace) or a timeout error from the removal.
     config = request.config
     if config.cluster_backend is not ClusterBackend.KUBERNETES:
         return
@@ -91,6 +120,11 @@ def _release_comparison_side(request: RunSideRequest) -> None:
 
 
 def remove_release_and_wait(*, release: str, namespace: str) -> None:
+    # [FUNCTION DOC] Uninstalls a helm release if present and blocks until both the release
+    # manifest is gone and no pods matching the release selector remain. Polls every second
+    # (the poll interval constant) with a 300 second deadline (the timeout constant).
+    # Raises a timeout error listing whether the release still exists and the sorted names of
+    # remaining pods. Side effects: helm uninstall, cluster queries via kubectl/helm wrappers.
     selector = Kubectl.release_selector(release)
     deadline = time.monotonic() + _RELEASE_TIMEOUT_SECONDS
 
@@ -124,6 +158,16 @@ def run_pipeline(
     release_side: ReleaseSideFn = _release_comparison_side,
     resolve_mode_fn: ResolveModeFn = resolve_mode,
 ) -> None:
+    # [FUNCTION DOC] Runs the whole comparison pipeline for one mode. Steps: use the given phases
+    # or a single empty phase; resolve the mode through the resolver; create the dump directory
+    # (named by test name under the current default config's run id) and print it; prepare the
+    # models and data once; then for each phase, for baseline then target: derive the side dump
+    # directory (dump dir / side [/ phase]), resolve the side config, build the target-side
+    # context (a no-op context for baseline or when no hook is given), build the request with
+    # train arguments from the corresponding builder, run the side inside the context, and always
+    # invoke the release hook afterwards even on failure. After all sides, when the dumper is
+    # enabled, call the compare function with the dump dir and mode. The dump directory is always
+    # deleted at the end (errors ignored), even on failure. Exceptions from any step propagate.
     """Full pipeline (prepare + every phase's baseline/target + compare) for one mode."""
     effective_phases: list[str] = phases or [""]
     ft_mode: FTTestMode = resolve_mode_fn(mode)
@@ -177,6 +221,20 @@ def create_comparison_app_and_run_ci(
     run_side: RunSideFn = run_one_release,
     resolve_mode_fn: ResolveModeFn = resolve_mode,
 ) -> tuple[typer.Typer, Callable[[str | None], None]]:
+    # [FUNCTION DOC] Factory wiring a comparison test. Takes the test name, baseline and target
+    # argument builders (mode, dump dir, dumper flag -> argument string), a compare function,
+    # optional phase names, and optional hooks (target-side context, per-side config, side runner,
+    # mode resolver). Returns a pair: a typer app with the commands baseline, target, compare,
+    # run and generate-data, and a one-shot runner taking an optional mode name. The runner
+    # runs the full pipeline with the dumper always enabled and a test name suffixed with the mode
+    # (when a mode is given) so concurrent CI modes use distinct dump directories.
+    # Command behaviors: baseline/target run a single side (mode, dump dir, phase, dumper flag
+    # options; dump dir defaults to the resolved dump directory for the config's run id; models
+    # are prepared first; the target side runs inside the target context). compare calls the
+    # compare function on a required dump directory. run executes the full pipeline.
+    # generate-data (default 12 steps, default output directory under the temp directory)
+    # prepares models and runs real-rollout training with the dumper disabled to record debug
+    # rollout data; it asserts the mode has a real rollout.
     """Build, from one wiring, the manual typer app and a run_ci(mode) one-shot runner.
 
     Returns ``(app, run_ci)``: ``app`` exposes run/baseline/target/compare for manual use;
@@ -197,6 +255,10 @@ def create_comparison_app_and_run_ci(
         *,
         enable_dumper: bool = True,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Runs exactly one side. Resolves the mode and side config, picks the
+        # dump directory (given, or resolved from test name and config run id), appends the
+        # side/phase sub-directory, builds train arguments, prepares models and data, then runs the
+        # side via the side runner (inside the target context for the target side only).
         ft_mode = resolve_mode_fn(mode)
         config = _resolve_config_for_side(side, config_for_side=config_for_side)
         if dump_dir is None:
@@ -230,6 +292,7 @@ def create_comparison_app_and_run_ci(
         phase: PhaseOption = "",
         enable_dumper: EnableDumperOption = True,
     ) -> None:
+        # [FUNCTION DOC] Command: runs only the baseline side with the given options.
         """Run baseline (normal DP) training."""
         _execute_one_side(BASELINE_SIDE, build_baseline_args, mode, dump_dir, phase, enable_dumper=enable_dumper)
 
@@ -240,6 +303,7 @@ def create_comparison_app_and_run_ci(
         phase: PhaseOption = "",
         enable_dumper: EnableDumperOption = True,
     ) -> None:
+        # [FUNCTION DOC] Command: runs only the target side with the given options.
         """Run target (indep_dp) training."""
         _execute_one_side(TARGET_SIDE, build_target_args, mode, dump_dir, phase, enable_dumper=enable_dumper)
 
@@ -248,6 +312,8 @@ def create_comparison_app_and_run_ci(
         dump_dir: Annotated[str, typer.Option(help="Dump base directory")],
         mode: OptionalModeOption = None,
     ) -> None:
+        # [FUNCTION DOC] Command: resolves the mode and calls the compare function on an existing
+        # dump base directory; no training is run.
         """Compare baseline and target dumps."""
         ft_mode = resolve_mode_fn(mode)
         compare_fn(dump_dir, ft_mode)
@@ -257,6 +323,8 @@ def create_comparison_app_and_run_ci(
         mode: OptionalModeOption = None,
         enable_dumper: EnableDumperOption = True,
     ) -> None:
+        # [FUNCTION DOC] Command: runs the full pipeline for the given mode and dumper flag using
+        # the closure's wiring.
         """Full pipeline: prepare + all phases + compare."""
         run_pipeline(
             test_name=test_name,
@@ -280,6 +348,9 @@ def create_comparison_app_and_run_ci(
             str, typer.Option(help="Output directory for rollout data")
         ] = "/tmp/generated_rollout_data",
     ) -> None:
+        # [FUNCTION DOC] Command: records debug rollout data into the output directory by training
+        # for the requested number of steps with a real rollout and no dumper. Asserts the
+        # resolved mode has real rollout engines; prepares models and data first.
         """Generate debug rollout data using real rollout (no dumper)."""
         ft_mode = resolve_mode_fn(mode)
         assert (
@@ -290,6 +361,8 @@ def create_comparison_app_and_run_ci(
         run_training(train_args=args, mode=ft_mode)
 
     def run_ci(mode: str | None = None) -> None:
+        # [FUNCTION DOC] Returned one-shot runner: runs the full pipeline for the given mode with
+        # the dumper enabled; test name gets a mode suffix when a mode is provided.
         """Run one mode's full pipeline (entry point for the per-mode CI files)."""
         run_pipeline(
             test_name=f"{test_name}_{mode}" if mode is not None else test_name,
@@ -310,6 +383,8 @@ def create_comparison_app_and_run_ci(
 def _resolve_config_for_side(
     side: str, *, config_for_side: ConfigForSideFn | None
 ) -> command_utils.ExecuteTrainConfig:
+    # [FUNCTION DOC] HELPER: Returns the default execution config, passed through the optional
+    # per-side config hook (called with the side name and the default config) when provided.
     config = command_utils.default_config()
     return config_for_side(side, config) if config_for_side is not None else config
 
@@ -320,6 +395,9 @@ def create_non_comparison_app(
     build_args: Callable[[FTTestMode, str], str],
     verify_fn: Callable[[str, FTTestMode], None] | None = None,
 ) -> typer.Typer:
+    # [FUNCTION DOC] Factory for a single-run test. Takes the test name, an argument builder
+    # (mode, dump dir -> argument string) and an optional verify function (dump dir, mode).
+    # Returns a typer app with one command, run, whose required option is the mode name.
     """Generate a typer app with a single 'run' command for non-comparison tests."""
     app: typer.Typer = typer.Typer()
 
@@ -327,6 +405,10 @@ def create_non_comparison_app(
     def run(
         mode: ModeOption,
     ) -> None:
+        # [FUNCTION DOC] Command: resolves the mode with the default resolver, creates and prints the
+        # dump directory, prepares models and data, trains once with the built arguments and
+        # default config, then calls the verify function if provided. The dump directory is not
+        # removed afterwards.
         """Full pipeline: prepare + execute + verify."""
         ft_mode = resolve_mode(mode)
         config = command_utils.default_config()
