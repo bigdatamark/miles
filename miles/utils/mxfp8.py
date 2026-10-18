@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# MXFP8 weight quantization through transformer engine: 8-bit E4M3 elements with one block scale per
+# 32 consecutive elements along the last dimension. Transformer engine is imported lazily.
 import torch
 
 
@@ -6,6 +9,12 @@ TE_MXFP8_ROW_ALIGNMENT = 32
 
 
 def mxfp8_quantize(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Quantizes a weight of any rank whose last dimension is divisible by 32 (value
+    # error otherwise). Makes it contiguous, flattens to rows, zero-pads the row count up to a
+    # multiple of 32 (the quantizer's alignment), quantizes row-wise only with E4M3 element type,
+    # then strips the padding. Returns (float8 E4M3 data shaped like the input, scales with the last
+    # dimension divided by 32 and the other dimensions as the input; compact, unswizzled, dtype as
+    # produced by the engine). Requires a gpu-capable transformer engine.
     """Quantize a tensor to rowwise MXFP8 with compact, unswizzled scales."""
     from transformer_engine.pytorch import MXFP8Quantizer
     from transformer_engine.pytorch.constants import TE_DType

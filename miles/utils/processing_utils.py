@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Tokenizer and multimodal processor helpers: cached tokenizer loading (with optional custom chat
+# template and a fix for transformers v5 tokenizer component mismatches), processor loading
+# (special-cased for inkling), building processor call arguments, calling processors (with the
+# media-list convention of kimi models), extracting trainable multimodal inputs, extracting vision
+# inputs from prompts, and encoding images as data urls for the rollout engine.
 import base64
 import inspect
 import io
@@ -17,6 +23,11 @@ logger = logging.getLogger(__name__)
 
 
 def _fix_v5_tokenizer_components(tokenizer: PreTrainedTokenizerBase, model_name_or_path: str) -> None:
+    # [FUNCTION DOC] HELPER: Repairs a loaded fast tokenizer in place. Does nothing if it has no
+    # backend tokenizer. Reads the raw tokenizer definition file from the local model directory, or
+    # from the local hub cache only (no network); any failure is logged as a warning and ends the
+    # fix. If the raw pre-tokenizer type name differs from the loaded one (both present), logs and
+    # replaces the loaded pre-tokenizer and decoder by the raw ones. Mutates the tokenizer.
     # transformers v5's LlamaTokenizerFast rebuilds pre_tokenizer/decoder in
     # __init__, discarding the originals from tokenizer.json.  DeepSeek-V3.2
     # declares LlamaTokenizerFast but actually uses ByteLevel, so without this
@@ -64,6 +75,9 @@ _TOKENIZER_CACHE: dict[tuple, PreTrainedTokenizerBase] = {}
 
 
 def _make_cache_key(name_or_path: str, chat_template_path: str | None, kwargs: dict) -> tuple | None:
+    # [FUNCTION DOC] HELPER: Cache key of name, template path and sorted keyword items; none if the
+    # keyword values are unhashable (or unsortable) so such loads are not cached. Note: key sorting
+    # and hashing failures other than a type error would propagate.
     try:
         kwargs_items = tuple(sorted(kwargs.items()))
         hash(kwargs_items)
@@ -73,6 +87,11 @@ def _make_cache_key(name_or_path: str, chat_template_path: str | None, kwargs: d
 
 
 def load_tokenizer(name_or_path: str, chat_template_path: str | None = None, **kwargs) -> PreTrainedTokenizerBase:
+    # [FUNCTION DOC] Returns a cached tokenizer if the same arguments were loaded before (the same
+    # object is shared, so mutating it affects all users). Otherwise registers model type aliases,
+    # loads with the auto tokenizer (extra keyword arguments passed through), applies the v5
+    # component fix, and if a chat template path is given asserts the file exists and replaces the
+    # tokenizer's chat template with its text. Caches when the key is hashable.
     # Cache keyed by (name, chat_template_path, kwargs) — the fast suite creates
     # hundreds of SessionServer / MockSGLangServer fixtures and each previously
     # triggered a fresh AutoTokenizer.from_pretrained, tripping HF Hub rate limits.
@@ -98,6 +117,10 @@ def load_tokenizer(name_or_path: str, chat_template_path: str | None = None, **k
 
 
 def build_processor_kwargs(multimodal_inputs: dict | None = None) -> dict:
+    # [FUNCTION DOC] Copies the multimodal inputs mapping (empty if none) and forces per-modality
+    # keyword groups: text keyword group gets no tensor type (plain lists), and audio, images and
+    # videos groups get tensor type "pt" (merged over any existing group contents; the forced value
+    # wins). Returns the new mapping; the input is not mutated.
 
     modality_forced = {"return_tensors": "pt"}
 
@@ -116,6 +139,8 @@ def build_processor_kwargs(multimodal_inputs: dict | None = None) -> dict:
 
 
 def processor_requires_medias(processor) -> bool:
+    # [FUNCTION DOC] True if the processor's call signature has both a medias and a text parameter;
+    # if the signature cannot be inspected, true when the processor has a media processor attribute.
     try:
         params = inspect.signature(processor).parameters
         return "medias" in params and "text" in params
@@ -124,6 +149,10 @@ def processor_requires_medias(processor) -> bool:
 
 
 def call_processor(processor, text, multimodal_inputs: dict | None = None):
+    # [FUNCTION DOC] Runs the processor on the text. For media-list processors, builds a list of
+    # typed media entries (images then videos, from the lists under those keys) and calls with text
+    # and medias (other multimodal keys are ignored). Otherwise calls with text and the keyword
+    # groups from the kwargs builder. Returns the processor output.
     multimodal_inputs = multimodal_inputs or {}
 
     # for kimi-vl & kimi-2.5
@@ -140,11 +169,17 @@ def call_processor(processor, text, multimodal_inputs: dict | None = None):
 
 
 def extract_multimodal_train_inputs(processor_output: Mapping[str, Any]) -> dict[str, Any] | None:
+    # [FUNCTION DOC] Returns the processor output entries other than input ids, attention mask and
+    # multimodal token type ids; none when nothing remains.
     excluded_keys = {"input_ids", "attention_mask", "mm_token_type_ids"}
     return {key: value for key, value in processor_output.items() if key not in excluded_keys} or None
 
 
 def load_processor(name_or_path: str, **kwargs):
+    # [FUNCTION DOC] Loads a multimodal processor. Inkling checkpoints (detected lazily) use a
+    # dedicated training processor from the plugin package. Otherwise uses the auto processor; load
+    # errors (operating system or value errors) are logged and give none. A result that is a bare
+    # tokenizer or not a processor is discarded (none). Returns the processor or none.
     from miles.utils.chat_template_utils.inkling import is_inkling_checkpoint
 
     if is_inkling_checkpoint(name_or_path):
@@ -166,6 +201,10 @@ def load_processor(name_or_path: str, **kwargs):
 
 
 def process_vision_info(prompt, processor):
+    # [FUNCTION DOC] Extracts media from a chat prompt. If the processor can extract media itself,
+    # delegates to it. Otherwise uses the qwen vision utility with the image processor's patch size
+    # (default 14, logged when used; the qwen3 models use 16) and returns a mapping with images and
+    # videos entries. The default is a temporary choice (see the to-do).
     if hasattr(processor, "extract_media"):
         return processor.extract_media(prompt)
 
@@ -183,6 +222,10 @@ def process_vision_info(prompt, processor):
 
 
 def encode_image_for_rollout_engine(image) -> str:
+    # [FUNCTION DOC] Converts a PIL-style image to RGB if needed, saves it as png into memory and
+    # returns a data url with base64 text.
+    # KNOWN ISSUE: the docstring says the image is loaded from a path, but the function takes an
+    # already loaded image object.
     """Load an image from path, ensure RGB, encode as PNG base64 string."""
     buffer = io.BytesIO()
     if image.mode != "RGB":

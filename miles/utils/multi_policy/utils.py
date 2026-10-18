@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Multi-policy training setup helpers: creating one trainer per policy (with take-over of existing
+# trainers on hot restart), verifying that restored checkpoints are consistent across policies,
+# validating that command line options are compatible with multi-policy training, and defining
+# per-policy metric step groups.
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,12 +21,22 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class TrainerInfo:
+    # [CLASS DOC] Immutable description of a created trainer: policy model id, the rollout id it
+    # starts from (zero for fresh, otherwise one past the restored checkpoint), and its handle.
     model_id: str
     start_rollout_id: int
     handle: BaseWorkerHandle
 
 
 async def create_trainers(args, *, rollout_executor: BaseWorkerHandle) -> dict[str, TrainerInfo]:
+    # [FUNCTION DOC] Creates all policy trainers and returns a mapping from model id to trainer info.
+    # Steps: compute trainer configs; create worker handles; take over existing trainers (a hot
+    # restart flag, resumed, is the result); for each config (asserting it has a model id and the id
+    # is unique) create the training model with per-trainer args and record its start rollout id and
+    # handle; push each trainer's parallel config to the rollout executor under its model id; compute
+    # the leader policy from the megatron config, its last completed rollout id (start id minus one),
+    # assert the global dataset state exists for it, and make the rollout executor load that
+    # rollout state. Does not call the restore-consistency assertion (callers do).
     trainer_configs = compute_trainer_configs(args)
     handles = create_trainer_handles(args, trainer_configs=trainer_configs)
     resumed = await take_over_trainers(args, handles=handles)
@@ -54,6 +69,10 @@ async def create_trainers(args, *, rollout_executor: BaseWorkerHandle) -> dict[s
 
 
 def _assert_global_rollout_state_exists(args, *, leader_rollout_id: int) -> None:
+    # [FUNCTION DOC] HELPER: Skips (returns) for fresh runs (negative id), when no global rollout
+    # dataset is used, or when no load directory is set. Otherwise asserts that the global dataset
+    # state file for that rollout id exists under the rollout subdirectory of the load directory,
+    # because a missing file would silently restart the data source from the first prompt.
     if leader_rollout_id < 0 or not args.rollout_global_dataset or args.load is None:
         return
 
@@ -65,6 +84,11 @@ def _assert_global_rollout_state_exists(args, *, leader_rollout_id: int) -> None
 
 
 def assert_consistent_restore(args, *, trainers: dict[str, TrainerInfo], leader_model_id: str) -> None:
+    # [FUNCTION DOC] Verifies the policies resumed consistently. Leader fresh (start rollout zero):
+    # asserts every policy is fresh, then returns. Otherwise: needs a load or save directory
+    # (assertion); loads the multi-policy record for the leader's last completed rollout id and
+    # asserts it exists, was written with the same leader, and that its per-policy rollout ids equal
+    # the ones restored (start id minus one for each trainer). Logs on success.
     leader_rollout_id = trainers[leader_model_id].start_rollout_id - 1
     if leader_rollout_id < 0:
         fresh = [model_id for model_id, trainer in trainers.items() if trainer.start_rollout_id != 0]
@@ -102,6 +126,12 @@ def assert_consistent_restore(args, *, trainers: dict[str, TrainerInfo], leader_
 
 
 def validate_multi_policy_args(args, *, megatron_config: MegatronConfig) -> None:
+    # [FUNCTION DOC] Asserts (each with an explanatory message) that: the megatron config names more
+    # than one policy; colocate is off; fully async mode is on; no critic; not debug-rollout-only;
+    # the async unused samples handler is not retry; no explicit checkpoint step; no debug rollout
+    # data flags; evaluation (if enabled) does not use snapshot backends; an sglang config is given
+    # and every policy model id matches a sglang model with weight updates enabled. Finally runs the
+    # async off-policy correction validation.
     assert megatron_config.is_multi_policy, (
         f"train_multi_policy.py trains several policies, but --megatron-config names "
         f"only {megatron_config.model_ids}; run train_async.py instead"
@@ -143,6 +173,8 @@ def validate_multi_policy_args(args, *, megatron_config: MegatronConfig) -> None
 
 
 def _assert_no_debug_rollout_data_flags(args) -> None:
+    # [FUNCTION DOC] HELPER: Asserts none of dump details, load debug rollout data, and inject
+    # rollout data path is set (truthy); message lists those that are.
     set_flags = [
         flag
         for flag, value in (
@@ -159,6 +191,9 @@ def _assert_no_debug_rollout_data_flags(args) -> None:
 
 
 def define_policy_metric_groups(megatron_config: MegatronConfig) -> None:
+    # [FUNCTION DOC] For every policy model id, registers two tracking metric groups keyed by their
+    # own step metrics: the model's rollout metrics (prefix is the id, step key rollout step) and its
+    # train metrics (prefix id plus train, step key train step). Side effect on the tracking backend.
     for model_id in megatron_config.model_ids:
         define_step_key_metric_group(prefix=model_id, step_key=f"{model_id}/rollout/step")
         define_step_key_metric_group(prefix=f"{model_id}/train", step_key=f"{model_id}/train/step")

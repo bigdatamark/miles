@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Helpers for "hot restart": a new orchestration script taking over workers (trainers and the
+# inference controller) that a previous script left initialized and possibly busy. Includes waiting
+# for a worker to be uninitialized, waiting for trainers to become idle and deciding whether to init
+# or reload state, and taking over the inference controller (idle wait, cell count wait, abort of
+# running generations, agent abort hook). Time limits are module constants in seconds.
 from __future__ import annotations
 
 import asyncio
@@ -31,7 +37,13 @@ _WORKER_READY_TIMEOUT_SECONDS = 60.0
 async def wait_until_worker_not_initialized(
     handle: BaseWorkerHandle, *, timeout: float = _WORKER_NOT_INITIALIZED_TIMEOUT_SECONDS
 ) -> None:
+    # [FUNCTION DOC] Polls (fixed 5 second delay, each attempt limited to 120 seconds, total limit
+    # the timeout, default 30 minutes) until the worker reports the not-initialized state, retrying
+    # on still-initialized, unreachable, restarted-server and retryable rpc errors. Raises whatever
+    # the retry helper raises at the deadline.
     async def attempt(remaining: float) -> None:
+        # [FUNCTION DOC] HELPER: One probe: waits for readiness (up to 60 seconds, allowing server id
+        # change), then raises the still-initialized error unless the init state is not-initialized.
         await handle.wait_ready(timeout=_WORKER_READY_TIMEOUT_SECONDS, allow_server_uuid_change=True)
         if (state := await handle.get_init_state()) != InitState.NOT_INITED.value:
             raise _StillInitializedError(f"the worker answers {state}, so a previous script already got hold of it")
@@ -48,6 +60,8 @@ async def wait_until_worker_not_initialized(
 
 
 class _StillInitializedError(Exception):
+    # [CLASS DOC] HELPER: Signals a worker that is already initialized by a previous script; used as
+    # a retryable condition.
     pass
 
 
@@ -55,6 +69,9 @@ class _StillInitializedError(Exception):
 
 
 async def wait_trainers_idle(handles: dict[str, BaseWorkerHandle]) -> bool:
+    # [FUNCTION DOC] Takes a non-empty mapping from trainer id to handle. Queries initialization of
+    # all concurrently and asserts they agree. Returns true if all are initialized (resumed), after
+    # sequentially waiting for each to be idle (10 minute limit each); returns false if none are.
     assert handles
 
     initialized = await asyncio.gather(*[handle.is_initialized() for handle in handles.values()])
@@ -72,6 +89,9 @@ async def wait_trainers_idle(handles: dict[str, BaseWorkerHandle]) -> bool:
 async def trainer_init_or_load_state(
     trainer: BaseWorkerHandle, model_args: Namespace, *, trainer_id: str, resumed: bool
 ) -> list[Any]:
+    # [FUNCTION DOC] If not resumed, initializes the trainer with the model args and returns its
+    # result. Otherwise loads the saved state with a one hour limit, logs and returns the start
+    # rollout ids it reports.
     if not resumed:
         return await trainer.init(model_args)
 
@@ -84,6 +104,10 @@ async def trainer_init_or_load_state(
 
 
 async def init_or_reset_inference_controller(inference_controller: BaseWorkerHandle, *, args: Namespace) -> None:
+    # [FUNCTION DOC] If the controller is not initialized, initializes it and returns. Otherwise
+    # takes it over: asserts the weight transfer mode is not disk-delta (its first update only
+    # records a baseline); waits for idle (1 hour), waits for the expected cell count (10 minutes),
+    # aborts all running generations (10 minutes), then runs the agent abort hook (10 minutes).
     if not await inference_controller.is_initialized():
         await inference_controller.init()
         return

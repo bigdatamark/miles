@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Seam between core rollout code and the optional dashboard for trajectory timing: a singleton
+# holder of an optional sink, and a function that records per-call timing segments into sample
+# metadata.
 """Trajectory-lifecycle seam callable from core rollout code.
 
 Core generation paths read ``TrajectoryLifecycle().sink`` unconditionally, so
@@ -11,11 +15,19 @@ from miles.utils.misc import SingletonMeta
 
 
 class TrajectoryLifecycle(metaclass=SingletonMeta):
+    # [CLASS DOC] Process singleton; its sink attribute is the dashboard sink or none (off).
     def __init__(self):
+        # [FUNCTION DOC] Initializes the sink to none (installed later by the dashboard).
         self.sink = None  # the dashboard TrajectorySink (duck-typed); None = off
 
 
 def attach_lifecycle_metadata(sample, record, prev_record, turn: int) -> None:
+    # [FUNCTION DOC] Writes a timing segment mapping into the sample's metadata under the key
+    # lifecycle (overwriting). Reads the first choice's meta info of the record's response for the
+    # end-to-end latency (seconds). Segment: end time = record timestamp; start = end minus latency
+    # (none if no latency reported); turn number; the request arrival timestamp if the record has
+    # one; and the previous record's end timestamp if a previous record is given. Raises key or
+    # index errors if the response has no first choice.
     """Fold one chat record's timing onto its sample via
     ``metadata["lifecycle"]`` so it rides the Sample across the session
     boundary. ``timestamp`` is the segment end; the start is the engine's

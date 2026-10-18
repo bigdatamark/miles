@@ -1,3 +1,5 @@
+# [MODULE DOC]
+# Common startup sequence for orchestration scripts (the driver process that launches workers).
 from argparse import Namespace
 from functools import partial
 
@@ -14,6 +16,12 @@ from miles.utils.tracking_utils.tracking import finish_tracking, init_tracking
 
 
 def init_orchestration_script(args: Namespace, *, disposer: Disposer) -> ActorHandle | None:
+    # [FUNCTION DOC] Ordered setup: restores event logger checkpoint state from args; configures
+    # logging for a process component named main; optionally starts periodic stack dumping; registers
+    # tracking shutdown with the disposer and initializes tracking; launches the worker manager and
+    # registers its shutdown with the disposer; initializes the object store singleton without
+    # contributing a memory segment (this process stores nothing). Returns the worker manager handle
+    # (or none if the launcher gives none). Cleanup callbacks run in the disposer's order, not here.
     event_logger_checkpoint.restore(args)
     configure_logger(args, source=SimpleProcessIdentity(component="main"))
     maybe_start_periodic_pyspy_dump()

@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Registers compatibility config (and causal model) classes for model types unknown to the installed
+# transformers, by subclassing a base config; then loads configs from checkpoints. Also helpers to
+# detect sparse-attention (DSA) model types and to check for the export completion marker file.
 """HuggingFace config loader with model-type alias registration and overrides.
 
 `load_hf_config` is the single entry point miles uses to load an HF config from a
@@ -21,6 +25,10 @@ from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
 
 @dataclass(frozen=True)
 class _HFConfigAlias:
+    # [CLASS DOC] HELPER: Describes one alias: new model type name, module and class name of the base
+    # config to subclass, name of the generated class, auto model classes to register a compatible
+    # model for (default causal lm), whether it may override a native transformers type, and the
+    # optional name of a module-level function that normalizes config kwargs.
     model_type: str
     base_module: str
     base_class: str
@@ -33,6 +41,9 @@ class _HFConfigAlias:
 
 
 def _normalize_deepseek_v41_kwargs(kwargs: dict) -> dict:
+    # [FUNCTION DOC] HELPER: Returns a copy of the kwargs with the text config merged to top level:
+    # removes the nested text config and the vision config; if the text config is a mapping, drops
+    # its model type and merges it under the outer kwargs (outer values win on conflicts).
     """Flatten the composite HF config (text_config holds the decoder)."""
     kwargs = dict(kwargs)
     text = kwargs.pop("text_config", None)
@@ -98,6 +109,15 @@ _REGISTERED_ALIASES: set[str] = set()
 
 
 def register_hf_config_aliases() -> None:
+    # [FUNCTION DOC] Registers every not-yet-registered alias. For each: raises a runtime error if
+    # transformers natively knows the type and override is not allowed; imports the base config
+    # class; creates a subclass with the alias model type (with a custom constructor that applies
+    # the kwargs normalizer, forces the model type and calls the base constructor, when configured);
+    # registers it with the auto config (replacing existing when override allowed); for each auto
+    # model class, subclasses the model class mapped to the base config with the new config class and
+    # registers it. Marks the alias done. Finally tries to import the sglang inkling config module
+    # for its side effect, ignoring import errors. Mutates global transformers registries and the
+    # module-level registered set.
     """Register miles model_type aliases with transformers. Idempotent.
 
     Already called inside `load_hf_config` and `load_tokenizer`. Only call
@@ -120,6 +140,8 @@ def register_hf_config_aliases() -> None:
             model_type = alias.model_type
 
             def __init__(self, *args, _normalize=normalize, _model_type=model_type, _base=base_config, **kwargs):
+                # [FUNCTION DOC] HELPER: Constructor of the generated config class: normalizes the
+                # keyword arguments, sets the alias model type, then calls the base constructor.
                 kwargs = _normalize(kwargs)
                 kwargs["model_type"] = _model_type
                 _base.__init__(self, *args, **kwargs)
@@ -148,6 +170,9 @@ def load_hf_config(
     trust_remote_code: bool = True,
     **autoconfig_kwargs,
 ):
+    # [FUNCTION DOC] Registers aliases, loads the config from the checkpoint path with remote code
+    # trusted by default and any extra keyword arguments, then sets each override attribute on it.
+    # Returns the config.
     """Load an HF config from a local checkpoint.
 
     Registers model aliases first for pre-set aliases.
@@ -165,6 +190,7 @@ def load_hf_config(
 
 
 def is_dsa(hf_config) -> bool:
+    # [FUNCTION DOC] True if the config's model type is one of deepseek v3.2, glm moe dsa, glm5 next.
     return getattr(hf_config, "model_type", None) in ("deepseek_v32", "glm_moe_dsa", "glm5_next")
 
 
@@ -173,4 +199,5 @@ HF_EXPORT_COMPLETE_MARKER = ".complete"
 
 
 def is_complete_hf_export(path: str | Path) -> bool:
+    # [FUNCTION DOC] True if the completion marker file exists in the directory.
     return (Path(path) / HF_EXPORT_COMPLETE_MARKER).exists()

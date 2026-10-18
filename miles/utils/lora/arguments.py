@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# LoRA command line arguments, and startup validation that derives the final target module lists
+# (huggingface-side targets and adapter-side targets) from the user's selectors and the model
+# config, storing them on the parsed args. Also validates multi-LoRA constraints and sets the
+# multi-LoRA flag.
 import logging
 from typing import Any
 
@@ -20,6 +25,13 @@ logger = logging.getLogger(__name__)
 
 
 def add_lora_arguments(parser):
+    # [FUNCTION DOC] Registers LoRA options on the parser and returns it: rank (int, default 0
+    # meaning disabled), alpha (int, 16), dropout (float, 0), type (standard or canonical split
+    # q/k/v), target modules and exclude modules (comma-separated text, default none), adapter path,
+    # sync-from-tensor, base cpu backup (colocate only), train-only (rollout stays on the frozen base
+    # policy), shared-outer expert loras, multi-lora adapter slot count (0 disables), and a weight
+    # equality check flag. Also sets the default of the sglang virtual experts option to true and adds
+    # a negating flag for it.
     """Add LoRA-related arguments for Megatron backend."""
     parser.add_argument(
         "--lora-rank",
@@ -134,6 +146,13 @@ def add_lora_arguments(parser):
 
 
 def validate_lora_args(args):
+    # [FUNCTION DOC] Validates multi-LoRA first (sets the multi-lora flag). Returns if LoRA is not
+    # enabled (rank positive or adapter path set). Otherwise asserts the megatron train backend and
+    # a positive rank, loads the huggingface config from the checkpoint, and stores on args the
+    # resolved huggingface targets and adapter targets. Then synchronizes shared-outer expert LoRA
+    # with the sglang attribute (if the sglang attribute exists and this flag is on, forces the
+    # sglang one on) and asserts both agree; logs a warning naming the expert layout when expert
+    # leaves are targeted. Mutates args.
     validate_multi_lora_args(args)
     if not is_lora_enabled(args):
         return
@@ -156,6 +175,18 @@ def validate_lora_args(args):
 
 
 def _resolve_lora_targets(args, hf_config):
+    # [FUNCTION DOC] HELPER: Returns (huggingface targets, adapter targets). Steps: collect model
+    # module names from a meta-device weight mapping (weight suffix removed); parse target and
+    # exclude selector lists; if targets were given, expand paired gate/up projections into packed
+    # ones, remember explicit (non-group, non-all-linear) targets, and use the expanded list;
+    # assert no module matched by both an explicit target and an exclusion; if no targets were given
+    # under multi-lora, use all groups; resolve groups to concrete targets and apply exclusions.
+    # If every target and exclusion matches some model module, the targets are final (with
+    # exclusions applied to the matched module list when exclusions exist). Else, in bridge mode,
+    # normalizes legacy megatron selectors to huggingface names through the bridge (lazy import);
+    # else expands against the static per-model layout. Adapter targets default to a copy of the
+    # huggingface targets; in raw mode inkling models and kimi k3 use model-specific plugin
+    # resolvers. Args selectors are not modified.
     """Return final HF and adapter targets without changing the CLI selectors in `args`."""
     hf_mapping = HfWeightMapping.from_config(hf_config)
     hf_modules = [name.removesuffix(".weight") for name in hf_mapping.parameter_names]
@@ -217,6 +248,16 @@ def _resolve_lora_targets(args, hf_config):
 
 
 def validate_multi_lora_args(args: Any) -> None:
+    # [FUNCTION DOC] Sets the multi-lora flag on args (true when the adapter slot count attribute is
+    # positive). If enabled, asserts (with explanatory messages): positive rank; megatron backend; no
+    # allgather context parallel; pipeline parallel size 1; thd qkv format; no shared-outer expert
+    # loras; optimizer not muon-like and equal to adam (default adam); not colocated; no
+    # independent-dp or train fault tolerance component; no train offload; no witness module; a
+    # single sglang tokenizer worker; no per-token loss. Finally forces bridge mode for megatron to
+    # huggingface conversion. Mutates args.
+    # KNOWN ISSUE: the muon check is redundant with the later requirement that the optimizer equals
+    # adam, and the optimizer message accesses the attribute directly even though earlier checks use
+    # a defaulted lookup.
     """Set ``args.multi_lora``, then validate the trainer-side constraints of
     the slot machinery. A no-op for normal runs."""
     args.multi_lora = getattr(args, "multi_lora_n_adapters", 0) > 0

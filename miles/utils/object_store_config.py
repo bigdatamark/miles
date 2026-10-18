@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Configuration of the mooncake store client. A table of fields describes, per setting, the name in
+# user init keyword arguments, the key in the store's configuration, the environment variable
+# fallback, the parser and the default. Resolution order per field: init keyword argument, then
+# environment variable, then default (empty values count as unset except for numeric size fields).
+# Sizes accept integers or text with k/m/g or kb/mb/gb suffixes (powers of 1024).
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -11,6 +17,8 @@ _MISSING = object()
 
 
 def compute_mooncake_init_kwargs_vanilla(*, host: str = "127.0.0.1", master_port: int = MOONCAKE_MASTER_PORT) -> dict:
+    # [FUNCTION DOC] Default init keyword arguments for a local master: tcp protocol, master address
+    # host:port (default loopback and port 50051), 2gb global segment and 2gb local buffer.
     return {
         "protocol": "tcp",
         MOONCAKE_MASTER_ADDRESS_KEY: f"{host}:{master_port}",
@@ -20,6 +28,10 @@ def compute_mooncake_init_kwargs_vanilla(*, host: str = "127.0.0.1", master_port
 
 
 def compute_mooncake_init_kwargs_from_env() -> dict:
+    # [FUNCTION DOC] Builds init keyword arguments from environment variables, limited to the settings
+    # that have a vanilla default (protocol, master address, global segment size, local buffer
+    # size); each is included only if its environment variable is set (even if empty). Values stay
+    # as raw text.
     defaulted_init_kwargs = compute_mooncake_init_kwargs_vanilla()
     return {
         field.init_kwarg: value
@@ -29,6 +41,9 @@ def compute_mooncake_init_kwargs_from_env() -> dict:
 
 
 def compute_mooncake_store_config(init_kwargs: dict[str, Any], *, contribute_segment: bool) -> dict[str, Any]:
+    # [FUNCTION DOC] Builds the store configuration mapping (keys are the store's config keys). Each
+    # field is resolved and parsed, except the global segment size, which is forced to zero when this
+    # process does not contribute a segment.
     config: dict[str, Any] = {}
     for field in _MOONCAKE_STORE_FIELDS:
         if field.config_key == _GLOBAL_SEGMENT_SIZE_KEY and not contribute_segment:
@@ -40,6 +55,9 @@ def compute_mooncake_store_config(init_kwargs: dict[str, Any], *, contribute_seg
 
 @dataclass(frozen=True)
 class _MooncakeStoreField:
+    # [CLASS DOC] HELPER: Description of one setting: init keyword name, store config key,
+    # environment variable name, parser function, default value or default factory (factory wins),
+    # and whether empty values are treated as unset (default true).
     init_kwarg: str
     config_key: str
     env_var: str
@@ -50,6 +68,9 @@ class _MooncakeStoreField:
 
 
 def _resolve_field(field: _MooncakeStoreField, *, init_kwargs: dict[str, Any]) -> Any:
+    # [FUNCTION DOC] HELPER: First usable value among the init keyword argument then the environment
+    # variable (a value is usable if present and truthy, or present when empty counts as set); else
+    # the default factory result if any; else the static default.
     for value in (init_kwargs.get(field.init_kwarg, _MISSING), os.environ.get(field.env_var, _MISSING)):
         if value is not _MISSING and (value or not field.treats_falsy_as_unset):
             return value
@@ -59,6 +80,11 @@ def _resolve_field(field: _MooncakeStoreField, *, init_kwargs: dict[str, Any]) -
 
 
 def _parse_size(value: Any) -> int:
+    # [FUNCTION DOC] HELPER: Integers pass through. Other values are converted to text, stripped and
+    # lower-cased; a recognized suffix (kb, mb, gb, k, m, g, checked in that order) multiplies the
+    # numeric part (a decimal is allowed) by the power of 1024 and truncates to an integer;
+    # otherwise the text must be an integer. Invalid text raises a value error.
+    # KNOWN ISSUE: a boolean is an integer in this language and passes through unchanged.
     if isinstance(value, int):
         return value
     text = str(value).strip().lower()
@@ -70,6 +96,8 @@ def _parse_size(value: Any) -> int:
 
 
 def _local_hostname() -> str:
+    # [FUNCTION DOC] HELPER: This node's ip as reported by ray (lazy import), used as the default
+    # local hostname.
     import ray
 
     return ray.util.get_node_ip_address()

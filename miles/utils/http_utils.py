@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Networking and http helpers: port discovery and readiness polling (sync and async), ip resolution
+# with ipv4/ipv6 preference through environment variables, router launching, process termination,
+# and the shared async http clients with retrying POST/GET/DELETE helpers. A rollout client with a
+# concurrency limit is created by the init function (derived from args); optionally POSTs are
+# dispatched through detached ray actors placed on every node, with a local fallback on failure.
 import asyncio
 import ipaddress
 import json
@@ -23,6 +29,9 @@ _CONNECT_RETRY_INTERVAL_SECONDS = 0.5
 
 
 def find_available_port(base_port: int):
+    # [FUNCTION DOC] Returns a bindable tcp port. Starts at the base plus a random offset between
+    # 100 and 1000, and while the port is unavailable steps up by 42 (below 60000) or down by 43
+    # (otherwise). Loops forever if nothing is available.
     port = base_port + random.randint(100, 1000)
     while True:
         if is_port_available(port):
@@ -34,6 +43,9 @@ def find_available_port(base_port: int):
 
 
 def is_port_available(port):
+    # [FUNCTION DOC] Tries to bind and listen on all interfaces at the port with address reuse on
+    # (the socket is closed again); true on success, false on operating system errors or an
+    # out-of-range port number.
     """Return whether a port is available."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
@@ -53,6 +65,9 @@ def wait_for_server_ready(
     process: "multiprocessing.Process | subprocess.Popen | None" = None,
     timeout: float = 30,
 ) -> None:
+    # [FUNCTION DOC] Blocking poll. Until the timeout (seconds, wall clock): if a process is given
+    # and is dead raises a runtime error; tries to connect (1 second connect timeout) and returns on
+    # success; on failure sleeps half a second. Raises a runtime error after the deadline.
     """Poll until a TCP port is accepting connections.
 
     Raises ``RuntimeError`` if the process dies or the timeout is exceeded.
@@ -70,6 +85,10 @@ def wait_for_server_ready(
 
 
 async def wait_tcp_ready_async(host: str, port: int, *, timeout: float = 30) -> None:
+    # [FUNCTION DOC] Async version without process monitoring: repeatedly opens a connection (host
+    # stripped of square brackets, 1 second per attempt), closes it and returns on success; retries
+    # every half second on operating system errors or attempt timeouts; raises a runtime error after
+    # the timeout.
     """Poll until a TCP port accepts connections."""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
@@ -87,12 +106,19 @@ async def wait_tcp_ready_async(host: str, port: int, *, timeout: float = 30) -> 
 
 
 def _is_process_running(process: "multiprocessing.Process | subprocess.Popen") -> bool:
+    # [FUNCTION DOC] HELPER: For subprocess handles, running means the poll has no exit code; for
+    # multiprocessing handles, the alive check.
     if isinstance(process, subprocess.Popen):
         return process.poll() is None
     return process.is_alive()
 
 
 def resolve_ip(host: str) -> str:
+    # [FUNCTION DOC] Returns a bindable ip text for a host name or address. A literal ip (brackets
+    # allowed) is returned as is (ipv6 wrapped in brackets). Otherwise resolves the name for stream
+    # sockets in the family chosen by the prefer-ipv6 environment variable (true values: 1, true,
+    # yes, on; otherwise ipv4 only, strictly), returns the first non-loopback address (ipv6 wrapped),
+    # and raises a runtime error if none exists. Resolution errors propagate.
     bare = host.strip("[]")
     try:
         ipaddress.ip_address(bare)
@@ -117,6 +143,8 @@ def resolve_ip(host: str) -> str:
 
 
 def wrap_ipv6(host):
+    # [FUNCTION DOC] If the text (brackets stripped) is a valid ipv6 address returns it in square
+    # brackets; otherwise returns the input unchanged.
     """Wrap IPv6 address in [] if needed."""
     try:
         ipaddress.IPv6Address(host.strip("[]"))
@@ -126,6 +154,8 @@ def wrap_ipv6(host):
 
 
 def router_worker_base_urls(urls: list[str]) -> list[str]:
+    # [FUNCTION DOC] Removes a trailing at-sign plus digits (rank suffix) from each url and returns
+    # the de-duplicated results in first-seen order.
     """Strip the `@<rank>` suffix dp-aware routing adds; ranks of one engine dedupe to one address."""
     bases = []
     for url in urls:
@@ -138,6 +168,9 @@ def router_worker_base_urls(urls: list[str]) -> list[str]:
 
 
 def run_router(args):
+    # [FUNCTION DOC] Process entry for the router: configures raw logging, lazily imports and calls
+    # the sglang router launcher with args. Returns 0 on a created router, 1 if the launcher returned
+    # nothing or any exception happened (logged at info level only).
     # Spawned as a fresh interpreter, so it inherits no logging config.
     configure_logger_raw("router")
     try:
@@ -153,6 +186,8 @@ def run_router(args):
 
 
 def terminate_process(process: multiprocessing.Process, timeout: float = 1.0) -> None:
+    # [FUNCTION DOC] No-op if the process is dead. Otherwise terminates, joins up to the timeout, and
+    # if still alive kills it and joins without a timeout.
     """Terminate a process gracefully, with forced kill as fallback.
 
     Args:
@@ -170,6 +205,9 @@ def terminate_process(process: multiprocessing.Process, timeout: float = 1.0) ->
 
 
 class GeneralHttpClientProvider:
+    # [CLASS DOC] Process-wide provider of one async http client per running event loop (clients are
+    # tied to their loop). Timeouts: connect 10 seconds, write 60, pool 60, read unlimited; no
+    # connection limits. Clients are cached forever (see the to-do about leaks).
     _CONNECT_TIMEOUT = 10.0
     _WRITE_TIMEOUT = 60.0
     _POOL_TIMEOUT = 60.0
@@ -183,6 +221,8 @@ class GeneralHttpClientProvider:
 
     @classmethod
     def client(cls) -> httpx.AsyncClient:
+        # [FUNCTION DOC] Returns the cached client for the current running loop, creating it if
+        # needed. Must be called inside a running event loop (otherwise a runtime error).
         loop = asyncio.get_running_loop()
         client = cls._clients.get(loop)
         if client is None:
@@ -204,6 +244,8 @@ _post_actor_idx: int = 0
 
 
 def _next_actor():
+    # [FUNCTION DOC] HELPER: Round-robin pick from the post actors (advances a global index); none if
+    # there are no actors.
     global _post_actor_idx
     if not _post_actors:
         return None
@@ -213,6 +255,11 @@ def _next_actor():
 
 
 async def _post(client, url, payload, max_retries=60, action="post", headers=None):
+    # [FUNCTION DOC] HELPER: Performs an http request with retries and returns the parsed json body
+    # (or the raw text if the body is not json). The action names the client method: for delete and
+    # get the payload must be empty (assertion); otherwise the payload (or an empty object) is sent
+    # as json. Any exception (including http error statuses) is logged and retried after one second,
+    # up to the max retries total attempts; the last exception is re-raised.
     retry_count = 0
     while retry_count < max_retries:
         try:
@@ -248,6 +295,10 @@ async def _post(client, url, payload, max_retries=60, action="post", headers=Non
 
 
 async def wait_http_ok(url: str, *, json_payload=None, timeout: float = 180.0, request_timeout: float = 60.0) -> None:
+    # [FUNCTION DOC] Polls the url every 5 seconds with a fresh client (post if a json payload is
+    # given, else get; each request limited to the request timeout) until status 200. Transport and
+    # http errors are recorded as the last error; after the deadline passes (checked after each
+    # failed attempt) raises a timeout error including the last error.
     """Poll ``url`` until it answers HTTP 200 (POST when ``json_payload`` is given,
     else GET); raise ``TimeoutError`` past the deadline."""
     deadline = time.time() + timeout
@@ -270,10 +321,14 @@ async def wait_http_ok(url: str, *, json_payload=None, timeout: float = 180.0, r
 
 
 async def post_bytes_no_retry(url: str, payload: dict, *, timeout: float) -> bytes:
+    # [FUNCTION DOC] Single POST of the json payload with the global rollout client, no retries.
+    # Asserts the client was initialized. Raises a runtime error for non-2xx statuses; the whole call
+    # is limited by the timeout (seconds; raises a timeout error). Returns the raw response bytes.
     """Perform one raw-bytes POST with a total timeout."""
     assert _http_client is not None, "init_http_client() must run before post_bytes_no_retry()"
 
     async def _do() -> bytes:
+        # [FUNCTION DOC] HELPER: Sends the request, checks the status, returns the body bytes.
         response = await _http_client.post(url, json=payload)
         if not (200 <= response.status_code < 300):
             raise RuntimeError(f"POST {url} failed with {response.status_code}: {response.text}")
@@ -283,6 +338,12 @@ async def post_bytes_no_retry(url: str, payload: dict, *, timeout: float) -> byt
 
 
 def init_http_client(args):
+    # [FUNCTION DOC] Creates the global rollout client. Does nothing if there are no rollout gpus and
+    # evaluation does not use snapshots. Concurrency = server concurrency times rollout gpus divided
+    # by gpus per engine (integer division), plus the same term for evaluation gpus when present, but
+    # at least one server's concurrency. Creates (once) a client with that connection limit and no
+    # timeout. If distributed post is requested, initializes the ray post actors and enables
+    # dispatch. Mutates module globals.
     """Initialize HTTP client and optionally enable distributed POST via Ray."""
     global _http_client, _client_concurrency, _distributed_post_enabled
     rollout_num_gpus = args.rollout_num_gpus or 0
@@ -306,6 +367,14 @@ def init_http_client(args):
 
 
 def _init_ray_distributed_post(args):
+    # [FUNCTION DOC] HELPER: Skips if actors already exist. Lists alive ray nodes (runtime error if
+    # none). Per-actor concurrency is (global concurrency plus node count) divided by node count
+    # (integer division). For each node creates a number of detached async poster actors (each with
+    # its own http client limited to that concurrency, pinned to the node with hard affinity, tiny cpu
+    # request) equal to the gpus per node argument. Stores them in the module list.
+    # KNOWN ISSUE: the docstring says the count per node is controlled by an environment variable,
+    # but the code uses the gpus-per-node argument; the per-actor concurrency divides by the node
+    # count rather than the total actor count.
     """Initialize one or more Ray async actors per node for HTTP POST.
 
     Uses NodeAffinitySchedulingStrategy to place actors on distinct nodes.
@@ -326,7 +395,9 @@ def _init_ray_distributed_post(args):
     # Define the async actor
     @ray.remote
     class _HttpPosterActor:
+        # [CLASS DOC] HELPER: Ray actor owning an async http client; performs retrying requests.
         def __init__(self, *, concurrency: int):
+            # [FUNCTION DOC] HELPER: Creates the client with at least one connection and no timeout.
             # Lazy creation to this actor's event loop
             self._client = httpx.AsyncClient(
                 limits=httpx.Limits(max_connections=max(1, concurrency)),
@@ -334,6 +405,7 @@ def _init_ray_distributed_post(args):
             )
 
         async def do_post(self, url, payload, max_retries=60, action="post", headers=None):
+            # [FUNCTION DOC] HELPER: Runs the retrying request helper with this actor's client.
             return await _post(self._client, url, payload, max_retries, action=action, headers=headers)
 
     # Create actors per node
@@ -359,12 +431,18 @@ def _init_ray_distributed_post(args):
 
 
 def _rollout_client() -> httpx.AsyncClient:
+    # [FUNCTION DOC] HELPER: The global rollout client if initialized, else the per-loop general
+    # client.
     # a process where init_http_client never ran, such as a subproc agent call, gets a default client
     return _http_client if _http_client is not None else GeneralHttpClientProvider.client()
 
 
 # TODO may generalize the name since it now contains http DELETE/GET etc (with retries and remote-execution)
 async def post(url, payload, max_retries=60, action="post", headers=None):
+    # [FUNCTION DOC] Retrying http request returning parsed json (or text). When distributed post is
+    # enabled and actors exist, sends it through the next actor (round-robin); any failure there is
+    # logged and falls back to a local request (which retries again, so total attempts can multiply).
+    # Otherwise uses the rollout client. See the retry helper for payload and retry semantics.
     # If distributed mode is enabled and actors exist, dispatch via Ray.
     if _distributed_post_enabled and _post_actors:
         try:
@@ -380,6 +458,8 @@ async def post(url, payload, max_retries=60, action="post", headers=None):
 
 # TODO unify w/ `post` to add retries and remote-execution
 async def get(url):
+    # [FUNCTION DOC] Single get with the rollout client, no retries; raises for http error statuses;
+    # returns the parsed json body.
     response = await _rollout_client().get(url)
     response.raise_for_status()
     output = response.json()

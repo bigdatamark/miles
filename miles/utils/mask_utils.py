@@ -1,21 +1,36 @@
+# [MODULE DOC]
+# Loss mask generation for multi-turn chat data. The generator tokenizes messages with the chat
+# template and marks assistant tokens (after the generation prompt prefix) with one and everything
+# else with zero; variants exist for qwen, qwen3 and distilled qwen templates. Template overhead
+# (system message length and generation prompt length) is probed once from the tokenizer.
 from transformers import AutoTokenizer
 
 
 def get_response_lengths(loss_masks: list[list[int]]) -> list[int]:
+    # [FUNCTION DOC] For each mask returns the length from its first one to the end (zero for masks
+    # without any one).
     # return the lengths starting from the first occurrence of 1 to the end of each loss mask
     return [len(mask[mask.index(1) :]) if 1 in mask else 0 for mask in loss_masks]
 
 
 class MultiTurnLossMaskGenerator:
+    # [CLASS DOC] Builds token ids and loss masks for message lists. Holds the tokenizer, the chat
+    # template flavor (qwen, qwen3, distill_qwen), and two probed lengths: tokens a template adds
+    # before a non-first message body (system message length) and tokens of the generation prompt.
     def __init__(self, tokenizer: AutoTokenizer, tokenizer_type: str = "qwen"):
+        # [FUNCTION DOC] Stores the tokenizer, probes the template lengths immediately (tokenizer
+        # calls), then stores the flavor name (unsupported names fail later in mask generation).
         self.tokenizer = tokenizer
         self.system_message_length, self.gen_token_length = self.get_system_message_length()
         self.tokenizer_type = tokenizer_type
 
     def get_response_lengths(self, loss_masks: list[list[int]]) -> list[int]:
+        # [FUNCTION DOC] Method wrapper over the module-level function of the same name.
         return get_response_lengths(loss_masks)
 
     def find_all_sublist_indices(self, main_list, sublist):
+        # [FUNCTION DOC] Start indices of every (possibly overlapping) occurrence of the sublist in
+        # the main list, ascending; empty if none.
         sublist_len = len(sublist)
         indices = []
         for i in range(len(main_list) - sublist_len + 1):
@@ -24,6 +39,17 @@ class MultiTurnLossMaskGenerator:
         return indices
 
     def get_system_message_length(self) -> tuple[int, int]:
+        # [FUNCTION DOC] Probes the chat template with two identical user messages containing a test
+        # string. Finds the two occurrences of the raw test token ids inside the templated token ids
+        # (unpacking fails with a value error unless there are exactly two). The template tail length
+        # is total minus raw minus second index. The generation prompt length is the token count with
+        # the generation prompt added minus without. Returns (system message length, generation
+        # prompt length) where the first is the first index minus the per-message overhead
+        # ((second minus first index) minus tail length minus raw length).
+        # KNOWN ISSUE: the generation length subtracts a token count of the tokenized chat template
+        # output from the length of the apply result, which assumes that call returns a flat id list
+        # (not a mapping) despite the dict-return flag being false; and the name says system message
+        # length while the value is the per-message template prefix length.
         test_string = "FOR TESTING ONLY"
         test_messages = [
             {"role": "user", "content": test_string},
@@ -48,6 +74,12 @@ class MultiTurnLossMaskGenerator:
     def gen_multi_turn_loss_mask_qwen(
         self, messages: list[dict], tools: list[dict] = None
     ) -> tuple[list[int], list[int]]:
+        # [FUNCTION DOC] Qwen flavor. Tokenizes each message alone with the chat template (tools only
+        # for the first message). For non-system messages after the first, drops the leading
+        # system-message-length tokens (the template's default preamble). Assistant messages get
+        # zeros for the generation prompt tokens and ones for the rest; others all zeros; a message
+        # whose step loss mask field is present and not one gets all zeros. Returns (token ids, loss
+        # mask) concatenated over messages.
         all_loss_masks = []
         all_token_ids = []
 
@@ -78,6 +110,12 @@ class MultiTurnLossMaskGenerator:
     def gen_multi_turn_loss_mask_qwen3(
         self, messages: list[dict], tools: list[dict] = None
     ) -> tuple[list[int], list[int]]:
+        # [FUNCTION DOC] Qwen3 flavor. Like the qwen flavor, but each message is tokenized together
+        # with a fixed dummy user message so templates that depend on neighbors render correctly: the
+        # first message is templated followed by the dummy and the dummy's token count is cut from
+        # the end; later messages are templated after the dummy and the dummy's token count is cut
+        # from the start. Then the same preamble drop, masking and step loss rule apply. Returns
+        # (token ids, loss mask).
         all_loss_masks = []
         all_token_ids = []
 
@@ -115,6 +153,11 @@ class MultiTurnLossMaskGenerator:
     def gen_multi_turn_loss_mask_distill_qwen(
         self, messages: list[dict], tools: list[dict] = None
     ) -> tuple[list[int], list[int]]:
+        # [FUNCTION DOC] Distilled qwen flavor (single prompt, single response). Prompt text is the
+        # template applied to only the first message with the generation prompt appended; the response
+        # is the content of the last message. Both are tokenized without special tokens and
+        # concatenated; mask is zeros over the prompt and ones over the response, all zeros if the
+        # last message's step loss mask field is present and not one. Middle messages are ignored.
         prompt = self.tokenizer.apply_chat_template(
             messages[:1], tokenize=False, add_generation_prompt=True, tools=tools
         )
@@ -131,6 +174,10 @@ class MultiTurnLossMaskGenerator:
         return token_ids, loss_mask
 
     def get_loss_mask(self, messages: list[dict], tools: list[dict] = None) -> tuple[list[int], list[int]]:
+        # [FUNCTION DOC] Dispatches on the flavor. Qwen: uses the distilled variant if the tokenizer's
+        # added vocabulary contains the full-width-bar assistant marker, else the qwen variant. Qwen3
+        # and distill_qwen use their variants. Any other flavor raises a value error. Returns (token
+        # ids, loss mask).
         if self.tokenizer_type == "qwen":
             if "<｜Assistant｜>" in self.tokenizer.get_added_vocab():
                 return self.gen_multi_turn_loss_mask_distill_qwen(messages, tools)
@@ -146,6 +193,12 @@ class MultiTurnLossMaskGenerator:
     def get_loss_mask_with_multimodal_alignment(
         self, messages: list[dict], input_ids: list[int], tools: list[dict] = None
     ) -> tuple[list[int], list[int]]:
+        # [FUNCTION DOC] Computes a mask for multimodal inputs whose real token ids are longer than
+        # the text-only tokenization. Flattens list-valued message contents into one space-joined
+        # string of text parts (dict parts of type text and bare strings; other parts dropped), computes
+        # the text-only loss mask, asserts the given input ids are not shorter than it, and left-pads
+        # the mask with zeros to the input length (assumes the extra tokens come before the text
+        # tokens). Returns (the given input ids unchanged, mask).
         text = []
         for msg in messages:
             if isinstance(msg.get("content"), list):
@@ -171,6 +224,8 @@ class MultiTurnLossMaskGenerator:
         return input_ids, loss_mask
 
     def get_text_from_loss_mask(self, token_ids: list[int], loss_masks: list[int]) -> list[str]:
+        # [FUNCTION DOC] Decodes each maximal run of tokens whose mask is one into a text; returns the
+        # list of decoded runs in order (empty if none).
         selected_texts = []
         current_tokens = []
 

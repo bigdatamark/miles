@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Static knowledge of which huggingface modules of each supported model type are LoRA targets, in
+# three groups: attention, mlp (dense, routed and shared experts) and unembed (output head). A table
+# maps model type to a spec (builder of relative module paths from the config mapping, layer prefix,
+# output head name, whether the text sub-config is nested, whether the head trains by default).
+# Module paths use wildcards for layers and experts. Also selector parsing, group resolution,
+# packed projection expansion and exclusion helpers. Matching uses the matcher from the utils module.
 """LoRA projection groups in the HF model namespace; backend layouts are resolved separately."""
 
 import logging
@@ -13,6 +20,8 @@ LORA_TARGET_GROUPS = ("attn", "mlp", "unembed")
 
 @dataclass(frozen=True)
 class HfLoraTargets:
+    # [CLASS DOC] Immutable full module patterns per group (attention, mlp, unembed) plus whether the
+    # output head is trained when the user asks for the default selection.
     attention: tuple[str, ...]
     mlp: tuple[str, ...]
     unembed: tuple[str, ...]
@@ -21,6 +30,9 @@ class HfLoraTargets:
 
 @dataclass(frozen=True)
 class _HfLoraModelSpec:
+    # [CLASS DOC] HELPER: Per model type recipe: a function from the (text) config mapping to the
+    # relative attention and mlp path tuples; the wildcard layer prefix; the output head module
+    # name; whether the config to use is the nested text config; and the default-train-head flag.
     build_groups: Callable[[dict], tuple[tuple[str, ...], tuple[str, ...]]]
     layer_prefix: str = "model.layers.*"
     unembed: str = "lm_head"
@@ -29,6 +41,7 @@ class _HfLoraModelSpec:
 
 
 def _prefix_paths(prefix, *paths):
+    # [FUNCTION DOC] HELPER: Tuple of the paths each joined to the prefix with a dot.
     return tuple(f"{prefix}.{path}" for path in paths)
 
 
@@ -43,14 +56,21 @@ _GDN_35 = _prefix_paths("linear_attn", "in_proj_qkv", "in_proj_z", "in_proj_b", 
 
 
 def _dense_targets(config):
+    # [FUNCTION DOC] HELPER: Standard attention projections and dense mlp projections (config unused).
     return _QKVO_ATTENTION, _DENSE_MLP
 
 
 def _gpt_oss_targets(config):
+    # [FUNCTION DOC] HELPER: Standard attention projections and packed expert projections (config
+    # unused).
     return _QKVO_ATTENTION, _PACKED_EXPERTS
 
 
 def _deepseek_mlp_targets(config):
+    # [FUNCTION DOC] HELPER: Mlp paths for deepseek-like configs: dense projections if any leading
+    # dense layers exist (first dense replace count above zero); packed experts if some layers are
+    # sparse (that count below the layer count), plus shared experts when the shared expert count is
+    # truthy. Returns a tuple.
     mlp = []
     if config["first_k_dense_replace"] > 0:
         mlp.extend(_DENSE_MLP)
@@ -62,15 +82,22 @@ def _deepseek_mlp_targets(config):
 
 
 def _mla_attention_targets(config):
+    # [FUNCTION DOC] HELPER: Latent attention paths: plain query projection when there is no query
+    # low rank, else the a/b query pair; plus kv a (with mqa), kv b and output projections.
     query = ("q_proj",) if config["q_lora_rank"] is None else ("q_a_proj", "q_b_proj")
     return _prefix_paths("self_attn", *query, "kv_a_proj_with_mqa", "kv_b_proj", "o_proj")
 
 
 def _deepseek_targets(config):
+    # [FUNCTION DOC] HELPER: Latent attention paths and deepseek mlp paths.
     return _mla_attention_targets(config), _deepseek_mlp_targets(config)
 
 
 def _kimi_targets(config):
+    # [FUNCTION DOC] HELPER: Latent attention plus mlp paths where the count of MoE layers (routed
+    # experts exist, layer index at least the first dense replace count, and divisible by the layer
+    # frequency, default 1) decides: dense projections if some layer is not MoE; per-expert (wildcard)
+    # routed projections if any MoE layer, plus shared experts when the shared count is truthy.
     # Kimi's custom HF implementation retains per-expert modules and interleaved dense layers.
     num_moe_layers = sum(
         bool(config["n_routed_experts"])
@@ -89,6 +116,11 @@ def _kimi_targets(config):
 
 
 def _kimi_k3_targets(config):
+    # [FUNCTION DOC] HELPER: Attention paths are the output, query-a and kv-a projections only. Mlp:
+    # dense projections if some layer is not MoE (experts configured, layer at least the first dense
+    # replace count, divisible by the layer frequency); if any MoE layer, per-expert w1/w2/w3
+    # projections of the sparse block, plus its shared experts when the shared expert count is not
+    # none.
     attention = _prefix_paths("self_attn", "o_proj", "q_a_proj", "kv_a_proj_with_mqa")
     num_moe_layers = sum(
         config["num_experts"] is not None
@@ -105,10 +137,14 @@ def _kimi_k3_targets(config):
 
 
 def _glm4_moe_targets(config):
+    # [FUNCTION DOC] HELPER: Standard attention and deepseek-style mlp paths.
     return _QKVO_ATTENTION, _deepseek_mlp_targets(config)
 
 
 def _glm_dsa_targets(config):
+    # [FUNCTION DOC] HELPER: Latent attention; mlp: dense projections if the layer type list contains
+    # dense, packed experts if it contains sparse, plus shared experts when the shared count is
+    # truthy.
     mlp = []
     if "dense" in config["mlp_layer_types"]:
         mlp.extend(_DENSE_MLP)
@@ -120,6 +156,10 @@ def _glm_dsa_targets(config):
 
 
 def _qwen_moe_mlp_targets(config, *, shared_expert=False):
+    # [FUNCTION DOC] HELPER: Counts MoE layers (experts configured, layer not in the mlp-only list,
+    # and one-based layer index divisible by the sparse step, default 1). Dense projections if some
+    # layer is not MoE; packed experts if any MoE layer, plus the single shared expert when requested
+    # and its intermediate size is truthy. Expert count read from the experts or local experts key.
     # Qwen3MoE serializes its num_experts alias as num_local_experts.
     num_experts = config["num_experts"] if "num_experts" in config else config["num_local_experts"]
     # These optional HF fields allow dense layers inside an otherwise MoE model.
@@ -140,6 +180,8 @@ def _qwen_moe_mlp_targets(config, *, shared_expert=False):
 
 
 def _hybrid_attention_targets(config, linear_attention):
+    # [FUNCTION DOC] HELPER: Union of standard attention paths if any layer is full attention, and the
+    # given linear attention paths if any layer is linear attention. Returns a tuple.
     attention = []
     if "full_attention" in config["layer_types"]:
         attention.extend(_QKVO_ATTENTION)
@@ -149,18 +191,24 @@ def _hybrid_attention_targets(config, linear_attention):
 
 
 def _qwen3_moe_targets(config):
+    # [FUNCTION DOC] HELPER: Standard attention and qwen moe mlp paths without shared expert.
     return _QKVO_ATTENTION, _qwen_moe_mlp_targets(config)
 
 
 def _qwen3_next_targets(config):
+    # [FUNCTION DOC] HELPER: Hybrid attention with the next-generation linear attention projections
+    # and qwen moe mlp paths including the shared expert.
     return _hybrid_attention_targets(config, _GDN_NEXT), _qwen_moe_mlp_targets(config, shared_expert=True)
 
 
 def _qwen3_5_targets(config):
+    # [FUNCTION DOC] HELPER: Hybrid attention with the 3.5 linear attention projections and dense mlp.
     return _hybrid_attention_targets(config, _GDN_35), _DENSE_MLP
 
 
 def _qwen3_5_moe_targets(config):
+    # [FUNCTION DOC] HELPER: Hybrid attention (3.5 linear projections); mlp is packed experts plus the
+    # single shared expert when its intermediate size is truthy.
     mlp = _PACKED_EXPERTS
     if config["shared_expert_intermediate_size"]:
         mlp += _QWEN_SHARED_EXPERT
@@ -168,6 +216,10 @@ def _qwen3_5_moe_targets(config):
 
 
 def _inkling_targets(config):
+    # [FUNCTION DOC] HELPER: Attention adds an r projection to the standard four. The layer type list
+    # comes from the config, or for older configs is derived (dense below the dense mlp index, sparse
+    # from there). Dense projections if any dense layer; packed experts if any sparse layer, plus
+    # shared experts when the shared count is truthy.
     attention = _prefix_paths("self_attn", "q_proj", "k_proj", "v_proj", "r_proj", "o_proj")
     # Older Inkling configs encode leading dense layers instead of mlp_layer_types.
     layer_types = config.get("mlp_layer_types")
@@ -230,6 +282,10 @@ _HF_LORA_MODELS = {
 
 
 def get_hf_lora_targets(hf_config: dict) -> HfLoraTargets:
+    # [FUNCTION DOC] Looks up the spec of the config's model type (assertion error if unsupported),
+    # picks the nested text config when the spec says so, builds the relative groups and returns the
+    # full patterns: layer prefix joined to each attention and mlp path; unembed is the single head
+    # name; default-train-head copied from the spec.
     model_type = hf_config["model_type"]
     assert model_type in _HF_LORA_MODELS, f"HF LoRA target layout is not defined for model_type={model_type!r}"
     spec = _HF_LORA_MODELS[model_type]
@@ -244,6 +300,12 @@ def get_hf_lora_targets(hf_config: dict) -> HfLoraTargets:
 
 
 def resolve_hf_lora_targets(hf_config: dict, *, target_modules: list[str] | None = None) -> list[str]:
+    # [FUNCTION DOC] Turns selectors into concrete module patterns. None or exactly all-linear means
+    # attention and mlp (plus unembed when the model trains the head by default). Asserts a non-empty
+    # list that does not mix all-linear with others. If no selector is a group name, returns the list
+    # unchanged (copied). Otherwise expands group names to their patterns from the model layout and
+    # keeps other entries as they are, de-duplicating while preserving order; asserts the result is
+    # non-empty.
     if target_modules is None or target_modules == ["all-linear"]:
         layout = get_hf_lora_targets(hf_config)
         target_modules = ["attn", "mlp", *(["unembed"] if layout.default_train_unembed else [])]
@@ -259,6 +321,11 @@ def resolve_hf_lora_targets(hf_config: dict, *, target_modules: list[str] | None
 
 
 def expand_packed_hf_lora_targets(targets: list[str], modules: list[str]) -> list[str]:
+    # [FUNCTION DOC] For each gate projection target that has a matching up projection target in the
+    # list and whose packed gate-up counterpart matches some model module: adds the packed pattern
+    # (unless an existing target already matches it) and drops gate/up targets that match no model
+    # module themselves. Logs a warning listing added patterns. Returns the order-preserving
+    # de-duplicated result: kept originals followed by additions.
     added, replaced = [], set()
     for gate in targets:
         if gate.rsplit(".", 1)[-1] != "gate_proj":
@@ -278,6 +345,9 @@ def expand_packed_hf_lora_targets(targets: list[str], modules: list[str]) -> lis
 
 
 def parse_lora_targets(value: str | list[str] | None) -> list[str] | None:
+    # [FUNCTION DOC] None stays none. A string is split on commas; a list is used as is; entries are
+    # stripped of whitespace. Asserts the list is non-empty with no empty entries. Returns the
+    # order-preserving de-duplicated list.
     if value is None:
         return None
     targets = value.split(",") if isinstance(value, str) else value
@@ -287,6 +357,8 @@ def parse_lora_targets(value: str | list[str] | None) -> list[str] | None:
 
 
 def exclude_hf_lora_targets(targets: list[str], exclusions: list[str]) -> list[str]:
+    # [FUNCTION DOC] Returns targets not matching any exclusion pattern, in order; asserts at least
+    # one remains.
     selected = [
         target for target in targets if not any(matches_lora_target(target, pattern) for pattern in exclusions)
     ]
@@ -295,6 +367,8 @@ def exclude_hf_lora_targets(targets: list[str], exclusions: list[str]) -> list[s
 
 
 def expand_hf_lora_targets(targets: list[str], layout: HfLoraTargets) -> list[str]:
+    # [FUNCTION DOC] Asserts each target matches at least one module pattern of the layout (attention,
+    # mlp, unembed concatenated); returns the layout patterns matched by any target, in layout order.
     available = layout.attention + layout.mlp + layout.unembed
     for target in targets:
         assert any(

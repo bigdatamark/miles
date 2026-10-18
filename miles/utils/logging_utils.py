@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Process logging setup. Configures root logging format (timestamp with milliseconds and a process
+# name), optionally an event logger and environment reporting, and installs a strict hook that turns
+# "coroutine was never awaited" warnings into a hard process exit, since they would otherwise be
+# swallowed in garbage collection.
 import logging
 import os
 import re
@@ -16,6 +21,10 @@ _FATAL_ASYNC_PATTERN = "coroutine .* was never awaited"
 
 
 def configure_logger(args, *, source: ProcessIdentity, report_env: bool = True) -> None:
+    # [FUNCTION DOC] Configures raw logging with the process identity's name. If args has a debug
+    # event data directory and no event logger exists yet, creates one writing a jsonl file named
+    # after the process. Unless disabled, starts environment reporting once per process (stores the
+    # reporter in a module global).
     name = source.to_name()
     configure_logger_raw(name)
 
@@ -29,6 +38,8 @@ def configure_logger(args, *, source: ProcessIdentity, report_env: bool = True) 
 
 
 def rebind_env_reporting(args) -> None:
+    # [FUNCTION DOC] If an env reporter was started, rebinds it to the new args object; otherwise
+    # does nothing.
     # TODO: stop rebinding here; the args object should not be overwritten in place all over the codebase.
     if _ENV_REPORTER is not None:
         _ENV_REPORTER.rebind(args)
@@ -36,6 +47,9 @@ def rebind_env_reporting(args) -> None:
 
 # ref: SGLang
 def configure_logger_raw(name: str = "") -> None:
+    # [FUNCTION DOC] Sets root logging at info level with format "[time.millis name] file:line -
+    # message", replacing existing handlers. On the first call in the process also installs strict
+    # async warnings.
     global _STRICT_ASYNC_WARNINGS_INSTALLED
 
     logging.basicConfig(
@@ -51,6 +65,10 @@ def configure_logger_raw(name: str = "") -> None:
 
 
 def configure_strict_async_warnings() -> None:
+    # [FUNCTION DOC] Makes never-awaited-coroutine runtime warnings raise as errors, and wraps the
+    # interpreter's unraisable hook: if the unraisable exception is such a warning, logs and prints a
+    # fatal message to standard error and exits the process immediately with status 1 (no cleanup);
+    # otherwise delegates to the previous hook. Calling it twice stacks wrappers.
     """Turn unawaited-coroutine warnings into fatal errors.
 
     Python emits RuntimeWarning when a coroutine is called but never awaited.
@@ -62,6 +80,7 @@ def configure_strict_async_warnings() -> None:
     _original_hook = sys.unraisablehook
 
     def _crash_on_async_misuse(unraisable):
+        # [FUNCTION DOC] HELPER: The replacement hook described above.
         if isinstance(unraisable.exc_value, RuntimeWarning) and re.search(
             _FATAL_ASYNC_PATTERN, str(unraisable.exc_value)
         ):
