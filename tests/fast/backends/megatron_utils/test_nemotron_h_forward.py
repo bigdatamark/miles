@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Tests for the loss-mask shim that the Nemotron-H Megatron-bridge plugin installs on the Mamba
+# model's forward method: forward calls without multi-token-prediction labels must pass through
+# unchanged, and labels must be shifted exactly once without mutating the caller's tensor or
+# mapping. The Mamba model module is replaced by a stub exposing a test-supplied model class.
 import importlib.util
 import sys
 from pathlib import Path
@@ -8,6 +13,11 @@ import torch
 
 
 def install_shim(monkeypatch: pytest.MonkeyPatch, model_class: type) -> None:
+    # [FUNCTION DOC] HELPER: Registers (via monkeypatch) a stub Mamba model module exposing the
+    # given class, loads the plugin file under a private name from the repository path four
+    # directories above this file, executes it, and calls its shim installer twice to verify
+    # idempotence (the class's forward method is wrapped in place). Raises an assertion error if
+    # the module spec cannot be created.
     stub = ModuleType("megatron.core.models.mamba")
     stub.MambaModel = model_class
     monkeypatch.setitem(sys.modules, stub.__name__, stub)
@@ -22,8 +32,15 @@ def install_shim(monkeypatch: pytest.MonkeyPatch, model_class: type) -> None:
 
 @pytest.mark.parametrize("mtp_kwargs", [None, {}, {"mtp_labels": None}])
 def test_forward_without_mtp_keyword(monkeypatch: pytest.MonkeyPatch, mtp_kwargs: dict[str, None] | None) -> None:
+    # [FUNCTION DOC] Parametrized over the extra multi-token-prediction keyword being absent
+    # (none), an empty mapping, or a mapping whose labels are none. Installs the shim on a model
+    # whose forward returns its tokens and loss mask, calls forward with tokens, mask and the
+    # parametrized keyword, and asserts the very same tokens and mask objects come back (the shim
+    # strips the keyword and does not alter data).
     class Model:
+        # [CLASS DOC] HELPER: Model stub whose forward accepts tokens and a keyword-only loss mask.
         def forward(self, tokens: torch.Tensor, *, loss_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            # [FUNCTION DOC] HELPER: Returns the tokens and loss mask as a pair, unchanged.
             return tokens, loss_mask
 
     install_shim(monkeypatch, Model)
@@ -35,8 +52,15 @@ def test_forward_without_mtp_keyword(monkeypatch: pytest.MonkeyPatch, mtp_kwargs
 
 
 def test_forward_shifts_mtp_labels_once_without_mutating_input(monkeypatch: pytest.MonkeyPatch) -> None:
+    # [FUNCTION DOC] Installs the shim on a model whose forward returns its loss mask and MTP
+    # labels. Calls forward with a ones mask and a mapping holding a 2-by-3 labels tensor. Asserts
+    # the mask is returned as the same object, the returned labels equal the input rolled left by
+    # one position along the last dimension (wrapping the first element to the end), the caller's
+    # labels tensor is unchanged, and the caller's mapping still references the original tensor.
     class Model:
+        # [CLASS DOC] HELPER: Model stub whose forward takes keyword-only loss mask and MTP labels.
         def forward(self, *, loss_mask: torch.Tensor, mtp_labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            # [FUNCTION DOC] HELPER: Returns the loss mask and the labels as a pair, unchanged.
             return loss_mask, mtp_labels
 
     install_shim(monkeypatch, Model)

@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Tests for the Megatron train actor's lifecycle in the shared PPO setup (actor and critic
+# sharing GPUs, with the driver controlling offload): train/sleep/wake-up behavior, log-prob
+# forward options, model save sequencing, weight-update connection and reconnection logic, model
+# weight switching between tags, skipping the actor's own log-prob forward, replay managers, and
+# the critic-to-actor values hand-off through an object store. The actor module is imported under
+# stubs for the GPU memory saver and peer-to-peer weight updater (module-scoped fixture); worker
+# objects are built without running constructors and filled with mocks, so no GPU or real Ray is
+# needed.
 import importlib
 import sys
 from argparse import Namespace
@@ -21,6 +30,14 @@ from miles.utils.tensor_backper import MainCastContext, TensorBackuper
 
 @pytest.fixture(scope="module")
 def actor_module():
+    # [FUNCTION DOC] HELPER: Module-scoped fixture. Imports the megatron backend package and the
+    # weight-update protocols package, remembers the current module-table entries and package
+    # attributes for the actor module, the peer-to-peer protocol module and the GPU memory saver,
+    # then installs a stub memory-saver module (with a mock saver), a stub peer-to-peer module
+    # whose updater class raises an assertion error if constructed, attaches that stub to its
+    # package, and drops the cached actor module and attribute so it is imported fresh. Yields the
+    # freshly imported actor module. On teardown it removes the fresh actor module and restores
+    # every remembered entry or attribute (deleting those that did not exist before).
     actor_module_name = "miles.backends.megatron_utils.actor"
     p2p_module_name = "miles.backends.training_utils.weight_update.protocols.p2p"
     actor_package = importlib.import_module("miles.backends.megatron_utils")
@@ -71,6 +88,9 @@ def actor_module():
 
 
 def _worker(actor_module, role, *, asleep=True):
+    # [FUNCTION DOC] HELPER: Creates a train-actor instance without running its constructor, with
+    # arguments (offload train on, not rollout-only), the given role, the given sleeping flag
+    # (default asleep), and mocks for its heartbeat, wake-up and sleep methods. Returns it.
     worker = object.__new__(actor_module.MegatronTrainRayActor)
     worker.args = Namespace(offload_train=True, debug_rollout_only=False)
     worker.role = role
@@ -82,6 +102,13 @@ def _worker(actor_module, role, *, asleep=True):
 
 
 def test_critic_train_wakes_and_leaves_offload_to_driver(actor_module, monkeypatch):
+    # [FUNCTION DOC] A sleeping critic worker whose critic-train method returns a normal step
+    # output carrying a boxed values reference; rollout-data loading is patched to return a small
+    # batch and a null context; the timer is patched to record phase names. Runs train for
+    # rollout 3. Asserts: wake-up called once without arguments, the critic-train called once,
+    # sleep never called (the driver owns offload), the very same output returned with outcome
+    # normal and the same boxed value, and recorded phases exactly data_preprocess then
+    # critic_train.
     worker = _worker(actor_module, "critic")
     critic_output = TrainStepOutput(outcome=TrainStepOutcome.NORMAL, values=Box("cpu-values-ref"))
     worker._train_critic = Mock(return_value=critic_output)
@@ -92,6 +119,8 @@ def test_critic_train_wakes_and_leaves_offload_to_driver(actor_module, monkeypat
 
     @contextmanager
     def capture_timer(name):
+        # [FUNCTION DOC] HELPER: Context manager recording the phase name in the enclosing list
+        # and yielding immediately.
         phases.append(name)
         yield
 
@@ -109,6 +138,10 @@ def test_critic_train_wakes_and_leaves_offload_to_driver(actor_module, monkeypat
 
 
 def test_actor_receives_critic_payload_and_leaves_offload_to_driver(actor_module, monkeypatch):
+    # [FUNCTION DOC] A sleeping actor worker with a mocked actor-train method. Runs train for
+    # rollout 4 with a critic output passed as external data. Asserts wake-up called once, the
+    # actor-train called once with that same object as its external-data keyword, sleep never
+    # called, and the result is none.
     worker = _worker(actor_module, "actor")
     worker._train_actor = Mock(return_value=None)
     monkeypatch.setattr(
@@ -126,6 +159,8 @@ def test_actor_receives_critic_payload_and_leaves_offload_to_driver(actor_module
 
 
 def test_train_keeps_model_resident(actor_module, monkeypatch):
+    # [FUNCTION DOC] An actor worker that is already awake runs train for rollout 5; asserts
+    # neither wake-up nor sleep is called.
     worker = _worker(actor_module, "actor", asleep=False)
     worker._train_actor = Mock(return_value=None)
     monkeypatch.setattr(
@@ -145,6 +180,11 @@ def test_train_keeps_model_resident(actor_module, monkeypatch):
 def test_compute_log_prob_replays_sampling_support_only_for_actor_scores(
     actor_module, monkeypatch, store_prefix, expected
 ):
+    # [FUNCTION DOC] Parametrized over the store prefix: empty (actor scores) expects sampling
+    # support replay on; "ref_" and "teacher_" expect it off. A worker with sampling-support
+    # replay enabled and the forward-only function mocked to return a log-probs mapping computes
+    # log probs for rollout 3. Asserts the mocked result is returned, the forward was called with
+    # fp32 output off, and with the rollout-sampling-mask flag equal to the expectation.
     """Policy log-prob forwards preserve the model's logits precision."""
     worker = object.__new__(actor_module.MegatronTrainRayActor)
     worker.args = Namespace(use_sampling_support_replay=True)
@@ -161,6 +201,10 @@ def test_compute_log_prob_replays_sampling_support_only_for_actor_scores(
 
 
 def test_save_model_does_not_manage_lifecycle(actor_module, monkeypatch):
+    # [FUNCTION DOC] A worker with synchronous save, no HuggingFace save and no post-save hook,
+    # with mocked save, process-group reload and destroy. Saves for rollout 6. Asserts the save
+    # function was called once with rollout 6, model, optimizer, scheduler and the snapshot
+    # publisher keyword, and that wake-up, sleep and both process-group functions were not called.
     worker = object.__new__(actor_module.MegatronTrainRayActor)
     worker.args = Namespace(
         async_save=False,
@@ -195,6 +239,10 @@ def test_save_model_does_not_manage_lifecycle(actor_module, monkeypatch):
 
 
 def test_force_sync_save_overlaps_hf_export_with_async_checkpoint(actor_module, monkeypatch):
+    # [FUNCTION DOC] A worker configured for asynchronous save plus a HuggingFace save path. The
+    # save, async-finalize and HuggingFace-save functions are replaced by recorders. Saving for
+    # rollout 6 with force-sync asserts the event order: finalize, save, save_hf, finalize (finish
+    # earlier async work, start the checkpoint, export HF while it runs, finish it).
     worker = object.__new__(actor_module.MegatronTrainRayActor)
     worker.args = Namespace(
         async_save=True,
@@ -226,6 +274,11 @@ def test_force_sync_save_overlaps_hf_export_with_async_checkpoint(actor_module, 
 
 @pytest.mark.parametrize("asleep", [False, True])
 def test_update_weights_only_uses_temporary_process_groups_when_asleep(actor_module, monkeypatch, asleep):
+    # [FUNCTION DOC] Parametrized over the sleeping state. A worker with offload enabled, weight
+    # update skipped by debug flag, and a mock weight updater whose connection status never needs
+    # reconnect, updates weights with empty rollout-engine info as rank 1. Asserts the process
+    # group reload and destroy functions were each called once when asleep and not at all when
+    # awake.
     """Weight update reloads and destroys temporary process groups only when the model is offloaded."""
     from miles.ray.rollout.inference_controller import UpdatableEngines
 
@@ -261,6 +314,11 @@ def test_update_weights_only_uses_temporary_process_groups_when_asleep(actor_mod
 
 
 def _lifecycle_worker(actor_module, monkeypatch, asleep):
+    # [FUNCTION DOC] HELPER: Creates a worker (no constructor) with offload on, no rematerialize,
+    # no quantized-workspace clearing, the given sleeping flag and no paused grad buffer. Patches
+    # the actor module's memory saver (mock), memory clearing and printing (mocks), process group
+    # destroy (mock) and reload (a kept mock), non-first-replica main rank check (false) and LoRA
+    # enabled check (false). Returns the worker, the saver mock and the reload mock.
     worker = object.__new__(actor_module.MegatronTrainRayActor)
     worker.args = Namespace(
         offload_train=True,
@@ -282,6 +340,8 @@ def _lifecycle_worker(actor_module, monkeypatch, asleep):
 
 
 def test_sleep_is_idempotent(actor_module, monkeypatch):
+    # [FUNCTION DOC] An awake worker sleeps twice. Asserts the memory saver was paused exactly
+    # once and the worker is marked asleep.
     worker, saver, _ = _lifecycle_worker(actor_module, monkeypatch, asleep=False)
 
     worker.sleep()
@@ -292,6 +352,8 @@ def test_sleep_is_idempotent(actor_module, monkeypatch):
 
 
 def test_wake_up_when_resident_skips_resume_but_restores_groups(actor_module, monkeypatch):
+    # [FUNCTION DOC] An already-awake worker wakes up. Asserts the saver is not resumed, the
+    # process groups are reloaded once without arguments, and the worker stays awake.
     # A retried attempt can die between wake and sleep: memory stays resident but the
     # process groups may already be gone, so wake_up must restore groups without resuming.
     worker, saver, reload_groups = _lifecycle_worker(actor_module, monkeypatch, asleep=False)
@@ -304,6 +366,8 @@ def test_wake_up_when_resident_skips_resume_but_restores_groups(actor_module, mo
 
 
 def test_wake_up_resumes_offloaded_model_once(actor_module, monkeypatch):
+    # [FUNCTION DOC] A sleeping worker wakes up twice. Asserts the saver was resumed exactly once
+    # and the worker is awake.
     worker, saver, _ = _lifecycle_worker(actor_module, monkeypatch, asleep=True)
 
     worker.wake_up()
@@ -314,6 +378,9 @@ def test_wake_up_resumes_offloaded_model_once(actor_module, monkeypatch):
 
 
 def test_lora_sleep_pauses_the_grad_buffers_and_wake_up_resumes_them(actor_module, monkeypatch):
+    # [FUNCTION DOC] With LoRA rollout enabled (patched to true), an awake worker sleeps then
+    # wakes. Asserts the saver pause calls are, in order, the grad-buffer tag then the default tag,
+    # and the resume calls are, in order, the default tag then the grad-buffer tag.
     """The LoRA grad buffers have no host backup, so a sleep that leaves them out keeps them on the GPU."""
     worker, saver, _ = _lifecycle_worker(actor_module, monkeypatch, asleep=False)
     monkeypatch.setattr(actor_module, "lora_rollout_enabled", lambda _args: True)
@@ -326,6 +393,9 @@ def test_lora_sleep_pauses_the_grad_buffers_and_wake_up_resumes_them(actor_modul
 
 
 def test_offload_grad_buffer_frees_them_once_and_sleep_does_not_pause_them_again(actor_module, monkeypatch):
+    # [FUNCTION DOC] With LoRA rollout enabled, an awake worker offloads its grad buffer twice,
+    # sleeps and wakes. Asserts pause calls are grad-buffer then default (grad buffer paused only
+    # once overall), resume calls are default then grad-buffer, and the paused flag ends false.
     """offload_grad_buffer() and sleep() must pause the grad buffers exactly once between them."""
     worker, saver, _ = _lifecycle_worker(actor_module, monkeypatch, asleep=False)
     monkeypatch.setattr(actor_module, "lora_rollout_enabled", lambda _args: True)
@@ -341,6 +411,9 @@ def test_offload_grad_buffer_frees_them_once_and_sleep_does_not_pause_them_again
 
 
 def _actor_train_args(**overrides):
+    # [FUNCTION DOC] HELPER: Returns an arguments namespace with defaults: compute advantages and
+    # returns on; rollout log probs, keep-old-actor, mismatch metrics and skip-actor-forward all
+    # off. Keyword overrides replace defaults (dictionary merge).
     defaults = dict(
         compute_advantages_and_returns=True,
         use_rollout_logprobs=False,
@@ -352,6 +425,12 @@ def _actor_train_args(**overrides):
 
 
 def _actor_reuse_worker(actor_module, **args_overrides):
+    # [FUNCTION DOC] HELPER: Creates an actor worker (no constructor) for the actor-training
+    # tests: arguments from the train-args helper with no critic plus overrides, placeholder
+    # model/optimizer/scheduler, a mock weights backuper with no backup tags, active tag "actor",
+    # mocks for model switching, replay stage setting, log-prob computation (returning a log-probs
+    # mapping), profiler, weight updater (pop-metrics returns empty) and heartbeat, and no
+    # rollout-data postprocess and no fault-tolerance test executor. Returns the worker.
     worker = object.__new__(actor_module.MegatronTrainRayActor)
     worker.args = _actor_train_args(use_critic=False, **args_overrides)
     worker.model = [object()]
@@ -372,8 +451,14 @@ def _actor_reuse_worker(actor_module, **args_overrides):
 
 
 def _patch_actor_reuse_dependencies(actor_module, monkeypatch, *, num_microbatches):
+    # [FUNCTION DOC] HELPER: Patches the actor module (via monkeypatch): no replay managers; a
+    # data-iterator getter returning a one-element iterator list and the given per-step
+    # microbatch counts; mocks for advantage computation, advantage event logging, rollout data
+    # logging, perf logging and debug train data saving; pass-through timers; and a training
+    # function mock returning the discarded-should-retry outcome.
     @contextmanager
     def passthrough_timer(_name):
+        # [FUNCTION DOC] HELPER: Context manager that ignores the name and yields immediately.
         yield
 
     monkeypatch.setattr(actor_module, "all_replay_managers", [])
@@ -408,6 +493,14 @@ def _patch_actor_reuse_dependencies(actor_module, monkeypatch, *, num_microbatch
 def test_actor_logprob_forward_is_explicit_single_step_opt_in(
     actor_module, monkeypatch, skip_actor_forward_only, use_rollout_logprobs, num_microbatches
 ):
+    # [FUNCTION DOC] Parametrized over (skip actor forward, use rollout log probs, microbatch
+    # counts per step): (no, no, [1]), (yes, no, [1]), (yes, yes, [1]), (yes, no, [2]). Runs the
+    # actor training for rollout 7 with rollout data holding one rollouts entry per step and
+    # total lengths summing to the microbatch count. Asserts the actor log-prob computation ran
+    # once only when neither skip nor rollout log probs is set, otherwise zero times; advantage
+    # computation was called once with the arguments and rollout data; and the train function's
+    # seventh positional argument is the rollouts list and its keywords are exactly no witness
+    # info, attempt 0 and no fault-tolerance executor.
     worker = _actor_reuse_worker(
         actor_module,
         skip_actor_forward_only=skip_actor_forward_only,
@@ -433,6 +526,10 @@ def test_actor_logprob_forward_is_explicit_single_step_opt_in(
 
 
 def test_skip_actor_forward_only_preserves_reference_teacher_and_training_forwards(actor_module, monkeypatch):
+    # [FUNCTION DOC] With skip-actor-forward on and backup tags for reference and teacher, the
+    # log-prob computation mock returns a mapping keyed by its store prefix. Runs actor training
+    # for rollout 7. Asserts the log-prob computation was called only with store prefixes "ref_"
+    # then "teacher_" (not the actor's own) and the train function ran once.
     worker = _actor_reuse_worker(actor_module, skip_actor_forward_only=True)
     worker.weights_backuper.backup_tags = {"ref", "teacher"}
     worker._compute_log_prob.side_effect = lambda *_args, store_prefix, **_kwargs: {
@@ -461,6 +558,18 @@ def test_skip_actor_forward_only_consumes_preloaded_rollout_replay_during_traini
     rollout_flag,
     data_key,
 ):
+    # [FUNCTION DOC] Parametrized over (routing replay manager, its rollout flag, its rollout
+    # data key) and (indexer replay manager, its flag, its key). Sets up an enabled manager with
+    # result checking off and one mock replay that queues recorded top-k indices on record and
+    # pops the oldest on backward. The worker skips the actor forward and enables the rollout flag;
+    # the manager is the only replay manager; the replay-stage setter copies the stage onto the
+    # manager. A patched replay-data filler asserts it was given the expected data key and the
+    # manager's replay list, and records the first rollout item (removed from the rollout data)
+    # into the first replay. The patched train function asks the manager for its top-k function
+    # (non-probability mode), applies it with k=1 on scores [[0, 1]] and asserts the result equals
+    # the preloaded indices [[1]]. Runs actor training for rollout 7. Asserts the log-prob
+    # computation was not called, the filler was called once, the replay's backward pop was called
+    # once, and the queue is empty at the end.
     manager = manager_cls()
     manager.enabled = True
     manager.enable_check_replay_result = False
@@ -483,6 +592,10 @@ def test_skip_actor_forward_only_consumes_preloaded_rollout_replay_during_traini
     expected_top_indices = torch.tensor([[1]], dtype=torch.int64)
 
     def preload_replay_data(**kwargs):
+        # [FUNCTION DOC] HELPER: Replacement for the replay-data filler. Takes keyword arguments;
+        # asserts the data key equals the expected one and the replay list is the manager's own
+        # list; removes the data entry from the rollout data and records its first element into
+        # the first replay.
         assert kwargs["data_key"] == data_key
         assert kwargs["replay_list"] is manager.replays
         kwargs["replay_list"][0].record(kwargs["rollout_data"].pop(data_key)[0])
@@ -491,6 +604,10 @@ def test_skip_actor_forward_only_consumes_preloaded_rollout_replay_during_traini
     monkeypatch.setattr(actor_module, "fill_replay_data", fill_replay_data)
 
     def train_with_replay(*_args, **_kwargs):
+        # [FUNCTION DOC] HELPER: Replacement for the train function; ignores its arguments. Gets
+        # the manager's top-k function wrapping a plain top-k-indices function, applies it with
+        # k=1 to scores [[0.0, 1.0]], asserts the output equals the expected preloaded indices,
+        # and returns the discarded-should-retry outcome.
         topk_fn = manager.get_topk_fn(
             lambda scores, topk: torch.topk(scores, topk, dim=1).indices,
             return_probs=False,
@@ -516,6 +633,9 @@ def test_skip_actor_forward_only_consumes_preloaded_rollout_replay_during_traini
 
 
 def test_skip_actor_forward_only_rejects_multiple_optimizer_steps(actor_module, monkeypatch):
+    # [FUNCTION DOC] With skip-actor-forward on and two optimizer steps ([1, 1] microbatches),
+    # actor training raises an assertion error saying it requires 1 optimizer step. Asserts no
+    # log-prob computation, no advantage computation and no training happened.
     worker = _actor_reuse_worker(actor_module, skip_actor_forward_only=True)
     _patch_actor_reuse_dependencies(actor_module, monkeypatch, num_microbatches=[1, 1])
     rollout_data = {"num_rollouts": [1, 1], "total_lengths": [1, 1]}
@@ -529,6 +649,9 @@ def test_skip_actor_forward_only_rejects_multiple_optimizer_steps(actor_module, 
 
 
 def test_skip_actor_forward_only_rejects_existing_actor_log_probs(actor_module, monkeypatch):
+    # [FUNCTION DOC] With skip-actor-forward on and rollout data already containing log probs,
+    # actor training raises an assertion error saying it must run without actor log probs.
+    # Asserts no log-prob computation, no advantage computation and no training happened.
     worker = _actor_reuse_worker(actor_module, skip_actor_forward_only=True)
     _patch_actor_reuse_dependencies(actor_module, monkeypatch, num_microbatches=[1])
     rollout_data = {"num_rollouts": [1], "total_lengths": [1]}
@@ -546,26 +669,39 @@ _OBJECT_REF_ID_BYTES = 28
 
 
 class _FakeRay:
+    # [CLASS DOC] HELPER: In-memory stand-in for the Ray put/get API that still hands out real
+    # object-reference values (built from 28-byte keys), so type checks on references hold.
     """A store ref is typed as holding a real ObjectRef, so the stand-in hands out real ones."""
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates an empty mapping from key bytes to stored values.
         self._objects: dict[bytes, Any] = {}
 
     def put(self, value: Any) -> ray.ObjectRef:
+        # [FUNCTION DOC] HELPER: Uses the current object count as a little-endian 28-byte key,
+        # stores the value under it and returns a real object reference built from the key.
         key = len(self._objects).to_bytes(_OBJECT_REF_ID_BYTES, "little")
         self._objects[key] = value
         return ray.ObjectRef(key)
 
     def get(self, ref: ray.ObjectRef) -> Any:
+        # [FUNCTION DOC] HELPER: Looks up and returns the value stored under the reference's
+        # binary id; raises a key error for an unknown reference.
         return self._objects[ref.binary()]
 
 
 @contextmanager
 def _noop_timer(_name: str) -> Iterator[None]:
+    # [FUNCTION DOC] HELPER: Timer replacement; ignores the name and yields immediately.
     yield
 
 
 def _patch_shared_train_helpers(actor_module: Any, monkeypatch: pytest.MonkeyPatch, fake_ray: _FakeRay) -> None:
+    # [FUNCTION DOC] HELPER: Patches (via monkeypatch) the object store module to use the fake Ray
+    # and a fresh store instance that does not free objects; and the actor module to have no
+    # replay managers, a data-iterator getter returning an object and microbatch counts [1], a
+    # no-op advantage computation, a train function returning the normal outcome, a parallel state
+    # reporting it is the last pipeline stage, and a no-op timer.
     monkeypatch.setattr(object_store, "ray", fake_ray)
     monkeypatch.setattr(object_store, "_INSTANCE", object_store.RayObjectStore(frees_objects=False))
     monkeypatch.setattr(actor_module, "all_replay_managers", [])
@@ -577,6 +713,8 @@ def _patch_shared_train_helpers(actor_module: Any, monkeypatch: pytest.MonkeyPat
 
 
 def _critic_worker(actor_module: Any) -> Any:
+    # [FUNCTION DOC] HELPER: Creates a critic-role worker (no constructor) with global batch size 1,
+    # no loss type, placeholder model/optimizer/scheduler and a mock heartbeat. Returns it.
     worker = object.__new__(actor_module.MegatronTrainRayActor)
     worker.args = Namespace(global_batch_size=1, loss_type=None)
     worker.role = "critic"
@@ -588,6 +726,12 @@ def _critic_worker(actor_module: Any) -> Any:
 
 
 def _actor_worker(actor_module: Any) -> Any:
+    # [FUNCTION DOC] HELPER: Creates an actor-role worker (no constructor) configured for a
+    # colocated run with a critic: arguments with advantages computed, rollout log probs used, no
+    # mismatch metrics, global batch size 1, no old actor, no reference update interval, no skip
+    # of actor forward; no reference or teacher; placeholder model/optimizer/scheduler; mocks for
+    # profiler, weight updater, weights backuper (no backup tags), model switching and heartbeat;
+    # active tag "actor"; no postprocess and no fault-tolerance executor. Returns it.
     worker = object.__new__(actor_module.MegatronTrainRayActor)
     worker.args = Namespace(
         colocate=True,
@@ -619,6 +763,12 @@ def _actor_worker(actor_module: Any) -> Any:
 
 
 def test_critic_output_roundtrips_into_actor_external_data(actor_module: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    # [FUNCTION DOC] Patches shared train helpers with a fake Ray, plus no-op forward-only, timer,
+    # logging, debug-save, and the CUDA current device reported as CPU. A critic worker trains for
+    # rollout 7 with rollout data holding two value tensors ([1, 2] and [3]). Asserts the output
+    # is a step output with outcome normal and non-empty values. Then an actor worker trains for
+    # rollout 8 with that output as external data and asserts its step output is normal and that
+    # the actor's rollout data now has values equal to [[1, 2], [3]] (retrieved from the store).
     """Real _train_critic ships values that real _train_actor reads back through TrainStepOutput.values."""
     fake_ray = _FakeRay()
     _patch_shared_train_helpers(actor_module, monkeypatch, fake_ray)
@@ -650,6 +800,9 @@ def test_critic_output_roundtrips_into_actor_external_data(actor_module: Any, mo
 def test_debug_rollout_only_train_answers_with_a_normal_train_step_output(
     actor_module: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # [FUNCTION DOC] An awake actor worker with debug rollout-only on and mocked actor/critic train
+    # methods, with patched rollout-data loading, logging and timer. Runs train for rollout 9.
+    # Asserts the result equals a normal step output (no values) and neither train method ran.
     """A debug-rollout-only step skips training yet still answers the driver with a NORMAL output."""
     worker = _worker(actor_module, "actor", asleep=False)
     worker.args.debug_rollout_only = True
@@ -672,6 +825,9 @@ def test_debug_rollout_only_train_answers_with_a_normal_train_step_output(
 def test_critic_without_shippable_values_returns_an_output_carrying_none(
     actor_module: Any, monkeypatch: pytest.MonkeyPatch, is_pp_last_stage: bool, rollout_data_values: Any
 ) -> None:
+    # [FUNCTION DOC] Parametrized over (not pipeline-last with values present) and (pipeline-last
+    # with no values key). With shared helpers patched and a no-op forward-only, the critic worker
+    # trains for rollout 7. Asserts it returns a normal step output with values none.
     """A critic rank that is not pp-last or has no values still returns a TrainStepOutput with values=None."""
     _patch_shared_train_helpers(actor_module, monkeypatch, _FakeRay())
     monkeypatch.setattr(actor_module, "forward_only", lambda *_args, **_kwargs: {})
@@ -686,6 +842,9 @@ def test_critic_without_shippable_values_returns_an_output_carrying_none(
 def test_actor_last_stage_rejects_a_critic_output_without_values(
     actor_module: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # [FUNCTION DOC] With shared helpers patched and a no-op inverse timer, an actor worker on the
+    # last pipeline stage trains with an external critic output whose values are none. Asserts an
+    # assertion error saying the critic output must have shipped 'values'.
     """A pp-last actor using a critic refuses to train on a TrainStepOutput that shipped no values."""
     _patch_shared_train_helpers(actor_module, monkeypatch, _FakeRay())
     monkeypatch.setattr(actor_module, "inverse_timer", _noop_timer)
@@ -696,7 +855,11 @@ def test_actor_last_stage_rejects_a_critic_output_without_values(
 
 
 class _RecordingWeightUpdater:
+    # [CLASS DOC] HELPER: Fake weight updater that records connection calls and counts weight
+    # updates, using a real connection-status manager to decide when to reconnect.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates a real connection-status manager, an empty list of
+        # connect-call records, and zeroed update count and weight version.
         self.conn_status = ConnStatusManager()
         self.connect_calls: list[dict[str, Any]] = []
         self.update_weights_calls: int = 0
@@ -708,6 +871,8 @@ class _RecordingWeightUpdater:
         engine_gpu_counts: list[int] | None = None,
         engine_gpu_offsets: list[int] | None = None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Appends a record holding a copy of the engines list and the
+        # optional GPU counts and offsets.
         self.connect_calls.append(
             dict(
                 rollout_engines=list(rollout_engines),
@@ -717,12 +882,17 @@ class _RecordingWeightUpdater:
         )
 
     def reconnect_if_needed(self, info: Any) -> bool:
+        # [FUNCTION DOC] HELPER: Asks the status manager whether the snapshot cell-to-hash mapping
+        # in the info requires a reconnect; if not returns false; otherwise reconnects and returns
+        # true.
         if not self.conn_status.needs_reconnect(info.snapshot_cell_id_to_hashes):
             return False
         self.reconnect(info)
         return True
 
     def reconnect(self, info: Any) -> None:
+        # [FUNCTION DOC] HELPER: Connects to the info's engines with its GPU counts and offsets,
+        # then marks the status manager as reconnected for the info's snapshot mapping.
         self.connect_rollout_engines(
             info.rollout_engines,
             engine_gpu_counts=info.engine_gpu_counts,
@@ -731,14 +901,21 @@ class _RecordingWeightUpdater:
         self.conn_status.mark_reconnected(info.snapshot_cell_id_to_hashes)
 
     def verify_engine_version(self, rollout_engines: list[Any]) -> None:
+        # [FUNCTION DOC] HELPER: No-op version check.
         pass
 
     def update_weights(self) -> None:
+        # [FUNCTION DOC] HELPER: Increments the update count and the weight version by one.
         self.update_weights_calls += 1
         self.weight_version += 1
 
 
 def _weight_update_worker(actor_module: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
+    # [FUNCTION DOC] HELPER: Creates a worker (no constructor) with arguments for weight update
+    # tests (CI test, rollout-only, skip-weight-update, train-only, keep-old-actor, offload and
+    # rematerialize all off; no actor-weights colocate attribute set), awake, a mock heartbeat and
+    # the recording weight updater. Patches the actor module's memory printing (mock), gloo group
+    # getter (returns none) and the distributed barrier (no-op). Returns the worker.
     worker = object.__new__(actor_module.MegatronTrainRayActor)
     worker.args = Namespace(
         ci_test=False,
@@ -762,6 +939,11 @@ def _weight_update_worker(actor_module: Any, monkeypatch: pytest.MonkeyPatch) ->
 def test_disaggregated_weight_sync_reads_host_backup_only_when_asleep(
     actor_module: Any, monkeypatch: pytest.MonkeyPatch, asleep: bool
 ) -> None:
+    # [FUNCTION DOC] Parametrized over the sleeping state. A non-colocated worker whose
+    # weight-sync-reads-backup property is patched false, active tag actor, with a mock backuper
+    # returning host weights and a mock live-weights iterator returning device weights. Asserts
+    # the actor-weights getter returns host weights when asleep and device weights when awake,
+    # and that exactly one of the two sources is queried accordingly.
     worker = _weight_update_worker(actor_module, monkeypatch)
     worker.args.colocate = False
     worker._asleep = asleep
@@ -782,6 +964,9 @@ def test_disaggregated_weight_sync_reads_host_backup_only_when_asleep(
 def test_offloading_keeps_weight_backup_without_reference_model(
     actor_module: Any, monkeypatch: pytest.MonkeyPatch, offload_train: bool
 ) -> None:
+    # [FUNCTION DOC] Parametrized over the offload-train flag. A non-colocated worker with no
+    # reference and no teacher model and the weight-sync-reads-backup property patched false.
+    # Asserts the weight-backup-enabled property equals the offload-train flag.
     worker = _weight_update_worker(actor_module, monkeypatch)
     worker.args.colocate = False
     worker.args.offload_train = offload_train
@@ -796,6 +981,10 @@ def test_offloading_keeps_weight_backup_without_reference_model(
 def test_switch_model_restores_the_already_active_tag(
     actor_module: Any, monkeypatch: pytest.MonkeyPatch, active_tag: str
 ) -> None:
+    # [FUNCTION DOC] Parametrized over the active tag (actor, ref, teacher, old_actor). With the
+    # weight-backup property patched true and a mock backuper whose tags include the active one,
+    # switching to the same tag asserts the backuper restore was called once with that tag and
+    # the active tag is unchanged.
     """The active tag's live storage may have been discarded by an offload
     cycle since the last switch (--offload-train disables the param buffers'
     memory-saver backup), so a same-tag switch must still restore."""
@@ -817,6 +1006,10 @@ def test_switch_model_restores_the_already_active_tag(
 def test_switch_model_restores_on_every_switch(
     actor_module: Any, monkeypatch: pytest.MonkeyPatch, active_tag: str | None, target_tag: str
 ) -> None:
+    # [FUNCTION DOC] Parametrized over (active tag, target tag) pairs including no active tag and
+    # changes between tags. With the weight-backup property patched true and a mock backuper with
+    # the target tag, switches to the target twice. Asserts restore was called exactly twice, the
+    # last time with the target tag (no same-tag skip), and the active tag is the target.
     worker = _weight_update_worker(actor_module, monkeypatch)
     monkeypatch.setattr(type(worker), "_enable_weight_backup", property(lambda _self: True))
     worker._active_model_tag = active_tag
@@ -835,6 +1028,9 @@ def test_switch_model_restores_on_every_switch(
 def test_switch_model_rejects_unknown_tag_even_when_marked_active(
     actor_module: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # [FUNCTION DOC] The active tag is "missing" but the backuper only knows "actor". Switching to
+    # "missing" raises a value error saying it cannot switch to the unknown model tag, and the
+    # backuper restore is never called.
     worker = _weight_update_worker(actor_module, monkeypatch)
     monkeypatch.setattr(type(worker), "_enable_weight_backup", property(lambda _self: True))
     worker._active_model_tag = "missing"
@@ -847,6 +1043,9 @@ def test_switch_model_rejects_unknown_tag_even_when_marked_active(
 
 
 def _updatable_engines(rollout_engines: list[Any], snapshot: dict[str, str], gpu_count: int) -> Any:
+    # [FUNCTION DOC] HELPER: Builds an updatable-engines info object from the engines, with every
+    # engine's GPU count equal to the given count, GPU offsets as index times count, and the
+    # given snapshot mapping of cell id to hash.
     from miles.ray.rollout.inference_controller import UpdatableEngines
 
     return UpdatableEngines(
@@ -862,6 +1061,15 @@ def _updatable_engines(rollout_engines: list[Any], snapshot: dict[str, str], gpu
 def test_connection_uses_safe_allocations_when_offloading(
     actor_module: Any, monkeypatch: pytest.MonkeyPatch, offload_train: bool, connect_fails: bool
 ) -> None:
+    # [FUNCTION DOC] Parametrized over offload-train and whether the connection fails. The worker
+    # sleeps exactly when offload is on. The memory saver mock's disable returns a context manager
+    # that tracks being inside a "safe allocation region" (asserting it is not nested). The
+    # patched connect function asserts that it runs inside the region if and only if offload is
+    # on, and raises a runtime error "connection failed" when configured. Updates weights with
+    # empty engines and one snapshot entry. Expects the error to propagate when failing. Asserts
+    # the region is always exited; the saver's disable was called 0 times without offload, else
+    # 1 time when the connection fails or 2 times when it succeeds; and the updater's update
+    # count is 1 on success and 0 on failure.
     worker = _weight_update_worker(actor_module, monkeypatch)
     worker.args.offload_train = offload_train
     worker._asleep = offload_train
@@ -869,6 +1077,8 @@ def test_connection_uses_safe_allocations_when_offloading(
 
     @contextmanager
     def safe_region() -> Iterator[None]:
+        # [FUNCTION DOC] HELPER: Context manager replacing the saver's disable: asserts not
+        # already inside, marks inside while active, and always clears the mark on exit.
         nonlocal inside_safe_region
         assert not inside_safe_region
         inside_safe_region = True
@@ -878,6 +1088,9 @@ def test_connection_uses_safe_allocations_when_offloading(
             inside_safe_region = False
 
     def check_connection(*_args: Any, **_kwargs: Any) -> None:
+        # [FUNCTION DOC] HELPER: Replacement for the connect function: asserts the inside-region
+        # mark equals the offload-train flag, then raises a runtime error saying connection failed
+        # when failure is configured.
         assert inside_safe_region == offload_train
         if connect_fails:
             raise RuntimeError("connection failed")
@@ -904,6 +1117,12 @@ def test_connection_uses_safe_allocations_when_offloading(
 def test_update_weights_reconnects_once_per_rollout_snapshot(
     actor_module: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # [FUNCTION DOC] Updates weights three times: twice with the same engines (4 GPUs each) and
+    # snapshot hash "hash-a", then with two replacement engines (2 GPUs each) and hash "hash-b".
+    # Asserts the connect calls are exactly the first engines then the replacement engines, the
+    # second record has GPU counts [2, 2] and offsets [0, 2], the updater ran 3 updates, the last
+    # update call returned weight version 3, and the status manager no longer needs a reconnect
+    # for hash-b.
     """The actor connects to a rollout snapshot once and reconnects with the new topology only when it changes."""
     worker = _weight_update_worker(actor_module, monkeypatch)
     updater = worker.weight_updater
@@ -925,6 +1144,10 @@ def test_update_weights_reconnects_once_per_rollout_snapshot(
 def test_reconfigure_indep_dp_forces_the_next_weight_update_to_reconnect(
     actor_module: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # [FUNCTION DOC] Patches the group reconfiguration function (mock), parallel state (empty
+    # object), rank 0 and world size 2. Updates weights, reconfigures the independent
+    # data-parallel group with a placeholder and an address, then updates weights again with the
+    # same engines and snapshot. Asserts two connect calls happened in total.
     """Rebuilding the independent-DP groups invalidates the trainer side, so the next update reconnects."""
     worker = _weight_update_worker(actor_module, monkeypatch)
     updater = worker.weight_updater
@@ -945,6 +1168,11 @@ def test_reconfigure_indep_dp_forces_the_next_weight_update_to_reconnect(
 def test_switch_model_restores_discarded_values_with_the_normal_backuper(
     actor_module: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # [FUNCTION DOC] Patches CUDA synchronize to a no-op. Builds a real tensor backuper over a
+    # live weight tensor [0, 1, 2, 3], injects an unpinned host backup for the actor tag with a
+    # copy of the values, zeroes the live tensor (simulating a discarded storage), and switches to
+    # the already-active actor tag with weight backup enabled. Asserts the live tensor again
+    # equals [0, 1, 2, 3].
     """--offload-train disables the param buffers' memory-saver backup: sleep()
     discards their contents and wake_up() reallocates the storage without
     values. The same-tag switch after wake must copy the host backup back into
@@ -969,6 +1197,11 @@ def test_switch_model_restores_discarded_values_with_the_normal_backuper(
 def test_switch_model_rebuilds_the_active_actor_for_main_cast(
     actor_module: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # [FUNCTION DOC] Patches CUDA synchronize to a no-op. Builds a real tensor backuper with an
+    # empty live-weight iterator and a main-cast context holding a mock cast function, no model
+    # chunks, no rematerializable ids and checking off. With weight backup enabled and the actor
+    # tag already active, switches to the actor tag and asserts the cast function was called
+    # once with no arguments.
     """--rematerialize-param-from-master-weight: restore('actor') replays the
     master-weight cast, rebuilding the params update_weights paused -- the
     per-cycle call must never be skipped for the already-active tag."""

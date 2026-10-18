@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Tests for the factory that builds the Megatron-to-HuggingFace weight iterator: routing of the
+# conversion mode (bridge, raw, unknown) to the matching implementation class, and resolution of
+# the weight-update placement as the join of the caller's required placement with the placement
+# each implementation forces. Implementation constructors are patched out, so nothing is loaded.
+# The module registers itself as a CPU test in the first CPU stage with an estimated 60 seconds
+# and no labels (the registration sits between the docstring and the imports).
 """Unit tests for the megatron hf-weight-iterator factory: mode routing and
 placement resolution against each implementation's forced placement."""
 
@@ -15,7 +22,10 @@ from miles.backends.training_utils.weight_update.hf_weight_iterator import Weigh
 
 
 class TestHfWeightIteratorFactory:
+    # [CLASS DOC] Tests for the weight-iterator factory function.
     def _make_args(self, mode="bridge"):
+        # [FUNCTION DOC] HELPER: Returns an arguments namespace with the given conversion mode
+        # (default bridge), a fake HuggingFace checkpoint path, and an update buffer size of 1.
         return Namespace(
             megatron_to_hf_mode=mode,
             hf_checkpoint="/fake/path",
@@ -23,6 +33,10 @@ class TestHfWeightIteratorFactory:
         )
 
     def _create(self, mode, required_placement=None):
+        # [FUNCTION DOC] HELPER: Imports the factory lazily and calls it with arguments for the
+        # given mode, a one-element list holding a mock model, the required placement (default:
+        # gather across pipeline stages), model name "qwen" and no quantization config. Returns
+        # the created iterator; propagates the factory's errors (unknown mode: key error).
         from miles.backends.megatron_utils.update_weight.hf_weight_iterator import get_hf_weight_iterator
 
         if required_placement is None:
@@ -36,6 +50,8 @@ class TestHfWeightIteratorFactory:
         )
 
     def test_bridge_mode_creates_bridge_iterator(self):
+        # [FUNCTION DOC] With the bridge implementation's constructor patched to do nothing,
+        # asserts the bridge mode yields an instance of the bridge iterator class.
         from miles.backends.megatron_utils.update_weight.hf_weight_iterator_bridge import HfWeightIteratorBridge
 
         with patch.object(HfWeightIteratorBridge, "__init__", return_value=None):
@@ -43,6 +59,8 @@ class TestHfWeightIteratorFactory:
             assert isinstance(iterator, HfWeightIteratorBridge)
 
     def test_raw_mode_creates_direct_iterator(self):
+        # [FUNCTION DOC] With the direct implementation's constructor patched to do nothing,
+        # asserts the raw mode yields an instance of the direct iterator class.
         from miles.backends.megatron_utils.update_weight.hf_weight_iterator_direct import HfWeightIteratorDirect
 
         with patch.object(HfWeightIteratorDirect, "__init__", return_value=None):
@@ -50,10 +68,16 @@ class TestHfWeightIteratorFactory:
             assert isinstance(iterator, HfWeightIteratorDirect)
 
     def test_invalid_mode_raises(self):
+        # [FUNCTION DOC] An unknown mode string makes the factory raise a key error.
         with pytest.raises(KeyError):
             self._create("invalid_mode")
 
     def test_forced_placement_resolves_by_implementation(self):
+        # [FUNCTION DOC] Asserts the class-level forced placements: bridge forces gathering across
+        # pipeline stages, direct allows keeping them local. Then replaces each constructor with a
+        # capturing stand-in recording the placement keyword, creates each iterator with a
+        # required placement of keeping pipeline stages local, and asserts the resolved placement
+        # is the full gather for bridge and the local one for direct (join with the floor).
         """Bridge forces a full gather; the direct iterator can keep PP local,
         so resolution joins the requirement with each implementation's floor."""
         from miles.backends.megatron_utils.update_weight.hf_weight_iterator_bridge import HfWeightIteratorBridge
@@ -67,6 +91,8 @@ class TestHfWeightIteratorFactory:
         captured = {}
 
         def _capture_init(self, args, model, *, placement, model_name, quantization_config):
+            # [FUNCTION DOC] HELPER: Stand-in constructor that stores the received placement in
+            # the enclosing test's capture mapping under the key "placement"; ignores all else.
             captured["placement"] = placement
 
         with patch.object(HfWeightIteratorBridge, "__init__", _capture_init):

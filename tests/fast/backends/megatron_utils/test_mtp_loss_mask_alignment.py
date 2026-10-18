@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Test that the loss mask produced by the miles data pipeline lines up with the targets used by
+# the real multi-token-prediction (MTP) loss function of Megatron. Skipped when the optional
+# Megatron MTP and packed-sequence modules are not installed. Runs on CPU by faking the parallel
+# state (single rank, no group) and neutralizing the CUDA device and tensor transfer calls.
 """Exercise the Miles mask through the real, optional Megatron MTP loss consumer."""
 
 from types import SimpleNamespace
@@ -24,6 +29,24 @@ def test_actual_mtp_loss_selects_intended_targets(
     per_token_loss: bool,
     qkv_format: str,
 ) -> None:
+    # [FUNCTION DOC] Parametrized over 1 or 2 MTP layers, loss masks zeroed or not, per-token
+    # versus per-sequence loss normalization, and packed ("thd") versus padded ("bshd") layout.
+    # Setup: single-rank fake parallel state patched into the rollout-data and context-parallel
+    # modules; CUDA current device reported as CPU and the tensor cuda method made the identity;
+    # the MTP loss auto-scaler's backward scale set to a tensor 1.0 (all undone by monkeypatch).
+    # Data: two samples of 12 and 10 tokens with response masks of lengths 9 and 7 (multiplied by
+    # zero when all are masked), maximum sequence length 24 each. A batch is built through the
+    # miles batch builder with micro batch size 2 and pad multiplier 8. The model's output layer
+    # is replaced by a fake that records the labels it receives and returns a ones-valued loss
+    # requiring gradients per label; the actual Megatron rolling, masking, normalization and
+    # gradient injection run. Hidden states are zeros of (layers + 1) times sequence length rows.
+    # The expected targets are all response-token ids selected by the mask, in sample order. The
+    # MTP loss processing is called with no labels (so Megatron derives them from the input ids),
+    # the batch's input loss mask, and, for the packed layout, packed sequence params built from
+    # the batch's cumulative lengths and max length. Then the summed output is back-propagated.
+    # Asserts, for every recorded depth: the gradient exists and is finite, and the labels at
+    # positions with nonzero gradient equal exactly the expected targets; and that the loss mask
+    # passed in was not modified in place.
     group = GroupInfo(rank=0, size=1, group=None)
     state = ParallelState(
         intra_dp=group, intra_dp_cp=group, cp=group, tp=group, pp=group, ep=group, etp=group, indep_dp=group
@@ -54,6 +77,10 @@ def test_actual_mtp_loss_selects_intended_targets(
     losses = []
 
     def output_layer(hidden: torch.Tensor, *, labels: torch.Tensor, **kwargs: object) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Fake output layer. Ignores the hidden states and extra keyword
+        # arguments; appends the labels to the enclosing target list, creates a float32 ones
+        # tensor shaped like the labels that requires gradients, appends it to the enclosing loss
+        # list and returns it.
         # Only the expensive model projection/CE is replaced. Real Megatron
         # rolling, masking, normalization and autograd injection run unchanged.
         targets.append(labels)
