@@ -1,3 +1,8 @@
+# [PACKAGE DOC]
+# Fast offline tests for the openenv terminal-bench-2 example, which lives outside the tests tree.
+# The package defines one constant, the example directory path (examples/experimental/openenv under
+# the repository root, five levels above this file's directory). The sibling conftest puts it on
+# the import path, and tests that assert on the example's own files read them from this path.
 """Tests for the openenv tbench2 example, which lives outside this tree.
 
 ``EXAMPLE_DIR`` is the one place that spans the two: conftest puts it on

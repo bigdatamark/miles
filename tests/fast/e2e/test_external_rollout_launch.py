@@ -1,3 +1,16 @@
+# [MODULE DOC]
+# Tests that the external-rollout end-to-end script's own training arguments survive the whole
+# Kubernetes helm launcher. A sandbox directory on a temp path holds an infra values file, a fake
+# model directory with a small model config and a reference checkpoint directory. The launch
+# helper runs the real launcher entry point with the helm command wrapper replaced by a fake that
+# answers with empty output (and an empty manifest for json requests), the release lookup returning
+# nothing, a fixed launch token, and the follow step skipped. It records the launch plan, reads the
+# written values file for the run, and renders the real run chart with the helm template command
+# (needs helm). Tests assert the argument vector selects the static external engine provider,
+# a mooncake object store plan is present, the master address is not loopback, no engine pool is
+# declared by the run itself, the controller and trainer pools remain, the controller command
+# carries the engine addresses, the engines ride in the release as a service and stateful set, and
+# no other rendered pod launches an engine.
 import shlex
 import subprocess
 from dataclasses import dataclass
@@ -54,6 +67,8 @@ POOL_SECTIONS = ("staticWorkers", "inferenceEngines", "trainerEngines")
 
 @dataclass(frozen=True)
 class _Launch:
+    # [CLASS DOC] HELPER: Immutable result of a simulated launch: the recorded launch plan, the
+    # values mapping written for the run, and the text rendered by the chart template.
     plan: LaunchPlan
     values: dict[str, Any]
     rendered: str
@@ -61,12 +76,17 @@ class _Launch:
 
 @pytest.fixture(autouse=True)
 def host_without_partition_or_wandb_key(monkeypatch):
+    # [FUNCTION DOC] HELPER: Autouse fixture removing the visible-devices and wandb key
+    # environment variables and setting the CUDA device max connections variable to 1.
     for name in ("CUDA_VISIBLE_DEVICES", "WANDB_API_KEY"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", "1")
 
 
 def infra_file(sandbox: Path) -> Path:
+    # [FUNCTION DOC] HELPER: Writes an infra yaml under the sandbox (image from a fake registry
+    # with tag v1, one host-path volume and mount in the sandbox cluster-storage folder, and a runs
+    # root path inside it) and returns its path. Side effect: file on disk.
     path = sandbox / "infra.yaml"
     path.write_text(
         yaml.safe_dump(
@@ -89,12 +109,17 @@ def infra_file(sandbox: Path) -> Path:
 
 
 def values_file(sandbox: Path) -> Path:
+    # [FUNCTION DOC] HELPER: Returns the path where the launcher writes the run's values file:
+    # under the sandbox runs root, the miles-runs folder, the run id, a values folder, named with
+    # the fixed launch token. Does not touch disk.
     return (
         sandbox / "cluster-storage" / "miles_data" / "miles-runs" / RUN_ID / "values" / f"values-{LAUNCH_TOKEN}.yaml"
     )
 
 
 def model_dir(sandbox: Path) -> Path:
+    # [FUNCTION DOC] HELPER: Creates (if needed) a model directory named after the script's model
+    # under the sandbox and writes the small Qwen2 config json into it; returns the directory.
     path = sandbox / script.MODEL_NAME
     path.mkdir(parents=True, exist_ok=True)
     (path / "config.json").write_text(MODEL_CONFIG_JSON)
@@ -102,12 +127,18 @@ def model_dir(sandbox: Path) -> Path:
 
 
 def ref_load_dir(sandbox: Path) -> Path:
+    # [FUNCTION DOC] HELPER: Creates (if needed) an empty reference checkpoint directory for the
+    # script's model under the sandbox (torch distributed suffix) and returns it.
     path = sandbox / f"{script.MODEL_NAME}_torch_dist"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def train_args_of(config: ExecuteTrainConfig, addrs: list[str], sandbox: Path) -> str:
+    # [FUNCTION DOC] HELPER: Builds the full train argument string as the script would write it: the
+    # shell-safe model arguments, a space, then the script's train args for the engine addresses
+    # and the config's object store args. The default root models path and default root reference
+    # checkpoint path in the text are rewritten to the sandbox directories (created as a side effect).
     written = f"{shell_safe_model_args(script.MODEL_TYPE)} " + script._train_args(
         addrs, object_store_args=script._object_store_args(config)
     )
@@ -116,6 +147,15 @@ def train_args_of(config: ExecuteTrainConfig, addrs: list[str], sandbox: Path) -
 
 
 def launch(monkeypatch, sandbox: Path) -> _Launch:
+    # [FUNCTION DOC] HELPER: Runs the real launcher for a Kubernetes config (namespace rl, fixed run
+    # id, the sandbox infra values file). Builds a train request from the script's engines
+    # (trainer gpus, model type, script path, no fsdp, Megatron path, engine prepare commands and
+    # manifests). Patches: the values builder to record each launch plan then delegate; the helm
+    # process runner to return success with empty output (an empty manifest json when the command
+    # asks for json); the release lookup to return nothing; the repository base dir; the launch
+    # token; and the follow-until-finished step to do nothing. Executes the train, then returns the
+    # last recorded plan, the written values file parsed as yaml, and the chart render of the infra
+    # file plus values file (requires helm on the path).
     config = ExecuteTrainConfig(
         cluster_backend=ClusterBackend.KUBERNETES,
         namespace=NAMESPACE,
@@ -140,12 +180,16 @@ def launch(monkeypatch, sandbox: Path) -> _Launch:
     build_values = entrypoint.build_values
 
     def record_plan(specs, plan):
+        # [FUNCTION DOC] HELPER: Records the launch plan then calls the original values builder and returns its result.
         planned.append(plan)
         return build_values(specs, plan)
 
     monkeypatch.setattr(entrypoint, "build_values", record_plan)
 
     def helm_answered_nothing(command, **kwargs) -> subprocess.CompletedProcess:
+        # [FUNCTION DOC] HELPER: Fake helm process runner. Returns a successful result whose
+        # output is a json object with an empty manifest if the command mentions json, otherwise
+        # empty output.
         # the launcher renders the upgrade it is about to install and reads the manifest out of the
         # json, so a helm that answers with nothing at all has to answer with an empty manifest
         rendered = '{"manifest": ""}' if "json" in command else ""
@@ -167,6 +211,9 @@ def launch(monkeypatch, sandbox: Path) -> _Launch:
 
 
 def render(*values_files: Path) -> str:
+    # [FUNCTION DOC] HELPER: Runs the helm template command (release name myrun, the run chart
+    # directory, the test namespace) with each given values file as a values option, capturing text
+    # output. Asserts return code zero with stderr as the message; returns stdout. Subprocess side effect.
     arguments = [argument for path in values_files for argument in ("-f", str(path))]
     result = subprocess.run(
         ["helm", "template", "myrun", str(RUN_CHART_DIR), "-n", NAMESPACE, *arguments],
@@ -178,10 +225,14 @@ def render(*values_files: Path) -> str:
 
 
 def pool_entries(values: dict[str, Any]) -> list[dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Returns the flat list of pool entries from the run section's static
+    # workers, inference engines and trainer engines lists (missing sections count as empty).
     return [entry for section in POOL_SECTIONS for entry in values["run"].get(section, [])]
 
 
 def named_pool_entry(values: dict[str, Any], name: str) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Returns the single pool entry with the given name. Raises an assertion
+    # error listing the available names unless exactly one entry matches.
     matched = [entry for entry in pool_entries(values) if entry["name"] == name]
     assert (
         len(matched) == 1
@@ -190,7 +241,12 @@ def named_pool_entry(values: dict[str, Any], name: str) -> dict[str, Any]:
 
 
 class TestTheScriptOwnArgvSelectsTheExternalPath:
+    # [CLASS DOC] Test that the script's arguments parse to the external rollout path (no helm needed).
     def test_the_addrs_are_what_the_run_builds_its_engine_provider_from(self, tmp_path):
+        # [FUNCTION DOC] Builds the script's train args for a Kubernetes config, splits them
+        # shell-style and parses them with the real argument parser under an overridden argument
+        # vector. Asserts the external rollout flag is on and the custom engine provider path is
+        # the static engine provider.
         """Reaching the pod is not enough: the addrs matter only if they select the static provider."""
         config = ExecuteTrainConfig(
             cluster_backend=ClusterBackend.KUBERNETES, helm_values=(str(infra_file(tmp_path)),)
@@ -207,7 +263,9 @@ class TestTheScriptOwnArgvSelectsTheExternalPath:
 
 @requires_helm
 class TestTheScriptOwnArgvSurvivesTheWholeLauncher:
+    # [CLASS DOC] Tests that run the full simulated launch; skipped unless helm is available.
     def test_the_run_is_given_the_object_store_the_backend_can_serve(self, monkeypatch, tmp_path):
+        # [FUNCTION DOC] Asserts the launch plan has a mooncake plan with a positive port.
         """Kubernetes forces mooncake, and a launch that named none aborts here, long before helm installs."""
         plan = launch(monkeypatch, tmp_path).plan
 
@@ -215,6 +273,8 @@ class TestTheScriptOwnArgvSurvivesTheWholeLauncher:
         assert plan.mooncake_plan.port > 0
 
     def test_the_master_the_pods_dial_is_the_one_this_release_installs(self, monkeypatch, tmp_path):
+        # [FUNCTION DOC] Asserts the values file has mooncake enabled and that the worker argument
+        # vector of the plan contains no loopback address.
         """The script names a loopback address, which is nothing at all from another pod."""
         launched = launch(monkeypatch, tmp_path)
 
@@ -222,18 +282,23 @@ class TestTheScriptOwnArgvSurvivesTheWholeLauncher:
         assert "127.0.0.1" not in " ".join(launched.plan.worker_argv)
 
     def test_the_run_declares_no_inference_engine_pool_of_its_own(self, monkeypatch, tmp_path):
+        # [FUNCTION DOC] Asserts no pool entry name starts with the inference engine prefix.
         """External rollout means miles provisions none, and one rendered anyway would take gpus and idle."""
         values = launch(monkeypatch, tmp_path).values
 
         assert [entry["name"] for entry in pool_entries(values) if entry["name"].startswith(ENGINE_POOL_PREFIX)] == []
 
     def test_the_run_still_deploys_everything_an_engine_is_not(self, monkeypatch, tmp_path):
+        # [FUNCTION DOC] Asserts the set of pool names contains both the controller pool and the trainer pool.
         """A launch that rendered nothing at all would satisfy every other assertion about engines."""
         names = {entry["name"] for entry in pool_entries(launch(monkeypatch, tmp_path).values)}
 
         assert {CONTROLLER_POOL, TRAINER_POOL} <= names
 
     def test_the_addrs_the_script_computed_reach_the_controller_that_dials_them(self, monkeypatch, tmp_path):
+        # [FUNCTION DOC] Recomputes the engine addresses from a fresh Kubernetes config and asserts
+        # the controller pool's command lists exactly those addresses directly after the external
+        # rollout engine addresses flag.
         """These addrs are written beside the manifest that serves them, and only argv carries them across."""
         launched = launch(monkeypatch, tmp_path)
         command = named_pool_entry(launched.values, CONTROLLER_POOL)["command"]
@@ -249,6 +314,8 @@ class TestTheScriptOwnArgvSurvivesTheWholeLauncher:
         assert command[start : start + len(addrs)] == addrs
 
     def test_the_engines_the_script_wrote_are_installed_with_the_run(self, monkeypatch, tmp_path):
+        # [FUNCTION DOC] Parses the rendered chart; asserts the kinds of objects whose name starts
+        # with the engine object name are exactly a service and a stateful set.
         """The whole point of the kubernetes half: the engines ride along in the release that trains against them."""
         objects = documents_of(launch(monkeypatch, tmp_path).rendered)
         engine_objects = {
@@ -258,6 +325,8 @@ class TestTheScriptOwnArgvSurvivesTheWholeLauncher:
         assert engine_objects == {"Service", "StatefulSet"}
 
     def test_no_rendered_pod_of_the_run_launches_an_engine_itself(self, monkeypatch, tmp_path):
+        # [FUNCTION DOC] Takes the rendered objects whose names do not start with the engine object
+        # name, dumps them to yaml text, and asserts the sglang launch-server module name is absent.
         """Only the manifest above may start an engine; a second one would fight it for the same gpus."""
         objects = documents_of(launch(monkeypatch, tmp_path).rendered)
         own = [obj for obj in objects if not obj["metadata"]["name"].startswith(script.ENGINE_OBJECT_NAME)]

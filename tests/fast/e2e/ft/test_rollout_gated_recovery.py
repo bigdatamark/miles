@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Asynchronous tests of rollout-engine fault recovery in a colocated two-engine deployment, built
+# from the real inference controller, rollout server, server cells, cell handler, and mini fault
+# tolerance controller, with only the outside world faked: the worker manager (cell start/stop and
+# info), the sglang router client, per-cell health checkers, the engine api client, the launch gate
+# and the server health probe. A harness object wires everything, can open a weight-update window,
+# crash a cell, run one mini-controller healing poll, and observe the api-server-shaped cell
+# objects. The tests assert phases (Running, Suspended, Pending), the Serving condition, router
+# membership, gate activation, and that the e2e recovery witness accepts or rejects the observed
+# sequences.
 from __future__ import annotations
 
 import asyncio
@@ -31,60 +41,89 @@ _CELL_IDS = ["inference-engine-0-0-0", "inference-engine-0-0-1"]
 
 
 class _StubProvider:
+    # [CLASS DOC] HELPER: Engine provider stub whose address lookup must never be used.
     async def get_addrs(self, worker_name: str) -> NamedHostAndPorts:
+        # [FUNCTION DOC] HELPER: Always raises an assertion error, because the tests patch address
+        # computation on server cells instead.
         raise AssertionError(f"this module addresses cells through a patched _compute_addr_info ({worker_name=})")
 
 
 class _FakeRouter:
+    # [CLASS DOC] HELPER: Fake sglang router client that keeps the ordered list of registered worker urls.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Starts with no registered worker urls.
         self.worker_urls: list[str] = []
 
     async def add_worker(
         self, *, worker_url: str, worker_type: str, use_legacy_api: bool, bootstrap_port: int | None
     ) -> None:
+        # [FUNCTION DOC] HELPER: Appends the worker url (other arguments ignored; duplicates are not prevented).
         self.worker_urls.append(worker_url)
 
     async def remove_worker(self, *, worker_url: str, use_legacy_api: bool) -> None:
+        # [FUNCTION DOC] HELPER: Removes the first occurrence of the url; raises a value error if absent.
         self.worker_urls.remove(worker_url)
 
 
 class _FakeHealthChecker:
+    # [CLASS DOC] HELPER: Fake cell health checker with a settable tri-state status (default true)
+    # and a started flag.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Status starts true, not started.
         self.status: TriState = TriState.TRUE
         self.started: bool = False
 
     def start(self) -> None:
+        # [FUNCTION DOC] HELPER: Marks the checker as started.
         self.started = True
 
     def stop(self) -> None:
+        # [FUNCTION DOC] HELPER: Marks the checker as stopped.
         self.started = False
 
 
 class _FakeEngineApiClient:
+    # [CLASS DOC] HELPER: Fake sglang engine api client: stores its url and key, makes memory
+    # release/resume no-ops, and returns fixed server info (a model path and one internal state
+    # with rank zero environment variables).
     def __init__(self, server_url: str, api_key: str | None = None) -> None:
+        # [FUNCTION DOC] HELPER: Stores the server url and optional api key.
         self.server_url = server_url
         self.api_key = api_key
 
     async def release_memory_occupation(self, tags: list[str] | None = None) -> None:
+        # [FUNCTION DOC] HELPER: No-op.
         return None
 
     async def resume_memory_occupation(self, tags: list[str] | None = None) -> None:
+        # [FUNCTION DOC] HELPER: No-op.
         return None
 
     async def get_server_info(self) -> dict[str, Any]:
+        # [FUNCTION DOC] HELPER: Returns a fixed mapping with a fake model path and one internal state with RANK 0.
         return {"model_path": "/fake/model", "internal_states": [{"env_vars": {"RANK": "0"}}]}
 
 
 class _RemoteMethod:
+    # [CLASS DOC] HELPER: Wraps a function so it can be invoked through a remote-call method like a Ray actor method.
     def __init__(self, fn: Callable[..., Any]) -> None:
+        # [FUNCTION DOC] HELPER: Stores the wrapped function.
         self._fn = fn
 
     def remote(self, *args: Any, **kwargs: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Calls the wrapped function directly with the arguments and returns
+        # its result (for async functions, a coroutine to await).
         return self._fn(*args, **kwargs)
 
 
 class _FakeWorkerManager:
+    # [CLASS DOC] HELPER: Fake worker manager for the two fixed cell ids. Tracks per-cell alive flags
+    # and generation counters (the generation changes the workers hash), builds cell info objects
+    # for one pool, and notifies a reconcile callback whenever a cell arrives, stops (info absent)
+    # or starts again (new generation). Exposes remote-style methods for cell infos, stop and start.
     def __init__(self, *, cell_ids: list[str], reconcile: Callable[[str, CellInfo | None], Any]) -> None:
+        # [FUNCTION DOC] HELPER: Marks all cells alive at generation zero, stores the reconcile
+        # callback, and creates remote-style wrappers for get-cell-infos, stop-cells, start-cells.
         self._alive: dict[str, bool] = {cell_id: True for cell_id in cell_ids}
         self._generation: dict[str, int] = {cell_id: 0 for cell_id in cell_ids}
         self._reconcile = reconcile
@@ -93,6 +132,11 @@ class _FakeWorkerManager:
         self.start_cells = _RemoteMethod(self._start_cells)
 
     def cell_info(self, cell_id: str) -> CellInfo:
+        # [FUNCTION DOC] HELPER: Builds the cell info of a known cell: pool id, alive flag, one
+        # worker named after the cell, a workers hash made from the cell id and current generation,
+        # and metadata for a regular default-model engine with one gpu, gpu offset equal to the cell's
+        # position, no api key, offload needed and weight update enabled. Raises a value error for
+        # an unknown cell id.
         index = _CELL_IDS.index(cell_id)
         return CellInfo(
             cell_id=cell_id,
@@ -112,18 +156,23 @@ class _FakeWorkerManager:
         )
 
     async def arrive_all(self) -> None:
+        # [FUNCTION DOC] HELPER: Reports every cell's current info to the reconcile callback in order.
         for cell_id in _CELL_IDS:
             await self._reconcile(cell_id, self.cell_info(cell_id))
 
     async def _get_cell_infos(self, *, pool_ids: list[str]) -> dict[str, CellInfo]:
+        # [FUNCTION DOC] HELPER: Returns a mapping from cell id to current info for all cells; the pool ids are ignored.
         return {cell_id: self.cell_info(cell_id) for cell_id in _CELL_IDS}
 
     async def _stop_cells(self, cell_ids: list[str]) -> None:
+        # [FUNCTION DOC] HELPER: Marks each cell not alive and tells the reconcile callback the cell is gone.
         for cell_id in cell_ids:
             self._alive[cell_id] = False
             await self._reconcile(cell_id, None)
 
     async def _start_cells(self, cell_ids: list[str]) -> None:
+        # [FUNCTION DOC] HELPER: Marks each cell alive, increments its generation (new workers
+        # hash), and reports its new info to the reconcile callback.
         for cell_id in cell_ids:
             self._alive[cell_id] = True
             self._generation[cell_id] += 1
@@ -131,26 +180,46 @@ class _FakeWorkerManager:
 
 
 class _FakeStopCellController:
+    # [CLASS DOC] HELPER: Fake inference controller exposing only stop-between-weight-updates, delegating to the fake worker manager.
     def __init__(self, *, worker_manager: _FakeWorkerManager) -> None:
+        # [FUNCTION DOC] HELPER: Stores the worker manager.
         self._worker_manager = worker_manager
 
     async def stop_cell_between_weight_updates(self, cell_id: str) -> None:
+        # [FUNCTION DOC] HELPER: Stops the single cell through the worker manager's remote-style stop method.
         await self._worker_manager.stop_cells.remote([cell_id])
 
 
 class _Harness:
+    # [CLASS DOC] HELPER: Wiring of a real inference controller, rollout server, cell handler and
+    # mini ft controller around fakes. Public pieces: router, health checkers keyed by cell id,
+    # activated gate urls, args, controller, worker manager, handler, ft controller. Methods:
+    # observe cells, open a weight update window, crash a cell, run one healing poll.
     def __init__(self, *, monkeypatch: pytest.MonkeyPatch) -> None:
+        # [FUNCTION DOC] HELPER: Patches the server cell module (gate activation, health probe
+        # that always reports healthy, engine api client, health checker factory that stores fakes
+        # keyed by the cell id without the name prefix), the cell address computation (per-index
+        # fake host, server port 30000, gate port 13000, no bootstrap port), the rollout server's
+        # router client, and the controller's ready-poll interval (zero). Then builds test args
+        # (colocated, fault tolerance on for rollout), a controller created without running its
+        # constructor and populated with the attributes it needs, one default rollout server
+        # expecting both cells, the fake worker manager reconciling into the controller, a cell
+        # handler over Ray cell operations, and a mini ft controller with zero poll interval and delay.
         self.router = _FakeRouter()
         self.health_checkers: dict[str, _FakeHealthChecker] = {}
         self.activated_gate_urls: list[str] = []
 
         async def _activate(gate_url: str) -> None:
+            # [FUNCTION DOC] HELPER: Records the gate url that was activated.
             self.activated_gate_urls.append(gate_url)
 
         async def _probe(server_url: str, api_key: str | None, timeout: float = 5.0) -> bool:
+            # [FUNCTION DOC] HELPER: Reports every server as healthy.
             return True
 
         async def _compute_addr_info(cell: ServerCell) -> CellAddrInfo:
+            # [FUNCTION DOC] HELPER: Derives fake server and gate urls from the cell's index among
+            # the known cell ids.
             index = _CELL_IDS.index(cell.meta.cell_id)
             return CellAddrInfo(
                 server_url=f"http://10.0.0.{index}:30000",
@@ -161,6 +230,8 @@ class _Harness:
         def _create_health_checker(
             *, args: Any, name: str, get_api_client: Any, get_activeness: Any
         ) -> _FakeHealthChecker:
+            # [FUNCTION DOC] HELPER: Creates a fake checker and stores it under the cell name with
+            # the rollout-cell prefix removed; returns it.
             checker = _FakeHealthChecker()
             self.health_checkers[name.removeprefix("rollout-cell-")] = checker
             return checker
@@ -212,10 +283,16 @@ class _Harness:
         )
 
     async def observe(self) -> dict[str, dict]:
+        # [FUNCTION DOC] HELPER: Lists the cells through the handler and returns a mapping from
+        # cell name to the cell serialized as a json-compatible dictionary.
         cells = await self.handler.list_cells()
         return {cell.metadata.name: cell.model_dump(mode="json") for cell in cells}
 
     async def open_weight_update_window(self, *, mark_weights_ready: bool = True) -> None:
+        # [FUNCTION DOC] HELPER: While a background task keeps ticking the controller's cells,
+        # starts a weight update (waiting at most 5 seconds) and then ends it, passing the
+        # snapshot of cell ids to hashes when weights are to be marked ready, or an empty mapping
+        # otherwise. Always cancels the ticking task afterwards and swallows its cancellation.
         tick_task = asyncio.create_task(self._tick_forever())
         try:
             engines = await asyncio.wait_for(self.controller.start_update_weights(), timeout=5)
@@ -226,15 +303,22 @@ class _Harness:
                 await tick_task
 
     def crash(self, cell_id: str) -> None:
+        # [FUNCTION DOC] HELPER: Makes the cell's fake health checker report a false status, so
+        # the ft controller considers the cell failed.
         self.health_checkers[cell_id].status = TriState.FALSE
 
     async def run_ft_controller_once(self) -> None:
+        # [FUNCTION DOC] HELPER: Runs one poll-and-heal iteration of the mini ft controller.
         await self.ft_controller._poll_and_heal()
 
     async def _get_cell_snapshots(self) -> list[Any]:
+        # [FUNCTION DOC] HELPER: Lists cells through the handler and converts each to the snapshot
+        # form the mini ft controller consumes.
         return [_compute_cell_snapshot(cell) for cell in await self.handler.list_cells()]
 
     async def _tick_forever(self) -> None:
+        # [FUNCTION DOC] HELPER: Loops forever, ticking the controller's cells and yielding to the
+        # event loop once per iteration; ends only when cancelled.
         while True:
             await self.controller._tick_cells()
             await asyncio.sleep(0)
@@ -242,6 +326,8 @@ class _Harness:
 
 @pytest.fixture
 async def harness(monkeypatch: pytest.MonkeyPatch) -> _Harness:
+    # [FUNCTION DOC] HELPER: Async fixture that builds the harness, has all cells arrive, and opens
+    # one weight update window with weights marked ready, returning the harness.
     """A colocated 2-engine rollout deployment wired to a fake worker manager, up and serving."""
     harness = _Harness(monkeypatch=monkeypatch)
     await harness.worker_manager.arrive_all()
@@ -250,10 +336,14 @@ async def harness(monkeypatch: pytest.MonkeyPatch) -> _Harness:
 
 
 def _serving_condition(cell: dict) -> str | None:
+    # [FUNCTION DOC] HELPER: Returns the status string of the cell's Serving condition, or none if
+    # the cell has no such condition.
     return next((cond["status"] for cond in cell["status"]["conditions"] if cond["type"] == "Serving"), None)
 
 
 async def test_a_healthy_deployment_reports_every_engine_as_serving(harness: _Harness) -> None:
+    # [FUNCTION DOC] Observes the healthy harness; asserts both cells are Running with a true
+    # Serving condition and the router holds both engine urls.
     """The soak's terminal criterion is Serving, so a fault-free deployment must report exactly that."""
     cells = await harness.observe()
 
@@ -263,6 +353,8 @@ async def test_a_healthy_deployment_reports_every_engine_as_serving(harness: _Ha
 
 
 async def test_a_crashed_engine_is_suspended_and_withdrawn_from_the_router(harness: _Harness) -> None:
+    # [FUNCTION DOC] Crashes the first cell and suspends it through the handler; asserts its phase
+    # is Suspended and the router holds only the second engine url.
     """Healing starts by tearing the engine down; leaving it registered would keep routing at a dead engine."""
     harness.crash(_CELL_IDS[0])
 
@@ -274,6 +366,8 @@ async def test_a_crashed_engine_is_suspended_and_withdrawn_from_the_router(harne
 
 
 async def test_the_mini_ft_controller_heals_exactly_the_crashed_engine(harness: _Harness) -> None:
+    # [FUNCTION DOC] Crashes the first cell and runs one healing poll; asserts the first cell is
+    # Pending, the second still Running, and the router holds only the second engine url.
     """A heal that also cycled the healthy engines would take the whole deployment down at once."""
     harness.crash(_CELL_IDS[0])
 
@@ -286,6 +380,8 @@ async def test_the_mini_ft_controller_heals_exactly_the_crashed_engine(harness: 
 
 
 async def test_the_replacement_engine_stays_gated_until_the_next_window(harness: _Harness) -> None:
+    # [FUNCTION DOC] Crashes the first cell, remembers the activated gates, runs one healing poll;
+    # asserts the first server cell is uninitialized, no new gate was activated, and its phase is Pending.
     """Under colocation the trainer owns the gpus mid-step, so the relaunched engine must not claim memory yet."""
     harness.crash(_CELL_IDS[0])
     gates_before = list(harness.activated_gate_urls)
@@ -299,6 +395,9 @@ async def test_the_replacement_engine_stays_gated_until_the_next_window(harness:
 
 
 async def test_the_replacement_engine_is_not_serving_before_it_gets_weights(harness: _Harness) -> None:
+    # [FUNCTION DOC] Crashes and heals the first cell, then opens a weight update window without
+    # marking weights ready; asserts the cell is Running with a false Serving condition and still
+    # absent from the router.
     """Regression: a relaunched engine holding stale weights reads Running, which alone proves no recovery."""
     harness.crash(_CELL_IDS[0])
     await harness.run_ft_controller_once()
@@ -312,6 +411,8 @@ async def test_the_replacement_engine_is_not_serving_before_it_gets_weights(harn
 
 
 async def test_the_next_window_puts_the_replacement_engine_back_in_the_router(harness: _Harness) -> None:
+    # [FUNCTION DOC] Crashes and heals the first cell, then opens a normal weight update window;
+    # asserts the cell serves again and the router holds both engine urls.
     """This is the recovery the soak asserts: the replaced engine ends up serving again."""
     harness.crash(_CELL_IDS[0])
     await harness.run_ft_controller_once()
@@ -324,6 +425,9 @@ async def test_the_next_window_puts_the_replacement_engine_back_in_the_router(ha
 
 
 async def test_the_observed_sequence_satisfies_the_soak_recovery_witness(harness: _Harness) -> None:
+    # [FUNCTION DOC] Records into an event log: an observation of the healthy cells, an injection
+    # note on the first cell, the crash and heal poll observation, then the post-window
+    # observation. Asserts the e2e views report no cells failing to serve after injection, with zero grace.
     """The fast-layer stand-in is only worth anything if the e2e witness accepts the sequence it produces."""
     log = state.EventLog()
     log.observe(list((await harness.observe()).values()))
@@ -339,6 +443,8 @@ async def test_the_observed_sequence_satisfies_the_soak_recovery_witness(harness
 
 
 async def test_the_witness_rejects_a_replacement_that_never_reaches_the_router(harness: _Harness) -> None:
+    # [FUNCTION DOC] Same sequence as the accepting test but the weight window does not mark
+    # weights ready; asserts the offender set is exactly the first cell id.
     """A weight update that silently skips the replaced cell leaves it Running forever, and must fail the soak."""
     log = state.EventLog()
     log.observe(list((await harness.observe()).values()))

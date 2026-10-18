@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Tests for the verifiers example launch script's execute function. Shell commands are recorded
+# instead of run, the Ray backend's nvlink check is patched to report none, and external-Ray and
+# submit environment flags are set so the final recorded command is the ray job submission. The
+# tests assert the legacy rollout flag (an environment variable) is consistent between the
+# adapter's choice of rollout function (new class-based function versus legacy generate function)
+# and the runtime environment forwarded to the Ray job, for combinations of the ambient process
+# value and an extra environment variable assignment given through the script arguments.
 import json
 import shlex
 
@@ -11,6 +19,9 @@ LEGACY_ROLLOUT_ENV = "MILES_USE_LEGACY_ROLLOUT_V1"
 
 
 def _rollout_config(submit_command: str) -> tuple[str, dict[str, str]]:
+    # [FUNCTION DOC] HELPER: Splits the submit command shell-style, returns a pair: the value after
+    # the rollout function path option, and the environment variables mapping parsed from the json
+    # of the runtime-env argument (the part after the equals sign). Raises if either is missing.
     argv = shlex.split(submit_command)
     rollout_fn = argv[argv.index("--rollout-function-path") + 1]
     runtime_env_arg = next(arg for arg in argv if arg.startswith("--runtime-env-json="))
@@ -35,6 +46,15 @@ def test_adapter_and_ray_runtime_use_the_same_legacy_flag(
     expected_rollout_fn,
     expected_runtime_value,
 ):
+    # [FUNCTION DOC] Parametrized over four cases: (ambient unset, no extra) gives the class-based
+    # rollout function and no runtime flag; (ambient 1, no extra) gives the legacy function with
+    # runtime flag 1; (ambient 0, extra sets flag 1) gives the legacy function with flag 1 (the
+    # extra assignment wins over the ambient value); (ambient 1, extra sets flag 0) gives the
+    # class-based function with flag 0. Setup: record commands, patch the nvlink check to false, set
+    # external ray, submit enabled and master address variables, remove ray address and nvls
+    # variables, and set or remove the ambient flag. Runs execute with a config path in the temp dir
+    # and the extra env vars string; reads the last recorded command and asserts the rollout
+    # function and the runtime-env flag (absent when the expected value is none).
     commands = record_commands(monkeypatch)
     patch_helper(monkeypatch, "_check_has_nvlink", lambda self: False, backend_class=RayCommandBackend)
     monkeypatch.setenv("MILES_SCRIPT_EXTERNAL_RAY", "1")

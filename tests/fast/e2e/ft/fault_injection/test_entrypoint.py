@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Tests for the fault injector handle in the ft fault-injection entrypoint module: a handle that
+# starts a background worker running the injection loop and later stops and joins it. Covers the
+# final state snapshot taken on stop, forwarding of poll settings to the loop, and failing loudly
+# when the worker is still mid-injection after the join timeout.
 import random
 import threading
 from unittest.mock import patch
@@ -17,6 +22,10 @@ from tests.fast.e2e.ft.fault_injection.utils import (
 
 
 def test_stop_and_join_takes_one_last_snapshot_before_the_log_is_read() -> None:
+    # [FUNCTION DOC] Builds a handle with a huge injection interval (so nothing is injected), with
+    # the core module's http client patched to list one serving rollout engine. Starts then stops
+    # and joins the handle. Asserts the event log holds the observed state history for that cell
+    # as a single serving state, proving a final snapshot is taken at stop.
     """Regression: a recovery completing after the final poll must not be lost to a race."""
     handle = entrypoint.FaultInjectorHandle(
         base_url="http://control",
@@ -36,11 +45,17 @@ def test_stop_and_join_takes_one_last_snapshot_before_the_log_is_read() -> None:
 
 
 def test_handle_forwards_the_quiescent_poll_override() -> None:
+    # [FUNCTION DOC] Replaces the entrypoint's loop function with a capturing stand-in that records
+    # its keyword arguments and signals an event. Starts a handle configured with a poll interval
+    # of 0.25 seconds and one required quiescent poll, waits up to 30 seconds for the stand-in, and
+    # joins the worker. Asserts both settings were forwarded unchanged.
     """A short scenario may rely on the controller's atomic injection gate."""
     captured: dict[str, object] = {}
     finished = threading.Event()
 
     def capture_loop(**kwargs: object) -> None:
+        # [FUNCTION DOC] HELPER: Stand-in for the injection loop: stores all keyword arguments and
+        # sets the finished event.
         captured.update(kwargs)
         finished.set()
 
@@ -63,11 +78,18 @@ def test_handle_forwards_the_quiescent_poll_override() -> None:
 
 
 def test_an_injector_that_outlives_the_join_fails_instead_of_racing_the_log() -> None:
+    # [FUNCTION DOC] Uses a stub fault form whose injection blocks on an event, three listed
+    # actors, an immediate injection schedule and a stop-and-join timeout patched to 0.2 seconds.
+    # Starts the handle, waits until the form is entered, then asserts stop_and_join raises an
+    # assertion error mentioning still being mid-injection. In cleanup it releases the blocked form
+    # and joins the worker.
     """Reading the log beside a still-running injector would assert on a half-written history."""
     released = threading.Event()
     entered = threading.Event()
 
     def slow_inject(cell: dict, rng: random.Random) -> None:
+        # [FUNCTION DOC] HELPER: Stub injection: signals entry, then blocks until released (at most
+        # 30 seconds).
         entered.set()
         released.wait(timeout=30)
 

@@ -1,3 +1,17 @@
+# [MODULE DOC]
+# Tests for the solver-verifier gsm8k split deployment example's launch script, which splits the
+# two-policy multi-policy run into five deployments: one trainer per policy, one engine deployment
+# per policy, and a primary script. Fixtures build script args for a Kubernetes run (fixed
+# namespace, run id, run uuid and 2 rollout gpus per model) and a mapping from deployment identity
+# to its train args. Asserted properties: identity list and count, trainer commands carrying only
+# their own policy's megatron config (equal to the whole run's entry for it), engine commands
+# serving only their own policy, per-engine gpu counts summing to the run total, the primary
+# expecting every engine and naming every trainer with release-correct addresses, which parts get
+# the controller address flags, a single shared object store, agreement on shared flags except an
+# allowed set (the two config flags added), and the assertion messages for a bad instance id, too
+# long a run id, and the all component. Also the expected engine cells per model for the primary,
+# including refusing policies that differ in cell count. Configs are read by resolving the file
+# argument value and parsing it as yaml.
 import dataclasses
 
 import pytest
@@ -47,6 +61,8 @@ _FLAGS_A_COMPONENT_MAY_DIFFER_ON: tuple[str, ...] = (
 
 @pytest.fixture
 def args() -> ScriptArgs:
+    # [FUNCTION DOC] HELPER: Fixture building the script args for a Kubernetes backend with the
+    # module namespace, run id, run uuid and 2 rollout gpus per model.
     return ScriptArgs(
         cluster_backend=ClusterBackend.KUBERNETES,
         namespace=NAMESPACE,
@@ -58,6 +74,9 @@ def args() -> ScriptArgs:
 
 @pytest.fixture
 def train_args_of_identity(args: ScriptArgs) -> dict[tuple[DeployComponent, str | None], str]:
+    # [FUNCTION DOC] HELPER: Fixture returning a mapping from each deployment identity (component,
+    # instance id) of the run to the train args string built for a copy of the args with that
+    # component and instance id set.
     return {
         (component, instance_id): build_deployment_train_args(
             dataclasses.replace(args, deploy_component=component, deploy_instance_id=instance_id)
@@ -67,7 +86,11 @@ def train_args_of_identity(args: ScriptArgs) -> dict[tuple[DeployComponent, str 
 
 
 class TestComputeDeploymentIdentities:
+    # [CLASS DOC] Tests for the list of deployment identities of the example run.
     def test_the_run_is_installed_by_one_command_per_policy_and_one_for_the_script(self, args):
+        # [FUNCTION DOC] Asserts the identities are, in order: a trainer per model id (instance id
+        # from the trainer id function), an inference deployment per model id (instance id the
+        # model id), then the primary.
         """Several trainer releases in one run is the shape this example exists to show."""
         assert compute_deployment_identities(args) == [
             *[(DeployComponent.TRAINER, compute_trainer_id(model_id)) for model_id in MODEL_IDS],
@@ -76,11 +99,13 @@ class TestComputeDeploymentIdentities:
         ]
 
     def test_the_run_is_the_two_policy_five_release_shape_every_assertion_here_reads(self, args):
+        # [FUNCTION DOC] Asserts the model id list has two entries and the run has five deployments.
         """The comparisons below are written against MODEL_IDS, and would all hold for a run of one policy."""
         assert len(MODEL_IDS) == NUM_POLICIES
         assert len(compute_deployment_identities(args)) == NUM_DEPLOYMENTS_OF_THE_RUN
 
     def test_the_command_that_drives_the_run_is_the_one_typed_last(self, args):
+        # [FUNCTION DOC] Asserts the last identity's component is the primary.
         """That command blocks until the run ends, so anything after it is typed into a finished run."""
         component, _ = compute_deployment_identities(args)[-1]
 
@@ -88,7 +113,11 @@ class TestComputeDeploymentIdentities:
 
 
 class TestBuildDeploymentTrainArgs:
+    # [CLASS DOC] Tests for the per-identity training argument strings.
     def test_a_trainer_command_carries_exactly_the_trainer_it_is_named_after(self, train_args_of_identity):
+        # [FUNCTION DOC] For every trainer identity, reads the megatron config in its args and
+        # asserts the list of trainer ids in it is exactly the one trainer id equal to the
+        # identity's instance id, for every model.
         """A command handed another policy's config would train a second copy of that policy instead."""
         carried = {
             instance_id: [one["trainer_id"] for one in _config_of(train_args, MEGATRON_CONFIG_FLAG)["trainers"]]
@@ -101,6 +130,9 @@ class TestBuildDeploymentTrainArgs:
     def test_a_trainer_command_carries_every_argument_the_whole_run_gives_that_policy(
         self, train_args_of_identity, args
     ):
+        # [FUNCTION DOC] Computes the whole-run megatron config keyed by trainer id (asserted to
+        # have two policies) and asserts each trainer command's config holds exactly the one
+        # whole-run entry for its trainer, unchanged.
         """Splitting the config per command must copy it, not rewrite it: a dropped override trains another model."""
         whole_run = {one["trainer_id"]: one for one in compute_megatron_config(args)["trainers"]}
         carried = {
@@ -113,6 +145,8 @@ class TestBuildDeploymentTrainArgs:
         assert carried == {instance_id: [whole_run[instance_id]] for instance_id in whole_run}
 
     def test_an_engine_command_serves_exactly_the_policy_it_is_named_after(self, train_args_of_identity):
+        # [FUNCTION DOC] For every inference identity, reads the sglang config in its args and
+        # asserts the list of model names is exactly that identity's model id.
         """An engine command that also declared its neighbour's model would install those engines twice."""
         served = {
             instance_id: [one["name"] for one in _config_of(train_args, SGLANG_CONFIG_FLAG)["sglang"]]
@@ -123,6 +157,8 @@ class TestBuildDeploymentTrainArgs:
         assert served == {model_id: [model_id] for model_id in MODEL_IDS}
 
     def test_the_engine_commands_together_carry_what_one_run_declares(self, train_args_of_identity, args):
+        # [FUNCTION DOC] Collects the rollout gpu count flag of each inference command; asserts each
+        # equals the per-model gpu setting and their sum equals the run's total rollout gpus.
         """A run short of engines still starts, and only the policy that never generates shows it."""
         declared = [
             int(value_of(train_args, ROLLOUT_NUM_GPUS_FLAG))
@@ -134,6 +170,8 @@ class TestBuildDeploymentTrainArgs:
         assert sum(declared) == args.rollout_num_gpus
 
     def test_the_driving_command_expects_every_engine_the_run_registers(self, train_args_of_identity, args):
+        # [FUNCTION DOC] Asserts the primary command's sglang config lists every model id in order,
+        # and its rollout gpu count flag equals the run's total rollout gpus.
         """It counts the cells it waits for out of its own config, so a trimmed one would start on half a fleet."""
         driver = train_args_of_identity[(DeployComponent.PRIMARY, None)]
         models = _config_of(driver, SGLANG_CONFIG_FLAG)["sglang"]
@@ -142,6 +180,9 @@ class TestBuildDeploymentTrainArgs:
         assert value_of(driver, ROLLOUT_NUM_GPUS_FLAG) == str(args.rollout_num_gpus)
 
     def test_the_driving_command_names_every_trainer_of_the_run(self, train_args_of_identity):
+        # [FUNCTION DOC] Takes each value after the trainer addresses flag in the primary command,
+        # keeps the part before the equals sign (the trainer id), and asserts the sorted list equals
+        # the sorted trainer ids of all models.
         """The orchestration script deploys no trainer, so a trainer it cannot address is one it never drives."""
         driver = train_args_of_identity[(DeployComponent.PRIMARY, None)]
         named = [entry.partition("=")[0] for entry in values_after(driver, TRAINER_CONTROLLER_ADDRS_FLAG)]
@@ -151,6 +192,9 @@ class TestBuildDeploymentTrainArgs:
     def test_the_driving_command_reaches_each_trainer_in_the_release_that_carries_it(
         self, train_args_of_identity, args
     ):
+        # [FUNCTION DOC] Builds the expected trainer addresses argument from an address book made
+        # from the args, with each trainer id mapped to itself as instance id, and asserts the
+        # primary command's values after the trainer addresses flag equal the expected values.
         """One address per trainer is the only thing tying the driver to releases it did not install."""
         address_book = RunAddressBook.of_config(args)
         driver = train_args_of_identity[(DeployComponent.PRIMARY, None)]
@@ -165,6 +209,8 @@ class TestBuildDeploymentTrainArgs:
         )
 
     def test_only_the_engine_commands_are_told_where_to_register(self, train_args_of_identity):
+        # [FUNCTION DOC] Asserts the set of components whose args contain the inference controller
+        # address flag is exactly the inference component.
         """Every other command holds the controller itself and refuses to be pointed at one."""
         told = {
             component
@@ -175,6 +221,8 @@ class TestBuildDeploymentTrainArgs:
         assert told == {DeployComponent.INFERENCE}
 
     def test_only_the_driving_command_is_told_where_the_trainers_are(self, train_args_of_identity):
+        # [FUNCTION DOC] Asserts the set of components whose args contain the trainer controller
+        # addresses flag is exactly the primary.
         """A command that carries a trainer reaches it in its own process and refuses the flag."""
         told = {
             component
@@ -185,6 +233,8 @@ class TestBuildDeploymentTrainArgs:
         assert told == {DeployComponent.PRIMARY}
 
     def test_every_command_redeems_its_references_at_one_object_store(self, train_args_of_identity):
+        # [FUNCTION DOC] Asserts all commands carry the same single mooncake init kwargs value and
+        # every command selects the mooncake object store backend.
         """Commands that disagree on the master hand each other references nothing can read back."""
         addresses = {value_of(one, MOONCAKE_INIT_KWARGS_FLAG) for one in train_args_of_identity.values()}
 
@@ -192,6 +242,9 @@ class TestBuildDeploymentTrainArgs:
         assert all(value_of(one, OBJECT_STORE_BACKEND_FLAG) == "mooncake" for one in train_args_of_identity.values())
 
     def test_the_commands_agree_on_everything_the_run_itself_declares(self, train_args_of_identity):
+        # [FUNCTION DOC] Reduces each command to its shared argv, dropping the flags allowed to
+        # differ (the split-run set plus the megatron and sglang config flags), and asserts all
+        # reduced forms equal the first.
         """Only what a command carries may differ; a drifted batch shape trains something else entirely."""
         shared = [
             shared_argv(one, differing_flags=_FLAGS_A_COMPONENT_MAY_DIFFER_ON)
@@ -201,6 +254,8 @@ class TestBuildDeploymentTrainArgs:
         assert all(one == shared[0] for one in shared)
 
     def test_a_command_naming_a_policy_this_run_does_not_train_is_refused(self, args):
+        # [FUNCTION DOC] A trainer deployment with instance id solver (a model id, not a trainer
+        # id) raises an assertion error saying the deploy instance id must be one of the trainer ids.
         """A misspelled policy would install a release the run waits for under another name for good."""
         with pytest.raises(AssertionError, match="--deploy-instance-id is one of"):
             build_deployment_train_args(
@@ -208,22 +263,31 @@ class TestBuildDeploymentTrainArgs:
             )
 
     def test_a_run_id_too_long_to_name_a_release_after_every_policy_is_refused(self, args):
+        # [FUNCTION DOC] A run id of 64 characters raises an assertion error saying this happens
+        # before helm refuses the release name.
         """helm refuses such a release name too, but only once the releases installed before it are up."""
         with pytest.raises(AssertionError, match="before helm refuses the release name"):
             build_deployment_train_args(dataclasses.replace(args, run_id="r" * 64))
 
     def test_a_command_naming_no_component_of_the_run_is_refused(self, args):
+        # [FUNCTION DOC] Building args for the all component raises an assertion error saying it names no part of the run.
         """An unsplit launch installs everything under one release, which is the shape this example is not."""
         with pytest.raises(AssertionError, match="names no part"):
             build_deployment_train_args(dataclasses.replace(args, deploy_component=DeployComponent.ALL))
 
 
 def _config_of(train_args: str, flag: str) -> dict:
+    # [FUNCTION DOC] HELPER: Reads the value after the flag in the train args, resolves it as a
+    # file argument (inline pseudo-file or path) to text, and returns its yaml-parsed mapping.
     return yaml.safe_load(resolve_file_arg(value_of(train_args, flag)))
 
 
 class TestTheEnginesThePrimaryWaitsFor:
+    # [CLASS DOC] Tests for the expected engine cell count flag.
     def test_the_primary_waits_for_every_engine_cell_a_policy_registers(self, train_args_of_identity, args):
+        # [FUNCTION DOC] Computes the sglang config for the first model alone; the expected count
+        # is its single server group's gpus divided by gpus per engine. Asserts the primary's
+        # init-expected-num-cells flag equals it and that it is greater than one.
         """A primary left to guess starts on one cell of a policy and rolls out on a fraction of its engines."""
         [model] = compute_sglang_config(args, model_ids=[MODEL_IDS[0]])["sglang"]
         [group] = model["server_groups"]
@@ -235,6 +299,7 @@ class TestTheEnginesThePrimaryWaitsFor:
         assert expected > 1
 
     def test_a_deployment_carrying_its_own_engines_declares_no_number_to_wait_for(self, train_args_of_identity):
+        # [FUNCTION DOC] Asserts no non-primary command contains the init-expected-num-cells flag.
         """--init-expected-num-cells is refused for a deployment that installs the engines itself."""
         others = [
             train_args
@@ -245,6 +310,9 @@ class TestTheEnginesThePrimaryWaitsFor:
         assert not [one for one in others if INIT_EXPECTED_NUM_CELLS_FLAG in one]
 
     def test_policies_registering_different_numbers_of_cells_are_refused(self, args, monkeypatch):
+        # [FUNCTION DOC] Computes the full sglang config, adds one gpu to the second model's first
+        # server group, and patches the script module's config function to return it. Asserts
+        # computing the engine cells per model raises an assertion error saying one number gates every policy.
         """One number gates every policy, so a run whose policies differ would start on the smaller one."""
         config = compute_sglang_config(args)
         config["sglang"][1]["server_groups"][0]["num_gpus"] += 1

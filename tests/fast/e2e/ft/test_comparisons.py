@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Tests for the deterministic two-side comparison in the ft comparisons module. Every primitive
+# check the comparison composes (reconfigure-event assertion, metric classification, metric
+# comparison, dump comparison, engine checksum comparison, weight-moved and gradient checks) is
+# replaced by a recorder, and the tests assert which primitives are called, how often, and with
+# which arguments for a baseline dump directory and a target dump directory.
 from pathlib import Path
 from typing import Any
 
@@ -25,10 +31,16 @@ _PRIMITIVES: tuple[str, ...] = (
 
 @pytest.fixture
 def recorded_calls(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[dict[str, Any]]]:
+    # [FUNCTION DOC] HELPER: Fixture replacing every primitive in the comparisons module with a
+    # recorder. Returns a mapping from primitive name to the list of calls, each a mapping with the
+    # positional arguments and the keyword arguments.
     calls: dict[str, list[dict[str, Any]]] = {name: [] for name in _PRIMITIVES}
 
     def make_recorder(name: str):
+        # [FUNCTION DOC] HELPER: Returns a recorder function that appends its arguments to the
+        # call list of the given primitive name.
         def recorder(*args: Any, **kwargs: Any) -> None:
+            # [FUNCTION DOC] HELPER: Appends the positional and keyword arguments; returns nothing.
             calls[name].append(dict(args=args, kwargs=kwargs))
 
         return recorder
@@ -40,6 +52,8 @@ def recorded_calls(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[dict[str, 
 
 
 def _compare(*, exclude_keys: list[str] | None = None) -> None:
+    # [FUNCTION DOC] HELPER: Runs the deterministic two-side comparison on the fixed baseline and
+    # target dirs with the module minimum of trained rollouts and the given excluded metric keys.
     comparisons.compare_deterministic_sides(
         baseline_dir=_BASELINE_DIR,
         target_dir=_TARGET_DIR,
@@ -49,9 +63,12 @@ def _compare(*, exclude_keys: list[str] | None = None) -> None:
 
 
 class TestCompareDeterministicSides:
+    # [CLASS DOC] Tests of which primitives the deterministic comparison calls and with what arguments.
     def test_metrics_are_compared_bitwise_over_the_compared_prefixes(
         self, recorded_calls: dict[str, list[dict[str, Any]]]
     ) -> None:
+        # [FUNCTION DOC] Asserts exactly one metric comparison call with both dirs, zero relative
+        # and absolute tolerance, the compared-prefix list, and an empty excluded-key list.
         """A nonzero tolerance would let a genuinely nondeterministic run pass this scenario."""
         _compare()
 
@@ -69,6 +86,8 @@ class TestCompareDeterministicSides:
     def test_a_scenario_may_exclude_named_keys_without_loosening_anything_else(
         self, recorded_calls: dict[str, list[dict[str, Any]]]
     ) -> None:
+        # [FUNCTION DOC] Passes one excluded metric key; asserts the single metric comparison call
+        # received exactly that excluded list, with all other arguments unchanged (zero tolerance).
         """Only the keys a scenario names are dropped; every remaining key keeps the zero-tolerance comparison."""
         excluded = ["rollout/weight_version/max"]
 
@@ -88,6 +107,9 @@ class TestCompareDeterministicSides:
     def test_dumps_are_compared_at_zero_relative_difference_with_the_input_tensor_patterns(
         self, recorded_calls: dict[str, list[dict[str, Any]]]
     ) -> None:
+        # [FUNCTION DOC] Asserts exactly one dump comparison call with both dirs, a catch-all
+        # pattern paired with a relative-difference threshold of zero, and the input-tensor skip and
+        # allowed-failure patterns.
         """The threshold and the skip/allow patterns are what make this a bitwise comparison rather than a smoke test."""
         _compare()
 
@@ -104,6 +126,9 @@ class TestCompareDeterministicSides:
     def test_every_metric_is_classified_per_side_against_the_prefix_partition(
         self, recorded_calls: dict[str, list[dict[str, Any]]]
     ) -> None:
+        # [FUNCTION DOC] Asserts metric classification ran once for each side dir (baseline first,
+        # then target), with the directory as the positional argument and the compared and ignored
+        # prefix sets as keyword arguments.
         """An unclassified metric is one nobody compares, so both sides must be checked against both prefix sets."""
         _compare()
 
@@ -118,6 +143,9 @@ class TestCompareDeterministicSides:
     def test_each_side_is_asserted_to_have_moved_weights_and_nonzero_gradients_exactly_once(
         self, recorded_calls: dict[str, list[dict[str, Any]]]
     ) -> None:
+        # [FUNCTION DOC] Asserts the weights-moved check ran once per side (baseline, then target)
+        # with side and dump dir, and the nonzero-gradient check ran once per side with side, dump
+        # dir and the minimum trained rollouts.
         """Two identical sides that both trained nothing would compare equal, so each side needs its own witness."""
         _compare()
 
@@ -133,6 +161,8 @@ class TestCompareDeterministicSides:
     def test_both_sides_are_required_to_have_reconfigured_never(
         self, recorded_calls: dict[str, list[dict[str, Any]]]
     ) -> None:
+        # [FUNCTION DOC] Asserts the reconfigure-event assertion ran once per side, each on the
+        # events subdirectory of that side's dump dir with an expected list that is empty.
         """A side that healed took a different code path, and comparing it bitwise proves nothing about determinism."""
         _compare()
 
@@ -143,6 +173,7 @@ class TestCompareDeterministicSides:
     def test_the_engine_checksums_of_the_two_sides_are_compared_once(
         self, recorded_calls: dict[str, list[dict[str, Any]]]
     ) -> None:
+        # [FUNCTION DOC] Asserts a single engine checksum comparison call with the two dirs.
         """Matching metrics and dumps still allow the two runs to have served different weights."""
         _compare()
 
@@ -152,6 +183,8 @@ class TestCompareDeterministicSides:
 
 
 class TestMetricPrefixPartition:
+    # [CLASS DOC] Sanity test of the module's metric prefix constants.
     def test_the_compared_and_ignored_prefixes_do_not_overlap(self) -> None:
+        # [FUNCTION DOC] Asserts the intersection of the compared and uncompared metric prefix sets is empty.
         """A prefix in both sets would be compared and excused at once, hiding whichever answer is wrong."""
         assert not set(comparisons.COMPARED_METRIC_PREFIXES) & set(comparisons.UNCOMPARED_METRIC_PREFIXES)

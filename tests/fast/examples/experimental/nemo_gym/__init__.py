@@ -1,3 +1,8 @@
+# [PACKAGE DOC]
+# Fast offline tests for the NeMo Gym example, which lives outside the tests tree in a directory
+# whose name (with a hyphen) is not a python identifier. The package defines one constant, the
+# example directory path (examples/experimental/nemo-gym under the repository root, five levels
+# above this file's directory), which the sibling conftest puts on the import path.
 """Tests for the NeMo Gym example, which lives outside this tree.
 
 The example directory is ``nemo-gym`` -- not a Python identifier -- so nothing

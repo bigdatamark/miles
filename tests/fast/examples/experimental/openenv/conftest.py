@@ -1,3 +1,7 @@
+# [MODULE DOC] HELPER: Pytest configuration for the openenv tests. At import it prepends the
+# example directory (from the package constant) to the module search path if it is not already
+# present as a string entry, so the example modules import each other and are imported by tests
+# by bare name. Side effect: mutates the process module search path.
 """Put the openenv example's modules on sys.path for this package's tests.
 
 A rollout loads them by path (``--custom-agent-function-path``), never as a

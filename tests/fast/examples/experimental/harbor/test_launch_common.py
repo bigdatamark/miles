@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Offline tests for the harbor launcher helper module (imported by bare name): the function that
+# turns parsed launcher arguments into the environment variables forwarded to the harbor workers
+# (environment type, tasks dir, provider key file paths and urls, optional knobs read from the
+# process environment) with preflight checks, and the function building the agentic training
+# argument string. Harbor and the provider sdks are replaced by empty modules so they only need to
+# be importable.
 """Offline tests for the launcher's Harbor-side wiring (no harbor, no keys)."""
 
 import sys
@@ -10,6 +17,9 @@ import pytest
 
 
 def _args(**overrides):
+    # [FUNCTION DOC] HELPER: Builds a simple namespace of launcher args with defaults (environment
+    # type e2b, empty env kwargs, tasks dir /tasks, trials dir /trials, model name, agent timeout
+    # 5400, empty key file and modal config paths), updated by the keyword overrides.
     defaults = dict(
         harbor_env_type="e2b",
         harbor_env_kwargs="",
@@ -27,17 +37,23 @@ def _args(**overrides):
 
 @pytest.fixture(autouse=True)
 def fake_harbor_and_sdk(monkeypatch):
+    # [FUNCTION DOC] HELPER: Autouse fixture installing empty placeholder modules for harbor, e2b,
+    # daytona and modal in the module table so the preflight import succeeds.
     """harbor and the provider SDKs only need to be importable for the preflight."""
     for name in ("harbor", "e2b", "daytona", "modal"):
         monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
 
 
 def test_env_type_is_required(monkeypatch):
+    # [FUNCTION DOC] An empty environment type raises a value error naming the environment type variable.
     with pytest.raises(ValueError, match="HARBOR_ENV_TYPE"):
         launch_common.harbor_env_vars(_args(harbor_env_type=""))
 
 
 def test_docker_is_refused_with_a_pointer_to_the_agent_server():
+    # [FUNCTION DOC] Environment type docker raises a value error pointing to the docker agent
+    # server recipe; the same with surrounding spaces and mixed case raises a value error about
+    # the Docker daemon (the guard normalizes the value).
     with pytest.raises(ValueError, match="swe-agent-harbor-docker"):
         launch_common.harbor_env_vars(_args(harbor_env_type="docker"))
     # the worker normalizes HARBOR_ENV_TYPE, so the guard must see the same value
@@ -46,12 +62,17 @@ def test_docker_is_refused_with_a_pointer_to_the_agent_server():
 
 
 def test_missing_harbor_names_the_install(monkeypatch):
+    # [FUNCTION DOC] With harbor made unimportable (module table entry none), asserts a runtime
+    # error mentioning the README install line.
     monkeypatch.setitem(sys.modules, "harbor", None)
     with pytest.raises(RuntimeError, match="README install line"):
         launch_common.harbor_env_vars(_args())
 
 
 def test_known_provider_is_provisioned_by_key_path(monkeypatch, tmp_path):
+    # [FUNCTION DOC] With an e2b key file and an e2b api url in the process environment, asserts the
+    # returned env maps: environment type e2b, tasks dir, key file path (the path, not the secret),
+    # and the api url; and that the secret text appears nowhere in the mapping.
     key_file = tmp_path / "api_key"
     key_file.write_text("e2b_secret\n")
     monkeypatch.setenv("E2B_API_URL", "http://agentenv.internal:8000")
@@ -66,6 +87,9 @@ def test_known_provider_is_provisioned_by_key_path(monkeypatch, tmp_path):
 
 
 def test_unknown_provider_passes_through_with_a_notice(monkeypatch, capsys):
+    # [FUNCTION DOC] For an unknown provider (runloop), asserts the env keeps the type, the
+    # printed output contains a notice that no credential wiring is known for it, and no env
+    # variable name contains KEY.
     """The backend still reaches Harbor untouched; the operator is told no
     credential wiring exists for it."""
     env = launch_common.harbor_env_vars(_args(harbor_env_type="runloop"))
@@ -75,6 +99,10 @@ def test_unknown_provider_passes_through_with_a_notice(monkeypatch, capsys):
 
 
 def test_env_kwargs_and_server_knobs_are_forwarded_when_set(monkeypatch):
+    # [FUNCTION DOC] Sets an e2b key, response length policy abort, cpu override 2 and cpu
+    # enforcement request in the process environment (and removes the max sequence length), with
+    # env kwargs json in the args. Asserts those four values and the kwargs are forwarded and the
+    # unset max sequence length is not.
     monkeypatch.setenv("E2B_API_KEY", "e2b_x")  # worker-env key supply
     monkeypatch.setenv("HARBOR_RESPONSE_LENGTH_POLICY", "abort")
     monkeypatch.setenv("HARBOR_OVERRIDE_CPUS", "2")
@@ -91,6 +119,12 @@ def test_env_kwargs_and_server_knobs_are_forwarded_when_set(monkeypatch):
 
 
 def test_agentic_wiring_is_the_shipped_wiring():
+    # [FUNCTION DOC] Builds agentic train args for model family qwen3 and four session server
+    # workers and asserts they contain the custom agent function path, the agentic tool call
+    # generate function path, the no-aborted dynamic sampling filter path, the tito model, the
+    # worker count, and the default session server port 30000. Imports the two miles-side
+    # functions to prove those paths resolve, and asserts every directory returned by the
+    # pythonpath helper exists.
     """One shared copy: the flags the GPU e2e exercises are the flags the recipes ship."""
     args = launch_common.agentic_train_args(tito_model="qwen3", session_server_workers=4)
     assert "--custom-agent-function-path harbor_agent_function.run" in args
