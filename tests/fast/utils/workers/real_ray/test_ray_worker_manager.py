@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Tests of the Ray worker manager actor against a real local Ray runtime. Workers are probe
+# processes (see the sibling conftest) that record their launch context. Covered: launch of every
+# worker with its own context and advertised address, port binding, spec environment variables,
+# static ports and conflicts, disabled specs, named manager lookup, shutdown, scale, relaunch,
+# cross-spec address wiring, per-cell master ports, placement groups, per-cell stop and restart,
+# worker info retrieval, and death of the actor and its command.
 from __future__ import annotations
 
 import asyncio
@@ -26,7 +33,12 @@ from miles.utils.workers.worker_spec import HostAndPort, PortInfo
 
 
 class TestLaunchOnRealRay:
+    # [CLASS DOC] Launch behavior of the manager.
     def test_every_worker_of_every_cell_ends_up_running_its_own_command(self, manager_factory, worker_probe_factory):
+        # [FUNCTION DOC] Launches a pool of 2 cells with 2 workers each; waits for 4 records.
+        # Asserts record keys 0-0, 0-1, 1-0, 1-1; all four pids are running and distinct; each
+        # recorded context has the right cell and worker indexes; and the recorded primary
+        # address equals (host, port, external host) advertised by the manager for that worker.
         """The manager starts one live subprocess per worker, each with its own launch context."""
         probe = worker_probe_factory()
         handle = manager_factory(
@@ -58,6 +70,9 @@ class TestLaunchOnRealRay:
             }
 
     async def test_the_advertised_address_is_one_the_worker_can_serve_on(self, manager_factory, worker_probe_factory):
+        # [FUNCTION DOC] Launches 3 probe workers in one cell that bind their primary port.
+        # Asserts the three advertised host and port pairs are distinct and that each accepts a
+        # tcp connection within 30 s.
         """A worker can bind the port allocated for it, and that endpoint is what the manager advertises."""
         probe = worker_probe_factory(bind_primary=True)
         handle = manager_factory(
@@ -77,6 +92,8 @@ class TestLaunchOnRealRay:
             await wait_tcp_ready_async(addr.host, addr.port, timeout=30)
 
     def test_the_worker_process_gets_the_env_vars_declared_by_its_spec(self, manager_factory, worker_probe_factory):
+        # [FUNCTION DOC] Launches a spec declaring one environment variable; asserts the probe
+        # recorded exactly that variable with its value.
         """Env vars from the spec are visible inside the launched process."""
         probe = worker_probe_factory(env_names=("MILES_REAL_RAY_PROBE_VAR",))
         manager_factory(
@@ -94,6 +111,8 @@ class TestLaunchOnRealRay:
         assert records["0-0"]["env"] == {"MILES_REAL_RAY_PROBE_VAR": "from-spec"}
 
     def test_a_static_port_reaches_the_worker_unchanged(self, manager_factory, worker_probe_factory):
+        # [FUNCTION DOC] Launches a spec pinning primary port 21987 with dynamic allocation off;
+        # asserts both the recorded context and the manager's advertised address use that port.
         """A spec that pins its port keeps it instead of being handed an allocated one."""
         probe = worker_probe_factory()
         handle = manager_factory(
@@ -112,6 +131,9 @@ class TestLaunchOnRealRay:
         assert ray.get(handle.get_worker_addrs.remote("router-00000-00000"))["primary"].port == 21987
 
     def test_a_static_port_a_stale_process_still_holds_is_refused(self, manager_factory, worker_probe_factory):
+        # [FUNCTION DOC] Opens a listening socket on an ephemeral port to act as a stale
+        # process, then launches a spec pinning that port without dynamic fallback; asserts the
+        # launch raises an error matching "Port <n> ... is already in use".
         """Readiness is a bare connect probe, which a stale listener satisfies, so a run that
         launched anyway would silently drive the router an earlier run left behind."""
         probe = worker_probe_factory()
@@ -133,6 +155,8 @@ class TestLaunchOnRealRay:
                 )
 
     def test_a_spec_without_cells_launches_no_worker(self, manager_factory, worker_probe_factory):
+        # [FUNCTION DOC] Launches a zero-cell spec next to a normal one; asserts the disabled
+        # spec produced no records and the normal one's worker has a positive advertised port.
         """A disabled spec is accepted and simply contributes no workers."""
         disabled_probe = worker_probe_factory()
         enabled_probe = worker_probe_factory()
@@ -150,9 +174,13 @@ class TestLaunchOnRealRay:
 
 
 class TestNamedManagerActor:
+    # [CLASS DOC] Lookup of the manager by its well-known name.
     async def test_a_driver_knowing_only_the_worker_name_reaches_its_live_endpoint(
         self, manager_factory, worker_probe_factory
     ):
+        # [FUNCTION DOC] Launches one binding probe, builds a provider on the named manager,
+        # resolves the worker's primary address by name; asserts it is a host-and-port value
+        # equal to the recorded one and accepts tcp connections within 30 s.
         """The provider resolves a worker's real endpoint through the named manager actor."""
         probe = worker_probe_factory(bind_primary=True)
         manager_factory([make_command_spec("router", launch_command=probe.launch_command)])
@@ -172,6 +200,8 @@ class TestNamedManagerActor:
     def test_an_unknown_worker_name_is_not_answered_with_another_workers_address(
         self, manager_factory, worker_probe_factory
     ):
+        # [FUNCTION DOC] Launches one worker, then asks the named manager for an unknown worker
+        # name; asserts the call raises a Ray task error.
         """The lookup forwards the requested name and fails when nothing matches it."""
         probe = worker_probe_factory()
         manager_factory([make_command_spec("router", launch_command=probe.launch_command)])
@@ -182,7 +212,10 @@ class TestNamedManagerActor:
 
 
 class TestRunShutdownOnRealRay:
+    # [CLASS DOC] Driver-side shutdown of the manager.
     async def test_shutdown_terminates_every_owned_worker_process(self, manager_factory, worker_probe_factory):
+        # [FUNCTION DOC] Launches 2 cells, calls the driver shutdown function on the manager,
+        # waits for every recorded pid to vanish, and for the named actor to be unregistered.
         """Normal driver completion must reclaim the exact subprocesses its manager launched."""
         probe = worker_probe_factory()
         handle = manager_factory([make_command_spec("engine", num_cells=2, launch_command=probe.launch_command)])
@@ -195,7 +228,11 @@ class TestRunShutdownOnRealRay:
 
 
 class TestScaleOnRealRay:
+    # [CLASS DOC] Port allocation across many workers.
     def test_a_larger_pool_still_gets_disjoint_port_blocks(self, manager_factory, worker_probe_factory):
+        # [FUNCTION DOC] Launches 3 cells of 2 workers, each with a dynamic primary port and a
+        # dynamic 3-port nccl block; collects the primary port and the three nccl ports of every
+        # worker (6 workers) and asserts no port appears twice.
         """Six workers with multi-port specs must not overlap, including inside reserved blocks."""
         probe = worker_probe_factory()
         manager_factory(
@@ -224,7 +261,11 @@ class TestScaleOnRealRay:
 
 
 class TestManagerRelaunchOnRealRay:
+    # [CLASS DOC] Reusing the manager name.
     def test_the_well_known_name_can_be_reused_after_the_manager_is_gone(self, manager_factory, worker_probe_factory):
+        # [FUNCTION DOC] Launches a manager, kills it and waits for the name to free up, then
+        # launches a second one with a new probe; asserts the second probe's pid differs from
+        # the first probe's recorded pid.
         """A restarted driver must be able to claim the manager name again."""
         first_probe = worker_probe_factory()
         first_handle = manager_factory([make_command_spec("router", launch_command=first_probe.launch_command)])
@@ -240,9 +281,14 @@ class TestManagerRelaunchOnRealRay:
 
 
 class TestCrossSpecWiringOnRealRay:
+    # [CLASS DOC] Visibility of other pools' addresses and isolation of environments.
     def test_a_dependent_workers_command_sees_the_addresses_of_the_spec_it_depends_on(
         self, manager_factory, worker_probe_factory
     ):
+        # [FUNCTION DOC] Launches a one-cell router spec and a two-cell session-server spec.
+        # Asserts each session-server record's pool address table lists exactly both pools, the
+        # router's first-cell primary address equals the manager's advertised one, and the
+        # session-server table has 2 entries.
         """A session-server-shaped worker can only find its router because the manager renders after all allocation."""
         router_probe = worker_probe_factory()
         session_probe = worker_probe_factory()
@@ -265,6 +311,8 @@ class TestCrossSpecWiringOnRealRay:
             assert len(pool_addrs["session-server"]) == 2
 
     def test_each_spec_only_gets_its_own_env(self, manager_factory, worker_probe_factory):
+        # [FUNCTION DOC] Launches router and engine specs with different variables; asserts each
+        # probe sees only its own variable and nothing for the other.
         """Env vars of one spec must not reach another spec's workers."""
         router_probe = worker_probe_factory(env_names=("ROUTER_ONLY", "ENGINE_ONLY"))
         engine_probe = worker_probe_factory(env_names=("ROUTER_ONLY", "ENGINE_ONLY"))
@@ -283,9 +331,15 @@ class TestCrossSpecWiringOnRealRay:
 
 
 class TestMasterPortsOnRealRay:
+    # [CLASS DOC] Master-mode ports are allocated once per cell by rank 0.
     def test_all_ranks_of_a_cell_are_launched_with_their_cells_master_endpoint(
         self, manager_factory, worker_probe_factory
     ):
+        # [FUNCTION DOC] Launches 2 cells of 2 workers with a primary port and a 4-port master
+        # block named dist_init. Asserts ranks in a cell share the same master endpoint and the
+        # two cells differ; the advertised address key sets per worker alternate between
+        # primary plus dist_init (rank 0) and primary only (rank 1); the four primary ports are
+        # distinct; and no master block port collides with any primary port.
         """Every worker of a cell receives the same master endpoint, allocated once by rank 0."""
         probe = worker_probe_factory()
         handle = manager_factory(
@@ -326,9 +380,14 @@ class TestMasterPortsOnRealRay:
 
 
 class TestPlacementOnRealRay:
+    # [CLASS DOC] Placement group binding.
     def test_workers_run_inside_their_placement_group_bundles_with_their_gpu_slice(
         self, manager_factory, worker_probe_factory, placement_group_factory
     ):
+        # [FUNCTION DOC] Creates a 4-bundle placement group whose gpu ids start at 10, launches
+        # 2 cells with two gpu slots per worker (visibility-masking variables disabled).
+        # Asserts the cells' gpu ids are [10, 11] and [12, 13], every worker sees the same
+        # visible-devices value as the test process, and the manager advertises 2 workers.
         """A pg-bound spec starts every worker on its own bundle and hands it the gpu ids of its slots."""
         probe = worker_probe_factory(env_names=("CUDA_VISIBLE_DEVICES",))
         pgs = {"rollout": placement_group_factory(num_bundles=4, first_gpu_id=10)}
@@ -358,9 +417,12 @@ class TestPlacementOnRealRay:
 
 
 class TestStopCellOnRealRay:
+    # [CLASS DOC] Per-cell stop and restart using the test-only stoppable manager.
     def test_stopping_a_cell_ends_its_worker_processes_and_leaves_the_others_alone(
         self, cell_stoppable_manager_factory, worker_probe_factory
     ):
+        # [FUNCTION DOC] Launches 2 cells of 2 workers, stops cell 1; waits until its two pids
+        # are gone and asserts the two pids of cell 0 are still running.
         """Tearing down one cell kills exactly that cell's worker processes."""
         probe = worker_probe_factory()
         manager_handle = cell_stoppable_manager_factory(
@@ -378,6 +440,10 @@ class TestStopCellOnRealRay:
     def test_a_restarted_cell_gets_new_actors_running_the_command_again(
         self, cell_stoppable_manager_factory, worker_probe_factory
     ):
+        # [FUNCTION DOC] Launches 2 single-worker cells and reads cell 1's worker info; stops
+        # cell 1, waits for its pid to vanish, starts it again. Asserts the worker name is
+        # unchanged and its generation grew; waits up to 60 s for a record with a different pid
+        # and asserts that pid and the surviving cell's pid are running.
         """Healing is only ever exercised against the fake cluster, and a fake handle cannot show
         that the dead slot is refilled by a genuinely new actor rather than the corpse of the old one."""
         probe = worker_probe_factory()
@@ -406,9 +472,15 @@ class TestStopCellOnRealRay:
 
 
 class TestWorkerInfosOnRealRay:
+    # [CLASS DOC] Worker info retrieval by a driver.
     async def test_a_driver_can_describe_and_reach_the_workers_of_one_cell(
         self, manager_factory, worker_probe_factory
     ):
+        # [FUNCTION DOC] Launches 2 cells of 2 workers; reads infos and handles for cell
+        # engine-00001. Asserts names, generation 1 for both, empty gpu ids, that each info's
+        # primary address equals the one recorded by the probe, and that the host of the
+        # address (brackets stripped) equals the node ip reported by the actor handle (private
+        # method).
         """Worker infos survive the trip to the driver, including usable actor handles."""
         probe = worker_probe_factory()
         manager_factory(
@@ -431,7 +503,12 @@ class TestWorkerInfosOnRealRay:
 
 
 class TestWorkerDeathOnRealRay:
+    # [CLASS DOC] Death propagation between worker commands and their actors.
     async def test_an_actor_dies_with_the_command_it_babysits(self, manager_factory, worker_probe_factory):
+        # [FUNCTION DOC] Launches 2 workers in one cell, asks the first to kill its subprocess
+        # (an unreachable error from the lost reply is tolerated). Polls up to 60 s until
+        # asking the first actor for its node ip fails as unreachable or times out (5 s per
+        # try), then asserts the second actor still answers within 30 s.
         """The actor's whole reason to exist is its subprocess, so its death must be visible to the driver."""
         probe = worker_probe_factory()
         manager_factory([make_command_spec("engine", num_workers_per_cell=2, launch_command=probe.launch_command)])
@@ -462,6 +539,9 @@ class TestWorkerDeathOnRealRay:
     def test_killing_the_manager_frees_the_ports_its_workers_commands_held(
         self, manager_factory, worker_probe_factory
     ):
+        # [FUNCTION DOC] Linux only. Launches 2 binding probes, records their ports, kills the
+        # manager, and polls up to 60 s until every port can be bound again; fails an assertion
+        # naming the ports still held.
         """Owner death force-kills the worker actors, and the commands they launched must not keep their ports."""
         probe = worker_probe_factory(bind_primary=True)
         manager_handle = manager_factory(
@@ -479,6 +559,8 @@ class TestWorkerDeathOnRealRay:
 
 
 def _can_bind(port: int) -> bool:
+    # [FUNCTION DOC] HELPER: Tries to bind a tcp socket (address reuse on) to all interfaces on
+    # the port; true on success, false if the operating system refuses.
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as candidate:
         candidate.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:

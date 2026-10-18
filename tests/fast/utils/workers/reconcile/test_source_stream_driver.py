@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Unit tests for the source stream driver, which repeatedly opens an event source, applies each
+# event to the object store, reports the affected parent keys through a callback, exposes a
+# barrier that opens at the first replace event, and reopens the source after a retry delay when
+# a stream ends, fails, or does not begin with a replace. A harness wires a fake source, a real
+# store and a fake clock around a driver running in a background task.
 from __future__ import annotations
 
 import asyncio
@@ -15,7 +21,13 @@ from miles.utils.workers.reconcile.source_stream_driver import SourceStreamDrive
 
 
 class DriverHarness:
+    # [CLASS DOC] HELPER: Builds a driver over the given fake source with an empty store keyed by
+    # cell, a fake clock and a list recording each reported set of affected parent keys, and
+    # immediately starts the driver's run in a background task. Must be created inside a running
+    # event loop.
     def __init__(self, *, source: FakeSource, retry_delay: float = 1.0) -> None:
+        # [FUNCTION DOC] HELPER: Creates the store, record list, clock and driver (retry delay
+        # default 1 s) and starts the driver task.
         self.source = source
         self.store = ObjectStore(key_map=pod_cell)
         self.affected: list[set[ParentKey]] = []
@@ -30,17 +42,22 @@ class DriverHarness:
         self.task = asyncio.create_task(self.driver.run())
 
     async def close(self) -> None:
+        # [FUNCTION DOC] HELPER: Cancels the driver task, waits for it, then closes the driver.
         self.task.cancel()
         await asyncio.gather(self.task, return_exceptions=True)
         await self.driver.aclose()
 
 
 def replace(*pods: Any) -> ReplaceEvent:
+    # [FUNCTION DOC] HELPER: Builds a replace event holding the pods keyed by name.
     return ReplaceEvent(objects={pod.metadata.name: pod for pod in pods})
 
 
 class TestSyncBarrier:
+    # [CLASS DOC] The initial-sync barrier.
     async def test_wait_for_sync_blocks_until_the_first_replace(self):
+        # [FUNCTION DOC] A waiter on the barrier stays pending until the source emits a replace,
+        # then completes.
         """The barrier is what keeps a half-filled store from being reconciled."""
         harness = DriverHarness(source=FakeSource())
         await settle()
@@ -55,6 +72,8 @@ class TestSyncBarrier:
         await harness.close()
 
     async def test_a_later_replace_keeps_the_barrier_open(self):
+        # [FUNCTION DOC] After a first and a second replace, waiting on the barrier returns
+        # within 1 s.
         """Once released the barrier stays released, so a relist never re-blocks a running loop."""
         harness = DriverHarness(source=FakeSource())
         await settle()
@@ -69,7 +88,10 @@ class TestSyncBarrier:
 
 
 class TestStreamProtocol:
+    # [CLASS DOC] Event application and the requirement that every stream begins with a replace.
     async def test_events_are_applied_to_the_store_and_reported(self):
+        # [FUNCTION DOC] A replace with one pod in cell-a is applied to the store and reported
+        # as a single affected set containing cell-a.
         """Every event lands in the store before its parents are announced."""
         harness = DriverHarness(source=FakeSource())
         await settle()
@@ -81,6 +103,9 @@ class TestStreamProtocol:
         await harness.close()
 
     async def test_a_stream_not_opening_with_a_replace_is_reopened(self):
+        # [FUNCTION DOC] The first event is an upsert: the stream is closed (one close), the
+        # barrier stays closed; after the 1 s delay the source was opened a second time, nothing
+        # was reported, and the barrier is still closed.
         """A stream whose first event is incremental cannot be trusted to describe the whole world."""
         harness = DriverHarness(source=FakeSource())
         await settle()
@@ -101,6 +126,10 @@ class TestStreamProtocol:
         await harness.close()
 
     async def test_a_reopened_stream_not_opening_with_replace_is_rejected(self):
+        # [FUNCTION DOC] After a first replace, the stream ends and reopens; the second stream
+        # sends an upsert first. Asserts that stream is closed (two closes in total), the source
+        # opened twice so far, nothing new reported, the store unchanged; after another 1 s the
+        # source opens a third time.
         """Every replacement stream must describe the whole world before sending incremental events."""
         harness = DriverHarness(source=FakeSource())
         await settle()
@@ -129,7 +158,10 @@ class TestStreamProtocol:
 
 
 class TestReopen:
+    # [CLASS DOC] Reopening the source after endings and failures.
     async def test_a_stream_that_ends_is_reopened_after_the_retry_delay(self):
+        # [FUNCTION DOC] Retry delay 5 s. After a replace and a stream end, the source is still
+        # opened once; after 5 s it was opened twice.
         """A source that returns is not a source that is finished."""
         harness = DriverHarness(source=FakeSource(), retry_delay=5.0)
         await settle()
@@ -146,6 +178,8 @@ class TestReopen:
         await harness.close()
 
     async def test_a_failing_stream_is_closed_before_the_next_one_opens(self):
+        # [FUNCTION DOC] A stream error followed by the 1 s delay: the first stream was closed
+        # once and the source opened twice.
         """The dead stream must not be left holding a connection while its replacement runs."""
         harness = DriverHarness(source=FakeSource())
         await settle()
@@ -159,6 +193,8 @@ class TestReopen:
         await harness.close()
 
     async def test_a_source_factory_that_raises_is_retried(self):
+        # [FUNCTION DOC] The first call to the source raises; one open after settling, two after
+        # the 1 s delay.
         """Failing to open at all is the same failure as failing mid-stream."""
         harness = DriverHarness(source=FakeSource(fail_calls=1))
         await settle()
@@ -171,21 +207,30 @@ class TestReopen:
         await harness.close()
 
     async def test_a_stream_close_failure_does_not_stop_reopening(self, caplog: pytest.LogCaptureFixture):
+        # [FUNCTION DOC] Uses a source returning empty streams whose close raises a runtime
+        # error, retry delay 3 s, error-level log capture. Asserts one open and a log message
+        # "SourceStreamDriver failed to close a source stream"; after 3 s asserts a second open.
+        # Cancels the driver task at the end.
         """A cleanup failure is logged without preventing the retry delay or replacement stream."""
 
         class CloseFailingStream:
+            # [CLASS DOC] HELPER: Async iterator that ends immediately and fails on close.
             def __aiter__(self) -> AsyncIterator[Any]:
+                # [FUNCTION DOC] HELPER: Returns itself.
                 return self
 
             async def __anext__(self) -> Any:
+                # [FUNCTION DOC] HELPER: Immediately signals the end of iteration.
                 raise StopAsyncIteration
 
             async def aclose(self) -> None:
+                # [FUNCTION DOC] HELPER: Always raises a runtime error.
                 raise RuntimeError("fake close failure")
 
         open_count = 0
 
         def source() -> Any:
+            # [FUNCTION DOC] HELPER: Counts the open and returns a new failing-close stream.
             nonlocal open_count
             open_count += 1
             return CloseFailingStream()
@@ -214,7 +259,10 @@ class TestReopen:
 
 
 class TestClose:
+    # [CLASS DOC] Teardown of the driver.
     async def test_cancelling_the_driver_closes_the_stream_it_was_iterating(self):
+        # [FUNCTION DOC] Cancelling the run task closes the open source stream (closed count
+        # goes from 0 to 1); closing the driver afterwards is harmless.
         """Teardown must not leave the source generator suspended and holding its connection."""
         harness = DriverHarness(source=FakeSource())
         await settle()
@@ -227,6 +275,8 @@ class TestClose:
         await harness.driver.aclose()
 
     async def test_aclose_without_a_stream_is_a_no_op(self):
+        # [FUNCTION DOC] Closing the harness immediately raises nothing, and the task result is
+        # a cancellation error.
         """Closing a driver that never opened anything is not an error."""
         harness = DriverHarness(source=FakeSource())
         await harness.close()
