@@ -1,3 +1,12 @@
+# [MODULE DOC] HELPER: Test fixture generator that writes a fake training dump directory (rollout,
+# evaluation, trajectory, dashboard column and per-rank training data files) by running the real
+# production dumping functions on small random samples. Public entry points: the dump generator
+# (returns ground truth of per-step shard sample indices and evaluation steps), a function that ages
+# file modification times so the reader's visibility guard accepts them, and a function that blanks
+# one step's samples as if the step was aborted before any generation. Samples are random but
+# reproducible from a seed; every third sample is agentic (multi-turn with mixed weight versions
+# and tool messages in a chat prompt). Side effects: writes files, optional tokenizer files, and
+# alters file times.
 """Generate a DUMMY ``--dump-details`` directory through miles'
 REAL dumping pipeline.
 
@@ -48,6 +57,9 @@ from miles.utils.types import Sample, WeightVersionSpan, WeightVersionsPerCall
 
 @dataclass
 class DummyRunTruth:
+    # [CLASS DOC] HELPER: Record of what the generator wrote: the number of samples per step, a
+    # mapping from step to one list of sample indices per data-parallel shard (as produced by the
+    # real partitioning, in dumped row order), and the list of steps that have an evaluation dump.
     """Ground truth returned by :func:`dump_dummy_run` for test assertions."""
 
     n_samples_per_step: int
@@ -73,6 +85,22 @@ def dump_dummy_run(
     duplicate_first_sample_index: bool = False,
     seed: int = 0,
 ) -> DummyRunTruth:
+    # [FUNCTION DOC] HELPER: Writes a dummy dump into dump_dir. Inputs (all keyword-only after the
+    # directory): steps (2), prompts per step (4), samples per prompt (2), data-parallel size (2),
+    # tensor-parallel duplication factor (2, each shard saved under that many ranks), maximum
+    # response length (16), whether to include entropy columns, an evaluation dump at step zero, and
+    # a tokenizer; positions within a step to flag as removed; whether to make the second sample
+    # copy the first's index and reward (to test duplicates); and the random seed (0). Asserts the
+    # per-step batch size (prompts times samples) is divisible by the data-parallel size. Per step:
+    # builds random samples (global index = step times batch size plus position; group index =
+    # position integer-divided by samples per prompt; the first two samples get a chat message
+    # list in their metadata), saves the rollout dump, optionally saves an evaluation dump with the
+    # first half of the samples (step zero only), converts the samples to training data with the real
+    # conversion, splits by data parallel rank with the real partition, records the shard indices,
+    # then for each shard runs the real shard processing, adds fake actor columns using a
+    # generator seeded from the main random stream, and saves it once per tensor-parallel
+    # duplicate with rank equal to shard index times the duplication factor plus duplicate index.
+    # Finally ages all files and returns the truth record.
     """``remove_sample_indices`` marks the given within-step positions as
     ``remove_sample=True`` in every step; the real conversion then writes an
     all-zero loss mask for them."""
@@ -131,6 +159,10 @@ def dump_dummy_run(
 
 
 def _dummy_messages(sample) -> list[dict]:
+    # [FUNCTION DOC] HELPER: Returns a fixed five-message chat transcript: system, user (the
+    # sample's prompt as text), an assistant message with content, reasoning content and one tool
+    # call to a lookup function, a tool result, and a final assistant reply mentioning the sample's
+    # index.
     return [
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": str(sample.prompt)},
@@ -146,6 +178,12 @@ def _dummy_messages(sample) -> list[dict]:
 
 
 def _make_args(dump_dir: Path, *, num_prompts: int, n_samples_per_prompt: int) -> Namespace:
+    # [FUNCTION DOC] HELPER: Builds the argument namespace consumed by the real dump functions:
+    # output path templates for rollout data, trajectory data and train data under the dump
+    # directory (with rollout id and rank placeholders), data balancing on, dynamic global batch
+    # size off, grpo advantage estimator with reward and standard deviation normalization, the given
+    # rollout batch size (prompts) and samples per prompt, no reward key, thd qkv format, and zero
+    # top log probabilities. Contains only attributes the invoked functions read.
     # Exactly the attributes the invoked dump-pipeline functions read; a new
     # attribute dependency in main code fails loudly here (drift detection).
     return Namespace(
@@ -168,6 +206,16 @@ def _make_args(dump_dir: Path, *, num_prompts: int, n_samples_per_prompt: int) -
 def _make_sample(
     rng: random.Random, *, index: int, group_index: int, max_response_len: int, remove_sample: bool = False
 ) -> Sample:
+    # [FUNCTION DOC] HELPER: Builds one random sample. Response length is uniform in 4 through the
+    # maximum; prompt length uniform in 3 through 8; truncated if the response reached the maximum
+    # (status truncated, else completed). Agentic samples (global index divisible by three) have a
+    # three-message chat prompt (user, assistant, tool) and two weight-version calls: the first
+    # covering the prompt through the response midpoint with version index mod 3, the second the rest
+    # with that version plus one; others have a plain prompt string and one version span (index mod 3)
+    # covering prompt end to total length. Tokens are random ids below the vocabulary size (100);
+    # the response text is "x" repeated response-length times; reward is 1.0 with probability one
+    # half, else 0.0; rollout log probabilities are negative random values, one per response token.
+    # The remove flag is passed through. Consumes the random generator.
     response_length = rng.randint(4, max_response_len)
     prompt_length = rng.randint(3, 8)
     truncated = response_length == max_response_len
@@ -209,6 +257,10 @@ _VOCAB_SIZE = 100
 
 
 def _write_tokenizer(dump_dir: Path) -> None:
+    # [FUNCTION DOC] HELPER: Builds a word-level tokenizer whose vocabulary maps the text "t<i>" to
+    # id i for i below the vocabulary size (unknown token is "t0"), wraps it in a fast pretrained
+    # tokenizer and saves it under a tokenizer folder in the dump directory. Imports the tokenizers
+    # and transformers libraries lazily; writes files.
     """Persist a tiny word-level tokenizer (token id i <-> text "t{i}") with the
     same ``save_pretrained`` mechanism the real data source uses for
     ``{dump_details}/tokenizer/``."""
@@ -221,12 +273,19 @@ def _write_tokenizer(dump_dir: Path) -> None:
 
 
 def _apply_dummy_actor_columns(shard: dict, generator: torch.Generator, *, with_entropy: bool) -> None:
+    # [FUNCTION DOC] HELPER: Mutates the shard mapping in place. Converts tokens, loss masks (32-bit
+    # integers) and rollout log probabilities lists into tensors per sample; adds per-sample random
+    # tensors of each response length (drawn from the given generator, uniform in zero to one) for
+    # log probs and reference log probs (negated), advantages and returns, and, if requested,
+    # entropy and reference entropy. Per-token values are random, not computed.
     """Mimic what the training actor does to a shard before dumping it:
     tensorize the converted columns and attach forward-pass outputs.
     The values are random; the column names mirror real dumps."""
     response_lengths = shard["response_lengths"]
 
     def per_token(sign: float = 1.0) -> list[torch.Tensor]:
+        # [FUNCTION DOC] HELPER: Returns one random tensor per sample with that sample's response
+        # length, multiplied by the sign (default positive one).
         return [sign * torch.rand(r, generator=generator) for r in response_lengths]
 
     shard["tokens"] = [torch.tensor(t) for t in shard["tokens"]]
@@ -242,6 +301,8 @@ def _apply_dummy_actor_columns(shard: dict, generator: torch.Generator, *, with_
 
 
 def age_files(dump_dir: Path, *, seconds: float = 100.0) -> None:
+    # [FUNCTION DOC] HELPER: Sets the access and modification times of every tensor dump file found
+    # recursively under the directory to the current time minus the given seconds (default 100).
     """Push mtimes into the past so files pass the reader's visibility guard."""
     stamp = time.time() - seconds
     for path in dump_dir.rglob("*.pt"):
@@ -249,6 +310,11 @@ def age_files(dump_dir: Path, *, seconds: float = 100.0) -> None:
 
 
 def blank_samples(dump_dir: Path, rollout_id: int, *, seconds: float = 100.0) -> None:
+    # [FUNCTION DOC] HELPER: Simulates a step aborted before generation. Loads the step's rollout
+    # dump (full unpickling on CPU), replaces its samples with an empty list and saves it back;
+    # rewrites the step's dashboard columns file with no rows; deletes the step's trajectory file
+    # if present and all of the step's per-rank train data files; then sets the rollout dump's file
+    # times to now minus seconds (default 100). Raises if the rollout dump does not exist.
     """Rewrite a step as one aborted before any generation landed."""
     path = dump_dir / "rollout_data" / f"{rollout_id}.pt"
     pack = torch.load(path, map_location="cpu", weights_only=False)

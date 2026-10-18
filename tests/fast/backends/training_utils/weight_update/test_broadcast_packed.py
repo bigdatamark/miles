@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# CPU-only tests for the broadcast and packed-broadcast weight transfer modes. The collective
+# broadcast and the rollout engine clients are replaced with fakes; the real SGLang flattened
+# tensor bucket class is used (loaded directly from the source tree named by the environment
+# variable for the SGLang source root when it is set, otherwise imported normally) so the packed
+# wire format is checked byte for byte against the receiver's reconstruction. Also covers protocol
+# selection rules for the transfer mode argument. Registered for the CPU stage-a suite.
 """CPU wire-format checks against the actual SGLang bucket implementation."""
 
 import importlib.util
@@ -22,6 +29,11 @@ register_cpu_ci(est_time=30, suite="stage-a-cpu", labels=[])
 
 @pytest.fixture
 def bucket_class(monkeypatch):
+    # [FUNCTION DOC] HELPER: Pytest fixture returning the SGLang flattened tensor bucket class.
+    # If the SGLang source root environment variable is unset, imports the class from the installed
+    # package. Otherwise loads only the pure-Torch tensor bucket module from that source tree by
+    # file path, registers it in the module table for the test's duration (undone by the monkeypatch
+    # fixture), executes it, and returns its class. Avoids importing SGLang's GPU runtime.
     # CPU CI supplies SGLANG_SOURCE_ROOT. Load this pure-Torch module directly
     # so format tests do not require SGLang's unrelated GPU runtime imports.
     root = os.environ.get("SGLANG_SOURCE_ROOT")
@@ -38,6 +50,11 @@ def bucket_class(monkeypatch):
 
 
 def _weights():
+    # [FUNCTION DOC] HELPER: Builds the sample named weight list used by the tests. Returns seven
+    # name and tensor pairs covering mixed dtypes and layouts: a transposed (non-contiguous) byte
+    # matrix, an 8-bit float scale vector built from raw bytes, a zero-dimensional negative-zero
+    # float32 scalar, a transposed bfloat16 matrix, strided (every second element) bfloat16 and
+    # float32 vectors, and an empty float32 tensor of shape zero by two.
     return [
         ("expert.weight", torch.arange(16, dtype=torch.uint8).reshape(2, 8).T),
         ("expert.weight_scale", torch.tensor([0, 128, 126, 255], dtype=torch.uint8).view(torch.float8_e4m3fn)),
@@ -50,6 +67,10 @@ def _weights():
 
 
 def _assert_same_bytes(expected, actual):
+    # [FUNCTION DOC] HELPER: Asserts two lists of name and tensor pairs are equivalent. Names must
+    # match in order; for each pair (zipped strictly, so lengths must match) the shape and dtype must
+    # be equal and the tensors' contiguous flattened raw bytes must be identical. Comparing bytes
+    # makes negative zero and NaN payloads significant.
     assert [name for name, _ in actual] == [name for name, _ in expected]
     for (_, original), (_, received) in zip(expected, actual, strict=True):
         assert original.shape == received.shape
@@ -61,6 +82,17 @@ def _assert_same_bytes(expected, actual):
 
 @pytest.mark.parametrize("packed", [False, True])
 def test_broadcast_roundtrip_preserves_mixed_dtype_bytes_and_scalar_shape(monkeypatch, bucket_class, packed):
+    # [FUNCTION DOC] Parametrized over unpacked and packed modes. Calls the low-level distributed
+    # update function with two fake engine clients, a fake collective broadcast (asserts source rank
+    # zero, asynchronous mode and a contiguous tensor, records a copy of each sent tensor, and
+    # returns a handle whose wait records the element count) and a patched async submit that returns
+    # the future unchanged. Asserts: the returned futures are the clients' results; the number of
+    # sends and waits is one when packed, else one per weight; each client received metadata with
+    # names, dtypes, shapes, selector and group name (plus the flattened bucket load format only
+    # when packed). When packed, the single sent tensor is a byte tensor whose length equals the
+    # total byte size, and a receiver bucket built from the metadata reconstructs the tensors; when
+    # unpacked, the sent tensors are used directly. Finally asserts received bytes equal the original
+    # clones and that the input weights were not mutated.
     weights = _weights()
     original = [(name, tensor.clone()) for name, tensor in weights]
     clients = [SimpleNamespace(update_weights_from_distributed=Mock(return_value=object())) for _ in range(2)]
@@ -119,6 +151,12 @@ def test_broadcast_roundtrip_preserves_mixed_dtype_bytes_and_scalar_shape(monkey
     ],
 )
 def test_pack_failure_does_not_dispatch_receivers(monkeypatch, bucket_class, failure, error, message):
+    # [FUNCTION DOC] Parametrized over three packing failures: an unaligned scale tensor (a one
+    # byte-tensor of three elements followed by a float scalar, giving byte offset three), a bucket
+    # class reporting no mixed-dtype support, and a bucket constructor raising a memory error. For
+    # each, calling the distributed update in packed mode must raise the expected exception type with
+    # the expected message, and neither the engine client call nor the collective broadcast may have
+    # been invoked (packing happens before any dispatch).
     weights = _weights()
     if failure == "unaligned":
         weights = [("byte", torch.ones(3, dtype=torch.uint8)), ("scale", torch.tensor(1.0))]
@@ -138,6 +176,13 @@ def test_pack_failure_does_not_dispatch_receivers(monkeypatch, bucket_class, fai
 def test_backing_buffer_lives_through_collective_wait_and_bucket_clears_after_receiver_completion(
     monkeypatch, bucket_class
 ):
+    # [FUNCTION DOC] Builds a protocol object without running its constructor and sets just the
+    # attributes needed (packed transfer mode, a no-op engine lock, group name, one fake engine, a
+    # selector), then calls its bucket send method with the sample weights. Verifies lifecycle
+    # ordering: the packed backing buffer is still alive (weak reference resolves) and the input
+    # weights list is still populated when the collective wait runs; the receivers are awaited only
+    # after the collective completes; and afterwards the weights list has been emptied (cleared) and
+    # the receiver call used the flattened bucket load format. Exactly one buffer is sent.
     weights = _weights()
     events = []
     buffers = []
@@ -145,10 +190,14 @@ def test_backing_buffer_lives_through_collective_wait_and_bucket_clears_after_re
     monkeypatch.setattr(broadcast.async_utils, "submit", lambda future: future)
 
     def send(tensor, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Fake collective broadcast. Records a weak reference to the sent
+        # tensor and returns a handle; the handle's wait asserts the tensor is still alive and the
+        # input weights are non-empty, then records a collective-complete event.
         ref = weakref.ref(tensor)
         buffers.append(ref)
 
         def wait():
+            # [FUNCTION DOC] HELPER: Wait callback of the fake handle; see the enclosing send helper.
             assert ref() is not None
             assert weights
             events.append("collective_complete")
@@ -156,6 +205,9 @@ def test_backing_buffer_lives_through_collective_wait_and_bucket_clears_after_re
         return SimpleNamespace(wait=wait)
 
     def wait_receivers(futures):
+        # [FUNCTION DOC] HELPER: Fake replacement for waiting on receiver futures. Asserts it got
+        # exactly the client's returned future, the input weights are still non-empty, and the
+        # collective has already completed, then records a receivers-complete event.
         assert futures == [client.update_weights_from_distributed.return_value]
         assert weights
         assert events == ["collective_complete"]
@@ -179,12 +231,17 @@ def test_backing_buffer_lives_through_collective_wait_and_bucket_clears_after_re
 
 @pytest.mark.parametrize("backend,colocate", [("megatron", True), ("fsdp", False), ("fsdp", True)])
 def test_packed_mode_rejects_backends_that_would_ignore_it(backend, colocate):
+    # [FUNCTION DOC] For each unsupported combination (Megatron colocated, FSDP non-colocated, FSDP
+    # colocated) with the packed broadcast mode, asking for the transfer protocol must raise a value
+    # error saying packed mode requires Megatron non-colocated.
     args = Namespace(train_backend=backend, colocate=colocate, update_weight_transfer_mode="broadcast_packed")
     with pytest.raises(ValueError, match="requires Megatron non-colocated"):
         get_weight_transfer_protocol(args)
 
 
 def test_unknown_mode_cannot_fall_back_to_colocated_transfer():
+    # [FUNCTION DOC] With Megatron colocated and a misspelled transfer mode, protocol selection must
+    # raise a value error for an unknown mode rather than silently choosing the colocated protocol.
     args = Namespace(train_backend="megatron", colocate=True, update_weight_transfer_mode="typo")
     with pytest.raises(ValueError, match="Unknown --update-weight-transfer-mode"):
         get_weight_transfer_protocol(args)
@@ -192,6 +249,9 @@ def test_unknown_mode_cannot_fall_back_to_colocated_transfer():
 
 @pytest.mark.parametrize("mode", ["broadcast", "broadcast_packed"])
 def test_both_broadcast_modes_share_protocol_and_preserve_selection(monkeypatch, mode):
+    # [FUNCTION DOC] For both broadcast and packed broadcast modes with Megatron non-colocated (and
+    # a patched parallel state reporting pipeline size one), protocol selection returns an instance
+    # of the distributed-update protocol class whose stored args keep the requested mode.
     monkeypatch.setattr(broadcast, "get_parallel_state", lambda: SimpleNamespace(pp=SimpleNamespace(size=1)))
     args = Namespace(train_backend="megatron", colocate=False, update_weight_transfer_mode=mode)
     protocol = get_weight_transfer_protocol(args)
@@ -200,6 +260,8 @@ def test_both_broadcast_modes_share_protocol_and_preserve_selection(monkeypatch,
 
 
 def test_direct_caller_without_mode_keeps_legacy_protocol(monkeypatch):
+    # [FUNCTION DOC] Args lacking the transfer mode attribute entirely (Megatron non-colocated) still
+    # select the distributed-update protocol, and selection must not add the attribute to the args.
     monkeypatch.setattr(broadcast, "get_parallel_state", lambda: SimpleNamespace(pp=SimpleNamespace(size=1)))
     args = Namespace(train_backend="megatron", colocate=False)
     assert isinstance(get_weight_transfer_protocol(args), broadcast.UpdateWeightFromDistributed)
@@ -207,6 +269,9 @@ def test_direct_caller_without_mode_keeps_legacy_protocol(monkeypatch):
 
 
 def test_low_level_helper_rejects_non_broadcast_mode_before_receiver_dispatch(monkeypatch):
+    # [FUNCTION DOC] Calling the low-level distributed update with a peer-to-peer mode must raise a
+    # value error ("Expected a broadcast transfer mode") before the engine client is called or any
+    # collective broadcast is issued.
     client = SimpleNamespace(update_weights_from_distributed=Mock())
     collective = Mock()
     monkeypatch.setattr(broadcast.dist, "broadcast", collective)

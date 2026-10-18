@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# CPU tests of LoRA weight sync validation: the engine result checker (raises on failure results,
+# with different messages for LoRA and base syncs, accepts plain tuple results), the updater's
+# handling of a base model whose weight iterator yields zero buckets (no send, post-base hook called
+# once, weight version becomes one), and flattened tensor bucket round trips (single dtype, mixed
+# dtypes expected to fail, receiver-side rebuild from flat tensor plus metadata, LoRA-only filter).
+# The bucket tests skip when SGLang's bucket class is not importable.
+# KNOWN ISSUE: the module docstring promises coverage of distributed NCCL adapter broadcast but no
+# test here covers it, and the module-path constants for the CUDA IPC and broadcast protocols are
+# defined but unused. The docstring also points at a test file path that is not where the iterator
+# tests live (they are in the weight_update subdirectory).
 """Tests for LoRA weight-sync validation logic.
 
 Verifies that silent failures are caught:
@@ -38,6 +49,8 @@ SAMPLE_LORA_WEIGHTS = [
 
 @dataclass
 class _FakeEngineResult:
+    # [CLASS DOC] HELPER: Simple record imitating an engine weight-sync result: a success flag and
+    # an optional error message (default none).
     """Mimics sglang's LoRAUpdateOutput / weight-sync result."""
 
     success: bool
@@ -45,6 +58,10 @@ class _FakeEngineResult:
 
 
 def _make_args(**overrides):
+    # [FUNCTION DOC] HELPER: Returns an argument namespace with defaults (LoRA rank 32, alpha 32,
+    # dropout 0, two target modules, bridge conversion mode, one GPU per engine, a fake checkpoint
+    # path, a one-gibibyte update buffer, one actor node with one GPU, retract pause mode) updated
+    # by any keyword overrides.
     defaults = dict(
         lora_rank=32,
         lora_alpha=32,
@@ -68,28 +85,38 @@ def _make_args(**overrides):
 
 
 class TestCheckWeightSyncResults:
+    # [CLASS DOC] Tests of the engine result checker.
     """Validate that check_weight_sync_results raises on engine failures."""
 
     def test_success_results_pass(self):
+        # [FUNCTION DOC] A single successful result passes without raising.
         results = [_FakeEngineResult(success=True)]
         check_weight_sync_results(results, is_lora=True)
 
     def test_failure_result_raises_for_lora(self):
+        # [FUNCTION DOC] A failed result with the LoRA flag on raises a runtime error whose message
+        # says the LoRA weight sync failed.
         results = [_FakeEngineResult(success=False, error_message="incompatible format")]
         with pytest.raises(RuntimeError, match="LoRA weight sync failed"):
             check_weight_sync_results(results, is_lora=True)
 
     def test_failure_result_raises_for_base(self):
+        # [FUNCTION DOC] A failed result with the LoRA flag off raises a runtime error whose message
+        # says the base model weight sync failed.
         results = [_FakeEngineResult(success=False, error_message="bad version")]
         with pytest.raises(RuntimeError, match="Base model weight sync failed"):
             check_weight_sync_results(results, is_lora=False)
 
     def test_plain_tuple_results_pass(self):
+        # [FUNCTION DOC] A result that is a plain pair of true and a message (not a record) passes
+        # without raising.
         """Non-dataclass results (e.g. (True, 'Success') tuples) should not raise."""
         results = [(True, "Success")]
         check_weight_sync_results(results, is_lora=False)
 
     def test_mixed_results_raises_on_first_failure(self):
+        # [FUNCTION DOC] With a success followed by a failure carrying the message "oops", the
+        # checker raises a runtime error containing that message.
         results = [
             _FakeEngineResult(success=True),
             _FakeEngineResult(success=False, error_message="oops"),
@@ -99,7 +126,13 @@ class TestCheckWeightSyncResults:
 
 
 class TestUpdateWeightsEmptyBaseIteration:
+    # [CLASS DOC] Test of the updater with an iterator that yields no buckets.
     def test_no_raise_for_base_model_zero_buckets(self):
+        # [FUNCTION DOC] Builds a non-LoRA updater around a mock protocol (session support on, sender
+        # role, begin sync returns true, one mock engine) and an iterator yielding nothing, with the
+        # engine pause, begin, version, end and resume helpers, distributed module and gloo group
+        # patched (rank zero). Runs one update and asserts: no bucket was sent, the protocol's
+        # after-base-weights hook was called exactly once, and the updater's weight version is one.
         """Base model weight sync with zero buckets is valid (e.g. empty model state)."""
         empty_iterator = MagicMock()
         empty_iterator.iter_hf_weights.return_value = iter([])
@@ -147,9 +180,12 @@ class TestUpdateWeightsEmptyBaseIteration:
 
 
 class TestFlattenedTensorBucketRoundTrip:
+    # [CLASS DOC] Round-trip tests of SGLang's flattened tensor bucket.
     """Verify serialize -> reconstruct preserves tensor values exactly."""
 
     def _get_bucket_class(self):
+        # [FUNCTION DOC] HELPER: Imports and returns SGLang's flattened tensor bucket class; skips
+        # the calling test if the import fails.
         try:
             from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
         except ImportError:
@@ -157,6 +193,8 @@ class TestFlattenedTensorBucketRoundTrip:
         return FlattenedTensorBucket
 
     def test_roundtrip_single_dtype(self):
+        # [FUNCTION DOC] Packs two random bfloat16 tensors into a bucket, reconstructs, and asserts
+        # same count, names, shapes, dtypes and exactly equal values, in order.
         FlattenedTensorBucket = self._get_bucket_class()
         tensors = [
             ("a", torch.randn(4, 4, dtype=torch.bfloat16)),
@@ -174,6 +212,10 @@ class TestFlattenedTensorBucketRoundTrip:
             assert torch.equal(orig_t, rec_t), f"Tensor {orig_name} values differ after round-trip"
 
     def test_roundtrip_mixed_dtypes(self):
+        # [FUNCTION DOC] Packs bfloat16, float32 and float16 tensors into one bucket and asserts that
+        # reconstruction raises a runtime error mentioning the storage offset, pinning the current
+        # upstream behavior (the docstring explains the latent alignment problem). The test will
+        # start failing when either side is fixed, which is the intended signal.
         """FIXME(sglang upstream contract): SGLang exposes
         ``FlattenedTensorBucket.supports_multi_dtypes = True`` but
         ``reconstruct_tensors()`` actually raises ``RuntimeError`` on mixed
@@ -209,6 +251,9 @@ class TestFlattenedTensorBucketRoundTrip:
             bucket.reconstruct_tensors()
 
     def test_roundtrip_from_flattened_data(self):
+        # [FUNCTION DOC] Builds a sender bucket from two bfloat16 tensors, takes its flat tensor and
+        # metadata, builds a receiver bucket from just those, reconstructs, and asserts names and
+        # values equal the originals in order.
         """Simulate the receiver side: reconstruct from flattened_tensor + metadata."""
         FlattenedTensorBucket = self._get_bucket_class()
 
@@ -229,6 +274,9 @@ class TestFlattenedTensorBucketRoundTrip:
             assert torch.equal(orig_t, rec_t)
 
     def test_lora_only_tensors_filtered_correctly(self):
+        # [FUNCTION DOC] Filters a three-tensor list to the two LoRA tensors using the name
+        # predicate, asserts two remain, packs and reconstructs them, and asserts names and values
+        # round-trip exactly.
         """Verify that after filtering, only LoRA tensors survive and round-trip intact."""
         FlattenedTensorBucket = self._get_bucket_class()
 

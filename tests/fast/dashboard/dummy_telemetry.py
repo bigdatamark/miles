@@ -1,3 +1,13 @@
+# [MODULE DOC] HELPER: Test fixture generator for fake live-collection telemetry written through
+# the real metric store into the dashboard folder of a dump directory. Writes run metadata, two
+# topology snapshots (engine B moves ports at the restart instant), per-second GPU samples (a
+# 30 second idle period before step zero, then per-step utilization shaped by rollout, training and
+# weight update phases, with one 100 percent spike), phase events per step (a rollout on a manager
+# node and, for each GPU rank, wait / train / weight update phases with small per-rank skew), one
+# metrics record per step, engine samples every two seconds (running requests, throughput, token
+# and first-token counters), and trajectory lifecycle events per sample. Module constants define the
+# timeline (base time, node addresses, step length 100 s, rollout 40 s, drain times, restart offset,
+# spike location). Timestamps are synthetic seconds starting at one million.
 """Generate DUMMY live-collection telemetry through miles' REAL store write path.
 
 Companion of ``dummy_dump.py`` (which fabricates the ``.pt`` dump side): only
@@ -63,6 +73,9 @@ SPIKE = dict(step=0, offset=50, gpu=0, util=100)
 
 @dataclass
 class DummyTelemetryTruth:
+    # [CLASS DOC] HELPER: Ground truth of the generated telemetry: step count, GPU count, the
+    # timestamp of the engine B restart, and the timestamp of the utilization spike, plus helpers
+    # giving the start time of a step and its rollout interval.
     """Ground truth returned by :func:`dump_dummy_telemetry` for test assertions."""
 
     steps: int
@@ -71,9 +84,12 @@ class DummyTelemetryTruth:
     spike_ts: float
 
     def step_start(self, step: int) -> float:
+        # [FUNCTION DOC] HELPER: Returns the base time plus the init gap plus step times the step
+        # length (seconds).
         return BASE_TS + INIT_SECONDS + step * STEP_SECONDS
 
     def rollout_interval(self, step: int) -> tuple[float, float]:
+        # [FUNCTION DOC] HELPER: Returns the pair (step start, step start plus rollout seconds).
         return self.step_start(step), self.step_start(step) + ROLLOUT_SECONDS
 
 
@@ -81,6 +97,15 @@ SAMPLES_PER_STEP = 8  # dummy_dump's default num_prompts * n_samples_per_prompt
 
 
 def _trajectory_events(store: MetricStore, truth: DummyTelemetryTruth, samples_per_step: int) -> None:
+    # [FUNCTION DOC] HELPER: Appends trajectory events to the store for every step and every sample
+    # position. Global sample index = step times samples per step plus position; agentic when the
+    # index is divisible by three; group index = position integer-divided by two (fixed, not tied to
+    # samples per prompt); weight version = index mod 3 (agentic second turn uses one more). Start
+    # time is staggered across the rollout window (rollout length minus 16 s, divided by the sample
+    # count, times the position). Events per sample: attempt start at start; generation start at +1
+    # (turn 1) and end at +6; if agentic, tool start at +6 and end at +9 (detail "1 calls"), then
+    # generation start at +9 and end at +14 on turn 2 with the bumped version; attempt end at +15
+    # (agentic) or +7 with detail "completed".
     """Lifecycle events for each step's batch, aligned with dummy_dump's
     global sample indices (step * n + i) and its agentic pattern (every third
     sample: two turns, one tool call, mixed weight versions)."""
@@ -94,6 +119,9 @@ def _trajectory_events(store: MetricStore, truth: DummyTelemetryTruth, samples_p
             version = str(index % 3)
 
             def emit(kind, ts, turn=-1, version=version, detail="", index=index, group=i // 2):
+                # [FUNCTION DOC] HELPER: Appends one trajectory event of the given kind and time to
+                # the store. Turn defaults to -1 (not turn-specific); version, detail, sample index
+                # and group index default to the loop's current values (bound at definition).
                 store.append(
                     TrajectoryEvent(
                         ts=ts,
@@ -121,6 +149,24 @@ def _trajectory_events(store: MetricStore, truth: DummyTelemetryTruth, samples_p
 def dump_dummy_telemetry(
     dump_dir: Path, *, steps: int = 3, gpus: int = 4, samples_per_step: int = SAMPLES_PER_STEP
 ) -> DummyTelemetryTruth:
+    # [FUNCTION DOC] HELPER: Writes the whole fake telemetry story into a metric store rooted at the
+    # dashboard folder of the dump directory and returns the truth record (restart time = base +
+    # init gap + one step + restart offset; spike time from the spike step and offset). Inputs
+    # (keyword-only): steps (3), GPU count (4), samples per step (default 8, matching the dump
+    # generator's default batch of 4 prompts times 2). Writes: metadata (run name "dummy-telemetry",
+    # start time = base, colocate argument); two topology snapshots (before: engines A on GPUs 0-1
+    # and B at its old address on GPUs 2-3; at the restart time: B at its new address); 30 seconds
+    # of idle GPU samples before step zero (20 percent util); per step a rollout phase on the
+    # manager node, per rank wait (1 + 0.2 times rank seconds), train (until 80 + 0.5 times rank
+    # after step start) and weight update (4 + 0.3 times rank seconds) phases, a metrics record near
+    # the end of the step (step time, wait ratio, reward mean, MFU and peak teraflops values that
+    # shift with the step), per-second GPU samples (during rollout 90 percent until the GPU's
+    # engine drains, 5 afterwards, drain being 38 s for GPUs 0-1 and 25 s for others; 95 percent
+    # until second 80; then 30; with the configured spike overriding one value), and every two
+    # seconds engine samples for A and for B (old or new address by time): running requests (16
+    # until drain or rollout end, else 0), generation throughput (50 times running), cumulative
+    # generation tokens (100 per second of offset), and first-token latency sum (0.4 per second) and
+    # count (2 per second). Finally appends trajectory events and flushes the store.
     truth = DummyTelemetryTruth(
         steps=steps,
         gpus=gpus,
@@ -131,6 +177,8 @@ def dump_dummy_telemetry(
     store.write_meta(Meta(run_name="dummy-telemetry", start_ts=BASE_TS, args={"colocate": True}))
 
     def engine(addr: str, engine_rank: int, gpu_ids: list[int]) -> EngineInfo:
+        # [FUNCTION DOC] HELPER: Builds a regular engine description at the address and rank, with
+        # GPUs on the GPU node for the given ids and unknown GPU unique identifiers.
         return EngineInfo(
             addr=addr,
             worker_type="regular",
@@ -145,6 +193,8 @@ def dump_dummy_telemetry(
     )
 
     def engine_b_addr(ts: float) -> str:
+        # [FUNCTION DOC] HELPER: Returns engine B's old address for times before the restart time and
+        # its new address from then on.
         return ENGINE_B_OLD if ts < truth.restart_ts else ENGINE_B_NEW
 
     for offset in range(INIT_SECONDS):

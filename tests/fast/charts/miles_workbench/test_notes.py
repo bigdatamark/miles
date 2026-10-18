@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Test (needs helm) of the workbench chart's post-install notes text: with default values, with rbac
+# creation disabled and with leader-worker-set rights disabled, the notes always contain the exec
+# command, the workbench and uninstaller service account names, and the uninstall command, and
+# contain the rbac.create warning only when rbac creation is disabled and the leader-worker-set
+# warning only when those rights are disabled. Module data: a fixed object name and service account
+# name set on every render.
 import subprocess
 
 from tests.fast.charts.utils import (
@@ -21,6 +28,9 @@ _COMMON_OVERRIDES = (
 
 
 def _render_notes(*args: str) -> str:
+    # [FUNCTION DOC] HELPER: Runs a client-side dry-run helm install of the workbench chart in the
+    # test namespace with the common overrides plus extra arguments; asserts success (output as
+    # message) and returns the text after the last "NOTES:" marker line.
     result = subprocess.run(
         [
             "helm",
@@ -42,7 +52,13 @@ def _render_notes(*args: str) -> str:
 
 @requires_helm
 class TestNotes:
+    # [CLASS DOC] Test of the rendered notes.
     def test_notes_render_actionable_commands_and_only_the_disabled_rbac_warnings(self):
+        # [FUNCTION DOC] Renders objects and three notes variants (default, no rbac, no
+        # leader-worker-set rights). In all three: the exec command for the stateful set name in the
+        # namespace, both service account names (quoted) and the uninstall command appear. Warning
+        # marker counts: default has zero of each; no-rbac has one rbac.create marker and zero
+        # leader-worker-set markers; no-lws has zero and one respectively.
         """Actionable commands and account names stay exact while RBAC warnings follow disabled capabilities."""
         objects = render(*_COMMON_OVERRIDES)
         default_notes = _render_notes()

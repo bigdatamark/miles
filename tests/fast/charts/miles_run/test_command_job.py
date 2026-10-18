@@ -1,5 +1,15 @@
+# [MODULE DOC]
+# Tests (helm rendering of the run chart) of the standalone command job template: it renders on its
+# own via show-only without a release or run values, has a fixed container name, never retries and
+# fails on a displaced pod, supports indexed multi-pod fan-out with a headless service and
+# required host anti-affinity merged with cluster affinity, requests GPUs only on demand, has
+# default and overridable deadline and time-to-live, carries the cluster environment and code
+# path, requires a name and command when enabled, and is absent from ordinary runs.
 from tests.fast.charts.utils import objects_of_kind, render_run, render_run_error, requires_helm, single_object_of_kind
 
+# Module data: ENABLE_COMMAND_JOB is the helm argument tuple enabling the command job (name
+# "convert", object name, command bash -c convert) and showing only its template; CODE_PYTHONPATH is
+# the expected path variable value.
 ENABLE_COMMAND_JOB = (
     "--show-only",
     "templates/command-job.yaml",
@@ -17,7 +27,11 @@ CODE_PYTHONPATH = "/root/miles:/root/Megatron-LM:/sgl-workspace/sglang/python"
 
 @requires_helm
 class TestCommandJob:
+    # [CLASS DOC] Tests of the command job template (needs helm); each renders with the enabling
+    # arguments plus per-test overrides.
     def test_renders_on_its_own_so_the_caller_can_apply_it_without_a_release(self):
+        # [FUNCTION DOC] Exactly one Job renders, named as the object name, whose container command
+        # is bash, dash-c and convert.
         """Command-job work is not part of a run, so it is rendered with --show-only and applied directly."""
         job = single_object_of_kind(render_run(*ENABLE_COMMAND_JOB), "Job")
 
@@ -25,6 +39,8 @@ class TestCommandJob:
         assert job["spec"]["template"]["spec"]["containers"][0]["command"] == ["bash", "-c", "convert"]
 
     def test_renders_without_the_values_a_run_would_carry(self):
+        # [FUNCTION DOC] Even with an empty orchestrator command (which a run would reject) the Job
+        # still renders with the expected name.
         """The launcher renders a command job off the bare chart, and helm evaluates every template
         before --show-only picks one, so a run's own guard would reject work that has no run."""
         job = single_object_of_kind(
@@ -34,12 +50,15 @@ class TestCommandJob:
         assert job["metadata"]["name"] == "myrun-miles-run-convert"
 
     def test_names_the_container_after_the_kind_of_work_it_does(self):
+        # [FUNCTION DOC] The Job's containers are exactly one, named command-job.
         """kubectl logs picks a container by name, so the launcher needs a name that never changes."""
         job = single_object_of_kind(render_run(*ENABLE_COMMAND_JOB), "Job")
 
         assert [container["name"] for container in job["spec"]["template"]["spec"]["containers"]] == ["command-job"]
 
     def test_a_displaced_pod_fails_the_step_instead_of_running_the_command_twice(self):
+        # [FUNCTION DOC] The Job spec has no pod failure policy, its pod replacement policy is
+        # "Failed" and the backoff limit is zero.
         """Forgiving a disruption lets kubernetes rerun a command step that is meant to run at most once."""
         job = single_object_of_kind(render_run(*ENABLE_COMMAND_JOB), "Job")
 
@@ -48,6 +67,7 @@ class TestCommandJob:
         assert job["spec"]["backoffLimit"] == 0
 
     def test_never_retries_a_failure(self):
+        # [FUNCTION DOC] Backoff limit is zero and the pod restart policy is Never.
         """The caller reports the failure; a silent retry would hide it and double the side effects."""
         job = single_object_of_kind(render_run(*ENABLE_COMMAND_JOB), "Job")
 
@@ -55,6 +75,8 @@ class TestCommandJob:
         assert job["spec"]["template"]["spec"]["restartPolicy"] == "Never"
 
     def test_runs_one_pod_per_node_when_asked(self):
+        # [FUNCTION DOC] With four completions requested, completions and parallelism are both four
+        # and the completion mode is Indexed.
         """A multi-node command job needs a pod per node, each knowing its index."""
         job = single_object_of_kind(render_run(*ENABLE_COMMAND_JOB, "--set", "commandJob.completions=4"), "Job")
 
@@ -62,6 +84,7 @@ class TestCommandJob:
         assert job["spec"]["completionMode"] == "Indexed"
 
     def test_indexes_a_single_pod_job_too(self):
+        # [FUNCTION DOC] By default the Job has one completion and Indexed completion mode.
         """Only Indexed mode gives the one pod the completion index and <job>-0 hostname its command substitutes."""
         job = single_object_of_kind(render_run(*ENABLE_COMMAND_JOB), "Job")
 
@@ -69,6 +92,9 @@ class TestCommandJob:
         assert job["spec"]["completionMode"] == "Indexed"
 
     def test_spreads_the_pods_without_dropping_the_cluster_s_own_required_terms(self):
+        # [FUNCTION DOC] With four completions and a cluster pod anti-affinity requiring a zone
+        # topology key, the rendered required anti-affinity terms are the hostname term followed by
+        # the cluster's zone term, in that order.
         """Merging over the configured affinity dropped its own required terms, letting a pod land where it must not."""
         job = single_object_of_kind(
             render_run(
@@ -89,6 +115,9 @@ class TestCommandJob:
         ]
 
     def test_a_multi_pod_job_merges_required_host_spreading_with_cluster_affinity(self) -> None:
+        # [FUNCTION DOC] With four completions and a cluster required node affinity (pool in gpu),
+        # the Job keeps that node affinity unchanged and its first required pod anti-affinity term
+        # has the hostname topology key.
         """A fan-out job keeps cluster placement while requiring its own pods to use separate hosts."""
         job = single_object_of_kind(
             render_run(
@@ -113,6 +142,9 @@ class TestCommandJob:
         )
 
     def test_a_multi_pod_job_gets_stable_peer_dns_through_its_headless_service(self) -> None:
+        # [FUNCTION DOC] With four completions, exactly one Service renders: headless (cluster IP
+        # None) with a selector of component convert, instance myrun and name miles-run. The Job's
+        # pod labels include the selector and its subdomain equals the service name.
         """A fan-out job joins a matching headless service so indexed pods have stable peer DNS."""
         objects = render_run(*ENABLE_COMMAND_JOB, "--set", "commandJob.completions=4")
         job = single_object_of_kind(objects, "Job")
@@ -129,6 +161,8 @@ class TestCommandJob:
         assert job["spec"]["template"]["spec"]["subdomain"] == service["metadata"]["name"]
 
     def test_requests_gpus_only_when_asked(self):
+        # [FUNCTION DOC] With eight GPUs per pod the container limits are a GPU limit of eight; by
+        # default the container has no resources key.
         """Checkpoint conversion needs gpus; a download must not sit in the gpu queue."""
         with_gpus = single_object_of_kind(render_run(*ENABLE_COMMAND_JOB, "--set", "commandJob.gpusPerPod=8"), "Job")
         without = single_object_of_kind(render_run(*ENABLE_COMMAND_JOB), "Job")
@@ -137,18 +171,21 @@ class TestCommandJob:
         assert "resources" not in without["spec"]["template"]["spec"]["containers"][0]
 
     def test_gives_up_on_a_job_that_never_gets_its_node(self):
+        # [FUNCTION DOC] The default active deadline is 10800 seconds.
         """Without a deadline a step waiting on an unavailable gpu would hold the queue forever."""
         job = single_object_of_kind(render_run(*ENABLE_COMMAND_JOB), "Job")
 
         assert job["spec"]["activeDeadlineSeconds"] == 10800
 
     def test_collects_a_finished_job_by_itself(self):
+        # [FUNCTION DOC] The default time-to-live after finish is 3600 seconds.
         """The launcher may die before deleting the Job, and the namespace must not fill up with corpses."""
         job = single_object_of_kind(render_run(*ENABLE_COMMAND_JOB), "Job")
 
         assert job["spec"]["ttlSecondsAfterFinished"] == 3600
 
     def test_lets_the_caller_choose_the_deadline_and_the_lifetime(self):
+        # [FUNCTION DOC] Overrides of deadline 60 and time-to-live 0 render as given (zero is honored).
         """The python launcher owns the real timeout, so the chart must accept it instead of drifting."""
         job = single_object_of_kind(
             render_run(
@@ -164,6 +201,8 @@ class TestCommandJob:
         assert (job["spec"]["activeDeadlineSeconds"], job["spec"]["ttlSecondsAfterFinished"]) == (60, 0)
 
     def test_bounds_a_multi_pod_job_the_same_way(self):
+        # [FUNCTION DOC] A four-completion Job has the same default deadline (10800) and
+        # time-to-live (3600).
         """A fan-out step is exactly the one most likely to wedge, so it may not escape the deadline."""
         job = single_object_of_kind(render_run(*ENABLE_COMMAND_JOB, "--set", "commandJob.completions=4"), "Job")
 
@@ -171,6 +210,7 @@ class TestCommandJob:
         assert job["spec"]["ttlSecondsAfterFinished"] == 3600
 
     def test_carries_the_cluster_environment_like_every_other_pod(self):
+        # [FUNCTION DOC] A proxy variable set through infra env appears in the container env.
         """A proxy the cluster needs is as necessary for a download here as it is inside the run."""
         job = single_object_of_kind(
             render_run(*ENABLE_COMMAND_JOB, "--set", "infra.env.HTTP_PROXY=http://proxy:7890"), "Job"
@@ -181,6 +221,8 @@ class TestCommandJob:
         )
 
     def test_uses_the_same_checkout_precedence_as_run_pods(self):
+        # [FUNCTION DOC] The container's path variable equals the expected miles, Megatron-LM and
+        # sglang path list.
         """A command job must import mounted code added after the image's editable metadata was built."""
         job = single_object_of_kind(render_run(*ENABLE_COMMAND_JOB), "Job")
         env = {entry["name"]: entry["value"] for entry in job["spec"]["template"]["spec"]["containers"][0]["env"]}
@@ -188,10 +230,13 @@ class TestCommandJob:
         assert env["PYTHONPATH"] == CODE_PYTHONPATH
 
     def test_refuses_to_be_enabled_without_a_name_or_a_command(self):
+        # [FUNCTION DOC] Enabling with no name, and enabling with a name but no command, both fail
+        # to render with an error message mentioning the command job.
         """Both are schema-valid at their defaults, and would render a Job that cannot run."""
         assert "commandJob" in render_run_error("--set", "commandJob.enabled=true")
         assert "commandJob" in render_run_error("--set", "commandJob.enabled=true", "--set", "commandJob.name=conv")
 
     def test_is_absent_from_a_run(self):
+        # [FUNCTION DOC] A default run rendering contains no Job.
         """Installing it with the release would rerun the whole command job on every helm upgrade."""
         assert objects_of_kind(render_run(), "Job") == []

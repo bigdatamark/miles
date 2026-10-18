@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Tests (helm rendering of the run chart) of the optional Mooncake master: nothing is rendered by
+# default; when enabled, a one-replica stateful set and a headless-style service agree on name,
+# selector, service name and the configured RPC and metrics ports, with the master command carrying
+# both ports; and the master inherits configured resources, cluster environment, and volumes and
+# mounts.
 from typing import Any
 
 from tests.fast.charts.utils import (
@@ -15,6 +21,8 @@ MOONCAKE_MASTER_NAME = f"{RUN_RELEASE_NAME}-miles-run-mooncake-master"
 
 
 def _mooncake_object(objects: list[dict[str, Any]], kind: str) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Returns the single object of the kind named as the Mooncake master;
+    # asserts exactly one matches.
     matches = [obj for obj in objects_of_kind(objects, kind) if obj["metadata"]["name"] == MOONCAKE_MASTER_NAME]
     assert len(matches) == 1
     return matches[0]
@@ -22,7 +30,9 @@ def _mooncake_object(objects: list[dict[str, Any]], kind: str) -> dict[str, Any]
 
 @requires_helm
 class TestMooncakeMaster:
+    # [CLASS DOC] Tests of the Mooncake master objects (need helm).
     def test_a_run_that_does_not_need_mooncake_renders_no_master(self) -> None:
+        # [FUNCTION DOC] A default run has no Service or StatefulSet named as the master.
         """The default run must not launch or expose a Mooncake master that none of its workers use."""
         objects = render_run()
 
@@ -32,6 +42,12 @@ class TestMooncakeMaster:
         )
 
     def test_the_service_and_master_process_share_names_selectors_and_ports(self) -> None:
+        # [FUNCTION DOC] Enables Mooncake with RPC port 51051 and metrics port 51052. Asserts the
+        # service and stateful set share a name; the service selector equals the stateful set's
+        # match labels and is contained in its pod labels; the stateful set's service name is the
+        # service name; replicas is one; the service ports and the container ports both equal the
+        # RPC and metrics port mapping; and the container command is the master binary with its
+        # RPC port and metrics port options.
         """The singleton master and its Service must agree on identity, selection, and both configured ports."""
         rpc_port = 51051
         metrics_port = 51052
@@ -64,6 +80,10 @@ class TestMooncakeMaster:
         ]
 
     def test_the_master_receives_resources_environment_and_configured_volumes(self) -> None:
+        # [FUNCTION DOC] Enables Mooncake with a CPU request of 3, a proxy environment variable and
+        # two host-path volumes (default storage and a read-only model cache). Asserts the master
+        # container has the CPU request, the proxy variable and the read-only model cache mount, and
+        # the pod has the model cache host-path volume.
         """An enabled master inherits its configured resources and the cluster runtime contract."""
         objects = render_run(
             "--set",

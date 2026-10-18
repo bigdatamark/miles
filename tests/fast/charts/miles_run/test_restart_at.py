@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Tests (helm rendering of the run chart, needs helm) of the restart-at annotation: a timestamp
+# value set on the orchestrator or on a static worker is stamped as an annotation on that
+# workload's pod template (so only that workload rolls), never on the stateful set metadata, and
+# nothing is stamped on an ordinary launch. Module data: two sample static workers (rollout executor
+# and router) and a sample stamp.
 import json
 from typing import Any
 
@@ -17,16 +23,23 @@ WORKERS = [
 
 
 def _render(*args: str, workers: list[dict[str, Any]] = WORKERS) -> list[dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Renders the run chart with the given static workers (default the two
+    # sample workers, given object names) plus extra helm arguments; returns parsed objects.
     return render_run("--set-json", f"run.staticWorkers={json.dumps(with_object_names(workers))}", *args)
 
 
 def _pod_annotations(objects: list[dict[str, Any]], name: str) -> dict[str, str]:
+    # [FUNCTION DOC] HELPER: Returns the annotations of the named stateful set's pod template
+    # metadata (empty mapping if none).
     return named_object(objects, "StatefulSet", name)["spec"]["template"]["metadata"].get("annotations", {})
 
 
 @requires_helm
 class TestRestartAtAnnotation:
+    # [CLASS DOC] Tests of the restart-at annotation placement.
     def test_an_ordinary_launch_stamps_no_annotation(self):
+        # [FUNCTION DOC] Without any stamp the orchestrator and rollout executor pod templates have
+        # no annotations.
         """Stamping a value on every launch would roll a live run's pods for nothing."""
         objects = _render()
 
@@ -34,12 +47,16 @@ class TestRestartAtAnnotation:
         assert _pod_annotations(objects, ROLLOUT_EXECUTOR) == {}
 
     def test_the_orchestrator_carries_the_stamp_it_is_given(self):
+        # [FUNCTION DOC] Setting the orchestrator's restart-at value yields exactly one pod template
+        # annotation with that key and value.
         """The pod template only changes, and the StatefulSet only rolls, because of this annotation."""
         objects = _render("--set", f"run.orchestrator.restartAt={STAMP}")
 
         assert _pod_annotations(objects, ORCHESTRATOR) == {RESTART_AT_ANNOTATION: STAMP}
 
     def test_only_the_static_worker_that_is_given_a_stamp_carries_one(self):
+        # [FUNCTION DOC] Stamping only the rollout executor worker annotates its pod template and
+        # leaves the router's without annotations.
         """The rollout executor is the second component a hot restart replaces; every other pod keeps running."""
         objects = _render(workers=[{**WORKERS[0], "restartAt": STAMP}, WORKERS[1]])
 
@@ -47,6 +64,8 @@ class TestRestartAtAnnotation:
         assert _pod_annotations(objects, ROUTER) == {}
 
     def test_the_stamp_does_not_reach_the_statefulset_metadata(self):
+        # [FUNCTION DOC] With an orchestrator stamp, the stateful set's own metadata annotations do
+        # not contain the annotation key.
         """Only a pod template change rolls the pods, so the annotation has to sit on the template."""
         objects = _render("--set", f"run.orchestrator.restartAt={STAMP}")
 

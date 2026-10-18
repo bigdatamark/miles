@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Tests (helm rendering of the run chart, needs helm) of the shared memory mount on pool pods: a
+# pool container mounts the host shared memory directory (type Directory, no private empty-dir)
+# so peers share CUDA IPC handles; the pod joins the host IPC namespace only when colocated; the
+# host path or an in-memory empty-dir can be configured through infra values; the old per-run size
+# value is rejected by the schema; every mounted volume is declared; and the orchestrator (which
+# runs no collective) gets no such mount. Module data: a one-GPU-group trainer pool entry, an
+# engine entry, and a colocate configuration pairing them.
 import json
 from typing import Any
 
@@ -50,12 +58,17 @@ COLOCATE = {
 
 
 def _pod_spec_of_sole_pool(*args: str) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Renders the run chart with only the trainer pool (plus extra helm
+    # arguments) and returns the first leader-worker-set's worker pod spec.
     rendered = render_run("--set-json", f"run.trainerEngines={json.dumps(with_object_names(TRAINER))}", *args)
     pool = objects_of_kind(rendered, "LeaderWorkerSet")[0]
     return pool["spec"]["leaderWorkerTemplate"]["workerTemplate"]["spec"]
 
 
 def _pod_spec_of_colocated_trainer_pool() -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Renders the run chart with the trainer pool, the engine pool and the
+    # colocate configuration, and returns the trainer pool's worker pod spec (found by its object
+    # name).
     rendered = render_run(
         "--set-json",
         f"run.trainerEngines={json.dumps(with_object_names(TRAINER))}",
@@ -69,12 +82,16 @@ def _pod_spec_of_colocated_trainer_pool() -> dict[str, Any]:
 
 
 def _shm_volume(pod_spec: dict[str, Any]) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Returns the pod volume backing the single shared memory mount; raises
+    # (unpacking error) if there is not exactly one such mount or one matching volume.
     [mount] = _shm_mounts(pod_spec)
     [volume] = [volume for volume in pod_spec["volumes"] if volume["name"] == mount["name"]]
     return volume
 
 
 def _shm_mounts(pod_spec: dict[str, Any]) -> list[dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Returns all container volume mounts of the pod spec whose mount path is
+    # /dev/shm.
     return [
         mount
         for container in pod_spec["containers"]
@@ -85,23 +102,30 @@ def _shm_mounts(pod_spec: dict[str, Any]) -> list[dict[str, Any]]:
 
 @requires_helm
 class TestPoolPodsShareTheHostSharedMemory:
+    # [CLASS DOC] Tests of the shared memory mount on pool pods (need helm).
     def test_a_pool_container_mounts_dev_shm(self):
+        # [FUNCTION DOC] Exactly one container mount at the shared memory path exists.
         """Kubernetes' default 64Mi of /dev/shm is less than NCCL asks for per peer it cannot reach over p2p."""
         assert len(_shm_mounts(_pod_spec_of_sole_pool())) == 1
 
     def test_that_mount_is_the_host_dev_shm_itself(self):
+        # [FUNCTION DOC] The backing volume is a host path at /dev/shm.
         """The pods share the host IPC namespace, and a CUDA IPC refcounter only works in the shm they all see."""
         assert _shm_volume(_pod_spec_of_sole_pool())["hostPath"]["path"] == "/dev/shm"
 
     def test_the_host_directory_has_to_exist_already(self):
+        # [FUNCTION DOC] The host path type is Directory.
         """DirectoryOrCreate would silently make a plain disk directory on a node whose /dev/shm is missing."""
         assert _shm_volume(_pod_spec_of_sole_pool())["hostPath"]["type"] == "Directory"
 
     def test_no_private_volume_of_its_own_shadows_it(self):
+        # [FUNCTION DOC] The backing volume has no empty-dir source.
         """An emptyDir here is what breaks the sharing, so its absence is the property worth pinning."""
         assert "emptyDir" not in _shm_volume(_pod_spec_of_sole_pool())
 
     def test_the_pods_that_mount_it_share_the_host_ipc_namespace(self):
+        # [FUNCTION DOC] In a colocated render the trainer pod has one shared memory mount and its
+        # host IPC flag is true.
         """Sharing the directory buys nothing unless the pods also share the namespace the handles live in."""
         pod_spec = _pod_spec_of_colocated_trainer_pool()
 
@@ -109,6 +133,7 @@ class TestPoolPodsShareTheHostSharedMemory:
         assert pod_spec["hostIPC"] is True
 
     def test_a_pool_that_shares_no_handles_gets_the_directory_and_not_the_namespace(self):
+        # [FUNCTION DOC] A non-colocated pool pod has one shared memory mount but no host IPC key.
         """A run nothing colocates needs the size nccl asks for, and no second pod holds handles into it."""
         pod_spec = _pod_spec_of_sole_pool()
 
@@ -116,12 +141,16 @@ class TestPoolPodsShareTheHostSharedMemory:
         assert "hostIPC" not in pod_spec
 
     def test_a_cluster_whose_nodes_keep_shared_memory_elsewhere_can_say_so(self):
+        # [FUNCTION DOC] Setting the shared memory host path value to /run/shm changes the volume's
+        # host path to it.
         """The path was hardcoded, which left a node that mounts its shm elsewhere with no way to be described."""
         pod_spec = _pod_spec_of_sole_pool("--set", "infra.devShm.hostPath.path=/run/shm")
 
         assert _shm_volume(pod_spec)["hostPath"]["path"] == "/run/shm"
 
     def test_a_cluster_that_would_rather_size_it_itself_can_ask_for_memory(self):
+        # [FUNCTION DOC] Nulling the host path and setting an in-memory empty-dir source yields a
+        # volume whose empty-dir is exactly the memory medium.
         """The size knob the run lost only ever made sense on a volume of the pod's own, which is this one."""
         pod_spec = _pod_spec_of_sole_pool(
             "--set", "infra.devShm.hostPath=null", "--set-json", 'infra.devShm.emptyDir={"medium":"Memory"}'
@@ -130,12 +159,16 @@ class TestPoolPodsShareTheHostSharedMemory:
         assert _shm_volume(pod_spec)["emptyDir"] == {"medium": "Memory"}
 
     def test_a_run_cannot_ask_for_a_private_size_any_more(self):
+        # [FUNCTION DOC] Setting the run shared-memory size value fails rendering with a schema
+        # error saying the property is not allowed.
         """The size knob belonged to the emptyDir; leaving it accepted would let a values file break sharing."""
         error = render_run_error("--set", "run.shmSize=8Gi")
 
         assert "'shmSize' not allowed" in error
 
     def test_every_mounted_volume_is_declared_by_the_pod_that_mounts_it(self):
+        # [FUNCTION DOC] The set of volume names mounted by containers is a subset of the pod's
+        # declared volume names; the failure message lists undeclared ones.
         """A container naming a volume the pod does not declare makes the whole manifest invalid."""
         pod_spec = _pod_spec_of_sole_pool()
         declared = {volume["name"] for volume in pod_spec["volumes"]}
@@ -144,6 +177,8 @@ class TestPoolPodsShareTheHostSharedMemory:
         assert mounted <= declared, f"{mounted - declared} is mounted but never declared"
 
     def test_a_pod_that_runs_no_collective_is_left_alone(self):
+        # [FUNCTION DOC] The orchestrator stateful set (found by name substring; exactly one must
+        # exist) has no shared memory mount.
         """The orchestrator only talks to the apiserver, so it has no reason to reach into the host's shm."""
         rendered = render_run("--set-json", f"run.trainerEngines={json.dumps(with_object_names(TRAINER))}")
         [orchestrator] = [
