@@ -1,3 +1,10 @@
+# [MODULE DOC] Static guard that only the shared session-scoped fixture (in the tests root
+# conftest) starts the ray cluster: scans every python file under the tests directory (skipping
+# the snapshots directory of rendered output) for calls to ray's init function, including aliased
+# module imports and direct or renamed imports of init, and asserts the conftest is the only
+# caller. Also tests the detector itself on synthetic sources (detected: plain, aliased, from-
+# import, renamed from-import, submodule import; not flagged: shutdown, an unrelated local or
+# other-library init). Constants: the tests root (parent of this directory) and snapshots root.
 from __future__ import annotations
 
 import ast
@@ -10,6 +17,9 @@ _SNAPSHOTS_ROOT = _TESTS_ROOT / "snapshots"
 
 
 def test_only_the_session_fixture_starts_the_ray_cluster():
+    # [FUNCTION DOC] Collects the relative paths of all test-tree files that call ray init and
+    # asserts the sorted list is exactly the shared conftest, with a message telling to use the
+    # session-scoped local-mode fixture instead.
     """A CPU suite runs many files in one pytest process, so whichever file calls ray.init
     first fixes the cluster's resources for every later file. A second initializer there
     silently produces a cluster without the logical GPUs the placement-group tests need."""
@@ -22,6 +32,9 @@ def test_only_the_session_fixture_starts_the_ray_cluster():
 
 
 def _test_files_calling_ray_init() -> list[Path]:
+    # [FUNCTION DOC] HELPER: Returns the python files under the tests root (regular files only,
+    # excluding anything under the snapshots directory) in which the detector finds a ray init
+    # call. Parses every candidate, so a file with a syntax error raises a syntax error.
     # Snapshot fixtures include directories named like modules, and the launch scripts
     # recorded under them are rendered output rather than code this suite runs.
     candidates = (path for path in _TESTS_ROOT.rglob("*.py") if path.is_file())
@@ -29,6 +42,9 @@ def _test_files_calling_ray_init() -> list[Path]:
 
 
 def _calls_ray_init(path: Path) -> bool:
+    # [FUNCTION DOC] HELPER: Parses the file, computes the names bound to the ray module and to
+    # ray's init, and returns true if any call is an attribute call named init on a name in the
+    # module aliases, or a bare call to a directly imported init name; false otherwise.
     tree = ast.parse(path.read_text(), filename=str(path))
     module_aliases, direct_names = _ray_init_bindings(tree)
     for node in ast.walk(tree):
@@ -44,6 +60,8 @@ def _calls_ray_init(path: Path) -> bool:
 
 
 class TestCallsRayInit:
+    # [CLASS DOC] Tests of the ray-init detector on small synthetic sources written to a
+    # temporary file.
     @pytest.mark.parametrize(
         "source",
         [
@@ -55,6 +73,8 @@ class TestCallsRayInit:
         ],
     )
     def test_every_way_of_reaching_ray_init_is_detected(self, source: str, tmp_path: Path) -> None:
+        # [FUNCTION DOC] Writes each source to a candidate file in the temporary directory and
+        # asserts the detector returns true.
         """A second cluster owner is just as real when it imports ray under another name."""
         path = tmp_path / "candidate.py"
         path.write_text(source)
@@ -71,6 +91,8 @@ class TestCallsRayInit:
         ],
     )
     def test_unrelated_init_calls_are_not_flagged(self, source: str, tmp_path: Path) -> None:
+        # [FUNCTION DOC] Writes each source to a candidate file in the temporary directory and
+        # asserts the detector returns false.
         """Flagging a local init() or another library's would make the guard unusable."""
         path = tmp_path / "candidate.py"
         path.write_text(source)
@@ -79,6 +101,10 @@ class TestCallsRayInit:
 
 
 def _ray_init_bindings(tree: ast.Module) -> tuple[set[str], set[str]]:
+    # [FUNCTION DOC] HELPER: Walks the syntax tree. The module-alias set starts with the plain
+    # name ray and gains, for each plain import of ray or a ray submodule, the alias or the first
+    # dotted component. The direct-name set gains, for each from-import of ray that imports init,
+    # the alias or init. Returns (module aliases, direct names).
     """Names bound to the ray module and to ray.init itself, so aliased imports still count."""
     module_aliases = {"ray"}
     direct_names: set[str] = set()

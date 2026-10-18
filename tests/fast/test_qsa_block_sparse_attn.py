@@ -1,3 +1,10 @@
+# [MODULE DOC] GPU tests (module skipped without torch or CUDA) checking the tensor-core
+# block-sparse QSA attention kernel against the gather kernel and an fp64 reference: forward
+# output agreement, gradient agreement, correctness when packed sequence starts are not
+# multiples of the block size (a sequence must not borrow its neighbour's blocks), and the
+# consistency of the forward and backward tile index lists. Constants: block size 4, 4 query
+# heads, 1 key/value head, head dimension 128 and the default attention scale (head dimension to
+# the power minus one half).
 """The tensor-core QSA kernel must match the gather kernel, including off-grid packed boundaries."""
 
 import pytest
@@ -23,6 +30,13 @@ SCALE = D**-0.5
 
 
 def _single_sequence_case(T=384, budget=64, seed=0):
+    # [FUNCTION DOC] HELPER: Builds a random single-sequence case on the GPU with a seeded
+    # generator: bfloat16 query (T by heads by head dim), key and value (T by one head by head
+    # dim), and a selection index tensor. For each token, random scores over blocks (T // block
+    # size plus one) are masked to -1 for blocks after the token's own block; the top
+    # (budget // block size) blocks (or all if fewer) are chosen, expanded to token indices, and
+    # indices after the token's position are replaced by -1. Returns (q, k, v, indices as 32-bit
+    # integers).
     """Selection as the indexer emits it: distinct blocks, tail clamped to the position."""
     g = torch.Generator(device="cuda").manual_seed(seed)
     q = torch.randn(T, HQ, D, device="cuda", dtype=torch.bfloat16, generator=g)
@@ -40,6 +54,11 @@ def _single_sequence_case(T=384, budget=64, seed=0):
 
 
 def _reference(q, k, v, idx, scale):
+    # [FUNCTION DOC] HELPER: Slow double-precision reference. For each token and each query head,
+    # takes the valid (non-negative) selected indices, computes scaled dot-product scores against
+    # the keys of the corresponding key/value head (heads grouped), softmax over the selection,
+    # and the weighted sum of values. Tokens with no selection keep zeros. Returns a float64 output
+    # of shape tokens by query heads by head dim.
     """fp64, one query at a time, straight from the documented semantics."""
     T, hq, d = q.shape
     group = hq // k.shape[1]
@@ -57,11 +76,18 @@ def _reference(q, k, v, idx, scale):
 
 
 def _rel(a, b):
+    # [FUNCTION DOC] HELPER: Compares two tensors in double precision; returns the maximum
+    # absolute difference and the mean absolute difference divided by the mean absolute value of
+    # the second tensor (plus a tiny constant), both as Python floats.
     d = (a.double() - b.double()).abs()
     return d.max().item(), (d.mean() / (b.double().abs().mean() + 1e-12)).item()
 
 
 def test_matches_gather_kernel_and_reference():
+    # [FUNCTION DOC] On a single-sequence case runs the reference, the gather kernel and the
+    # from-indices tensor-core kernel. Asserts the new kernel's max error is at most four times
+    # the old kernel's, its relative error against the reference is under 1e-2, and its relative
+    # difference from the old kernel is under 1e-2.
     q, k, v, idx = _single_sequence_case()
     ref = _reference(q, k, v, idx, SCALE)
     old = qsa_sparse_attention(q, k, v, idx, SCALE)
@@ -76,10 +102,16 @@ def test_matches_gather_kernel_and_reference():
 
 
 def test_gradients_match_gather_kernel():
+    # [FUNCTION DOC] Runs forward and backward (with a random output gradient) through the
+    # from-indices kernel and the gather kernel on a single-sequence case, and asserts the
+    # gradients of query, key and value each differ from each other by relative error under 1e-2.
     q, k, v, idx = _single_sequence_case()
     gout = torch.randn(q.shape, device="cuda", dtype=torch.bfloat16)
 
     def run(fn):
+        # [FUNCTION DOC] HELPER: Clones q, k, v as leaf tensors requiring grad, runs the given
+        # kernel with the selection indices and scale, back-propagates the output gradient and
+        # returns the three gradients.
         qq, kk, vv = (t.clone().requires_grad_(True) for t in (q, k, v))
         fn(qq, kk, vv, idx, SCALE).backward(gout)
         return qq.grad, kk.grad, vv.grad
@@ -91,6 +123,15 @@ def test_gradients_match_gather_kernel():
 
 @pytest.mark.parametrize("lens", [[301, 211], [61, 128]])
 def test_packed_boundary_not_a_multiple_of_the_block(lens):
+    # [FUNCTION DOC] Parametrized over two packed length lists. Builds random q, k, v for the
+    # concatenated tokens and per-token metadata: token base (sequence start), block base
+    # (cumulative block counts), position within the sequence, and per-block first and last token
+    # (last clipped to the sequence end). For each token picks up to 7 random earlier blocks plus
+    # its own block, sets those in a block-selection bitmap and builds a token index list (clipped
+    # to the sequence start and to the token itself). Runs the block-sparse kernel with these
+    # inputs and compares to the reference both overall and for the tail after the first
+    # sequence (relative error under 1e-2), then compares its gradients with those of the gather
+    # kernel for the same indices (each under 1e-2).
     """A sequence starting off the global block grid must not borrow its neighbour's blocks."""
     T = sum(lens)
     g = torch.Generator(device="cuda").manual_seed(0)
@@ -146,6 +187,10 @@ def test_packed_boundary_not_a_multiple_of_the_block(lens):
 
 
 def test_tile_index_pair_is_consistent_both_ways():
+    # [FUNCTION DOC] For a 256-token case, converts the selection to a block bitmap, builds the
+    # forward (key list per query tile) and backward (query list per key tile) tile index pair
+    # with tile sizes 64 and 32, and asserts the set of (query tile, key tile) pairs from the
+    # forward lists equals the set from the backward lists.
     q, k, v, idx = _single_sequence_case(T=256, budget=32)
     sel = selection_to_block_bitmap(idx, 256, BLK)
     block_first = torch.arange(sel.shape[1], dtype=torch.int32, device="cuda") * BLK

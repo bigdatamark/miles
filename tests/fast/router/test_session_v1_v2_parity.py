@@ -1,3 +1,12 @@
+# [MODULE DOC] Parity tests between the v1 and v2 session servers. A mock SGLang backend serves
+# scripted responses (keyed by marker text found in the prompt) to a batch of 16 scripted
+# agentic trajectories that include tool calls, rollbacks/retries, system reminders, user
+# follow-ups and assistant-carried input. The tests assert that the v2 server yields training
+# samples bitwise equal to v1's, that an aborted generation is not committed, and that the
+# bitwise sample comparator is sensitive to signed zero and to exported turn arguments.
+# Module constants: model name, batch size 16, nine backend requests per trajectory, the table of
+# scripted responses (each tagged with a distinct weight version) and the list of weight versions
+# expected to be selected into the samples.
 import uuid
 from copy import deepcopy
 
@@ -70,7 +79,13 @@ _SELECTED_WEIGHT_VERSIONS = ["w0", "w1", "w2", "w3", "w4", "w7", "w8"]
 
 @pytest.mark.parametrize("version", [V1, V2])
 def test_aborted_generation_is_not_committed(version):
+    # [FUNCTION DOC] For each server version: starts a mock backend whose generation always ends
+    # with an abort finish reason, serves a session on it, creates a session over HTTP and posts a
+    # one-message chat request. Asserts the response is HTTP 503 with the body "upstream
+    # generation aborted before completion" and that the session afterwards has no records.
     def abort_generation(_prompt: str) -> ProcessResult:
+        # [FUNCTION DOC] HELPER: Mock generation callback; ignores the prompt and returns a
+        # partial text with the abort finish reason.
         return ProcessResult(text="partial response", finish_reason="abort")
 
     with with_mock_server(model_name=_MODEL, process_fn=abort_generation) as backend:
@@ -91,10 +106,19 @@ def test_aborted_generation_is_not_committed(version):
 
 @pytest.mark.parametrize("random_tool_ids", [False, True])
 def test_agentic_v2_same_prompt_retries_match_v1_training_payload_bitwise(random_tool_ids, monkeypatch):
+    # [FUNCTION DOC] Optionally (parameter random_tool_ids) patches the mock server so every
+    # returned tool call gets a fresh random id. Runs the scripted agent batch against v1 and v2,
+    # then asserts both produce 16 runs and, per index: the first sample's index and rollout id
+    # equal the position, the per-call weight-version spans equal the expected selected versions
+    # (one version per call) for both versions, and the full retry-trajectory parity check
+    # passes. The patch is undone by monkeypatch at test end.
     if random_tool_ids:
         original = MockSGLangServer._compute_chat_completions_response
 
         def response_with_random_tool_ids(self, payload):
+            # [FUNCTION DOC] HELPER: Wraps the original mock chat-completion computation and
+            # overwrites each choice's tool call ids with a call_ prefix plus a random 32-hex
+            # token; returns the modified response.
             response = original(self, payload)
             for choice in response["choices"]:
                 for call in choice["message"].get("tool_calls") or []:
@@ -121,6 +145,8 @@ def test_agentic_v2_same_prompt_retries_match_v1_training_payload_bitwise(random
 
 
 def test_sample_bitwise_comparator_distinguishes_signed_zero():
+    # [FUNCTION DOC] Comparing samples with rewards 0.0 and negative 0.0 must raise an assertion
+    # error saying the reward is not bitwise equal.
     with pytest.raises(AssertionError, match="sample.reward is not bitwise equal"):
         assert_sample_bitwise_equal(Sample(reward=0.0), Sample(reward=-0.0))
 
@@ -134,6 +160,10 @@ def test_sample_bitwise_comparator_distinguishes_signed_zero():
     ],
 )
 def test_turn_args_parity_checks_exported_request_values(path, value):
+    # [FUNCTION DOC] Parametrized over (key path, new value) cases: a tool function name, a chat
+    # template kwarg and the temperature (0 versus 1). Builds sample metadata holding turn args,
+    # deep-copies it, changes the value at the path in the copy, and asserts the bitwise sample
+    # comparator, using the training metadata projection, raises an assertion error.
     metadata = {
         "turn_args": {
             "tools": [{"type": "function", "function": {"name": "get_weather"}}],
@@ -153,6 +183,13 @@ def test_turn_args_parity_checks_exported_request_values(path, value):
 
 
 def _run_scripted_agents(version: str):
+    # [FUNCTION DOC] HELPER: Runs the scripted agentic retry trajectories for the given server
+    # version. Builds 16 input samples (index and rollout id equal to position, initial messages
+    # as prompt, reward 0.25, metadata marking the source as parity), starts a mock backend with a
+    # 0.05 second latency and the prompt-keyed response function, and runs the trajectories.
+    # Asserts the backend logged 16 times nine requests, that all requests carried the shared
+    # parity seed, and that all 16 trajectories were in flight concurrently. Returns the
+    # per-trajectory results.
     input_samples = [
         Sample(
             index=index,
@@ -177,6 +214,11 @@ def _run_scripted_agents(version: str):
 
 
 def _process_agent_prompt(prompt: str) -> ProcessResult:
+    # [FUNCTION DOC] HELPER: Mock backend callback choosing a scripted response by marker text
+    # found in the rendered prompt, checked in this priority order: assistant-input follow-up,
+    # force-final, system reminder (retry response), second tool result (Shanghai result), user
+    # follow-up (Shanghai call), first tool result (Beijing result); otherwise the initial
+    # response. Returns the matching scripted result.
     if ASSISTANT_INPUT_FOLLOWUP_TEXT in prompt:
         return _AGENT_RESPONSES["assistant_input"]
     if FORCE_FINAL_TEXT in prompt:

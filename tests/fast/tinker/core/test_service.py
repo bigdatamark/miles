@@ -1,3 +1,15 @@
+# [MODULE DOC] Behavior tests of the tinker gateway service (core dispatch logic) over a fake
+# backend with two adapter slots, using the shared service fixture (a running service) and the
+# harness builders. Covers: idempotent resubmission by sequence id; two-phase model creation and
+# slot accounting; user error mapping (no free slots, wrong base model, illegal sequence id,
+# unsupported LoRA settings, unknown session); ordering of out-of-order chunks with optimizer
+# barriers; failure isolation (a failed training batch or failed step retires only that model and
+# frees or quarantines its slot; read-only failures keep queued training); checkpoint save/load
+# round trips, overwrite rules, traversal-name rejection, tenant ownership and metadata checks;
+# sampler checkpoint publication, naming, versioning and sampling resolution independent of the
+# lease; lease expiry reclaiming tenants while checkpoints outlive them; admission validation of
+# loss inputs and sample counts; and dispatcher shutdown behavior on unknown failures, dead
+# trainers and cancellation. Helper at module level builds an optimizer payload.
 """The service preserves request ordering, tenant isolation, and failure isolation."""
 
 import asyncio
@@ -21,10 +33,15 @@ from miles.tinker.core.utils import resolve_checkpoint_dir, resolve_sampler_chec
 
 
 def _optim_payload(model_id: str, seq_id: int) -> dict:
+    # [FUNCTION DOC] HELPER: Builds an optimizer-step payload mapping with the model id, sequence
+    # id and a copy of the default Adam parameters.
     return {"model_id": model_id, "seq_id": seq_id, "adam_params": dict(ADAM)}
 
 
 async def test_resubmitted_seq_id_reuses_the_future_and_runs_once(service):
+    # [FUNCTION DOC] Submitting the same forward/backward payload twice returns the same request
+    # id; after it completes (state done), a third submission still returns that id, and the
+    # backend ran forward/backward exactly once.
     model_id = await created_model(service)
     payload = fb_payload(model_id, 1, [datum()])
 
@@ -39,6 +56,9 @@ async def test_resubmitted_seq_id_reuses_the_future_and_runs_once(service):
 
 
 async def test_create_model_is_two_phase(service):
+    # [FUNCTION DOC] Creating a model with LoRA rank 8 returns a request id and model id
+    # immediately; the future later resolves with the create-model result naming that model, the
+    # backend's slot load received rank 8, and the model is registered in the service.
     request_id, model_id = service.create_model("tenant", model_payload(service, lora_config={"rank": 8}))
 
     future = await await_settled(service, "tenant", request_id)
@@ -48,6 +68,9 @@ async def test_create_model_is_two_phase(service):
 
 
 async def test_failed_slot_init_returns_the_slot(service):
+    # [FUNCTION DOC] If the backend's slot load fails (error mapping), the creation future is
+    # failed with category server, the model is not registered, and the set of free slots is
+    # unchanged.
     free_before = set(service.free_slots)
     service.backend.fail_next = {"error": "init blew up"}
     request_id, model_id = service.create_model("tenant", model_payload(service))
@@ -59,6 +82,8 @@ async def test_failed_slot_init_returns_the_slot(service):
 
 
 async def test_no_free_slots_is_a_user_error(service):
+    # [FUNCTION DOC] After creating as many models as there are slots, one more creation raises a
+    # user input error saying there are no free adapter slots.
     for _ in range(service.config.n_slots):
         await created_model(service)
     with pytest.raises(UserInputError, match="no free adapter slots"):
@@ -66,11 +91,17 @@ async def test_no_free_slots_is_a_user_error(service):
 
 
 async def test_the_wrong_base_model_is_rejected(service):
+    # [FUNCTION DOC] Creating a model for a different base model raises a user input error whose
+    # message mentions what the service serves.
     with pytest.raises(UserInputError, match="serves"):
         service.create_model("tenant", model_payload(service, base_model="other"))
 
 
 async def test_out_of_order_chunks_complete_and_the_barrier_waits(service):
+    # [FUNCTION DOC] Submits optimizer step 3, then forward/backward 2; after 50 ms the optimizer
+    # step has not run (it waits for earlier operations). Submitting forward/backward 1 lets all
+    # three finish with state done, and in the backend's call order the optimizer step comes after
+    # every forward/backward call.
     model_id = await created_model(service)
 
     optim = service.submit("tenant", "optim_step", _optim_payload(model_id, 3))
@@ -87,6 +118,9 @@ async def test_out_of_order_chunks_complete_and_the_barrier_waits(service):
 
 
 async def test_admission_failure_terminates_the_training_model_queue(service):
+    # [FUNCTION DOC] A forward/backward request with a datum longer than the configured maximum
+    # tokens per datum fails; afterwards submitting further training to that model raises a user
+    # input error telling to create a new model.
     model_id = await created_model(service)
 
     oversized = service.submit(
@@ -99,6 +133,8 @@ async def test_admission_failure_terminates_the_training_model_queue(service):
 
 
 async def test_forward_backward_outputs_align_to_datums(service):
+    # [FUNCTION DOC] A request with datums of 2 and 5 target tokens yields outputs whose logprob
+    # lists have lengths 2 and 5, in datum order.
     model_id = await created_model(service)
     request_id = service.submit("tenant", "forward_backward", fb_payload(model_id, 1, [datum(2), datum(5)]))
 
@@ -107,6 +143,8 @@ async def test_forward_backward_outputs_align_to_datums(service):
 
 
 async def test_optim_step_returns_the_slot_grad_norm(service):
+    # [FUNCTION DOC] After a forward/backward and an optimizer step, the step result's metrics
+    # equal the fake backend's gradient norm for the model's slot (0.5 plus slot number).
     model_id = await created_model(service)
     slot = service.models[model_id].slot
     service.submit("tenant", "forward_backward", fb_payload(model_id, 1, [datum()]))
@@ -117,6 +155,10 @@ async def test_optim_step_returns_the_slot_grad_norm(service):
 
 
 async def test_save_then_load_roundtrip_paths(service):
+    # [FUNCTION DOC] Saves state named ckpt (no overwrite): the result path is the tinker-scheme
+    # path model/weights/ckpt. Loading that path without the optimizer finishes done and the
+    # backend's last slot load had the optimizer flag false and the resolved on-disk checkpoint
+    # path under the checkpoint root.
     model_id = await created_model(service)
     save = service.submit(
         "tenant", "save_state", {"model_id": model_id, "seq_id": 1, "name": "ckpt", "overwrite": False}
@@ -135,6 +177,9 @@ async def test_save_then_load_roundtrip_paths(service):
 
 
 async def test_sampler_save_publishes_successive_versions(service):
+    # [FUNCTION DOC] Two sampler-weight saves with sequence ids 1 and 2 return paths ending in
+    # sampler_weights/1 and /2; the backend's two slot exports went to the matching on-disk
+    # sampler-weights version directories.
     model_id = await created_model(service)
     for seq_id in (1, 2):
         request_id = service.submit("tenant", "save_weights_for_sampler", {"model_id": model_id, "seq_id": seq_id})
@@ -147,6 +192,9 @@ async def test_sampler_save_publishes_successive_versions(service):
 
 
 async def test_sampling_resolves_against_the_saved_version(service):
+    # [FUNCTION DOC] After a sampler save, submitting a sample request for 2 samples with that
+    # path returns a request id and two sequence ids; the future holds two sequences and the
+    # backend's sample call used the adapter name model-id at version 1.
     model_id = await created_model(service)
     save = service.submit("tenant", "save_weights_for_sampler", {"model_id": model_id, "seq_id": 1})
     sampler_path = (await await_settled(service, "tenant", save)).result["path"]
@@ -169,6 +217,8 @@ async def test_sampling_resolves_against_the_saved_version(service):
 
 
 async def test_sampler_requests_carry_the_published_checkpoint_path(service):
+    # [FUNCTION DOC] After a sampler save, the export went to the on-disk version-1 directory, and
+    # the later sample call's adapter path is that same directory.
     model_id = await created_model(service)
     request_id = service.submit("tenant", "save_weights_for_sampler", {"model_id": model_id, "seq_id": 1})
     path = (await await_settled(service, "tenant", request_id)).result["path"]
@@ -192,6 +242,9 @@ async def test_sampler_requests_carry_the_published_checkpoint_path(service):
 
 
 async def test_sample_failure_preserves_the_snapshot_and_training_model_queue(service):
+    # [FUNCTION DOC] After a sampler save, makes the backend's next sample fail with engine down;
+    # the sample future fails with that error text, the saved sampler checkpoint still resolves
+    # to the same adapter name, and a later forward/backward on the model still completes.
     model_id = await created_model(service)
     request_id = service.submit("tenant", "save_weights_for_sampler", {"model_id": model_id, "seq_id": 1})
     future = await await_settled(service, "tenant", request_id)
@@ -226,6 +279,10 @@ async def test_sample_failure_preserves_the_snapshot_and_training_model_queue(se
 
 
 async def test_lease_expiry_reclaims_the_tenant(service):
+    # [FUNCTION DOC] Creates a session and model, completes an optimizer step, then queues a
+    # gapped (sequence 3) forward/backward that stays queued. Ages the session heartbeat beyond
+    # the lease timeout and runs the expiry sweep: the model is removed, its slot returns to the
+    # free pool, the backend unloaded exactly that slot, and the stale queued future is failed.
     session_id = service.create_session("tenant")
     model_id = await created_model(service, session_id=session_id)
     slot = service.models[model_id].slot
@@ -243,6 +300,7 @@ async def test_lease_expiry_reclaims_the_tenant(service):
 
 
 async def test_a_fresh_heartbeat_keeps_the_model(service):
+    # [FUNCTION DOC] After a heartbeat for the session, the expiry sweep keeps the model.
     session_id = service.create_session("tenant")
     model_id = await created_model(service, session_id=session_id)
 
@@ -254,6 +312,9 @@ async def test_a_fresh_heartbeat_keeps_the_model(service):
 
 @pytest.mark.parametrize("name", ["../evil", "a/b", "..", ".hidden"], ids=["parent", "slash", "dotdot", "hidden"])
 async def test_traversal_checkpoint_names_are_rejected(service, name):
+    # [FUNCTION DOC] Parametrized over names with parent references, slashes, dot-dot and a
+    # hidden name: saving state under such a name fails with category user and an error about an
+    # invalid checkpoint path segment, and the backend's save is never called.
     model_id = await created_model(service)
     request_id = service.submit(
         "tenant", "save_state", {"model_id": model_id, "seq_id": 1, "name": name, "overwrite": False}
@@ -265,6 +326,8 @@ async def test_traversal_checkpoint_names_are_rejected(service, name):
 
 
 async def test_traversal_sampler_paths_are_rejected(service):
+    # [FUNCTION DOC] A sample request whose model path climbs out of the weights directory with
+    # parent references raises a user input error.
     model_id = await created_model(service)
     with pytest.raises(UserInputError):
         service.submit_sample(
@@ -281,6 +344,11 @@ async def test_traversal_sampler_paths_are_rejected(service):
 
 
 async def test_expired_result_on_resubmit_fails_instead_of_410(service, monkeypatch):
+    # [FUNCTION DOC] Completes a forward/backward, patches the finished-result lifetime negative
+    # so the result ages out (retrieval gives none), and resubmits the same command: it gets a
+    # different request id. With the lifetime restored, the new future is failed with category
+    # user and an expired message, and the backend's forward/backward ran only once (an executed
+    # command never re-runs).
     from miles.tinker.core import future as future_module
 
     model_id = await created_model(service)
@@ -299,6 +367,9 @@ async def test_expired_result_on_resubmit_fails_instead_of_410(service, monkeypa
 
 
 async def test_save_state_refuses_to_overwrite_unless_asked(service):
+    # [FUNCTION DOC] Saving state name ckpt succeeds; saving the same name again without
+    # overwrite fails with category user and a message mentioning overwrite; saving with
+    # overwrite set succeeds.
     model_id = await created_model(service)
     payload = {"model_id": model_id, "name": "ckpt", "overwrite": False}
     first = service.submit("tenant", "save_state", payload | {"seq_id": 1})
@@ -314,6 +385,9 @@ async def test_save_state_refuses_to_overwrite_unless_asked(service):
 
 
 async def test_checkpoints_outlive_the_lease(service):
+    # [FUNCTION DOC] Saves state, expires the session lease (heartbeat set far in the past) so the
+    # model is reclaimed, then creates a new session and model and loads the saved path with the
+    # optimizer: the load finishes done.
     session_id = service.create_session("tenant")
     model_id = await created_model(service, session_id=session_id)
     save = service.submit(
@@ -332,6 +406,9 @@ async def test_checkpoints_outlive_the_lease(service):
 
 
 async def test_a_foreign_tenants_checkpoint_does_not_load(service):
+    # [FUNCTION DOC] Tenant "tenant" saves state; tenant "thief" with its own model tries to load
+    # that path: the future fails with category user and an error about the checkpoint not
+    # belonging to the tenant.
     model_id = await created_model(service)
     save = service.submit(
         "tenant", "save_state", {"model_id": model_id, "seq_id": 1, "name": "mine", "overwrite": False}
@@ -348,6 +425,9 @@ async def test_a_foreign_tenants_checkpoint_does_not_load(service):
 
 
 async def test_a_failed_batch_terminates_the_model_queue(service):
+    # [FUNCTION DOC] With two queued forward/backward requests and the backend failing the next
+    # call, both futures fail (the failed accumulation terminates training), the model is removed
+    # and its slot unloaded.
     model_id = await created_model(service)
     first = service.submit("tenant", "forward_backward", fb_payload(model_id, 1, [datum(), datum()]))
     second = service.submit("tenant", "forward_backward", fb_payload(model_id, 2, [datum()]))
@@ -361,6 +441,9 @@ async def test_a_failed_batch_terminates_the_model_queue(service):
 
 
 async def test_merged_optim_settles_each_slot_on_its_own(service):
+    # [FUNCTION DOC] Two models' optimizer steps merge in one backend call; the second model's
+    # slot is configured to return an error. The first future is done with a gradient norm
+    # metric; the second fails with category server and an error containing boom.
     model_a = await created_model(service)
     model_b = await created_model(service)
     slot_b = service.models[model_b].slot
@@ -375,6 +458,8 @@ async def test_merged_optim_settles_each_slot_on_its_own(service):
 
 
 async def test_a_nonfinite_step_reports_the_skip(service):
+    # [FUNCTION DOC] If the backend reports a skipped-nonfinite outcome for the slot, the optimizer
+    # step future is done and its metrics are exactly that skipped marker.
     model_id = await created_model(service)
     slot = service.models[model_id].slot
     service.backend.optim_outcomes[slot] = {"skipped_nonfinite": 1.0}
@@ -385,6 +470,8 @@ async def test_a_nonfinite_step_reports_the_skip(service):
 
 
 async def test_num_samples_is_capped(service):
+    # [FUNCTION DOC] After a sampler save, a sample request with one more than the configured
+    # maximum samples per request raises a user input error.
     model_id = await created_model(service)
     version = service.submit("tenant", "save_weights_for_sampler", {"model_id": model_id, "seq_id": 1})
     path = (await await_settled(service, "tenant", version)).result["path"]
@@ -403,6 +490,10 @@ async def test_num_samples_is_capped(service):
 
 
 async def test_malformed_loss_inputs_are_rejected_at_admission(service):
+    # [FUNCTION DOC] Four malformed cases (unknown loss name, missing required input, wrong input
+    # length, an input that the loss never reads such as weights with an importance sampling
+    # loss). For each, a fresh model is created and the request submitted; each future fails with
+    # category user. Finally the backend's forward/backward was never called.
     cases = {
         "unknown loss_fn": {"loss_fn": "made_up", "datums": [datum()]},
         "missing input": {"loss_fn": "importance_sampling", "datums": [datum()]},
@@ -430,6 +521,11 @@ async def test_malformed_loss_inputs_are_rejected_at_admission(service):
 
 
 async def test_a_failed_window_stops_already_queued_training(service):
+    # [FUNCTION DOC] One model completes a forward/backward; then the backend is set to fail the
+    # next call and four more commands are queued (forward/backward, step, forward/backward,
+    # step). All four fail, the earlier result stays done, no optimizer step reached the backend,
+    # the backend saw two forward/backward calls, further training on the model raises the create
+    # a new model user error, and a healthy second model's step still completes.
     model_id = await created_model(service)
     healthy = await created_model(service)
     early = service.submit("tenant", "forward_backward", fb_payload(model_id, 1, [datum()]))
@@ -452,6 +548,9 @@ async def test_a_failed_window_stops_already_queued_training(service):
 
 
 async def test_unsupported_lora_configs_are_rejected(service):
+    # [FUNCTION DOC] Creating a model with a LoRA seed, with unembed training, or with MLP
+    # training disabled raises a user input error; the supported combination (rank 8, attention
+    # and MLP trained, unembed not) is accepted and registered.
     for lora_config in ({"rank": 8, "seed": 7}, {"rank": 8, "train_unembed": True}, {"rank": 8, "train_mlp": False}):
         with pytest.raises(UserInputError):
             service.create_model("tenant", model_payload(service, lora_config=lora_config))
@@ -464,6 +563,12 @@ async def test_unsupported_lora_configs_are_rejected(service):
 
 @pytest.mark.parametrize("expire_lease", [False, True])
 async def test_sampler_paths_resolve_independently_of_the_lease(service, expire_lease):
+    # [FUNCTION DOC] Parametrized on whether the lease is expired first. After a sampler save
+    # (and optional lease expiry that removes the model and a new session), resolving the sampler
+    # path for the owning tenant gives adapter name model-id at version 1 and a path ending in
+    # the version directory; another tenant gets a user input or ownership error; and after
+    # changing the service's base model to a different one, resolution raises a user input error
+    # mentioning base_model. Mutates the service config in place.
     session_id = service.create_session("tenant")
     model_id = await created_model(service, session_id=session_id)
     save = service.submit("tenant", "save_weights_for_sampler", {"model_id": model_id, "seq_id": 1})
@@ -486,6 +591,9 @@ async def test_sampler_paths_resolve_independently_of_the_lease(service, expire_
 
 
 async def test_an_unnamed_sampler_save_returns_a_sampling_session(service):
+    # [FUNCTION DOC] A sampler save with no sampler path returns a sampling session id in its
+    # result, registered on the service for the tenant with the result's path; a sampler save with
+    # a name returns no sampling session id.
     model_id = await created_model(service)
     unnamed = service.submit(
         "tenant", "save_weights_for_sampler", {"model_id": model_id, "seq_id": 1, "sampler_path": None}
@@ -501,6 +609,10 @@ async def test_an_unnamed_sampler_save_returns_a_sampling_session(service):
 
 
 async def test_weights_info_reads_the_checkpoint_not_the_lease(service):
+    # [FUNCTION DOC] After saving state and deleting the model from the service, the weights info
+    # for the path returns base model, is-LoRA true, rank 8, attention and MLP trained and
+    # unembed not trained (read from the checkpoint metadata); another tenant gets an ownership
+    # error.
     model_id = await created_model(service)
     save = service.submit(
         "tenant", "save_state", {"model_id": model_id, "seq_id": 1, "name": "ck", "overwrite": False}
@@ -522,6 +634,9 @@ async def test_weights_info_reads_the_checkpoint_not_the_lease(service):
 
 
 async def test_a_failed_optim_step_retires_the_model(service):
+    # [FUNCTION DOC] With the slot's optimizer outcome set to an error, the step future fails with
+    # that message; the model is removed, its slot is free and was unloaded, and a later step on
+    # the model raises a user input error telling to restore from a checkpoint.
     model_id = await created_model(service)
     slot = service.models[model_id].slot
     service.backend.optim_outcomes[slot] = {"error": "slot update rejected"}
@@ -538,6 +653,9 @@ async def test_a_failed_optim_step_retires_the_model(service):
 
 
 async def test_an_out_of_order_validation_failure_blocks_later_training(service):
+    # [FUNCTION DOC] Submits step 3, then an invalid forward/backward 2 (unknown loss, no datums),
+    # then valid forward/backward 1. Sequence 1 completes, 2 and 3 fail, and the backend ran only
+    # one forward/backward and no optimizer step.
     model_id = await created_model(service)
     step = service.submit("tenant", "optim_step", _optim_payload(model_id, 3))
     rejected = service.submit("tenant", "forward_backward", fb_payload(model_id, 2, [], loss_fn="unknown"))
@@ -550,6 +668,9 @@ async def test_an_out_of_order_validation_failure_blocks_later_training(service)
 
 
 async def test_a_backend_level_optim_failure_retires_every_model_in_the_barrier(service):
+    # [FUNCTION DOC] With the whole optimizer call set to fail, two models' merged steps both fail
+    # with a message about restoring from a checkpoint; both models are removed with two slot
+    # unloads; a new model can still be created afterwards (the dispatch loop survived).
     model_a = await created_model(service)
     model_b = await created_model(service)
     service.backend.fail_on["optim_step"] = {"error": "slot updates rejected"}
@@ -567,6 +688,9 @@ async def test_a_backend_level_optim_failure_retires_every_model_in_the_barrier(
 
 
 async def test_a_failed_unload_keeps_the_slot_out_of_the_free_pool(service):
+    # [FUNCTION DOC] With the backend's unload set to fail, expiring the session removes the model
+    # but the slot stays out of the free pool (it is dirty); a second sweep still runs without
+    # error.
     session_id = service.create_session("tenant")
     model_id = await created_model(service, session_id=session_id)
     slot = service.models[model_id].slot
@@ -581,6 +705,9 @@ async def test_a_failed_unload_keeps_the_slot_out_of_the_free_pool(service):
 
 
 async def test_a_named_sampler_save_uses_the_name_and_rejects_reuse(service):
+    # [FUNCTION DOC] A sampler save with name v1 returns path model/sampler_weights/v1 without a
+    # sampling session id; sampling from it uses adapter name model-id at v1; saving again with
+    # the same name fails with a message that it already exists (saved versions are immutable).
     model_id = await created_model(service)
     save = service.submit(
         "tenant", "save_weights_for_sampler", {"model_id": model_id, "seq_id": 1, "sampler_path": "v1"}
@@ -611,6 +738,10 @@ async def test_a_named_sampler_save_uses_the_name_and_rejects_reuse(service):
 
 
 async def test_checkpoint_meta_stores_a_digest_not_the_credential(service):
+    # [FUNCTION DOC] After saving state, reads the checkpoint's metadata file as JSON and asserts
+    # it contains no entry for the tenant name, that the stored tenant digest differs from the
+    # tenant name (the bearer credential is not persisted), and that weights info reports
+    # attention and MLP trained and unembed not.
     import json
     import os
 
@@ -629,6 +760,9 @@ async def test_checkpoint_meta_stores_a_digest_not_the_credential(service):
 
 
 async def test_a_checkpoint_saved_under_other_settings_does_not_load(service):
+    # [FUNCTION DOC] Saves state, rewrites its metadata file with the LoRA alpha increased by
+    # one, then loads the checkpoint: the future fails with category user and an error mentioning
+    # lora_alpha, and the backend's slot load was not called again (only the initial load exists).
     import json
     import os
 
@@ -653,6 +787,9 @@ async def test_a_checkpoint_saved_under_other_settings_does_not_load(service):
 
 
 async def test_a_recycled_slot_belongs_to_a_fresh_model_queue(service):
+    # [FUNCTION DOC] A model's batch fails (retiring it); then the lease expires so the slot is
+    # freed and the session removed. A new model takes the same slot; its forward/backward and
+    # optimizer step both complete (state done), showing the recycled slot has a fresh queue.
     session_id = service.create_session("tenant")
     model_id = await created_model(service, session_id=session_id)
     slot = service.models[model_id].slot
@@ -676,6 +813,14 @@ async def test_a_recycled_slot_belongs_to_a_fresh_model_queue(service):
 
 @pytest.mark.parametrize("source", ["handler", "worker", "create", "sweep", "export", "load"])
 async def test_an_unknown_failure_stops_the_dispatcher(tmp_path, source):
+    # [FUNCTION DOC] Parametrized over the failure source (handler, worker, create, sweep, export,
+    # load). Builds its own service (not the shared fixture) in the temporary directory and runs
+    # it as a task; creates a model; then injects an unexpected error: an IO error for export and
+    # load, a runtime error otherwise, delivered via the backend failure mapping (export, load,
+    # create, optimizer step) or by replacing the barrier handler with a raising coroutine, or via
+    # a failed unload during a forced lease sweep run as an observed background task. Asserts the
+    # dispatcher task finishes (2 second timeout) by raising that same error type and message.
+    # In cleanup cancels the run task if still running.
     from tests.fast.tinker.harness import make_service
 
     gateway = make_service(tmp_path)
@@ -710,6 +855,8 @@ async def test_an_unknown_failure_stops_the_dispatcher(tmp_path, source):
             if source == "handler":
 
                 async def broken_handler(unit):
+                    # [FUNCTION DOC] HELPER: Async stand-in for the barrier handler; ignores the
+                    # unit and always raises a runtime error saying fatal execution failure.
                     raise RuntimeError("fatal execution failure")
 
                 gateway._run_barrier = broken_handler
@@ -726,12 +873,17 @@ async def test_an_unknown_failure_stops_the_dispatcher(tmp_path, source):
 
 
 async def test_a_dead_trainer_escapes_the_dispatch_loop(tmp_path, monkeypatch):
+    # [FUNCTION DOC] Runs its own service as a task and creates a model; replaces the backend's
+    # trainer-dead check with one returning true (reverted by monkeypatch) and submits a
+    # forward/backward. The dispatcher task must end within 2 seconds by raising a runtime error
+    # saying the trainer workers died. Cleanup cancels the task if still running.
     gateway = make_service(tmp_path)
     run_task = asyncio.create_task(gateway.run())
     try:
         model_id = await created_model(gateway)
 
         async def _dead() -> bool:
+            # [FUNCTION DOC] HELPER: Async fake health check that always reports the trainer dead.
             return True
 
         monkeypatch.setattr(gateway.backend, "trainer_dead", _dead)
@@ -746,6 +898,8 @@ async def test_a_dead_trainer_escapes_the_dispatch_loop(tmp_path, monkeypatch):
 
 
 async def test_a_retried_create_model_returns_the_first_allocation(service):
+    # [FUNCTION DOC] Creating a model twice with the same payload returns an equal result (request
+    # id and model id) and only one slot load reaches the backend.
     """A network retry must not occupy a second slot."""
     payload = model_payload(service)
     first = service.create_model("tenant", payload)
@@ -755,16 +909,23 @@ async def test_a_retried_create_model_returns_the_first_allocation(service):
 
 
 async def test_an_unknown_session_is_rejected(service):
+    # [FUNCTION DOC] Creating a model for a nonexistent session id raises a user input error
+    # saying unknown session.
     with pytest.raises(UserInputError, match="unknown session"):
         service.create_model("tenant", model_payload(service, session_id="session-gone"))
 
 
 async def test_a_retried_sampling_session_returns_the_same_id(service):
+    # [FUNCTION DOC] Creating a sampling session twice with the same session id and sampling
+    # session sequence id returns equal results.
     payload = {"session_id": service.create_session("tenant"), "sampling_session_seq_id": 1}
     assert service.create_sampling_session("tenant", payload) == service.create_sampling_session("tenant", payload)
 
 
 async def test_a_retried_sample_does_not_sample_again(service):
+    # [FUNCTION DOC] Creates a sampling session from a saved sampler path, submits a sample
+    # request, and resubmits the identical request: the result (request id and sequence ids) is
+    # equal, and the backend's sample ran exactly once.
     model_id = await created_model(service)
     save = service.submit("tenant", "save_weights_for_sampler", {"model_id": model_id, "seq_id": 1})
     path = (await await_settled(service, "tenant", save)).result["path"]
@@ -785,6 +946,7 @@ async def test_a_retried_sample_does_not_sample_again(service):
 
 
 async def test_an_illegal_seq_id_is_rejected(service):
+    # [FUNCTION DOC] An optimizer step with sequence id 0 raises a user input error mentioning seq_id.
     """seq_id 0 would never enter the ordered model queue; every future would pend."""
     model_id = await created_model(service)
     with pytest.raises(UserInputError, match="seq_id"):
@@ -792,6 +954,8 @@ async def test_an_illegal_seq_id_is_rejected(service):
 
 
 async def test_an_expired_lease_sweeps_its_sessions(service):
+    # [FUNCTION DOC] After a session's heartbeat is set far in the past and the sweep runs,
+    # creating a model on that session raises a user input error saying unknown session.
     session_id = service.create_session("tenant")
     service.sessions[session_id].last_heartbeat = -1e9
     await service._expire_sessions()
@@ -800,12 +964,16 @@ async def test_an_expired_lease_sweeps_its_sessions(service):
 
 
 async def test_a_sampling_session_for_another_base_model_is_rejected(service):
+    # [FUNCTION DOC] Creating a sampling session naming a different base model raises a user input
+    # error mentioning what the service serves.
     payload = {"session_id": service.create_session("tenant"), "sampling_session_seq_id": 1, "base_model": "other"}
     with pytest.raises(UserInputError, match="serves"):
         service.create_sampling_session("tenant", payload)
 
 
 async def test_a_read_only_batch_failure_preserves_queued_training(service):
+    # [FUNCTION DOC] With the backend's forward-only set to fail, a forward-only request fails
+    # while the queued forward/backward and optimizer step both complete (done).
     model_id = await created_model(service)
     service.backend.fail_on["forward_only"] = {"error": "request rejected"}
     readonly = service.submit("tenant", "forward_only", fb_payload(model_id, 1, [datum()]))
@@ -818,15 +986,27 @@ async def test_a_read_only_batch_failure_preserves_queued_training(service):
 
 @pytest.mark.parametrize("shutdown", ["cancel", "failure"])
 async def test_dispatcher_shutdown_stops_model_creation_and_sampling(tmp_path, monkeypatch, shutdown):
+    # [FUNCTION DOC] Parametrized over cancelling the dispatcher or making its lease sweeper fail.
+    # Builds its own service; replaces the backend's slot load and sample with calls that block
+    # forever (recording their tasks) and the lease sweeper with one that raises after an event.
+    # Starts the dispatcher, starts a model creation and a sample submission, waits (2 seconds
+    # each) for both backend calls to start, then either cancels the dispatcher (expecting a
+    # cancellation error) or triggers the sweeper failure (expecting its runtime error). Asserts
+    # both blocked backend tasks are done afterwards (none outlives the dispatcher). Cleanup
+    # cancels and gathers all tasks.
     gateway = make_service(tmp_path)
     started = asyncio.Queue()
     fail_sweep = asyncio.Event()
 
     async def blocked_backend_call(*args):
+        # [FUNCTION DOC] HELPER: Async fake backend call; records the current task in the queue
+        # then blocks forever on an event nobody sets.
         started.put_nowait(asyncio.current_task())
         await asyncio.Event().wait()
 
     async def _run_lease_sweeper():
+        # [FUNCTION DOC] HELPER: Async fake sweeper; waits for the trigger event then raises a
+        # runtime error saying the lease sweeper failed.
         await fail_sweep.wait()
         raise RuntimeError("lease sweeper failed")
 

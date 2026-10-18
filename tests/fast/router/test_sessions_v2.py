@@ -1,3 +1,11 @@
+# [MODULE DOC] HTTP-level tests for the v2 (tree serving) session server, run against a real
+# uvicorn-hosted v2 server in front of a mock SGLang backend. Covers request chat-template
+# kwargs, LoRA adapter pass-through, completion post-processing before commit, health identity,
+# indexer-replay wiring, concurrent sibling commits, rollback/retry pins that mirror the v1 pins
+# (with the v2 differences: deep divergence branches instead of failing, root divergence opens a
+# new root), truncated-generation and compaction handling, and routed-experts request offsets on
+# the tree. Module helpers build the server, patch replay payloads out of the mock meta info and
+# decode the packed samples reply.
 """HTTP tests for session server v2 (tree serving, --use-session-server v2).
 
 The v1 HTTP surface keeps its own modules (test_sessions.py untouched at
@@ -33,9 +41,18 @@ from miles.utils.test_utils.uvicorn_thread_server import UvicornThreadServer
 
 @contextmanager
 def _serve_router(extra_args: dict | None = None):
+    # [FUNCTION DOC] HELPER: Context manager that starts a mock backend echoing the prompt and a
+    # standalone v2 session server over it. Builds an argument namespace of defaults (30 second
+    # router timeout, Qwen3 0.6B checkpoint, thinking disabled, default TITO model, all replay
+    # features off, v2 server mode, random instance id, retract pause mode, the same-prompt-retry
+    # sample picker and default postprocessor), updated by the optional extra_args mapping. Computes
+    # the server config for a free port from 31000, serves it with uvicorn in a thread, yields a
+    # namespace with url and backend, and stops the server on exit.
     """A standalone v2 SessionServer with arg overrides."""
 
     def process_fn(prompt: str) -> ProcessResult:
+        # [FUNCTION DOC] HELPER: Mock generation callback echoing the prompt with a stop finish
+        # reason.
         return ProcessResult(text=f"echo: {prompt}", finish_reason="stop")
 
     with with_mock_server(process_fn=process_fn) as backend:
@@ -83,15 +100,24 @@ def _serve_router(extra_args: dict | None = None):
 
 @pytest.fixture(scope="class")
 def router_env():
+    # [FUNCTION DOC] HELPER: Class-scoped fixture. Patches the mock backend's chat-completion
+    # computation so each choice gets meta info (logprob/token-id pairs, completion count, fake
+    # routed-experts and indexer-top-k payloads), then yields the default v2 server environment.
+    # The patch is active for the fixture's lifetime.
     """v2 twin of test_sessions.router_env: same mock backend + R3 payloads,
     tree serving enabled."""
 
     def process_fn(prompt: str) -> ProcessResult:
+        # [FUNCTION DOC] HELPER: Unused here; defined but never passed to the server, which gets
+        # its own backend from the server-building helper.
+        # KNOWN ISSUE: dead code, this callback is never used.
         return ProcessResult(text=f"echo: {prompt}", finish_reason="stop")
 
     original_chat_response = MockSGLangServer._compute_chat_completions_response
 
     def patched_chat_response(self, payload: dict) -> dict:
+        # [FUNCTION DOC] HELPER: Calls the original computation and sets the first choice's meta
+        # info (logprob/token-id pairs, completion count, replay payloads); returns the response.
         response = original_chat_response(self, payload)
         choice = response["choices"][0]
         logprobs_content = choice["logprobs"]["content"]
@@ -113,7 +139,10 @@ def router_env():
 
 
 class TestRequestChatTemplateKwargs:
+    # [CLASS DOC] Tests that per-request chat-template kwargs override the launch defaults.
     def test_override_reaches_render_and_backend(self, router_env):
+        # [FUNCTION DOC] A request with no kwargs sends the launch default (thinking disabled) to
+        # the backend; a request enabling thinking sends the override and different input ids.
         default_session = _create_session(router_env.url)
         resp = _post_chat(router_env.url, default_session, {"messages": [{"role": "user", "content": "hi"}]})
         assert resp.status_code == 200
@@ -136,6 +165,8 @@ class TestRequestChatTemplateKwargs:
 
 
 def test_lora_adapter_reaches_backend():
+    # [FUNCTION DOC] With LoRA rank 8 configured, a chat request returns 200 and the backend
+    # request's lora path equals the standard adapter name.
     with _serve_router({"lora_rank": 8}) as env:
         session_id = _create_session(env.url)
         response = _post_chat(env.url, session_id, {"messages": [{"role": "user", "content": "hi"}]})
@@ -145,16 +176,28 @@ def test_lora_adapter_reaches_backend():
 
 
 def test_proxy_chat_postprocesses_completion_before_commit(router_env, monkeypatch):
+    # [FUNCTION DOC] Replaces the TITO completion post-processing hook with a recorder that adds a
+    # reasoning-content field to the client-visible choice message and returns a stored copy with
+    # an extra server-state field, and wraps the core's commit function to record the committed
+    # assistant message. After one request asserts: 200; the client message has the parsed
+    # reasoning content; no meta info in the client choice; exactly one hook call with non-empty
+    # completion ids; the committed message is the stored copy (with reasoning and server state);
+    # and the stored record's meta info equals the original choice's meta info. Patches are
+    # reverted by monkeypatch.
     calls = []
     committed_messages = []
     original_commit = session_core_v2.commit_generation
 
     def postprocess(self, *, choice, assistant_message, completion_token_ids):
+        # [FUNCTION DOC] HELPER: Records its arguments, mutates the choice's message to add
+        # reasoning content, and returns the message plus a server-state marker as the stored form.
         calls.append((choice, assistant_message, completion_token_ids))
         choice["message"] = {**assistant_message, "reasoning_content": "parsed"}
         return {**choice["message"], "_server_state": "stored"}
 
     def commit(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Records the assistant message keyword argument, then delegates to
+        # the original commit and returns its result.
         committed_messages.append(kwargs["assistant_message"])
         return original_commit(*args, **kwargs)
 
@@ -179,7 +222,10 @@ def test_proxy_chat_postprocesses_completion_before_commit(router_env, monkeypat
 
 
 class TestHealth:
+    # [CLASS DOC] Health route tests for the v2 server.
     def test_health_reports_configured_instance_id(self):
+        # [FUNCTION DOC] Serves a v2 server with a specific instance id; health returns 200 with
+        # status ok and that id.
         """The v2 core is built with config.instance_id, so /health echoes the configured identity."""
         with _serve_router({"session_server_instance_id": "v2-instance-under-test"}) as env:
             response = requests.get(f"{env.url}/health", timeout=5.0)
@@ -191,7 +237,10 @@ class TestHealth:
 
 
 class TestIndexerReplayWiring:
+    # [CLASS DOC] Tests that the indexer-replay launch flag controls the backend request flag.
     def test_indexer_replay_config_requests_indexer_topk_from_backend(self):
+        # [FUNCTION DOC] With indexer replay on, the backend request's return-indexer-top-k flag
+        # is true.
         """With indexer replay enabled, the upstream chat request asks for indexer topk."""
         with _serve_router({"use_rollout_indexer_replay": True}) as env:
             session_id = _create_session(env.url)
@@ -201,6 +250,8 @@ class TestIndexerReplayWiring:
             assert env.backend.request_log[-1]["return_indexer_topk"] is True
 
     def test_without_indexer_replay_the_backend_request_sends_false_indexer_topk(self, router_env):
+        # [FUNCTION DOC] With the default server, the backend request carries an explicit false
+        # return-indexer-top-k flag.
         """The flag comes from config rather than being hardcoded: a plain server sends an explicit False."""
         session_id = _create_session(router_env.url)
         response = _post_chat(router_env.url, session_id, {"messages": [{"role": "user", "content": "hi"}]})
@@ -210,10 +261,19 @@ class TestIndexerReplayWiring:
 
 
 def _keep_all_picker(leaf_samples, _session_metadata):
+    # [FUNCTION DOC] HELPER: Sample-picker replacement that ignores the session metadata and
+    # returns all leaf samples as a new list (no same-prompt-retry dropping).
     return list(leaf_samples)
 
 
 def test_concurrent_requests_from_same_parent_commit_siblings():
+    # [FUNCTION DOC] Temporarily registers the keep-all picker under the default picker path.
+    # Creates a session with a first turn, then sends two identical follow-up requests (user
+    # branch message after the assistant) concurrently from two threads; the backend handler is
+    # patched so each request waits until both have arrived (event with 5 second timeout), proving
+    # genuine concurrency. Asserts both return 200, the tree has the first node plus two children
+    # both with the first node as parent whose response ids equal the two returned ids, and the
+    # samples reply (200) contains one sample per response id by each sample's leaf metadata.
     """Successful concurrent generations from one parent are both collected."""
     picker_path = "miles.rollout.session.v2.picker_hub.drop_same_prompt_retries"
     with function_registry.temporary(picker_path, _keep_all_picker):
@@ -234,6 +294,10 @@ def test_concurrent_requests_from_same_parent_commit_siblings():
             release = None
 
             async def wait_for_pair(self, request, compute_fn):
+                # [FUNCTION DOC] HELPER: Async replacement for the mock backend's handler. Reads
+                # the JSON payload, logs it, lazily creates a shared event, counts the arrival and
+                # sets the event when the second request arrives, waits up to 5 seconds for it
+                # (timeout error otherwise), and returns the computed JSON response.
                 nonlocal arrivals, release
                 payload = await request.json()
                 self.request_log.append(payload)
@@ -266,6 +330,8 @@ def test_concurrent_requests_from_same_parent_commit_siblings():
 
 
 class TestRollbackPins:
+    # [CLASS DOC] v2 mirror of the v1 rollback pins at the HTTP layer. Class constants: U1 user
+    # question, T1 tool result for call t0, T1_DIFF a different tool result for the same call.
     """HTTP-level pins for the rollback dispatch surface (retry semantics).
 
     These lock today's behavior before the classify/apply split rewires the
@@ -279,14 +345,20 @@ class TestRollbackPins:
     T1_DIFF = {"role": "tool", "content": "tool-result-DIFFERENT", "tool_call_id": "t0"}
 
     def _turn(self, url: str, session_id: str, messages: list) -> dict:
+        # [FUNCTION DOC] HELPER: Posts the messages as a chat request, asserts HTTP 200, and
+        # returns the first choice's assistant message.
         resp = _post_chat(url, session_id, {"messages": messages})
         assert resp.status_code == 200
         return resp.json()["choices"][0]["message"]
 
     def _get(self, url: str, session_id: str) -> dict:
+        # [FUNCTION DOC] HELPER: Fetches the session over HTTP (5 second timeout) and returns its
+        # JSON body.
         return requests.get(f"{url}/sessions/{session_id}", timeout=5.0).json()
 
     def _two_turn_session(self, env) -> tuple[str, dict, dict]:
+        # [FUNCTION DOC] HELPER: Creates a session and runs two turns, asserting two records;
+        # returns the session id and both assistant messages.
         """Stored history after this: [U1, a1, T1, a2] with 2 records."""
         session_id = _create_session(env.url)
         a1 = self._turn(env.url, session_id, [self.U1])
@@ -295,6 +367,8 @@ class TestRollbackPins:
         return session_id, a1, a2
 
     def test_pure_drop_retry_rolls_back_and_regenerates(self, router_env):
+        # [FUNCTION DOC] Resending history without the last assistant returns 200; the served
+        # chain has two records, the last ending with the tool result.
         session_id, a1, _ = self._two_turn_session(router_env)
 
         retry = _post_chat(router_env.url, session_id, {"messages": [self.U1, a1, self.T1]})
@@ -305,6 +379,8 @@ class TestRollbackPins:
         assert records[-1]["request"]["messages"][-1] == self.T1
 
     def test_divergent_retry_rolls_back_and_continues(self, router_env):
+        # [FUNCTION DOC] A different tool result returns 200; two records, the last ending with
+        # the different tool result.
         session_id, a1, _ = self._two_turn_session(router_env)
 
         retry = _post_chat(router_env.url, session_id, {"messages": [self.U1, a1, self.T1_DIFF]})
@@ -315,6 +391,10 @@ class TestRollbackPins:
         assert records[-1]["request"]["messages"][-1] == self.T1_DIFF
 
     def test_deep_divergence_branches_and_keeps_both_lines(self, router_env):
+        # [FUNCTION DOC] With clean meta info, builds three generations, then sends a request
+        # diverging two generations back. Asserts 200, the served view has two records, the tree
+        # has four nodes with leaf path lengths of two and three, and the samples reply holds two
+        # samples whose lifecycle segments all have non-empty request timestamps.
         """Was the deep-rollback 400 pin: a divergence beyond one generation now
         branches at the deep anchor (200), the abandoned deep line stays in the
         tree, and the samples op emits BOTH lines (deep abandons are data)."""
@@ -346,6 +426,9 @@ class TestRollbackPins:
                 assert segments and all(seg["req_ts"] is not None for seg in segments)
 
     def test_root_divergence_opens_new_root(self, router_env):
+        # [FUNCTION DOC] With clean meta info, a second first-request with a different opening
+        # message returns 200; the served view has one record, the tree has two root nodes (no
+        # parent), and the samples reply holds two samples.
         """Was the no-anchor 400 pin: divergence inside the root delta now opens
         a second root (200); both roots produce samples."""
         with _clean_r3_meta():
@@ -367,12 +450,16 @@ class TestRollbackPins:
             assert len(_decode_samples_meta(samples.content)["samples"]) == 2
 
     def test_failed_first_turn_then_different_first_request_accepted(self, router_env):
+        # [FUNCTION DOC] With the backend rejecting with 400, the first request fails and no
+        # records exist; a different first request is then accepted (200) and is the only record.
         """A failed first turn records nothing, so a completely different first
         request is a fresh first turn and must be accepted — the empty-session
         accept-anything semantics that later dispatch rewrites must preserve."""
         session_id = _create_session(router_env.url)
 
         async def reject(self, request, compute_fn):
+            # [FUNCTION DOC] HELPER: Async stand-in for the backend handler; returns a 400 JSON
+            # error "context too long" regardless of input.
             return JSONResponse(content={"error": "context too long"}, status_code=400)
 
         with patch.object(MockSGLangServer, "_handle_generate_like_request", new=reject):
@@ -388,6 +475,7 @@ class TestRollbackPins:
         assert records[0]["request"]["messages"] == [other_first]
 
     def test_degenerate_extension_resend_exact_history(self, router_env):
+        # [FUNCTION DOC] Resending the exact stored history returns 200 and yields two records.
         session_id = _create_session(router_env.url)
         a1 = self._turn(router_env.url, session_id, [self.U1])
 
@@ -397,6 +485,9 @@ class TestRollbackPins:
         assert len(self._get(router_env.url, session_id)["records"]) == 2
 
     def test_disallowed_append_role_400_has_no_side_effect(self, router_env):
+        # [FUNCTION DOC] Appending a developer-role message returns 400 with an error ending in the
+        # statement that the TITO fixed template does not support appending this role; nothing was
+        # committed so the served chain keeps two records.
         session_id, a1, _ = self._two_turn_session(router_env)
 
         resp = _post_chat(
@@ -412,6 +503,9 @@ class TestRollbackPins:
         assert len(self._get(router_env.url, session_id)["records"]) == 2
 
     def test_collect_samples_after_rollback_single_sample(self, router_env):
+        # [FUNCTION DOC] With replay payloads removed from the mock meta info, runs two turns and a
+        # pure-drop retry (200), requests samples and decodes the reply: 200, no empty reason, one
+        # sample with positive response length and a loss mask as long as the response.
         from miles.rollout.session.samples.codec import decode_samples_and_merge_input_sample
         from miles.utils.types import Sample
 
@@ -421,6 +515,8 @@ class TestRollbackPins:
         fixture_response = MockSGLangServer._compute_chat_completions_response
 
         def clean_meta_response(mock_self, payload: dict) -> dict:
+            # [FUNCTION DOC] HELPER: Computes the normal response and drops the routed-experts and
+            # indexer-top-k entries from the first choice's meta info; returns it.
             response = fixture_response(mock_self, payload)
             meta = response["choices"][0]["meta_info"]
             meta.pop("routed_experts", None)
@@ -443,6 +539,8 @@ class TestRollbackPins:
         assert len(sample.loss_mask) == sample.response_length
 
     def test_few_shot_first_request_divergent_retry_rolls_back_cleanly(self, router_env):
+        # [FUNCTION DOC] Two-turn session from a few-shot prompt, then a divergent retry: returns
+        # 200 and the served chain has two records (not three).
         """Assistants carried by the first request are prompt, not checkpoints.
 
         Historically the rollback anchor math counted the few-shot assistant
@@ -469,12 +567,18 @@ class TestRollbackPins:
 
 @contextmanager
 def _clean_r3_meta():
+    # [FUNCTION DOC] HELPER: Context manager that, for its duration, patches the mock backend's
+    # chat-completion computation to remove the routed-experts and indexer-top-k entries from the
+    # first choice's meta info, so sample assembly does not try to decode the fake replay
+    # payloads. Yields nothing; the patch is reverted on exit.
     """The class fixture plants fake R3 replay payloads that only the records
     path tolerates; assembly would try to decode them. Samples-op tests run
     with clean meta_info."""
     fixture_response = MockSGLangServer._compute_chat_completions_response
 
     def clean_meta_response(mock_self, payload: dict) -> dict:
+        # [FUNCTION DOC] HELPER: Computes the normal response, drops the replay entries from the
+        # first choice's meta info and returns it.
         response = fixture_response(mock_self, payload)
         meta = response["choices"][0]["meta_info"]
         meta.pop("routed_experts", None)
@@ -486,19 +590,29 @@ def _clean_r3_meta():
 
 
 def _decode_samples_meta(payload: bytes) -> dict:
+    # [FUNCTION DOC] HELPER: Loads the packed tensor archive from the raw bytes, takes the samples
+    # metadata entry, decodes its bytes as UTF-8 text and parses it as JSON; returns the resulting
+    # mapping (with a samples list).
     tensors = safetensors.numpy.load(payload)
     return json.loads(tensors["_samples_meta"].tobytes().decode("utf-8"))
 
 
 class TestTruncationAndCompaction:
+    # [CLASS DOC] Tests for extending a length-truncated generation and for compaction branches
+    # carrying a client assistant. Class constants: U1 user question, T1 a tool result for call t0.
     U1 = {"role": "user", "content": "What is 1+2?"}
     T1 = {"role": "tool", "content": "tool-result-1", "tool_call_id": "t0"}
 
     def test_extending_truncated_generation_is_409(self, router_env):
+        # [FUNCTION DOC] With the backend patched to finish with length, the first request is 200;
+        # extending it with a tool result returns 409 with an error saying a truncated generation
+        # cannot be extended; a fresh different opening still returns 200 (new root).
         session_id = _create_session(router_env.url)
         fixture_response = MockSGLangServer._compute_chat_completions_response
 
         def length_finish(self, payload: dict) -> dict:
+            # [FUNCTION DOC] HELPER: Computes the normal response, sets the first choice's finish
+            # reason to length and returns it.
             response = fixture_response(self, payload)
             response["choices"][0]["finish_reason"] = "length"
             return response
@@ -517,6 +631,9 @@ class TestTruncationAndCompaction:
         assert reroot.status_code == 200
 
     def test_compaction_branch_with_carried_assistant(self, router_env):
+        # [FUNCTION DOC] After one turn, sends history with a client-carried assistant summary then
+        # a tool message; asserts 200 and that the tree has two nodes with the second a child of
+        # the first (never a second root).
         """A branch delta carrying a client assistant (compaction) is accepted:
         the carried assistant is prompt (loss 0 comes from assembly), and the
         suffix render appends onto the inherited snapshot."""
@@ -543,14 +660,22 @@ class TestTruncationAndCompaction:
 
 
 class TestAdditionR3RequestOffsetV2:
+    # [CLASS DOC] Tests of the routed-experts start-length offsets on the tree in non-retract
+    # pause modes. Class constant MESSAGES is a one-message user prompt.
     MESSAGES = [{"role": "user", "content": "hi"}]
 
     def _accumulated(self, url: str, session_id: str) -> list[int]:
+        # [FUNCTION DOC] HELPER: Fetches the session and returns the accumulated token ids list
+        # from its metadata.
         data = requests.get(f"{url}/sessions/{session_id}", timeout=5.0).json()
         return data["metadata"]["accumulated_token_ids"]
 
     @pytest.mark.parametrize("mode", ["abort", "in_place"])
     def test_incremental_offsets_across_turns_and_branches(self, mode):
+        # [FUNCTION DOC] For abort and in-place modes with replay on: turn one requests routed
+        # experts with start length 0; turn two's start length is the first checkpoint's length
+        # minus one and the accumulated ids grow; a divergent replay of turn two attaches at the
+        # turn-one node as a sibling branch and the start length returns to the turn-one value.
         with _serve_router({"use_rollout_routing_replay": True, "pause_generation_mode": mode}) as env:
             session_id = _create_session(env.url)
 
@@ -591,6 +716,8 @@ class TestAdditionR3RequestOffsetV2:
             assert len(checkpoint1) - 1 < len(checkpoint2) - 1
 
     def test_retract_request_has_no_start_len(self):
+        # [FUNCTION DOC] In retract mode with replay on, the backend request asks for routed
+        # experts but includes no start-length field.
         with _serve_router({"use_rollout_routing_replay": True, "pause_generation_mode": "retract"}) as env:
             session_id = _create_session(env.url)
             assert _post_chat(env.url, session_id, {"messages": self.MESSAGES}).status_code == 200

@@ -1,3 +1,6 @@
+# [MODULE DOC] Unit tests of the tinker request future store: resolving and failing futures
+# settle their state, reading another tenant's future raises an ownership error, finished futures
+# past their time-to-live read as unknown (none), and terminal states never change afterwards.
 """RequestFuture reads enforce tenant ownership and expire finished results."""
 
 import pytest
@@ -8,6 +11,8 @@ from miles.tinker.core.types import OwnershipError
 
 
 def test_resolve_and_fail_settle_the_state():
+    # [FUNCTION DOC] Creates two futures; resolving one yields state done, failing the other with
+    # message boom and category user yields state failed with that error and category.
     store = RequestFutureStore()
     done = store.create("model", "tenant")
     failed = store.create("model", "tenant")
@@ -22,6 +27,7 @@ def test_resolve_and_fail_settle_the_state():
 
 
 def test_cross_tenant_get_raises_ownership():
+    # [FUNCTION DOC] Reading a future created for tenant a as tenant b raises the ownership error.
     store = RequestFutureStore()
     future = store.create("model", "tenant-a")
     with pytest.raises(OwnershipError):
@@ -29,6 +35,8 @@ def test_cross_tenant_get_raises_ownership():
 
 
 def test_an_expired_future_returns_none(monkeypatch):
+    # [FUNCTION DOC] After resolving a future and patching the module's finished-result lifetime
+    # to a negative value (reverted by monkeypatch), reading it returns none.
     store = RequestFutureStore()
     future = store.create("model", "tenant")
     store.resolve(future.request_id, {"op": "optim_step"})
@@ -38,6 +46,8 @@ def test_an_expired_future_returns_none(monkeypatch):
 
 
 def test_terminal_states_do_not_flip():
+    # [FUNCTION DOC] A failed future stays failed with no result when resolved later; a done
+    # future stays done when failed later.
     store = RequestFutureStore()
     failed = store.create("model", "tenant")
     store.fail(failed.request_id, "lease expired", "user")

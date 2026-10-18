@@ -1,3 +1,9 @@
+# [MODULE DOC] CPU unit tests for reassembling the full natural-order token row of a packed
+# (THD) batch from per-context-parallel-rank rows in the Qwen3-VL plugin, and re-slicing it per
+# rank in zigzag order. Includes a reference copy of the training code's per-sample zigzag slicing
+# and a helper that mimics batch packing (slice per sample per rank, concatenate, pad to a
+# multiple, scale cumulative boundaries by CP size). Also tests that an indivisible segment makes
+# the reassembly give up (return none) so the caller falls back to the dense path.
 """CPU unit test for the Qwen3-VL CP+THD packed mRoPE reconstruction (issue #1296).
 
 Under context parallelism each rank's THD row holds only its zigzag chunks of every packed
@@ -15,6 +21,11 @@ from miles_plugins.models.qwen3_vl import _natural_to_zigzag_slice, _reassemble_
 
 
 def _slice_with_cp(tokens, cp_size, cp_rank, pad_value=0):
+    # [FUNCTION DOC] HELPER: Zigzag slice of one sample's 1-D token tensor for a context-parallel
+    # rank: the chunk size is the ceiling of length over twice the CP size; the tensor is padded
+    # on the right with the pad value (default 0) to twice the CP size times the chunk; the result
+    # concatenates chunk number rank and chunk number (2 times CP size minus rank minus one).
+    # Returns the concatenated slice.
     """Reference copy of cp_utils.slice_with_cp's THD zigzag slicing (per sample)."""
     token_len = len(tokens)
     chunk = (token_len + 2 * cp_size - 1) // (2 * cp_size)
@@ -27,6 +38,12 @@ def _slice_with_cp(tokens, cp_size, cp_rank, pad_value=0):
 
 
 def _build_like_get_batch(sample_lens, cp_size, pad_size=8):
+    # [FUNCTION DOC] HELPER: Creates one sample per length with unique nonzero consecutive ids,
+    # builds each rank's row as the concatenation of its zigzag slices of all samples, and builds
+    # cumulative boundaries from rank zero's slice lengths. If the row length is not a multiple of
+    # the pad size (default 8), pads every rank's row with zeros and appends the pad as a final
+    # segment. Finally scales all boundaries by the CP size. Returns (samples, per-rank rows,
+    # boundaries).
     """Mimic miles get_batch THD+CP packing: per-sample zigzag slice, concat, pad, cu*cp."""
     samples = []
     base = 1
@@ -53,6 +70,12 @@ def _build_like_get_batch(sample_lens, cp_size, pad_size=8):
     [(2, [10, 7, 13]), (2, [16, 16]), (4, [20, 9, 30, 5]), (2, [3]), (4, [40, 17])],
 )
 def test_reassemble_is_inverse_of_slice_with_cp(cp_size, sample_lens):
+    # [FUNCTION DOC] Parametrized over five (CP size, sample lengths) cases. Packs like the batch
+    # builder, asserts the last boundary equals CP size times the local row length, reassembles
+    # the full row from the per-rank rows, and asserts it is not none and has that many elements;
+    # each sample's tokens appear in order at the start of its segment; and re-slicing each
+    # segment of the full row in zigzag order for each rank and concatenating reproduces that
+    # rank's row exactly.
     samples, per_rank, cu = _build_like_get_batch(sample_lens, cp_size)
     local_len = per_rank[0].size(0)
     assert cu[-1] == cp_size * local_len
@@ -74,6 +97,8 @@ def test_reassemble_is_inverse_of_slice_with_cp(cp_size, sample_lens):
 
 
 def test_reassemble_bails_on_indivisible_segment():
+    # [FUNCTION DOC] With boundaries [0, 6] and CP size 2 (segment length 6 not divisible by 4),
+    # the reassembly returns none.
     # A segment length not divisible by 2*cp -> None (caller falls back to dense path).
     cu = [0, 6]  # 6 not divisible by 2*cp=4
     gathered = [torch.zeros(3, dtype=torch.long), torch.zeros(3, dtype=torch.long)]

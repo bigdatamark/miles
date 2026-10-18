@@ -1,3 +1,11 @@
+# [MODULE DOC] Tests (module skipped without torch) that the Qwen3 8B-next QSA indexer, when run
+# on a packed variable-length batch, treats each sequence as if it ran alone: key compression
+# by block mean never mixes sequences, the packed block-causal mask equals per-sequence masks
+# and hides other sequences' blocks, a global block grid wrongly points later sequences at the
+# front of the buffer (documenting the bug the packed path avoids), block-local positions restart
+# per sequence, and (CUDA only) the full indexer's packed selection equals single-sequence
+# selections shifted by the sequence offset. Constants: compression ratio 4, sequence lengths
+# 37, 13, 22 (none a multiple of the ratio) and key dimension 8.
 """A packed (thd) QSA indexer batch must score each sequence as if it ran alone."""
 
 import pytest
@@ -18,6 +26,10 @@ DIM = 8
 
 
 def _packed_positions(cu, total):
+    # [FUNCTION DOC] HELPER: Given cumulative sequence boundaries and the total token count,
+    # returns each token's position within its own sequence (token index minus its sequence
+    # start), by marking sequence starts, cumulative-summing to get segment ids and indexing the
+    # start offsets.
     idx = torch.arange(total)
     starts = cu[:-1].long()
     seg = torch.zeros(total, dtype=torch.long)
@@ -27,6 +39,9 @@ def _packed_positions(cu, total):
 
 
 def _fixture():
+    # [FUNCTION DOC] HELPER: Builds the shared packed case: 32-bit cumulative boundaries of the
+    # module lengths, the total, per-token in-sequence positions, and random key vectors (total by
+    # key dimension) after seeding the generator with 0. Returns (cu, total, positions, keys).
     cu = torch.tensor([0, *LENS]).cumsum(0).to(torch.int32)
     total = int(cu[-1])
     positions = _packed_positions(cu, total)
@@ -36,6 +51,8 @@ def _fixture():
 
 
 def test_packed_blocks_never_mix_sequences():
+    # [FUNCTION DOC] Compressing keys by block mean with the packed layout equals concatenating
+    # the unpacked per-sequence compressions: same shape and values.
     cu, total, positions, token_k = _fixture()
     layout = PackedBlockLayout(cu, positions, RATIO)
 
@@ -50,6 +67,9 @@ def test_packed_blocks_never_mix_sequences():
 
 
 def test_packed_mask_matches_per_sequence_mask():
+    # [FUNCTION DOC] The packed block-causal mask has shape (tokens, total blocks). For each
+    # sequence, the window of rows and its own block columns equals the single-sequence mask, and
+    # every other column in those rows is false.
     cu, total, positions, _ = _fixture()
     layout = PackedBlockLayout(cu, positions, RATIO)
 
@@ -73,6 +93,9 @@ def test_packed_mask_matches_per_sequence_mask():
 
 
 def test_global_block_grid_points_at_the_wrong_sequence():
+    # [FUNCTION DOC] Builds a block-causal mask on a global block grid using per-sequence
+    # positions. For the last query of the second sequence asserts it sees some blocks, all
+    # located before the sequence's own first block, and none of its own blocks.
     """Characterises the bug the packed path exists to avoid.
 
     A global block grid combined with per-sequence positions sends every sequence
@@ -93,6 +116,9 @@ def test_global_block_grid_points_at_the_wrong_sequence():
 
 
 def test_layout_block_local_positions_restart_per_sequence():
+    # [FUNCTION DOC] The layout's block-local index equals the concatenation of ranges from zero
+    # to each sequence's block count (ceiling of length over ratio), and the total block count is
+    # the sum of those counts.
     cu, total, positions, _ = _fixture()
     layout = PackedBlockLayout(cu, positions, RATIO)
 
@@ -103,6 +129,14 @@ def test_layout_block_local_positions_restart_per_sequence():
 
 @pytest.mark.parametrize("lens", [[37, 13], [64, 64], [1, 41]])
 def test_selection_equals_single_sequence_runs(lens):
+    # [FUNCTION DOC] Parametrized over three length lists; skipped without CUDA. Builds a small
+    # Megatron transformer config (hidden 64, 4 heads, bf16) with indexer settings (2 heads, 1
+    # key/value head, head dim 32, budget 16, the module compression ratio), creates the QSA
+    # indexer on the GPU, packed boundaries/positions, random bf16 hidden states and a neox-style
+    # rotary embedding (base 1e7, rotary dim 8). Without gradients runs the indexer on the packed
+    # batch and then on each sequence alone; per row compares the sets of non-negative selected
+    # token ids (alone results shifted by the sequence start), because an alone result can be
+    # narrower.
     """Full indexer: packed selection == per-sequence selection + token offset."""
     if not torch.cuda.is_available():
         pytest.skip("indexer projection needs a CUDA device (TELinear)")

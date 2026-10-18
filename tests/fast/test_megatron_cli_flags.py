@@ -1,3 +1,9 @@
+# [MODULE DOC] Tests that command-line flags parsed by the project's argument parser reach the
+# Megatron transformer config: the post self-attention and post MLP layernorm flags, and the
+# YaRN rope settings of the Kimi model presets (multi-latent config with yarn rope type, original
+# max position 4096, beta fast 1 or 32, beta slow 1). Both tests are skipped when Megatron's
+# training arguments module is unavailable. Validation hooks are stubbed out, and fused kernels
+# that need GPU-only libraries are disabled on the config.
 import sys
 
 import pytest
@@ -6,6 +12,13 @@ from tests.fast.launch_scripts.model_args_harness import expand_model_args
 
 
 def test_post_layernorm_flags_propagate_to_megatron(monkeypatch):
+    # [FUNCTION DOC] Skips if Megatron is missing. Stubs the project's and Megatron backend's
+    # argument validators (reverted by monkeypatch), sets the process arguments to a minimal
+    # Megatron train backend with one layer, hidden size 8, one attention head and both
+    # post-layernorm flags, parses them, asserts both flags are true, picks the params dtype from
+    # the bf16/fp16 flags (bfloat16, then float16, else float32), disables the fused rope option
+    # (GPU-only dependency), builds the Megatron transformer config and asserts it carries both
+    # flags as true.
     pytest.importorskip("megatron.training.arguments")
 
     import torch
@@ -63,6 +76,12 @@ def test_post_layernorm_flags_propagate_to_megatron(monkeypatch):
     [("kimi-k2", 1), ("kimi-k2-thinking", 1), ("kimi-k25", 32), ("kimi-k25_2layer", 32)],
 )
 def test_kimi_yarn_flags_propagate_to_megatron(monkeypatch, model_type, beta_fast):
+    # [FUNCTION DOC] Parametrized over four Kimi presets with the expected beta-fast value. Skips
+    # if Megatron is missing. Stubs the validators, sets the process arguments to the Megatron
+    # train backend with rollout batch size 1 plus the preset's expanded model arguments, parses
+    # them, picks the params dtype as in the other test, disables fused MoE permutation (needs
+    # Transformer Engine), builds the config and asserts it is the multi-latent config type with
+    # yarn rope type, original max position embeddings 4096, the expected beta fast and beta slow 1.
     pytest.importorskip("megatron.training.arguments")
 
     import torch

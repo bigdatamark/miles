@@ -1,3 +1,8 @@
+# [MODULE DOC] Tests (module skipped without torch) that the trainer's QSA indexer rotary
+# embedding reproduces the serving engine's eager neox-style rotation bit for bit (zero
+# tolerance), using an independent re-implementation of the engine's cos/sin cache and rotation
+# as reference, and that position zero is an identity rotation. Constants: rotary base 1e7,
+# rotary dimension 64 (head dim 256 times partial factor 0.25), head dim 256 and 4096 positions.
 """The trainer's QSA indexer RoPE must reproduce sglang's eager neox rotation bit for bit."""
 
 import pytest
@@ -13,6 +18,10 @@ MAX_POS = 4096
 
 
 def _megatron_rotary_pos_emb(max_pos: int) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Builds the non-interleaved Megatron rotary table: inverse frequencies
+    # base to the power of (even index over rotary dim), outer product with positions 0 to
+    # max_pos minus one in float32, frequencies duplicated along the last axis and given two
+    # singleton axes in the middle. Returns shape (max_pos, 1, 1, rotary dim).
     """Megatron ``RotaryEmbedding.get_emb`` for rotary_interleaved=False."""
     inv_freq = 1.0 / (BASE ** (torch.arange(0, ROTARY_DIM, 2, dtype=torch.float32) / ROTARY_DIM))
     seq = torch.arange(max_pos, dtype=inv_freq.dtype)
@@ -21,6 +30,12 @@ def _megatron_rotary_pos_emb(max_pos: int) -> torch.Tensor:
 
 
 def _sglang_reference(x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Reference rotation of the serving engine. Builds a cos/sin cache for
+    # all positions up to the maximum, selects rows for the given positions, repeats the halves to
+    # full width and splits into cos and sin truncated to half the rotary dim, casts them to the
+    # data dtype, and rotates the first rotary-dim features in neox style (first half becomes x1
+    # cos minus x2 sin, second half x2 cos plus x1 sin). Features beyond the rotary dim are left
+    # unchanged. Returns a tensor of the same shape as the input.
     """sglang RotaryEmbedding._compute_cos_sin_cache + QSAIndexer.apply_rope + apply_rotary_emb."""
     inv_freq = 1.0 / (BASE ** (torch.arange(0, ROTARY_DIM, 2, dtype=torch.float) / ROTARY_DIM))
     t = torch.arange(MAX_POS, dtype=torch.float)
@@ -46,6 +61,11 @@ def _sglang_reference(x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("heads", [1, 8])
 def test_indexer_rope_matches_sglang(dtype, heads):
+    # [FUNCTION DOC] Parametrized over bfloat16/float32 and 1 or 8 heads. With a generator seeded
+    # by the head count, draws 257 tokens of random features and random positions, applies the
+    # trainer's rotary function with the Megatron table and the reference, and asserts the output
+    # dtype is preserved, equals the reference exactly, and leaves non-rotary features exactly
+    # equal to the input.
     g = torch.Generator().manual_seed(heads)
     tokens = 257
     x = torch.randn(tokens, heads, HEAD_DIM, generator=g).to(dtype)
@@ -60,6 +80,8 @@ def test_indexer_rope_matches_sglang(dtype, heads):
 
 
 def test_indexer_rope_rotates_position_zero_to_identity():
+    # [FUNCTION DOC] Rotating random bf16 features at position zero (table of 16 positions) gives
+    # exactly the input.
     x = torch.randn(4, 2, HEAD_DIM).to(torch.bfloat16)
     got = apply_indexer_rope(x, _megatron_rotary_pos_emb(16), torch.zeros(4, dtype=torch.long))
     torch.testing.assert_close(got, x, rtol=0, atol=0)
