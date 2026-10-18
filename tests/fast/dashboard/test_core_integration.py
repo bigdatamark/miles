@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# End-to-end test of dashboard activation through the tracking registry on a local ray instance
+# (via the ray_local_mode fixture), plus a registry membership check. Verifies the produced
+# dashboard directory using the store, and the HTTP application built over it. GPU samples are
+# not asserted, so the test works on hosts with and without NVML.
 """Integration of the dashboard with miles core, on a local Ray instance.
 
 Exercises the REAL activation path: tracking registry -> MilesDashboardBackend
@@ -19,6 +24,10 @@ from miles.utils.timer import Timer, timer
 
 
 def _args(tmp_path) -> Namespace:
+    # [FUNCTION DOC] HELPER: Returns a namespace of training arguments enabling the dashboard:
+    # dump directory is the temporary path, run group "wiring-e2e", rollout entropy on, flush and
+    # gpu sample intervals 0.2 s, scrape interval 2.0 s, scrape mode auto, no custom metric list,
+    # prometheus forwarding off.
     return Namespace(
         use_miles_dashboard=True,
         dump_details=str(tmp_path),
@@ -34,6 +43,16 @@ def _args(tmp_path) -> Namespace:
 
 
 def test_tracking_backend_end_to_end_local_ray(tmp_path, ray_local_mode):
+    # [FUNCTION DOC] Skips if ray is missing. Saves the timer's event sinks, initialises tracking
+    # with the dashboard args (asserts a current collector exists), logs one metrics dict with
+    # step 3 through the tracking log, registers the driver as a train actor, times two phases
+    # (actor_train ~50 ms, update_weights ~10 ms) and finishes tracking (flush and synchronous
+    # collector shutdown); the timer sinks are restored in a finally block. Then loads the store
+    # and asserts: run name equals the group, exactly one metrics record with step 3 and the
+    # logged reward, both phases present, actor_train has the train role and a duration of about
+    # 50 ms (tolerance 50 ms). Finally builds the web app over the store (skips if fastapi is
+    # missing, follow disabled) and asserts the meta endpoint reports the run name, a timeline
+    # capability and the logged metric key.
     pytest.importorskip("ray")
     from miles.dashboard import backend, hooks
     from miles.utils.tracking_utils.tracking import finish_tracking, init_tracking
@@ -82,6 +101,8 @@ def test_tracking_backend_end_to_end_local_ray(tmp_path, ray_local_mode):
 
 
 def test_registry_contains_dashboard_backend():
+    # [FUNCTION DOC] Asserts the tracking backend registry entry "miles_dashboard" maps to the
+    # dashboard backend class and the enabling argument flag "use_miles_dashboard".
     from miles.utils.tracking_utils.base import MilesDashboardBackend
     from miles.utils.tracking_utils.tracking import BACKEND_REGISTRY
 

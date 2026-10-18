@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Tests for the hot-restart evidence readers and container: reading the last saved checkpoint
+# iteration from tracker files (absent, single, several trackers refused, half-written ignored),
+# reading finished rollout ids from the event log (only train-metric events with a rollout id,
+# deduplicated and sorted), combining both into run progress, and a write/load round trip of the
+# evidence object (plus a loud failure when the evidence file is missing). All data lives in
+# temporary directories.
 from pathlib import Path
 
 import pytest
@@ -18,32 +25,42 @@ from miles.utils.audit_utils.process_identity import SimpleProcessIdentity
 
 
 def _write_metric_event(events_dir: Path, *, rollout_id: int | None, metrics: dict[str, float]) -> None:
+    # [FUNCTION DOC] HELPER: Appends one metric event with the given rollout id (possibly none)
+    # and metrics mapping to the "main" event log file in the events directory, without printing.
     logger = EventLogger(log_dir=events_dir, file_name="main.jsonl", source=SimpleProcessIdentity(component="main"))
     logger.log(MetricEvent, {"rollout_id": rollout_id, "metrics": metrics}, print_log=False)
 
 
 def _write_tracker(checkpoint_dir: Path, *, relative: str, iteration: str) -> None:
+    # [FUNCTION DOC] HELPER: Writes a checkpoint tracker file under the checkpoint directory at
+    # the relative subdirectory (created as needed), containing the iteration text and a newline.
     path = checkpoint_dir / relative / CHECKPOINT_TRACKER_FILENAME
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"{iteration}\n")
 
 
 class TestReadLastSavedIteration:
+    # [CLASS DOC] Tests of the saved iteration reader (returns an integer or none).
     def test_a_run_that_never_saved_reports_nothing(self, tmp_path):
+        # [FUNCTION DOC] An existing empty checkpoint directory gives none.
         """Restarting before the first checkpoint would resume a run from weights nothing wrote."""
         assert read_last_saved_iteration(tmp_path) is None
 
     def test_a_missing_checkpoint_directory_reports_nothing(self, tmp_path):
+        # [FUNCTION DOC] A non-existent directory gives none.
         """The directory only appears with the first save, and polling starts before that."""
         assert read_last_saved_iteration(tmp_path / "absent") is None
 
     def test_the_tracker_names_the_iteration_a_take_over_would_resume_from(self, tmp_path):
+        # [FUNCTION DOC] A tracker at the directory root containing "3" gives 3.
         """The saved iteration is the rollout id the trainer would reload, and the window starts after it."""
         _write_tracker(tmp_path, relative=".", iteration="3")
 
         assert read_last_saved_iteration(tmp_path) == 3
 
     def test_a_run_saving_several_trackers_is_refused(self, tmp_path):
+        # [FUNCTION DOC] Trackers in two policy subdirectories raise an assertion error matching
+        # "several policies".
         """One restart window cannot be read off several trainers that each save at their own pace."""
         _write_tracker(tmp_path, relative="trainers/solver", iteration="2")
         _write_tracker(tmp_path, relative="trainers/verifier", iteration="4")
@@ -52,6 +69,7 @@ class TestReadLastSavedIteration:
             read_last_saved_iteration(tmp_path)
 
     def test_a_half_written_tracker_is_not_read_as_a_save(self, tmp_path):
+        # [FUNCTION DOC] A tracker with empty iteration text gives none.
         """A save observed mid-write would open the gate on a checkpoint no trainer can load."""
         _write_tracker(tmp_path, relative=".", iteration="")
 
@@ -59,11 +77,15 @@ class TestReadLastSavedIteration:
 
 
 class TestReadFinishedRolloutIds:
+    # [CLASS DOC] Tests of the finished-rollout reader over the event log directory.
     def test_a_run_with_no_events_yet_reports_nothing(self, tmp_path):
+        # [FUNCTION DOC] A missing events directory gives an empty list.
         """Polling starts before the pods are even up."""
         assert read_finished_rollout_ids(tmp_path / "events") == []
 
     def test_only_a_metric_of_a_finished_train_step_counts(self, tmp_path):
+        # [FUNCTION DOC] Events: a train metric at rollout 0, a rollout-side metric at rollout 1,
+        # a train metric with no rollout id. Only rollout 0 is reported.
         """Rollout-side metrics are logged before the trainer has moved any weights."""
         events_dir = tmp_path / "events"
         _write_metric_event(events_dir, rollout_id=0, metrics={"train/grad_norm": 1.5})
@@ -73,6 +95,7 @@ class TestReadFinishedRolloutIds:
         assert read_finished_rollout_ids(events_dir) == [0]
 
     def test_the_ids_a_run_finished_are_reported_in_order_without_repeats(self, tmp_path):
+        # [FUNCTION DOC] Train metric events logged for rollouts 2, 0, 2, 1 give [0, 1, 2].
         """A step logs several metric events, and the gate counts steps, not events."""
         events_dir = tmp_path / "events"
         for rollout_id in (2, 0, 2, 1):
@@ -82,7 +105,10 @@ class TestReadFinishedRolloutIds:
 
 
 class TestReadRunProgress:
+    # [CLASS DOC] Test of the combined progress reader.
     def test_progress_is_the_last_save_and_the_last_finished_step(self, tmp_path):
+        # [FUNCTION DOC] A tracker with iteration 1 and a train metric at rollout 2 give progress
+        # with last saved iteration 1 and last finished rollout 2.
         """The gate is a function of exactly these two numbers, so they are read together."""
         _write_tracker(tmp_path / "ckpt", relative=".", iteration="1")
         _write_metric_event(tmp_path / "events", rollout_id=2, metrics={"train/grad_norm": 1.0})
@@ -93,7 +119,10 @@ class TestReadRunProgress:
 
 
 class TestHotRestartEvidence:
+    # [CLASS DOC] Tests of the evidence container's persistence.
     def test_what_the_target_side_observed_survives_to_the_comparison(self, tmp_path):
+        # [FUNCTION DOC] Evidence with one record, one snapshot and the demo release is written to
+        # the dump directory and loaded back equal.
         """The compare step runs as a subcommand of its own and cannot watch the run itself."""
         evidence = HotRestartEvidence(
             records=(HotRestartRecord(index=0, saved_iteration_at_trigger=1, frozen_rollout_id=2),),
@@ -107,6 +136,7 @@ class TestHotRestartEvidence:
         assert HotRestartEvidence.load(dump_dir=str(tmp_path)) == evidence
 
     def test_comparing_without_a_target_run_fails_loudly(self, tmp_path):
+        # [FUNCTION DOC] Loading evidence from a directory with none raises an assertion error.
         """A missing file would otherwise read as a run that redid nothing."""
         with pytest.raises(AssertionError):
             HotRestartEvidence.load(dump_dir=str(tmp_path))

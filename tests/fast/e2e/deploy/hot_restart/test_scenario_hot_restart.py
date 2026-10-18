@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Tests for the checkpointed hot-restart deterministic scenario module: the table of modes (unique
+# names, the checkpointed mode listed, its entry file running it), per-side release isolation
+# derived from the parent run id, the timing design of the freeze schedule (one freeze per
+# restart, pinned saves match the real save cadence, freezes land between saves, redo windows do
+# not overlap, a step remains after the last take-over, gradient floor within the run, plus
+# refusals of malformed modes), exclusion of weight-version statistics from the comparison,
+# argument construction (stable across relaunches, replaced weight decay, per-side checkpoint
+# directories, save interval, distinct wandb groups, freeze arming on the target side only), the
+# modes the scenario refuses (no step left, colocated, engine-less), the one-optimizer-step-per-
+# rollout premise, pairing of each mode with its redo verdict, and synchronous saving.
 import dataclasses
 import json
 import shlex
@@ -27,6 +38,9 @@ ENTRY_DIR: Path = Path(tests.e2e.deploy.__file__).parent
 
 
 def _saved_rollout_ids(restart_mode: HotRestartMode) -> list[int]:
+    # [FUNCTION DOC] HELPER: Returns the rollout ids (below the scenario's rollout count) at which
+    # a run in the given mode saves, using the project's periodic action rule with the mode's save
+    # interval and no epoch length.
     return [
         rollout_id
         for rollout_id in range(scenario.NUM_ROLLOUTS)
@@ -37,15 +51,21 @@ def _saved_rollout_ids(restart_mode: HotRestartMode) -> list[int]:
 
 
 class TestModes:
+    # [CLASS DOC] Tests of the mode table.
     def test_every_mode_of_the_table_names_its_own_test(self):
+        # [FUNCTION DOC] The set of test names over all modes has as many entries as the table.
         """The test name reaches dump directories and wandb runs, so two modes sharing one would collide."""
         assert len({one.test_name for one in scenario.MODES}) == len(scenario.MODES)
 
     def test_the_checkpointed_mode_is_the_one_the_table_offers(self):
+        # [FUNCTION DOC] The checkpointed mode is a member of the modes table.
         """A mode nothing runs is a mode nobody notices going stale."""
         assert scenario.CHECKPOINTED in scenario.MODES
 
     def test_the_entry_of_the_checkpointed_mode_runs_that_mode(self):
+        # [FUNCTION DOC] Reads the entry test file named after the mode (in the e2e deploy
+        # directory) and asserts its text imports the mode and the ci runner together and invokes
+        # the runner with that mode.
         """Nothing else ties the file a red ci job names back to the mode it drove."""
         source = (ENTRY_DIR / f"test_{scenario.CHECKPOINTED.test_name}.py").read_text()
 
@@ -54,7 +74,10 @@ class TestModes:
 
 
 class TestComparisonReleaseIsolation:
+    # [CLASS DOC] Tests of per-side configuration derivation.
     def test_the_two_sides_get_distinct_releases_from_the_parent_run_id(self):
+        # [FUNCTION DOC] For parent run id "demo", the baseline and target side configurations
+        # have run ids "demo-" plus each side name.
         """A target command must never upgrade the baseline release whose workload command differs."""
         config = ExecuteTrainConfig(run_id="demo")
 
@@ -65,6 +88,8 @@ class TestComparisonReleaseIsolation:
         assert target.run_id == f"demo-{TARGET_SIDE}"
 
     def test_a_parent_run_id_without_room_for_the_suffix_is_refused(self):
+        # [FUNCTION DOC] A parent run id of the maximum allowed length leaves no room for the side
+        # suffix: deriving the target side's configuration raises an assertion error.
         """Truncating the parent id would let two long parents share a side release."""
         config = ExecuteTrainConfig(run_id="a" * RUN_ID_MAX_LENGTH)
 
@@ -73,11 +98,15 @@ class TestComparisonReleaseIsolation:
 
 
 class TestTiming:
+    # [CLASS DOC] Tests of the checkpointed mode's freeze schedule against its save cadence.
     def test_the_scenario_pins_a_freeze_for_every_restart_it_drives(self):
+        # [FUNCTION DOC] The schedule length equals the mode's restart count.
         """A schedule shorter than the run would leave a take-over free to land wherever it liked."""
         assert len(scenario.CHECKPOINTED.schedule) == scenario.CHECKPOINTED.num_restarts
 
     def test_the_save_each_take_over_resumes_from_is_one_this_run_really_writes(self):
+        # [FUNCTION DOC] The pinned saved iterations are [1, 3] and are a subset of the rollout
+        # ids at which the mode actually saves.
         """The pinned save is what the take-over rolls back to, so the run has to write it."""
         assert [one.saved_iteration for one in scenario.CHECKPOINTED.schedule] == [1, 3]
         assert {one.saved_iteration for one in scenario.CHECKPOINTED.schedule} <= set(
@@ -85,16 +114,23 @@ class TestTiming:
         )
 
     def test_the_cadence_the_pinned_saves_are_checked_against_is_the_one_the_run_really_saves_at(self):
+        # [FUNCTION DOC] The scenario's saved-rollout-id computation for the mode's save interval,
+        # sorted, equals the independently computed saved ids.
         """The literal pinned saves are validated against this rule, and a rule of its own would drift."""
         assert sorted(
             scenario.compute_saved_rollout_ids(save_interval=scenario.CHECKPOINTED.save_interval)
         ) == _saved_rollout_ids(scenario.CHECKPOINTED)
 
     def test_every_freeze_lands_on_a_step_the_run_did_not_save(self):
+        # [FUNCTION DOC] The frozen rollout ids and the saved rollout ids are disjoint.
         """This is why the run saves every other step: the take-over throws away work no checkpoint holds."""
         assert not set(scenario.CHECKPOINTED.frozen_rollout_ids) & set(_saved_rollout_ids(scenario.CHECKPOINTED))
 
     def test_the_windows_two_take_overs_redo_cannot_overlap(self):
+        # [FUNCTION DOC] For each consecutive pair of freezes, the later saved iteration is at
+        # least the earlier frozen rollout.
+        # KNOWN ISSUE: the pairing uses non-strict zip, so a length mismatch would be silently
+        # ignored, and the saved iteration at or above the earlier frozen rollout is the check.
         """Two restarts sharing a redone step would make that step cost three attempts, not two."""
         assert all(
             later.saved_iteration >= earlier.frozen_rollout_id
@@ -102,14 +138,18 @@ class TestTiming:
         )
 
     def test_the_run_still_trains_a_step_the_last_take_over_did_not_redo(self):
+        # [FUNCTION DOC] The largest frozen rollout is below the last rollout id.
         """A run whose every remaining step is a redone one proves nothing about training on past a take-over."""
         assert max(scenario.CHECKPOINTED.frozen_rollout_ids) < scenario.NUM_ROLLOUTS - 1
 
     def test_the_gradient_floor_sits_within_the_steps_the_run_trains(self):
+        # [FUNCTION DOC] The minimum trained rollouts constant does not exceed the rollout count.
         """The surviving log holds every step, and a floor above them could never be met."""
         assert scenario.MIN_TRAINED_ROLLOUTS <= scenario.NUM_ROLLOUTS
 
     def test_a_mode_freezing_where_its_own_cadence_saves_is_refused(self):
+        # [FUNCTION DOC] A copy of the checkpointed mode with save interval 1 makes the schedule
+        # validator raise an assertion error matching "redo nothing".
         """Such a take-over resumes exactly where the script it replaced stood, so it redoes nothing."""
         eager = dataclasses.replace(scenario.CHECKPOINTED, save_interval=1)
 
@@ -117,6 +157,8 @@ class TestTiming:
             scenario.assert_freeze_schedule_leaves_redo_window(eager)
 
     def test_a_mode_whose_run_would_only_ever_save_its_last_step_is_refused(self):
+        # [FUNCTION DOC] Save interval equal to the rollout count: the validator raises matching
+        # "only ever saves the last step".
         """The comparison watches the run save after it was taken over, and such a run performs none."""
         rare = dataclasses.replace(scenario.CHECKPOINTED, save_interval=scenario.NUM_ROLLOUTS)
 
@@ -124,6 +166,8 @@ class TestTiming:
             scenario.assert_freeze_schedule_leaves_redo_window(rare)
 
     def test_a_mode_freezing_twice_after_the_same_step_is_refused(self):
+        # [FUNCTION DOC] A schedule with two identical freezes (rollout 2, iteration 1): the
+        # validator raises matching "freezes the run twice after the same step".
         """The driver reads the sentinel's step to tell this freeze from the one before it."""
         repeated = dataclasses.replace(
             scenario.CHECKPOINTED,
@@ -137,6 +181,8 @@ class TestTiming:
             scenario.assert_freeze_schedule_leaves_redo_window(repeated)
 
     def test_a_mode_pinning_a_save_its_own_cadence_never_writes_is_refused(self):
+        # [FUNCTION DOC] A schedule pinning saved iteration 0 for a freeze at 2 (the cadence never
+        # saves at 0): the validator raises matching "never reasoned about".
         """The pinned save is a literal now, and a wrong one would resume the take-over somewhere else."""
         wrong = dataclasses.replace(
             scenario.CHECKPOINTED, schedule=(ScheduledFreeze(frozen_rollout_id=2, saved_iteration=0),)
@@ -147,7 +193,14 @@ class TestTiming:
 
 
 class TestWeightVersionExclusion:
+    # [CLASS DOC] Test of the comparison's excluded keys.
     def test_the_comparison_drops_the_weight_version_statistics_and_nothing_else(self, tmp_path, monkeypatch):
+        # [FUNCTION DOC] With evidence written to a temporary dump directory, the take-over
+        # script-only assertion and the redo verdict replaced by no-ops, and the deterministic
+        # comparison replaced by a recorder, running the scenario's comparison makes exactly one
+        # call with baseline and target directories under the dump directory, the mode's engine
+        # count, the minimum trained rollouts, and the four weight-version statistic keys (mean,
+        # median, max, min) excluded.
         """A surviving engine keeps a monotonic publication counter, but every other metric still compares exactly."""
         calls: list[dict[str, Any]] = []
         dump_dir = _dump_dir_with_evidence(tmp_path)
@@ -174,6 +227,9 @@ class TestWeightVersionExclusion:
 
 
 def _dump_dir_with_evidence(tmp_path: Path) -> str:
+    # [FUNCTION DOC] HELPER: Writes hot-restart evidence (two records: saved 1 / frozen 2 and
+    # saved 3 / frozen 4, no snapshots, release "demo") into the target side's directory under a
+    # "hot_restart_checkpointed" directory in the temporary path. Returns that directory as text.
     dump_dir = tmp_path / "hot_restart_checkpointed"
     evidence = HotRestartEvidence(
         records=(
@@ -188,7 +244,11 @@ def _dump_dir_with_evidence(tmp_path: Path) -> str:
 
 
 class TestBuildArgs:
+    # [CLASS DOC] Tests of the scenario's training argument construction.
     def test_the_relaunch_of_a_run_repeats_the_arguments_it_was_installed_with(self, monkeypatch):
+        # [FUNCTION DOC] With a tracking key in the environment, building arguments twice for the
+        # same target directory (second time as a relaunch) gives identical strings, and the wandb
+        # group flag value equals the wandb run id flag value.
         """Each call draws a new run id, and a hot restart whose wandb group followed it would change the pods."""
         monkeypatch.setenv("WANDB_API_KEY", "key")
 
@@ -203,6 +263,8 @@ class TestBuildArgs:
         assert first == second
 
     def test_a_relaunch_repeats_the_string_the_run_was_installed_with(self):
+        # [FUNCTION DOC] The installed-arguments lookup for the directory returns the string just
+        # built, and that string does not contain the dumper directory flag.
         """Rebuilding the arguments would drop whatever the pipeline was asked for, such as the dumper."""
         args = scenario._build_args(scenario.CHECKPOINTED, scenario._MODE, "/dumps/target/plain", False)
 
@@ -210,17 +272,22 @@ class TestBuildArgs:
         assert "--dumper-dir" not in args
 
     def test_relaunching_a_run_this_process_never_installed_fails(self):
+        # [FUNCTION DOC] Looking up installed arguments for a never-installed directory raises an
+        # assertion error matching "nothing installed a run".
         """A relaunch of arguments nobody installed would render a pod template of its own."""
         with pytest.raises(AssertionError, match="nothing installed a run"):
             read_installed_args("/dumps/target/never-installed")
 
     def test_the_weight_decay_of_the_common_arguments_is_replaced_and_not_repeated(self):
+        # [FUNCTION DOC] The weight decay flag appears with exactly one value, "0".
         """A repeated flag leaves it to the parser which value wins, and this run needs the one it asked for."""
         argv = shlex.split(scenario._build_args(scenario.CHECKPOINTED, scenario._MODE, "/dumps/target"))
 
         assert ArgvManipulator.get(argv, "--weight-decay") == ["0"]
 
     def test_each_side_of_the_comparison_checkpoints_into_its_own_directory(self):
+        # [FUNCTION DOC] Arguments for the target side contain the target checkpoint directory
+        # and not the baseline's.
         """A shared checkpoint directory would let the target resume from what the baseline wrote."""
         args = scenario._build_args(scenario.CHECKPOINTED, scenario._MODE, "/dumps/target")
 
@@ -228,12 +295,15 @@ class TestBuildArgs:
         assert str(compute_checkpoint_dir("/dumps/baseline")) not in args
 
     def test_the_run_is_installed_with_the_save_interval_its_mode_is_reasoned_from(self):
+        # [FUNCTION DOC] The save interval flag value equals the mode's save interval as text.
         """The pinned triggers are read off this cadence, so a run saving at another pace lands elsewhere."""
         argv = shlex.split(scenario._build_args(scenario.CHECKPOINTED, scenario._MODE, "/dumps/target/interval"))
 
         assert ArgvManipulator.get(argv, "--save-interval") == [str(scenario.CHECKPOINTED.save_interval)]
 
     def test_two_modes_installing_one_dump_directory_would_still_be_told_apart(self):
+        # [FUNCTION DOC] The wandb group computed for the same dump directory differs between the
+        # checkpointed and the no-checkpoint test names.
         """The wandb group is derived per test name, so one soak's history cannot swallow another's."""
         first = scenario._compute_wandb_group(test_name="hot_restart_checkpointed", dump_dir="/dumps/target")
         second = scenario._compute_wandb_group(test_name="hot_restart_no_checkpoint", dump_dir="/dumps/target")
@@ -242,8 +312,12 @@ class TestBuildArgs:
 
 
 class TestTheFreezeTheRunIsInstalledWith:
+    # [CLASS DOC] Tests of freeze arming in the installed arguments.
     # TODO ad hoc hack: revert after the args refactor
     def test_the_target_side_is_armed_to_sleep_at_the_first_pinned_step(self, tmp_path):
+        # [FUNCTION DOC] Frozen arguments for a target directory reference the freeze plan path
+        # through the actions-path flag, and the plan file holds exactly one action: sleep forever
+        # at the end of the first pinned frozen rollout.
         """Nothing else makes the run stand still, and a take-over of a moving run lands wherever it likes."""
         dump_dir = f"{tmp_path}/target"
         args = scenario._build_frozen_args(scenario.CHECKPOINTED, scenario._MODE, dump_dir, False)
@@ -256,12 +330,16 @@ class TestTheFreezeTheRunIsInstalledWith:
 
     # TODO ad hoc hack: revert after the args refactor
     def test_the_baseline_side_is_never_frozen(self):
+        # [FUNCTION DOC] Plain (unfrozen) arguments for a baseline directory do not define the
+        # actions-path flag.
         """The baseline is the run nobody touched, and one asleep at step 2 would never finish."""
         args = scenario._build_args(scenario.CHECKPOINTED, scenario._MODE, "/dumps/baseline/plain", False)
 
         assert not ArgvManipulator.is_defined(shlex.split(args), CI_FT_TEST_ACTIONS_PATH_FLAG)
 
     def test_the_relaunch_repeats_the_frozen_arguments_the_run_is_up_with(self, tmp_path):
+        # [FUNCTION DOC] The installed arguments recorded for the directory equal the frozen
+        # arguments just built.
         """A relaunch whose argv differs from the installed one is refused as more than a hot restart."""
         dump_dir = f"{tmp_path}/target"
         args = scenario._build_frozen_args(scenario.CHECKPOINTED, scenario._MODE, dump_dir, False)
@@ -270,7 +348,10 @@ class TestTheFreezeTheRunIsInstalledWith:
 
 
 class TestTheModesThisScenarioRefuses:
+    # [CLASS DOC] Tests of mode shapes the scenario rejects.
     def test_a_mode_whose_last_take_over_leaves_no_step_to_train_is_refused(self):
+        # [FUNCTION DOC] A schedule freezing at the last rollout makes the validator raise
+        # matching "leaving no step past the last take-over".
         """Every remaining step being a redone one proves nothing about training on past a take-over."""
         too_late = dataclasses.replace(
             scenario.CHECKPOINTED,
@@ -281,6 +362,8 @@ class TestTheModesThisScenarioRefuses:
             scenario.assert_freeze_schedule_leaves_redo_window(too_late)
 
     def test_a_colocated_mode_is_refused(self):
+        # [FUNCTION DOC] A colocated copy of the scenario's mode (2 engines of 1 gpu) makes the
+        # script argument builder raise matching "colocates them".
         """A take-over keeps the trainers and the engines up, and a colocated mode shares their gpus."""
         colocated = dataclasses.replace(
             scenario._MODE, colocate=True, rollout_num_engines=2, rollout_gpus_per_engine=1
@@ -292,6 +375,8 @@ class TestTheModesThisScenarioRefuses:
             )
 
     def test_a_mode_with_no_engines_is_refused(self):
+        # [FUNCTION DOC] A copy of the mode with zero engines makes the script argument builder
+        # raise matching "no engines for it to drive".
         """The take-over replaces the rollout executor, which needs engines to drive when it returns."""
         engineless = dataclasses.replace(scenario._MODE, rollout_num_engines=0, rollout_gpus_per_engine=0)
 
@@ -302,7 +387,10 @@ class TestTheModesThisScenarioRefuses:
 
 
 class TestTheOneEventPerRolloutPremise:
+    # [CLASS DOC] Tests of the one optimizer step per rollout premise.
     def test_the_run_is_installed_to_take_exactly_one_optimizer_step_per_rollout(self):
+        # [FUNCTION DOC] In the built arguments the global batch size equals the rollout batch
+        # size times samples per prompt.
         """Every attempt count in the redo verdict is read off one grad_norm event per rollout."""
         argv = shlex.split(scenario._build_args(scenario.CHECKPOINTED, scenario._MODE, "/dumps/target/batch", False))
         product = int(ArgvManipulator.get(argv, scenario.ROLLOUT_BATCH_SIZE_FLAG)[0]) * int(
@@ -312,6 +400,9 @@ class TestTheOneEventPerRolloutPremise:
         assert int(ArgvManipulator.get(argv, scenario.GLOBAL_BATCH_SIZE_FLAG)[0]) == product
 
     def test_a_run_taking_several_optimizer_steps_per_rollout_is_refused(self):
+        # [FUNCTION DOC] Arguments with global batch 128 against rollout batch 32 times 8 samples
+        # (256 samples per rollout) make the premise check raise matching "one train/grad_norm
+        # event per rollout".
         """Such a run logs one event per step, so every attempt count would be a multiple of the truth."""
         with pytest.raises(AssertionError, match="one train/grad_norm event per rollout"):
             scenario._assert_one_train_event_per_step(
@@ -320,15 +411,24 @@ class TestTheOneEventPerRolloutPremise:
 
 
 class TestTheVerdictEachModeIsMeasuredAgainst:
+    # [CLASS DOC] Tests of the pairing between a mode and its redo verdict.
     def test_the_checkpointed_mode_is_paired_with_the_checkpointed_verdict(self):
+        # [FUNCTION DOC] The mode's redo assertion is the post-checkpoint-steps-redone assertion
+        # object (identity).
         """A mode pointing at the other verdict would measure the run against the wrong redo."""
         assert scenario.CHECKPOINTED.assert_redone is scenario.assert_only_post_checkpoint_steps_redone
 
     def test_the_comparison_hands_the_verdict_the_target_side_dumps(self):
+        # [FUNCTION DOC] With a mode whose redo assertion is a recorder, evidence loading stubbed
+        # to empty evidence and the script-only and deterministic comparisons stubbed, running the
+        # comparison for a base directory passes the verdict the target side's dump and checkpoint
+        # directories (ending in /target and /target/checkpoints), the scenario's rollout count and
+        # the mode's schedule.
         """Handing it the base directory would read the two sides' logs as one run's."""
         recorded: dict[str, object] = {}
 
         def record(**kwargs) -> None:
+            # [FUNCTION DOC] HELPER: Stores the received keyword arguments into the shared mapping.
             recorded.update(kwargs)
 
         mode = dataclasses.replace(scenario.CHECKPOINTED, assert_redone=record)
@@ -345,17 +445,23 @@ class TestTheVerdictEachModeIsMeasuredAgainst:
 
 
 def _evidence() -> HotRestartEvidence:
+    # [FUNCTION DOC] HELPER: Returns empty evidence (no records, no snapshots) for release
+    # "miles-run-demo-all".
     return HotRestartEvidence(records=(), snapshots=(), release="miles-run-demo-all")
 
 
 class TestTheSaveShapeTheTakeOverNeeds:
+    # [CLASS DOC] Tests of the synchronous save requirement.
     def test_the_run_is_installed_to_save_synchronously(self):
+        # [FUNCTION DOC] Built arguments do not define the async save flag.
         """Every take-over is pinned to the checkpoint the frozen run is already holding."""
         args = scenario._build_args(scenario.CHECKPOINTED, scenario._MODE, "/dumps/target/sync", False)
 
         assert not ArgvManipulator.is_defined(shlex.split(args), scenario.ASYNC_SAVE_FLAG)
 
     def test_a_run_saving_asynchronously_is_refused(self):
+        # [FUNCTION DOC] An argument string with the async save flag makes the save-before-report
+        # check raise matching "lets a checkpoint land after".
         """Such a checkpoint can land after the step that triggered it, so the pin means nothing."""
         with pytest.raises(AssertionError, match="lets a checkpoint land after"):
             scenario._assert_run_saves_before_step_report("--save /ckpt --async-save ")

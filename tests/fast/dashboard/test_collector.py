@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Unit tests for the dashboard collector actor class (configuration, record ingestion, topology
+# de-duplication, periodic flushing, scraper wiring, GPU sampler reconciliation, prometheus
+# forwarding and the keyword-only construction contract). Everything runs in-process: the ray
+# actor is never started, scraping uses an injected fake http getter that returns a canned
+# router metrics page loaded once at import time from the fixtures directory, and persisted
+# output is verified by reloading the metric store from the temporary directory.
 import logging
 import time
 from pathlib import Path
@@ -25,6 +32,11 @@ ROUTER_FIXTURE = (Path(__file__).parent / "fixtures" / "engine_metrics_router.tx
 
 
 def make_collector(tmp_path, **kwargs) -> DashboardCollector:
+    # [FUNCTION DOC] HELPER: Builds a collector. Takes an optional config entry out of the extra
+    # keyword arguments; when absent, uses a default configuration writing to a dashboard
+    # directory under the temporary path, with run name "collector-test" and start time 1.0.
+    # Remaining keyword arguments (scraper getter, prometheus factory, ...) pass through to the
+    # collector constructor. Returns the collector without starting any thread.
     config = kwargs.pop("config", None) or CollectorConfig(
         dashboard_dir=str(tmp_path / "dashboard"), run_name="collector-test", start_ts=1.0
     )
@@ -32,6 +44,13 @@ def make_collector(tmp_path, **kwargs) -> DashboardCollector:
 
 
 def test_collector_satisfies_dummy_telemetry_contract(tmp_path):
+    # [FUNCTION DOC] Writes dummy telemetry straight to a store directory, loads it as the
+    # reference, then replays every record of each stream through the collector's public push
+    # methods (metrics, phases, topology snapshots, gpu samples grouped per node) plus the
+    # private append path used by the scraper sink for engine series, with the same start time
+    # as the fixture. After a flush, reloads from the collector's directory and asserts lanes,
+    # topology windows, phases by lane, gpu series, one engine series, bubbles and the run name
+    # equal the reference.
     """Records routed through the collector's RPC surface must be interpreted
     by the timeline queries exactly like the fixture's direct writes."""
     dump_dummy_telemetry(tmp_path / "direct")
@@ -72,6 +91,9 @@ def test_collector_satisfies_dummy_telemetry_contract(tmp_path):
 
 
 def test_push_gpu_processes_round_trips(tmp_path):
+    # [FUNCTION DOC] Pushes two per-process gpu samples for one node, flushes, reloads the store
+    # and asserts the stored gpu process list holds both as plain mappings with identical field
+    # values and order.
     collector = make_collector(tmp_path)
     batch = [
         GpuProcessSample(ts=2.0, node="n", gpu=0, pid=111, name="sglang", mem_mb=4096),
@@ -88,6 +110,8 @@ def test_push_gpu_processes_round_trips(tmp_path):
 
 
 def test_push_data_buffer_round_trips(tmp_path):
+    # [FUNCTION DOC] Pushes two data buffer length samples (4 then 9), flushes, reloads and
+    # asserts the latest recorded buffer length is 9.
     collector = make_collector(tmp_path)
     collector.push_data_buffer(DataBufferSample(ts=3.0, length=4))
     collector.push_data_buffer(DataBufferSample(ts=4.0, length=9))
@@ -98,10 +122,15 @@ def test_push_data_buffer_round_trips(tmp_path):
 
 
 def _engine(addr: str) -> EngineInfo:
+    # [FUNCTION DOC] HELPER: Returns an engine description for the given address: regular worker
+    # type, rank 0, bound to GPU 0 of node "n" with an unknown gpu uuid.
     return EngineInfo(addr=addr, worker_type="regular", engine_rank=0, gpus=[["n", 0]], gpu_uuids=[None])
 
 
 def test_topology_dedup_keeps_changes_only(tmp_path):
+    # [FUNCTION DOC] Sends three topology snapshots: engine A at t=1, the identical engine set at
+    # t=2, a different engine address (restart) at t=3. After flush and reload, asserts the
+    # topology windows start only at 1.0 and 3.0, i.e. the unchanged snapshot was dropped.
     collector = make_collector(tmp_path)
     collector.update_topology(TopologySnapshot(ts=1.0, engines=[_engine("http://a:1")]))
     collector.update_topology(TopologySnapshot(ts=2.0, engines=[_engine("http://a:1")]))  # same engines
@@ -113,6 +142,9 @@ def test_topology_dedup_keeps_changes_only(tmp_path):
 
 
 def test_flush_thread_persists_periodically(tmp_path):
+    # [FUNCTION DOC] Starts the collector with a 50 ms flush interval, pushes one metrics record,
+    # sleeps 200 ms without calling flush explicitly, and asserts the on-disk store already holds
+    # exactly one metrics record. Always shuts the collector down afterwards.
     config = CollectorConfig(
         dashboard_dir=str(tmp_path / "dashboard"), run_name="r", start_ts=0.0, flush_interval_seconds=0.05
     )
@@ -127,6 +159,9 @@ def test_flush_thread_persists_periodically(tmp_path):
 
 
 def test_shutdown_flushes_and_stops_scraper(tmp_path):
+    # [FUNCTION DOC] Sets a router address (creating the scraper with the fake getter), pushes a
+    # metrics record, then shuts down without an explicit flush. Asserts the scraper's stop event
+    # is set and the reloaded store contains the one metrics record.
     collector = make_collector(tmp_path, scraper_http_get=lambda url, timeout: ROUTER_FIXTURE)
     collector.set_router("http://router:3000")
     assert collector._scraper is not None
@@ -139,6 +174,8 @@ def test_shutdown_flushes_and_stops_scraper(tmp_path):
 
 
 def _router_mode_collector(tmp_path):
+    # [FUNCTION DOC] HELPER: Builds a collector whose configuration explicitly selects the
+    # "router" scrape mode and whose scraper http getter returns the canned router page.
     config = CollectorConfig(
         dashboard_dir=str(tmp_path / "dashboard"), run_name="collector-test", start_ts=1.0, scrape_mode="router"
     )
@@ -146,6 +183,8 @@ def _router_mode_collector(tmp_path):
 
 
 def test_auto_scrape_mode_is_direct(tmp_path):
+    # [FUNCTION DOC] With the default (auto) scrape mode, setting a router address creates a
+    # scraper whose resolved mode is direct scraping of engines. Shuts the collector down.
     collector = make_collector(tmp_path, scraper_http_get=lambda url, timeout: ROUTER_FIXTURE)
     collector.set_router("http://router:3000")
     assert collector._scraper.mode == ScrapeMode.DIRECT
@@ -153,6 +192,8 @@ def test_auto_scrape_mode_is_direct(tmp_path):
 
 
 def test_explicit_router_scrape_mode_is_honoured(tmp_path):
+    # [FUNCTION DOC] With the scrape mode explicitly set to router, asserts the scraper created
+    # by setting the router address uses router mode. Shuts the collector down.
     collector = _router_mode_collector(tmp_path)
     collector.set_router("http://router:3000")
     assert collector._scraper.mode == ScrapeMode.ROUTER
@@ -160,6 +201,11 @@ def test_explicit_router_scrape_mode_is_honoured(tmp_path):
 
 
 def test_scraper_repoint(tmp_path):
+    # [FUNCTION DOC] Verifies scraper lifecycle on router changes. Setting the same router address
+    # again is a no-op (same scraper object). After registering one actor engine and setting a
+    # different router address, a new scraper replaces the old one, the old one is stopped, and
+    # the new scraper's engine address list is the actor-registered engine first followed by the
+    # two external engine addresses remembered from the first router's scrape (in fixture order).
     collector = _router_mode_collector(tmp_path)
     collector.set_router("http://router:3000")
     first = collector._scraper
@@ -182,6 +228,10 @@ def test_scraper_repoint(tmp_path):
 
 
 def test_disk_failure_is_loud_and_buffers_stay_bounded(tmp_path, monkeypatch, caplog):
+    # [FUNCTION DOC] Lowers the per-stream buffer cap to 100 and makes the store's flush always
+    # raise an out-of-space error. Pushes 150 metrics records and flushes while capturing error
+    # logs. Asserts the buffered metrics count stays within the cap plus a small slack (105) and
+    # that error messages mention both a failure and dropped data.
     collector = make_collector(tmp_path)
     monkeypatch.setattr(DashboardCollector, "MAX_BUFFERED_PER_STREAM", 100)
     monkeypatch.setattr(MetricStore, "flush", lambda self: (_ for _ in ()).throw(OSError("no space left")))
@@ -198,13 +248,22 @@ def test_disk_failure_is_loud_and_buffers_stay_bounded(tmp_path, monkeypatch, ca
 
 
 def test_prometheus_forwarding_snapshot(tmp_path):
+    # [FUNCTION DOC] Enables prometheus forwarding with a fake remote handle recording every
+    # snapshot sent. Pushes one gpu sample (util 87) and one 60 second train phase, flushes
+    # twice. Asserts two snapshots were forwarded (the latest-value cache survives the first
+    # flush), the gpu utilisation gauge for node 10.0.0.1 gpu 0 is 87.0 and the phase seconds
+    # gauge is 60.0, and no metric key contains a dot or colon.
     updates: list[dict] = []
 
     class FakeRemote:
+        # [CLASS DOC] HELPER: Mimics a ray remote method wrapper; calling remote records the
+        # snapshot into the enclosing list.
         def remote(self, snapshot):
+            # [FUNCTION DOC] HELPER: Appends the snapshot to the recorded updates; returns nothing.
             updates.append(snapshot)
 
     class FakeHandle:
+        # [CLASS DOC] HELPER: Fake prometheus actor handle exposing only the update method.
         update = FakeRemote()
 
     config = CollectorConfig(
@@ -228,6 +287,8 @@ def test_prometheus_forwarding_snapshot(tmp_path):
 
 
 def test_forwarding_disabled_by_default(tmp_path):
+    # [FUNCTION DOC] Builds a collector with default config and a prometheus handle factory that
+    # records calls; after a flush asserts the factory was never invoked.
     called = []
     collector = make_collector(tmp_path, prometheus_handle_factory=lambda: called.append(1))
     collector.flush()
@@ -235,12 +296,20 @@ def test_forwarding_disabled_by_default(tmp_path):
 
 
 def test_sampler_reconcile_spawns_late_nodes_and_skips_nvml_less(tmp_path, monkeypatch):
+    # [FUNCTION DOC] Replaces the collector module's node listing, sampler spawn and sampler kill
+    # functions with fakes. Asserts that reconcile (1) spawns a sampler for an initial node,
+    # (2) picks up a node joining later, (3) for a node whose spawn yields nothing (no NVML)
+    # spawns exactly once and never retries, (4) when a node id changes at the same ip, replaces
+    # the old sampler entry with a new one, and (5) shutdown kills exactly the live sampler
+    # handles (the replaced node and the late node), not the old or NVML-less ones.
     from miles.dashboard import collector as collector_mod
 
     nodes = [("id-a", "10.0.0.1")]
     spawned, killed = [], []
 
     def fake_spawn(node_id, node_ip, interval):
+        # [FUNCTION DOC] HELPER: Fake spawn; records the node id and returns nothing for the
+        # NVML-less node id, otherwise a string handle derived from the node id.
         spawned.append(node_id)
         return None if node_id == "id-nvmlless" else f"handle-{node_id}"
 
@@ -273,6 +342,11 @@ def test_sampler_reconcile_spawns_late_nodes_and_skips_nvml_less(tmp_path, monke
 
 
 def test_external_engines_synthesized_from_scrapes(tmp_path):
+    # [FUNCTION DOC] Appends engine samples for two addresses never registered by an actor, then
+    # runs the external-topology sync step twice (second must add no snapshot) and flushes.
+    # Asserts exactly one topology snapshot exists listing both as worker type "external" with
+    # no gpus. Then registers a real actor snapshot for the first address and asserts the latest
+    # stored snapshot reports that address as "regular" while the second stays "external".
     """Pure sglang engines (no miles actor) never reach register_engines;
     the scrape itself is the topology source (disagg report 2026-07-14)."""
     from miles.dashboard.store import EngineSample, Stream, TopologySnapshot
@@ -318,7 +392,10 @@ def test_external_engines_synthesized_from_scrapes(tmp_path):
 
 
 class TestConstructorContract:
+    # [CLASS DOC] Tests for how the collector must be constructed.
     def test_a_positional_config_is_rejected(self, tmp_path):
+        # [FUNCTION DOC] Passing the configuration positionally must raise a type error because
+        # the constructor is keyword-only (it is created as a ray actor).
         """The collector is built as a ray actor, so config must be bound by keyword only."""
         config = CollectorConfig(dashboard_dir=str(tmp_path / "dashboard"), run_name="r", start_ts=1.0)
 
@@ -327,35 +404,55 @@ class TestConstructorContract:
 
 
 class _FakeSamplerStart:
+    # [CLASS DOC] HELPER: Fake remote method wrapper for the sampler start call.
     def remote(self):
+        # [FUNCTION DOC] HELPER: Returns true, standing in for a started remote call.
         return True
 
 
 class _FakeSamplerHandle:
+    # [CLASS DOC] HELPER: Fake actor handle wrapping a real in-process sampler object and
+    # exposing a start attribute with a remote method.
     def __init__(self, sampler):
+        # [FUNCTION DOC] HELPER: Stores the sampler and creates the fake start wrapper.
         self.sampler = sampler
         self.start = _FakeSamplerStart()
 
 
 class _FakeRayActorClass:
+    # [CLASS DOC] HELPER: Fake replacement for a ray-decorated actor class. Records the options
+    # given and the positional and keyword arguments passed to remote, and instantiates the real
+    # class in-process instead of creating an actor.
     def __init__(self, cls):
+        # [FUNCTION DOC] HELPER: Stores the wrapped class and initialises the recorded options,
+        # positional arguments and keyword arguments to nothing.
         self._cls = cls
         self.options_kwargs = None
         self.positional_args = None
         self.keyword_args = None
 
     def options(self, **kwargs):
+        # [FUNCTION DOC] HELPER: Records the options and returns itself for chaining.
         self.options_kwargs = kwargs
         return self
 
     def remote(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Records the arguments, builds the real object with them and
+        # returns a fake handle around it.
         self.positional_args = args
         self.keyword_args = kwargs
         return _FakeSamplerHandle(self._cls(*args, **kwargs))
 
 
 class TestDefaultSpawnSampler:
+    # [CLASS DOC] Tests for the collector module's default sampler spawn function.
     def test_builds_the_gpu_sampler_through_keyword_arguments_only(self, monkeypatch):
+        # [FUNCTION DOC] Patches the ray remote decorator, get, kill and runtime context with
+        # fakes (the current actor is a string), then calls the default spawn function with a
+        # 56-character node id, an ip and a 0.25 interval. Asserts exactly one actor class was
+        # created, it received no positional arguments, its keyword arguments were exactly push,
+        # node, interval and push_processes, the built sampler is a gpu sampler with the given
+        # ip and interval, and its push target is the collector module's self-push adapter.
         """The sampler actor is constructed with keywords its keyword-only signature accepts."""
         import ray
 
@@ -365,6 +462,8 @@ class TestDefaultSpawnSampler:
         actor_classes: list[_FakeRayActorClass] = []
 
         def fake_ray_remote(cls):
+            # [FUNCTION DOC] HELPER: Fake remote decorator; wraps the class in the fake actor
+            # class, remembers it and returns it.
             actor_class = _FakeRayActorClass(cls)
             actor_classes.append(actor_class)
             return actor_class

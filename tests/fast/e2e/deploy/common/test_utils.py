@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Tests for the deploy common utilities module: the reason a cluster environment is deemed
+# unconfigured (non-kubernetes backend, missing namespace), the assertion that the cluster can
+# deploy runs (fails instead of skipping; probing is replaced by fakes), the cluster-checking
+# entry wrapper, and the deterministic comparison wrapper that must forward exactly the same
+# comparison as the unsplit fault-tolerance pair plus an engine count check on both sides.
 from typing import Any
 
 import pytest
@@ -14,23 +20,32 @@ _EXPECTED_ENGINE_COUNT: int = 2
 
 
 def _config(*, cluster_backend: ClusterBackend, namespace: str) -> ExecuteTrainConfig:
+    # [FUNCTION DOC] HELPER: Builds a training execution configuration with the given backend and
+    # namespace and run id "demo".
     return ExecuteTrainConfig(cluster_backend=cluster_backend, namespace=namespace, run_id="demo")
 
 
 class TestComputeUnconfiguredReason:
+    # [CLASS DOC] Tests of the unconfigured-reason computation: returns a reason text when the
+    # environment cannot run deploy tests, or none when it can.
     def test_an_environment_on_another_backend_declares_no_kubernetes(self):
+        # [FUNCTION DOC] For the ray backend (with a namespace) the reason is non-empty and
+        # mentions the backend's name.
         """Only kubernetes installs one release per deployment, so any other backend is a declared absence."""
         reason = utils._compute_unconfigured_reason(_config(cluster_backend=ClusterBackend.RAY, namespace="rl"))
 
         assert reason is not None and ClusterBackend.RAY.value in reason
 
     def test_a_kubernetes_environment_without_a_namespace_is_unconfigured(self):
+        # [FUNCTION DOC] For kubernetes with an empty namespace the reason is non-empty and names
+        # the environment variable that supplies the namespace.
         """An empty namespace is how the environment says it configured no cluster of its own."""
         reason = utils._compute_unconfigured_reason(_config(cluster_backend=ClusterBackend.KUBERNETES, namespace=""))
 
         assert reason is not None and utils.RUN_NAMESPACE_ENV_VAR in reason
 
     def test_a_configured_kubernetes_environment_is_not_excused(self):
+        # [FUNCTION DOC] For kubernetes with namespace "rl" the result is none (no excuse).
         """A declared namespace commits the environment to actually running these tests."""
         assert (
             utils._compute_unconfigured_reason(_config(cluster_backend=ClusterBackend.KUBERNETES, namespace="rl"))
@@ -39,7 +54,11 @@ class TestComputeUnconfiguredReason:
 
 
 class TestAssertTheClusterCanDeployRuns:
+    # [CLASS DOC] Tests of the cluster readiness assertion. The backend-creation probe is
+    # replaced by fakes: one that always fails and one that succeeds.
     def test_a_non_kubernetes_backend_fails_rather_than_skips(self, monkeypatch):
+        # [FUNCTION DOC] With a ray configuration the assertion raises an assertion error whose
+        # message mentions kubernetes.
         """A run that quietly does nothing reports green for a test that never installed anything."""
         monkeypatch.setattr(utils, "create_backend_for_run", _refuse_to_probe)
 
@@ -47,6 +66,8 @@ class TestAssertTheClusterCanDeployRuns:
             utils.assert_cluster_can_deploy_runs(_config(cluster_backend=ClusterBackend.RAY, namespace="rl"))
 
     def test_an_environment_that_named_no_namespace_fails_rather_than_skips(self, monkeypatch):
+        # [FUNCTION DOC] With kubernetes and no namespace the assertion raises an assertion error
+        # whose message names the namespace environment variable.
         """The reason names the variable to set, which is the whole value of failing here rather than in helm."""
         monkeypatch.setattr(utils, "create_backend_for_run", _refuse_to_probe)
 
@@ -54,6 +75,8 @@ class TestAssertTheClusterCanDeployRuns:
             utils.assert_cluster_can_deploy_runs(_config(cluster_backend=ClusterBackend.KUBERNETES, namespace=""))
 
     def test_a_declared_cluster_that_cannot_be_reached_fails_rather_than_skips(self, monkeypatch):
+        # [FUNCTION DOC] With kubernetes, a namespace and a probe that raises, the assertion
+        # raises an assertion error rather than skipping.
         """Exiting 0 here would report green for a test that never installed anything."""
         monkeypatch.setattr(utils, "create_backend_for_run", _refuse_to_probe)
 
@@ -61,12 +84,17 @@ class TestAssertTheClusterCanDeployRuns:
             utils.assert_cluster_can_deploy_runs(_config(cluster_backend=ClusterBackend.KUBERNETES, namespace="rl"))
 
     def test_a_reachable_cluster_lets_the_test_run(self, monkeypatch):
+        # [FUNCTION DOC] With kubernetes, a namespace and a probe that succeeds, the assertion
+        # returns without raising.
         """The check exists to fail unconfigured environments early, not to narrow configured ones."""
         monkeypatch.setattr(utils, "create_backend_for_run", lambda config: None)
 
         utils.assert_cluster_can_deploy_runs(_config(cluster_backend=ClusterBackend.KUBERNETES, namespace="rl"))
 
     def test_the_entry_wrapper_checks_the_cluster_before_it_runs_anything(self, monkeypatch):
+        # [FUNCTION DOC] Replaces the default configuration with a kubernetes one and the cluster
+        # assertion with a failing fake. Calling the wrapped function produced by the entry wrapper
+        # raises the assertion error ("no cluster here") and the wrapped recorder was never called.
         """Every deploy entry goes through this wrapper, so the check may not be skippable by forgetting it."""
         ran: list[str | None] = []
         monkeypatch.setattr(
@@ -83,19 +111,29 @@ class TestAssertTheClusterCanDeployRuns:
 
 
 def _refuse_to_probe(config: ExecuteTrainConfig) -> None:
+    # [FUNCTION DOC] HELPER: Fake backend probe; always raises an assertion error saying the
+    # configured backend is not reachable.
     raise AssertionError(f"the {config.cluster_backend.value} backend is not reachable")
 
 
 def _refuse_cluster(config: ExecuteTrainConfig) -> None:
+    # [FUNCTION DOC] HELPER: Fake cluster assertion; always raises an assertion error "no cluster
+    # here".
     raise AssertionError("no cluster here")
 
 
 @pytest.fixture
 def recorded_calls(monkeypatch) -> dict[str, list[dict[str, Any]]]:
+    # [FUNCTION DOC] HELPER: Fixture. Replaces the utilities module's deterministic side
+    # comparison (in the comparisons module) and engine count assertion with recorders. Returns a
+    # mapping from each function's name to the list of keyword-argument mappings it was called with.
     calls: dict[str, list[dict[str, Any]]] = {"compare_deterministic_sides": [], "assert_engine_count": []}
 
     def record(name: str):
+        # [FUNCTION DOC] HELPER: Returns a recorder function that appends its keyword arguments
+        # to the list stored under the given name.
         def recorder(**kwargs: Any) -> None:
+            # [FUNCTION DOC] HELPER: Appends the keyword arguments as one entry; returns nothing.
             calls[name].append(kwargs)
 
         return recorder
@@ -107,6 +145,9 @@ def recorded_calls(monkeypatch) -> dict[str, list[dict[str, Any]]]:
 
 
 def _compare(*, exclude_keys: list[str] | None = None) -> None:
+    # [FUNCTION DOC] HELPER: Invokes the utilities module's deterministic side comparison with the
+    # fixed baseline and target directories, expected engine count 2, minimum trained rollouts 2
+    # and the given optional exclusion list (default none).
     utils.compare_deterministic_sides(
         baseline_dir=_BASELINE_DIR,
         target_dir=_TARGET_DIR,
@@ -117,7 +158,11 @@ def _compare(*, exclude_keys: list[str] | None = None) -> None:
 
 
 class TestCompareDeterministicSides:
+    # [CLASS DOC] Tests of the deploy wrapper around the deterministic comparison.
     def test_the_two_sides_are_compared_exactly_as_an_unsplit_pair_is(self, recorded_calls):
+        # [FUNCTION DOC] One comparison call forwards exactly one underlying call with the
+        # baseline dir, target dir, minimum trained rollouts and no exclusions; the engine count is
+        # not forwarded to it.
         """A deploy comparison that dropped one of ft's checks would pass a split run ft would refuse."""
         _compare()
 
@@ -131,6 +176,8 @@ class TestCompareDeterministicSides:
         ]
 
     def test_a_deploy_scenario_can_name_the_keys_its_comparison_must_drop(self, recorded_calls):
+        # [FUNCTION DOC] A given exclusion list (one weight-version key) is forwarded unchanged to
+        # the underlying comparison.
         """The deploy wrapper forwards the exclusions rather than deciding them for every scenario."""
         excluded = ["rollout/weight_version/max"]
 
@@ -139,6 +186,9 @@ class TestCompareDeterministicSides:
         assert recorded_calls["compare_deterministic_sides"][0]["exclude_keys"] == excluded
 
     def test_both_sides_are_required_to_have_served_the_engines_the_run_declared(self, recorded_calls):
+        # [FUNCTION DOC] The comparison also calls the engine count assertion exactly twice, in
+        # order: baseline side with the baseline dir and then target side with the target dir,
+        # each expecting 2 engines.
         """This is what the unsplit comparison cannot check: a split run losing an engine deployment."""
         _compare()
 

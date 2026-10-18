@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Tests for trajectory (per-sample lifecycle) views of the metric store and server: lane assembly
+# from raw events (pairing generation and tool spans, attempts, versions, status, aborted
+# spans closed by attempt end, single-turn probes, coarse spans superseded by per-turn spans),
+# the lifecycle heatmap (palette, submit-ordered rows, row cap), and the per-rollout trajectories
+# endpoint (filtering by sample and empty result without probes). Uses the combined dummy dump
+# plus telemetry directory (the same composition as the demo mode) and hand-written events.
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
@@ -11,6 +18,8 @@ from miles.dashboard.store import MetricStore, TrajectoryEvent, TrajectoryEventK
 
 @pytest.fixture
 def combined(tmp_path):
+    # [FUNCTION DOC] HELPER: Fixture. Writes a dummy dump and dummy telemetry into the same
+    # temporary directory; returns a triple of the loaded store, a dump reader and the truth.
     """dump + telemetry in one dir — the same composition serve --demo uses."""
     dump_dummy_run(tmp_path)
     truth = dump_dummy_telemetry(tmp_path)
@@ -21,12 +30,20 @@ def combined(tmp_path):
 
 
 def _event(ts, kind, index=1, turn=-1, version="2", detail=""):
+    # [FUNCTION DOC] HELPER: Builds a trajectory event at the given time and kind for the given
+    # sample index (default 1), group 0, turn (default -1 meaning attempt level), version
+    # (default "2") and detail (default empty).
     return TrajectoryEvent(
         ts=ts, kind=kind, sample_index=index, group_index=0, turn=turn, weight_version=version, detail=detail
     )
 
 
 def test_trajectory_lanes_pairs_spans_and_attempts(tmp_path):
+    # [FUNCTION DOC] Writes the events of one sample with two attempts (the first aborted, with a
+    # turn-2 generation never ended; the second completed). Asserts a single lane with sample
+    # index 1, status completed (from the last attempt), versions [2, 3, 4], attempts
+    # [10..19, 30..36], and segments: gen 11-15 turn 1, tool 15-18 turn 1, gen 18-19 turn 2
+    # (closed by the attempt end), gen 31-35 turn 1.
     writer = MetricStore(tmp_path)
     kinds = TrajectoryEventKind
     for event in (
@@ -61,6 +78,9 @@ def test_trajectory_lanes_pairs_spans_and_attempts(tmp_path):
 
 
 def test_lifecycle_heatmap_row_cap(combined, monkeypatch):
+    # [FUNCTION DOC] With the store's lifecycle row cap lowered to 5, the lifecycle heatmap has
+    # 5 rows, reports the total row count (steps times samples per step), and keeps the earliest
+    # submitted samples (indices 0..4).
     store, _, truth = combined
     monkeypatch.setattr(MetricStore, "LIFECYCLE_MAX_ROWS", 5)
     result = store.heatmap("lifecycle", x_buckets=50)
@@ -71,6 +91,9 @@ def test_lifecycle_heatmap_row_cap(combined, monkeypatch):
 
 
 def test_lifecycle_heatmap_palette_and_rows(combined):
+    # [FUNCTION DOC] The lifecycle heatmap (200 buckets) has palette ["", queue, generating,
+    # tool_wait]; one row per sample of all steps; the cell matrix contains generating and
+    # tool_wait cells; the first rows' sample indices are in ascending (submit) order.
     store, _, truth = combined
     result = store.heatmap("lifecycle", x_buckets=200)
     assert result["palette"] == ["", "queue", "generating", "tool_wait"]
@@ -84,6 +107,9 @@ def test_lifecycle_heatmap_palette_and_rows(combined):
 
 
 def test_single_turn_gen_closes_at_attempt_end(tmp_path):
+    # [FUNCTION DOC] Events: attempt start 10, attempt-level generation start 12 (no end), attempt
+    # end 50. The lane has one closed gen segment from 12 to 50 (a dangling span would be painted
+    # to the consume line).
     # the generate_and_rm probe alone (single-turn path: no gen_end) must
     # yield a CLOSED gen span; dangling spans painted every sample's end at
     # the consume line (report 2026-07-13)
@@ -101,6 +127,9 @@ def test_single_turn_gen_closes_at_attempt_end(tmp_path):
 
 
 def test_coarse_gen_span_superseded_by_turn_spans(tmp_path):
+    # [FUNCTION DOC] Events include a coarse attempt-level generation start plus a per-turn
+    # generation (turn 1). The lane's segments contain only the turn-1 gen: the coarse span is
+    # dropped when per-turn spans exist.
     writer = MetricStore(tmp_path)
     kinds = TrajectoryEventKind
     for event in (
@@ -120,6 +149,10 @@ def test_coarse_gen_span_superseded_by_turn_spans(tmp_path):
 
 
 def test_rollout_trajectories_endpoint(combined):
+    # [FUNCTION DOC] The trajectories endpoint for step 1 returns lanes exactly for that step's
+    # sample indices. An agentic lane (index divisible by 3) has 2 versions and segments gen, tool,
+    # gen; a plain lane (index mod 3 equal 1) has 1 version and a single gen; all lanes are
+    # completed; if a consume timestamp is reported, every lane's last event is not after it.
     store, reader, truth = combined
     client = TestClient(make_app(store, reader))
 
@@ -137,6 +170,7 @@ def test_rollout_trajectories_endpoint(combined):
 
 
 def test_rollout_trajectories_single_sample_filter(combined):
+    # [FUNCTION DOC] Passing a sample index filter returns exactly that one lane.
     store, reader, _ = combined
     client = TestClient(make_app(store, reader))
     payload = client.get("/api/rollout/1/trajectories", params={"sample_index": SAMPLES_PER_STEP + 1}).json()
@@ -145,6 +179,8 @@ def test_rollout_trajectories_single_sample_filter(combined):
 
 
 def test_rollout_trajectories_empty_for_probe_less_runs(tmp_path):
+    # [FUNCTION DOC] With a dump only (no telemetry or trajectory events), the endpoint returns an
+    # empty lanes list.
     dump_dummy_run(tmp_path)  # dump only: no telemetry, no events
     client = TestClient(make_app(MetricStore.load(tmp_path / "dashboard"), DumpReader(tmp_path)))
     payload = client.get("/api/rollout/0/trajectories").json()

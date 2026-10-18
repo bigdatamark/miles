@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Tests for the trajectory event sink in the dashboard hooks: event emission carrying sample
+# identity and the latest weight version, explicit-time generation and tool spans, draining of
+# per-turn lifecycle metadata at attempt end (including agent gaps bounded by request arrival),
+# batching with swallowed push failures, attaching and detaching through the global lifecycle
+# seam, and a store round trip of trajectory events across hour partitions. Uses a fake
+# collector handle with a recording trajectory push method; an autouse fixture clears the global
+# lifecycle sink before and after each test.
 import pytest
 
 from miles.dashboard import hooks
@@ -8,29 +16,40 @@ from miles.utils.types import Sample, WeightVersionSpan, WeightVersionsPerCall
 
 
 class FakeRemoteMethod:
+    # [CLASS DOC] HELPER: Stand-in for a ray remote method wrapper that records calls.
     def __init__(self, fail=False):
+        # [FUNCTION DOC] HELPER: Initialises an empty call list and the failure flag.
         self.calls = []
         self.fail = fail
 
     def remote(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Raises a runtime error (collector unreachable) if configured to
+        # fail; otherwise records the positional and keyword arguments as one entry.
         if self.fail:
             raise RuntimeError("collector unreachable")
         self.calls.append((args, kwargs))
 
 
 class FakeHandle:
+    # [CLASS DOC] HELPER: Fake collector handle exposing only a recording trajectory push method.
     def __init__(self, fail_push=False):
+        # [FUNCTION DOC] HELPER: Creates the recording method, failing when fail_push is set.
         self.push_trajectories = FakeRemoteMethod(fail=fail_push)
 
 
 @pytest.fixture(autouse=True)
 def clean_sink():
+    # [FUNCTION DOC] HELPER: Autouse fixture. Clears the global trajectory lifecycle's sink before
+    # the test and again after it.
     TrajectoryLifecycle().sink = None
     yield
     TrajectoryLifecycle().sink = None
 
 
 def _sample(index=7, group=2, versions=("3", "4")):
+    # [FUNCTION DOC] HELPER: Builds a sample with the given index (default 7), group (default 2)
+    # and one generation call per version, each a single span of that version over consecutive
+    # one-token ranges.
     return Sample(
         index=index,
         group_index=group,
@@ -41,6 +60,8 @@ def _sample(index=7, group=2, versions=("3", "4")):
 
 
 def _pushed(handle):
+    # [FUNCTION DOC] HELPER: Flattens all event batches pushed to the fake handle into one list in
+    # push order.
     return [event for (args, _) in handle.push_trajectories.calls for event in args[0]]
 
 
@@ -48,6 +69,9 @@ def _pushed(handle):
 
 
 def test_attempt_and_gen_events_carry_identity_and_version():
+    # [FUNCTION DOC] Emitting attempt start, generation start and attempt end for one sample then
+    # flushing pushes events of those kinds in order; each carries sample index 7, group 2 and the
+    # last weight version "4"; the attempt end's detail is the sample's pending status value.
     handle = FakeHandle()
     sink = TrajectorySink(handle)
     sample = _sample()
@@ -69,6 +93,8 @@ def test_attempt_and_gen_events_carry_identity_and_version():
 
 
 def test_event_without_weight_version_spans_uses_empty_version():
+    # [FUNCTION DOC] A sample with no version spans still emits an attempt-start event, with
+    # sample index 7 and an empty version string.
     """A sample whose generation reported no weight version is still emitted, with an empty version."""
     handle = FakeHandle()
     sink = TrajectorySink(handle)
@@ -81,6 +107,8 @@ def test_event_without_weight_version_spans_uses_empty_version():
 
 
 def test_event_uses_last_span_from_multi_span_generation_call():
+    # [FUNCTION DOC] For a sample whose last call has spans "4" then "5", the generation-start
+    # event's version is "5" (last span of the last call).
     """The reported version is the last span of the last call, not that call's first span."""
     handle = FakeHandle()
     sample = Sample(
@@ -101,6 +129,9 @@ def test_event_uses_last_span_from_multi_span_generation_call():
 
 
 def test_spans_use_explicit_timestamps_and_turns():
+    # [FUNCTION DOC] A generation span 10.0..14.5 (turn 3, detail "120") and a tool span
+    # 14.5..16.0 (turn 3) push four events in order: gen start, gen end, tool start, tool end, with
+    # the given timestamps and turn; the gen end event carries detail "120".
     handle = FakeHandle()
     sink = TrajectorySink(handle)
     sample = _sample()
@@ -119,6 +150,11 @@ def test_spans_use_explicit_timestamps_and_turns():
 
 
 def test_attempt_end_drains_lifecycle_metadata_from_turn_samples():
+    # [FUNCTION DOC] Two turn samples carry lifecycle metadata (start, end, turn); turn 1 has an
+    # unknown start (only its end is emitted); turn 2 has a previous end of 110.0 and a request
+    # arrival of 110.6. Ending the attempt with the list of both emits: gen end (turn 1), tool
+    # start and tool end (turn 2, spanning 110.0 to 110.6, the arrival and not the generation
+    # start, detail "agent gap"), gen start and gen end (turn 2), then the attempt end with turn -1.
     handle = FakeHandle()
     sink = TrajectorySink(handle)
     turns = []
@@ -146,6 +182,9 @@ def test_attempt_end_drains_lifecycle_metadata_from_turn_samples():
 
 
 def test_batching_and_failure_swallowed():
+    # [FUNCTION DOC] One fewer than the batch maximum of events pushes nothing; one more pushes a
+    # full batch. A sink over a failing handle fed more than a batch of events, then flushed,
+    # never raises.
     handle = FakeHandle()
     sink = TrajectorySink(handle)
     sample = _sample()
@@ -162,6 +201,9 @@ def test_batching_and_failure_swallowed():
 
 
 def test_attach_detach_via_lifecycle_seam():
+    # [FUNCTION DOC] Initially no lifecycle sink. Attaching installs a trajectory sink; attaching
+    # again with another handle keeps the same sink (one per process). An emitted event followed
+    # by detach-and-flush clears the lifecycle sink and pushed exactly that one event.
     assert TrajectoryLifecycle().sink is None
     handle = FakeHandle()
     hooks.attach_trajectory_sink(handle)
@@ -177,6 +219,13 @@ def test_attach_detach_via_lifecycle_seam():
 
 
 def test_trajectory_events_roundtrip_store(tmp_path):
+    # [FUNCTION DOC] Writes two generation-start events an hour-plus apart (t=10 and t=3700),
+    # flushes and loads. The store reports the trajectory stream present, the partition directory
+    # holds two hourly files, the event query returns timestamps [10, 3700] (and [3700] when
+    # starting at 3600), and the record iterator yields events with version "2".
+    # KNOWN ISSUE: the file-count assertion wraps a lazy glob in a boolean expression, so it
+    # effectively measures the list of files and is needlessly convoluted; it also re-imports the
+    # store class locally.
     from miles.dashboard.store import MetricStore
 
     writer = MetricStore(tmp_path)

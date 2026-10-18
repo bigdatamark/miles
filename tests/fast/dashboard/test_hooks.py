@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Tests for the dashboard hooks and backend glue: the phase sink attached to the global timer
+# (batching by event count and by elapsed time, identity re-resolution until the rank is known,
+# swallowing push failures, idempotent attach and detach-with-flush, begin events), train actor
+# registration, engine registration (grouping worker infos per cell, fingerprint de-duplication,
+# dead cell handling, concurrent uuid probing, retry after failures), metric logging filtering,
+# router registration, and data buffer reporting. Everything uses fake remote handles, fake
+# worker providers and fake cells; an autouse fixture resets module globals and the timer sinks.
 import asyncio
 import logging
 
@@ -16,18 +24,26 @@ from miles.utils.workers.worker_spec import HostAndPort, NamedHostAndPorts
 
 
 class FakeRemoteMethod:
+    # [CLASS DOC] HELPER: Stand-in for a ray remote method wrapper that records calls.
     def __init__(self, fail=False):
+        # [FUNCTION DOC] HELPER: Initialises an empty call list and the failure flag.
         self.calls = []
         self.fail = fail
 
     def remote(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Raises a runtime error (collector unreachable) if configured to
+        # fail; otherwise records the positional and keyword arguments as one call entry.
         if self.fail:
             raise RuntimeError("collector unreachable")
         self.calls.append((args, kwargs))
 
 
 class FakeHandle:
+    # [CLASS DOC] HELPER: Fake collector actor handle with recording remote methods for pushing
+    # phases (optionally failing), metrics, topology updates, router setting and data buffer.
     def __init__(self, fail_push=False):
+        # [FUNCTION DOC] HELPER: Creates the five recording methods; only the phase push one
+        # fails when fail_push is set.
         self.push_phases = FakeRemoteMethod(fail=fail_push)
         self.push_metrics = FakeRemoteMethod()
         self.update_topology = FakeRemoteMethod()
@@ -37,6 +53,10 @@ class FakeHandle:
 
 @pytest.fixture(autouse=True)
 def clean_state(monkeypatch):
+    # [FUNCTION DOC] HELPER: Autouse fixture. Saves the global timer's event sinks and clears
+    # them; resets the hooks module's phase sink and engine fingerprint; replaces identity
+    # resolution with a fixed identity (node 10.0.0.3, gpu 3, rank 7); resets the backend's
+    # handle, primary flag and resolution-failed flag. After the test, restores the saved sinks.
     timer = Timer()
     saved = list(timer.event_sinks)
     timer.event_sinks.clear()
@@ -54,6 +74,9 @@ def clean_state(monkeypatch):
 
 
 def test_phase_sink_batches_by_count():
+    # [FUNCTION DOC] Attaches a train sink and feeds it one fewer events than the batch maximum:
+    # nothing is pushed. One more event triggers one push of a full batch whose last event has
+    # the given name and times and the fixed identity (node, gpus, rank) with the train role.
     handle = FakeHandle()
     hooks.attach_phase_sink(handle, Role.TRAIN)
     [sink] = Timer().event_sinks
@@ -72,6 +95,8 @@ def test_phase_sink_batches_by_count():
 
 
 def test_phase_sink_batches_by_time():
+    # [FUNCTION DOC] After one event nothing is pushed. Moving the sink's last-flush time back by
+    # more than the maximum batch seconds makes the next event flush both events in order.
     handle = FakeHandle()
     hooks.attach_phase_sink(handle, Role.TRAIN)
     [sink] = Timer().event_sinks
@@ -85,6 +110,9 @@ def test_phase_sink_batches_by_time():
 
 
 def test_phase_sink_reresolves_until_rank_known(monkeypatch):
+    # [FUNCTION DOC] Identity first resolves with rank -1 (distributed not yet initialised) for
+    # the first event, then with rank 5 for the second. After detach-and-flush, the single
+    # pushed batch has ranks [-1, 5]: the identity is re-resolved until the rank is known.
     handle = FakeHandle()
     monkeypatch.setattr(hooks, "_resolve_identity", lambda: _Identity(node="n", gpus=[0], rank=-1))
     hooks.attach_phase_sink(handle, Role.TRAIN)
@@ -100,6 +128,8 @@ def test_phase_sink_reresolves_until_rank_known(monkeypatch):
 
 
 def test_phase_sink_swallows_push_failures(caplog):
+    # [FUNCTION DOC] With a handle whose phase push raises, feeding a full batch of events must
+    # not raise out of the sink, and a warning containing "phase sink failed" is logged.
     handle = FakeHandle(fail_push=True)
     hooks.attach_phase_sink(handle, Role.TRAIN)
     [sink] = Timer().event_sinks
@@ -110,6 +140,9 @@ def test_phase_sink_swallows_push_failures(caplog):
 
 
 def test_attach_is_idempotent_and_detach_flushes():
+    # [FUNCTION DOC] A second attach (different role) is ignored, leaving one timer sink. After
+    # one event and detach-and-flush, the timer has no sinks and the one pushed batch holds the
+    # event.
     handle = FakeHandle()
     hooks.attach_phase_sink(handle, Role.TRAIN)
     hooks.attach_phase_sink(handle, Role.ROLLOUT_MANAGER)  # second attach ignored
@@ -123,12 +156,16 @@ def test_attach_is_idempotent_and_detach_flushes():
 
 
 def test_register_train_actor_disabled_is_free(monkeypatch):
+    # [FUNCTION DOC] With the dashboard flag off, registering a train actor must not resolve the
+    # collector (resolution fails the test) and must attach no timer sink.
     monkeypatch.setattr(backend, "resolve_collector", lambda: pytest.fail("must not resolve when disabled"))
     hooks.register_train_actor(type("Args", (), {"use_miles_dashboard": False})())
     assert Timer().event_sinks == []
 
 
 def test_register_train_actor_attaches_train_sink(monkeypatch):
+    # [FUNCTION DOC] With the flag on and collector resolution returning a fake handle,
+    # registering attaches exactly one timer sink whose role is train.
     handle = FakeHandle()
     monkeypatch.setattr(backend, "resolve_collector", lambda: handle)
     hooks.register_train_actor(type("Args", (), {"use_miles_dashboard": True})())
@@ -140,43 +177,64 @@ def test_register_train_actor_attaches_train_sink(monkeypatch):
 
 
 class FakeWorkerHandle(BaseWorkerHandle):
+    # [CLASS DOC] HELPER: Minimal worker handle: gpu uuid probing returns one unknown (none)
+    # entry per requested gpu; readiness returns immediately; the death probe reports dead.
     async def _get_gpu_uuids(self, *, gpu_ids):
+        # [FUNCTION DOC] HELPER: Returns a list of none, one per requested gpu id.
         return [None] * len(gpu_ids)
 
     async def wait_ready(self, *, timeout):
+        # [FUNCTION DOC] HELPER: Returns immediately.
         return None
 
     async def probe_is_dead(self):
+        # [FUNCTION DOC] HELPER: Always reports the worker as dead.
         return True
 
 
 class UuidWorkerHandle(BaseWorkerHandle):
+    # [CLASS DOC] HELPER: Worker handle whose uuid probe answers from a mapping from gpu id to
+    # uuid; the death probe fails the test (registration must never probe for death).
     def __init__(self, uuid_by_gpu_id: dict[int, str]):
+        # [FUNCTION DOC] HELPER: Stores the gpu id to uuid mapping.
         self._uuid_by_gpu_id = uuid_by_gpu_id
 
     async def probe_is_dead(self) -> bool:
+        # [FUNCTION DOC] HELPER: Raises an assertion error; must never be called.
         raise AssertionError("registering engines must not probe a worker for death")
 
     async def _get_gpu_uuids(self, *, gpu_ids):
+        # [FUNCTION DOC] HELPER: Returns the mapped uuid for each gpu id in order; raises a key
+        # error for an unmapped id.
         return [self._uuid_by_gpu_id[gpu_id] for gpu_id in gpu_ids]
 
     async def wait_ready(self, *, timeout):
+        # [FUNCTION DOC] HELPER: Returns immediately.
         return None
 
     async def wait_dead(self, *, timeout):
+        # [FUNCTION DOC] HELPER: Returns immediately.
         return None
 
 
 class GatedWorkerHandle(BaseWorkerHandle):
+    # [CLASS DOC] HELPER: Worker handle for concurrency tests. On a uuid probe it optionally
+    # sets a signal event on entry and optionally waits for another event before answering with
+    # its fixed uuid for every gpu.
     def __init__(self, uuid, *, signal=None, wait_for=None):
+        # [FUNCTION DOC] HELPER: Stores the uuid, the event to set on probe entry (optional) and
+        # the event to wait for before answering (optional).
         self._uuid = uuid
         self._signal = signal
         self._wait_for = wait_for
 
     async def probe_is_dead(self) -> bool:
+        # [FUNCTION DOC] HELPER: Raises an assertion error; must never be called.
         raise AssertionError("registering engines must not probe a worker for death")
 
     async def _get_gpu_uuids(self, *, gpu_ids):
+        # [FUNCTION DOC] HELPER: Sets the signal event if present, awaits the wait-for event if
+        # present, then returns the fixed uuid once per requested gpu.
         if self._signal is not None:
             self._signal.set()
         if self._wait_for is not None:
@@ -184,47 +242,70 @@ class GatedWorkerHandle(BaseWorkerHandle):
         return [self._uuid for _ in gpu_ids]
 
     async def wait_ready(self, *, timeout):
+        # [FUNCTION DOC] HELPER: Returns immediately.
         return None
 
     async def wait_dead(self, *, timeout):
+        # [FUNCTION DOC] HELPER: Returns immediately.
         return None
 
 
 class FlakyWorkerHandle(BaseWorkerHandle):
+    # [CLASS DOC] HELPER: Worker handle whose uuid probe raises a runtime error while its fail
+    # flag is set (initially set), and otherwise returns unknown entries.
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Starts in the failing state.
         self.fail = True
 
     async def probe_is_dead(self) -> bool:
+        # [FUNCTION DOC] HELPER: Raises an assertion error; must never be called.
         raise AssertionError("registering engines must not probe a worker for death")
 
     async def _get_gpu_uuids(self, *, gpu_ids):
+        # [FUNCTION DOC] HELPER: Raises a runtime error (worker unreachable) while failing;
+        # otherwise returns a list of none, one per gpu id.
         if self.fail:
             raise RuntimeError("worker unreachable")
         return [None] * len(gpu_ids)
 
     async def wait_ready(self, *, timeout):
+        # [FUNCTION DOC] HELPER: Returns immediately.
         return None
 
     async def wait_dead(self, *, timeout):
+        # [FUNCTION DOC] HELPER: Returns immediately.
         return None
 
 
 class FakeWorkerProvider:
+    # [CLASS DOC] HELPER: Fake worker provider backed by a mapping from cell id to worker info
+    # list and an optional mapping from worker name to handle.
     def __init__(self, infos_by_cell, handles_by_name=None):
+        # [FUNCTION DOC] HELPER: Stores the infos mapping and the handle mapping (empty default).
         self._infos_by_cell = infos_by_cell
         self._handles_by_name = handles_by_name or {}
 
     def get_worker_infos(self, *, cell_ids):
+        # [FUNCTION DOC] HELPER: Returns, for each requested cell id in order, its worker info
+        # list; raises a key error for an unknown cell.
         return [self._infos_by_cell[cell_id] for cell_id in cell_ids]
 
     def get_handles_of_worker_infos(self, infos):
+        # [FUNCTION DOC] HELPER: Returns a mapping from worker name to its configured handle, or
+        # a fresh default fake handle when none is configured.
         return {info.name: self._handles_by_name.get(info.name, FakeWorkerHandle()) for info in infos}
 
 
 class FakeCell:
+    # [CLASS DOC] HELPER: Fake server cell exposing only metadata (model default, given worker
+    # type, cell id "inference-engine-0-0-<index>", one gpu per engine, gpu offset equal to the
+    # index, worker name with suffix -0, no weight update, hash per index), a server url and a
+    # liveness flag.
     """Duck-typed ServerCell: the hooks read only the driver-side routing facts."""
 
     def __init__(self, url, cell_index=0, alive=True, worker_type="regular"):
+        # [FUNCTION DOC] HELPER: Builds the metadata, stores the url and the alive flag as the
+        # pending-or-serving property.
         self.meta = ServerCellMetadata(
             model_id="default",
             worker_type=worker_type,
@@ -242,6 +323,8 @@ class FakeCell:
 
 
 def _worker_info(name, node, gpus, generation=1):
+    # [FUNCTION DOC] HELPER: Builds a worker info with the given name, generation (default 1),
+    # a primary address at the given host and port 30001, and the given gpu ids.
     return WorkerInfo(
         name=name,
         generation=generation,
@@ -251,11 +334,18 @@ def _worker_info(name, node, gpus, generation=1):
 
 
 def _servers(cells):
+    # [FUNCTION DOC] HELPER: Wraps cells in a fake server object whose cell mapping has keys
+    # "cell-0", "cell-1", ...; returns a mapping with the single model name "default".
     server = type("FakeServer", (), {"server_cells": {f"cell-{i}": cell for i, cell in enumerate(cells)}})()
     return {"default": server}
 
 
 async def test_register_engines_groups_multinode_and_dedups(monkeypatch):
+    # [FUNCTION DOC] Two cells, the first with workers on two nodes. First registration pushes
+    # one topology snapshot with both engine addresses; the multi-node engine lists gpus of both
+    # nodes in order and four uuid slots. A second identical registration pushes nothing (the
+    # fingerprint is unchanged). Bumping a worker's generation (recovery) pushes again, and the
+    # republished snapshot still has both addresses and correct gpus for the recovered engine.
     """Worker-manager infos become one EngineInfo per cell; repush only on worker change."""
     handle = FakeHandle()
     monkeypatch.setattr(backend, "_handle", handle)
@@ -292,6 +382,8 @@ async def test_register_engines_groups_multinode_and_dedups(monkeypatch):
 
 
 async def test_register_engines_skips_dead_cells(monkeypatch):
+    # [FUNCTION DOC] With two cells, the second not alive and with no worker infos configured
+    # (so any query for it would fail), the snapshot lists only the first cell's address.
     """Cells that are not alive are left out of the snapshot and never queried."""
     handle = FakeHandle()
     monkeypatch.setattr(backend, "_handle", handle)
@@ -306,15 +398,21 @@ async def test_register_engines_skips_dead_cells(monkeypatch):
 
 
 async def test_register_engines_survives_missing_worker_manager(monkeypatch, caplog):
+    # [FUNCTION DOC] With a provider whose worker info lookup raises a value error, registration
+    # does not raise: no topology is pushed and a warning containing "engine registration
+    # failed" is logged (the rate-limit window of the module warner is reset first).
     """Engines not yet owned by the worker manager degrade to a warning, not a crash."""
     handle = FakeHandle()
     monkeypatch.setattr(backend, "_handle", handle)
 
     class _UnreachableProvider:
+        # [CLASS DOC] HELPER: Provider simulating a missing worker manager actor.
         def get_worker_infos(self, *, cell_ids):
+            # [FUNCTION DOC] HELPER: Always raises a value error (actor not found).
             raise ValueError("worker manager actor not found")
 
         def get_handles_of_worker_infos(self, infos):
+            # [FUNCTION DOC] HELPER: Fails the test with an assertion error; must not be called.
             raise AssertionError("nothing to build a handle for")
 
     hooks._warner.reset_window_for_test()
@@ -326,11 +424,16 @@ async def test_register_engines_survives_missing_worker_manager(monkeypatch, cap
 
 
 async def test_register_engines_without_collector_is_noop():
+    # [FUNCTION DOC] With no collector handle, registration returns and leaves the engine
+    # fingerprint unset.
     await hooks.register_engines(_servers([FakeCell("http://a:1")]), provider=FakeWorkerProvider({}))
     assert hooks._engines_fingerprint is None
 
 
 async def test_register_engines_publishes_topology_from_a_running_event_loop(monkeypatch, caplog):
+    # [FUNCTION DOC] Runs registration from inside the running event loop of this async test and
+    # asserts the topology snapshot is pushed with the cell's address, the fingerprint is set
+    # and no "engine registration failed" warning was logged.
     """Driven from inside a running asyncio loop (as prepare_rollout does), the topology is published without warning."""
     handle = FakeHandle()
     monkeypatch.setattr(backend, "_handle", handle)
@@ -347,6 +450,10 @@ async def test_register_engines_publishes_topology_from_a_running_event_loop(mon
 
 
 async def test_compute_engine_infos_projects_cells_and_workers_exactly():
+    # [FUNCTION DOC] Two cells (decode, prefill), the first with two workers (one with an IPv6
+    # host) and the second with one. Asserts the engine info list: one per cell in order with
+    # worker type, engine rank equal to cell position, gpu (host, id) pairs concatenated
+    # worker by worker, and uuids from each worker's handle aligned with those pairs.
     """Every cell becomes one EngineInfo whose gpu pairs and probed uuids stay aligned worker by worker."""
     cells = [
         FakeCell("http://a:1", cell_index=0, worker_type="decode"),
@@ -389,17 +496,27 @@ async def test_compute_engine_infos_projects_cells_and_workers_exactly():
 
 
 class TestComputeEngineInfos:
+    # [CLASS DOC] Tests of engine info computation edge cases.
     async def test_compute_engine_infos_uses_null_gpu_uuids_when_provider_has_no_handle(self):
+        # [FUNCTION DOC] A provider returns a handle only for the first of two workers. The
+        # engine's gpu pairs still cover all workers' gpus, and uuids are the first worker's
+        # uuid followed by unknown entries for the handle-less worker's two gpus.
         """A worker without a callable handle retains one null UUID slot for each GPU."""
 
         class _MissingHandleWorkerProvider(BaseWorkerProvider):
+            # [CLASS DOC] HELPER: Provider returning a handle for the first info only; the other
+            # methods fail the test if used.
             async def get_addrs(self, worker_name: str) -> NamedHostAndPorts:
+                # [FUNCTION DOC] HELPER: Raises an assertion error; must not be called.
                 raise AssertionError(f"dashboard must not request addresses for {worker_name}")
 
             def get_worker_infos(self, *, cell_ids: list[str]) -> list[list[WorkerInfo]]:
+                # [FUNCTION DOC] HELPER: Raises an assertion error; must not be called.
                 raise AssertionError(f"dashboard already received worker infos for {cell_ids}")
 
             def get_handles_of_worker_infos(self, infos: list[WorkerInfo]) -> dict[str, BaseWorkerHandle]:
+                # [FUNCTION DOC] HELPER: Returns a mapping with only the first info's name to a
+                # handle serving uuid "GPU-a" for gpu 0.
                 return {infos[0].name: UuidWorkerHandle({0: "GPU-a"})}
 
         worker_infos = [
@@ -416,6 +533,9 @@ class TestComputeEngineInfos:
 
 
 async def test_compute_engine_infos_probes_workers_concurrently():
+    # [FUNCTION DOC] The first worker's uuid probe only completes after the second worker's
+    # probe has started. The computation must finish within 5 seconds (serial probing would
+    # hang) and return both uuids in order.
     """The first worker's probe only finishes once the second one started, so serial probing would hang."""
     second_started = asyncio.Event()
     worker_infos = [_worker_info("engine-0-0", "node-a", [0]), _worker_info("engine-0-1", "node-b", [1])]
@@ -435,6 +555,9 @@ async def test_compute_engine_infos_probes_workers_concurrently():
 
 
 async def test_register_engines_retries_after_gpu_uuid_probe_failure(monkeypatch, caplog):
+    # [FUNCTION DOC] With a worker whose uuid probe fails first: registration pushes nothing,
+    # leaves the fingerprint unset and logs "engine registration failed". After the probe is
+    # fixed, the next registration pushes the snapshot with the engine address.
     """A failed uuid probe publishes nothing and leaves the fingerprint unset, so the next call republishes."""
     handle = FakeHandle()
     monkeypatch.setattr(backend, "_handle", handle)
@@ -459,6 +582,9 @@ async def test_register_engines_retries_after_gpu_uuid_probe_failure(monkeypatch
 
 
 async def test_register_engines_republishes_on_cell_liveness_transitions(monkeypatch):
+    # [FUNCTION DOC] Registers with two live cells, then with the second marked not alive, then
+    # alive again. The three pushed snapshots list addresses [a, b], [a], [a, b] respectively:
+    # liveness changes alter the fingerprint and trigger republishing.
     """A cell that drops out and comes back must be removed from and then restored to the published topology."""
     handle = FakeHandle()
     monkeypatch.setattr(backend, "_handle", handle)
@@ -487,6 +613,10 @@ async def test_register_engines_republishes_on_cell_liveness_transitions(monkeyp
 
 
 def test_dashboard_log_filters_to_scalars(monkeypatch):
+    # [FUNCTION DOC] Logging a mapping containing floats, text, a list, a numpy float and a
+    # nested mapping with step 3 and a step key pushes one metrics record whose metrics keep only
+    # scalar entries (float, text, numpy float converted to 2.5), dropping list and nested
+    # mapping, with the step and step key carried over.
     handle = FakeHandle()
     monkeypatch.setattr(backend, "_handle", handle)
     backend.dashboard_log(
@@ -501,6 +631,7 @@ def test_dashboard_log_filters_to_scalars(monkeypatch):
 
 
 def test_dashboard_log_without_handle_is_noop():
+    # [FUNCTION DOC] Logging with no collector handle does not raise.
     backend.dashboard_log({"a": 1})  # must not raise
 
 
@@ -508,6 +639,8 @@ def test_dashboard_log_without_handle_is_noop():
 
 
 def _router_args(ip="10.0.0.5", port=3333, use_miles_dashboard=True):
+    # [FUNCTION DOC] HELPER: Builds a simple arguments object with router ip (default 10.0.0.5),
+    # router port (default 3333) and the dashboard flag (default on).
     return type(
         "Args",
         (),
@@ -520,6 +653,8 @@ def _router_args(ip="10.0.0.5", port=3333, use_miles_dashboard=True):
 
 
 def test_register_router_pushes_resolved_addr(monkeypatch):
+    # [FUNCTION DOC] Registering the router calls the collector's set-router once with the single
+    # positional argument "http://10.0.0.5:3333" and no keyword arguments.
     handle = FakeHandle()
     monkeypatch.setattr(backend, "_handle", handle)
     hooks.register_router(_router_args())
@@ -529,6 +664,8 @@ def test_register_router_pushes_resolved_addr(monkeypatch):
 
 
 def test_register_router_resolves_the_collector_itself(monkeypatch):
+    # [FUNCTION DOC] With no cached handle but a working resolver, registering the router
+    # resolves the collector itself and calls set-router once.
     """register_router works in a process that never ran init_tracking."""
     handle = FakeHandle()
     monkeypatch.setattr(backend, "_handle", None)
@@ -538,12 +675,16 @@ def test_register_router_resolves_the_collector_itself(monkeypatch):
 
 
 def test_register_router_before_router_start_is_a_wiring_bug(monkeypatch):
+    # [FUNCTION DOC] With a handle but no router ip, registering raises an assertion error
+    # matching "after start_rollout_servers".
     monkeypatch.setattr(backend, "_handle", FakeHandle())
     with pytest.raises(AssertionError, match="after start_rollout_servers"):
         hooks.register_router(_router_args(ip=None))
 
 
 def test_register_router_without_resolvable_collector_is_noop(monkeypatch):
+    # [FUNCTION DOC] With no handle and a resolver returning nothing, registering returns
+    # without raising even when the router ip is missing.
     """An unreachable collector must end the hook before it asserts on the router address."""
     monkeypatch.setattr(backend, "_handle", None)
     monkeypatch.setattr(backend, "resolve_collector", lambda: None)
@@ -552,12 +693,16 @@ def test_register_router_without_resolvable_collector_is_noop(monkeypatch):
 
 
 def test_register_router_without_dashboard_is_noop(monkeypatch):
+    # [FUNCTION DOC] With the dashboard flag off, registering returns before any collector
+    # resolution (the resolver fails the test if called).
     """With the dashboard off the hook returns before resolve_collector, which would block."""
     monkeypatch.setattr(backend, "resolve_collector", _never_resolve)
     hooks.register_router(_router_args(use_miles_dashboard=False))
 
 
 def _never_resolve():
+    # [FUNCTION DOC] HELPER: Resolver stand-in that raises an assertion error; used to prove
+    # resolution never happens.
     raise AssertionError("resolve_collector must not be called when the dashboard is disabled")
 
 
@@ -565,6 +710,8 @@ def _never_resolve():
 
 
 def test_report_data_buffer_pushes_length(monkeypatch):
+    # [FUNCTION DOC] Reporting length 7 calls push-data-buffer once with a sample whose length is
+    # 7 and no keyword arguments.
     handle = FakeHandle()
     monkeypatch.setattr(backend, "_handle", handle)
     hooks.report_data_buffer(7)
@@ -575,6 +722,7 @@ def test_report_data_buffer_pushes_length(monkeypatch):
 
 
 def test_report_data_buffer_none_is_noop(monkeypatch):
+    # [FUNCTION DOC] Reporting none (a plain data source without a buffer) pushes nothing.
     handle = FakeHandle()
     monkeypatch.setattr(backend, "_handle", handle)
     hooks.report_data_buffer(None)  # plain RolloutDataSource: nothing to report
@@ -582,10 +730,14 @@ def test_report_data_buffer_none_is_noop(monkeypatch):
 
 
 def test_report_data_buffer_without_collector_is_noop():
+    # [FUNCTION DOC] Reporting with no collector handle does not raise.
     hooks.report_data_buffer(7)  # must not raise
 
 
 def test_report_data_buffer_swallows_push_failures(monkeypatch, caplog):
+    # [FUNCTION DOC] With a push that raises, reporting does not raise and logs a warning
+    # containing "data-buffer report failed". The module-level rate-limited warner's last-warn
+    # time is reset to negative infinity so earlier warnings cannot suppress this one.
     handle = FakeHandle()
     handle.push_data_buffer = FakeRemoteMethod(fail=True)
     monkeypatch.setattr(backend, "_handle", handle)
@@ -598,6 +750,9 @@ def test_report_data_buffer_swallows_push_failures(monkeypatch, caplog):
 
 
 def test_phase_sink_begin_pushes_open_event_immediately():
+    # [FUNCTION DOC] Calling the sink's begin for a phase pushes immediately (no batching) one
+    # event with that name and start, marked open with the open sentinel end time, and the fixed
+    # identity node and rank.
     from miles.dashboard.store import PhaseEvent
 
     handle = FakeHandle()

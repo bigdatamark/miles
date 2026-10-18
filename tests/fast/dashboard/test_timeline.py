@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Tests for the timeline queries of the metric store against the dummy telemetry fixture (a
+# single GPU node, two engines where engine B restarts mid-run, rollout / train / update-weights
+# phases per step, a 1 Hz gpu series with a known spike, drain dip and per-step perf metrics):
+# lanes, topology windows, rollout expansion over engine lanes (including clipping at a
+# restart), train phase skew, time filters, gpu downsampling, engine series split on restart,
+# synthesized initialize bands, bubbles, the fleet overview, the HTTP timeline endpoints, and
+# open-interval handling.
 import pytest
 from fastapi.testclient import TestClient
 from tests.fast.dashboard.dummy_telemetry import (
@@ -18,16 +26,22 @@ from miles.dashboard.store import MetricStore, Role
 
 @pytest.fixture
 def loaded(tmp_path):
+    # [FUNCTION DOC] HELPER: Fixture. Writes dummy telemetry into the temporary path and returns
+    # a pair of the loaded store and the ground-truth description.
     truth = dump_dummy_telemetry(tmp_path)
     return MetricStore.load(tmp_path / "dashboard"), truth
 
 
 def test_lanes(loaded):
+    # [FUNCTION DOC] The store lists one lane per gpu of the single node, each with node, gpu id
+    # and index equal to the gpu id.
     store, truth = loaded
     assert store.lanes() == [dict(node=GPU_NODE, gpu=g, index=g) for g in range(truth.gpus)]
 
 
 def test_topology_windows(loaded):
+    # [FUNCTION DOC] Two topology windows: the first from the base time to the restart time with
+    # engines [A, old B], the second from the restart to open end (none) with [A, new B].
     store, truth = loaded
     windows = store.topology_windows()
     assert len(windows) == 2
@@ -38,6 +52,9 @@ def test_topology_windows(loaded):
 
 
 def test_rollout_expansion_covers_engine_lanes(loaded):
+    # [FUNCTION DOC] The rollout-manager phase of step 0 (wholly inside the first topology
+    # window) is expanded into one interval per gpu lane, each on the node, starting at the step
+    # start and ending after the rollout duration.
     store, truth = loaded
     phases = store.phases_by_lane()
     rollout0 = [p for p in phases if p["role"] == Role.ROLLOUT_MANAGER and p["t0"] == truth.step_start(0)]
@@ -48,6 +65,9 @@ def test_rollout_expansion_covers_engine_lanes(loaded):
 
 
 def test_rollout_expansion_clips_at_topology_restart(loaded):
+    # [FUNCTION DOC] For step 1's rollout, during which engine B restarts, lane 2's expanded
+    # intervals are two: from the rollout start to the restart time, and from the restart time to
+    # the rollout end.
     store, truth = loaded
     t0, t1 = truth.rollout_interval(1)  # engine B restarts mid-way through this rollout
     on_lane_2 = [
@@ -57,6 +77,8 @@ def test_rollout_expansion_clips_at_topology_restart(loaded):
 
 
 def test_train_phases_keep_rank_and_skew(loaded):
+    # [FUNCTION DOC] Weight update phases before step 1 number one per gpu; the highest rank
+    # finishes later than rank 0 (cross-rank skew preserved); each phase's gpu equals its rank.
     store, truth = loaded
     updates = [p for p in store.phases_by_lane() if p["name"] == "update_weights" and p["t0"] < truth.step_start(1)]
     assert len(updates) == truth.gpus
@@ -66,6 +88,9 @@ def test_train_phases_keep_rank_and_skew(loaded):
 
 
 def test_phases_time_filter(loaded):
+    # [FUNCTION DOC] A window from step 0's rollout start to one second before its end returns a
+    # non-empty list where every phase overlaps the window, and only rollout phases (train events
+    # of step 0 start at the rollout's end).
     store, truth = loaded
     t0, t1 = truth.rollout_interval(0)
     phases = store.phases_by_lane(t0=t0, t1=t1 - 1)
@@ -74,6 +99,10 @@ def test_phases_time_filter(loaded):
 
 
 def test_gpu_series_downsampling_preserves_spike(loaded):
+    # [FUNCTION DOC] With a cap of 40 points, lane 0 has at most 40 sorted timestamps, still
+    # holds the fixture's spike (util 100) and drain dip (util 5), and the four value lists have
+    # equal length. Without a cap, lane 0 has one point per second: 30 initialize seconds plus 100
+    # per step.
     store, truth = loaded
     lanes = store.gpu_series(max_points=40)
     lane0 = lanes[f"{GPU_NODE}:0"]
@@ -89,6 +118,8 @@ def test_gpu_series_downsampling_preserves_spike(loaded):
 
 
 def test_gpu_series_time_filter(loaded):
+    # [FUNCTION DOC] With a window equal to step 0's rollout interval, every lane's timestamps lie
+    # within the (inclusive) window.
     store, truth = loaded
     t0, t1 = truth.rollout_interval(0)
     lanes = store.gpu_series(t0=t0, t1=t1)
@@ -97,6 +128,10 @@ def test_gpu_series_time_filter(loaded):
 
 
 def test_engine_series_split_on_restart(loaded):
+    # [FUNCTION DOC] The running-requests series is split by engine address into three series (A,
+    # old B, new B). Old B ends before the restart and new B starts at or after it; A starts at
+    # the first step start. In a late rollout window, after B's drain time new B reports only
+    # zero running requests. An unknown metric returns an empty list.
     store, truth = loaded
     series = store.engine_series("sglang_num_running_reqs")
     by_addr = {s["addr"]: s for s in series}
@@ -115,6 +150,9 @@ def test_engine_series_split_on_restart(loaded):
 
 
 def test_initialize_phase_synthesized_per_lane(loaded):
+    # [FUNCTION DOC] Initialize bands: one per lane, role derived, rank -1, spanning from the
+    # collector start time (metadata start) to the first observed event. A query whose window
+    # starts at step 0's rollout returns no initialize bands.
     store, truth = loaded
     init = [p for p in store.phases_by_lane() if p["name"] == "initialize"]
     assert len(init) == truth.gpus  # one band per lane
@@ -128,6 +166,8 @@ def test_initialize_phase_synthesized_per_lane(loaded):
 
 
 def test_bubbles(loaded):
+    # [FUNCTION DOC] Bubble entries are one per step in order; the first has wait ratio 0.4 and
+    # step time 95.
     store, truth = loaded
     bubbles = store.bubbles()
     assert [b["step"] for b in bubbles] == list(range(truth.steps))
@@ -136,6 +176,10 @@ def test_bubbles(loaded):
 
 
 def test_fleet_overview(loaded):
+    # [FUNCTION DOC] The fleet overview with 32 buckets reports the lane count; in every bucket
+    # the phase fractions (including "none") sum to 1 within 1e-6; at least one non-"none" phase
+    # exists; wherever the median band is sampled, the bands are ordered min <= p10 <= p50 <= p90
+    # and bounded to 0..100.
     store, truth = loaded
     fleet = store.fleet(x_buckets=32)
     assert fleet["lanes"] == truth.gpus
@@ -152,6 +196,8 @@ def test_fleet_overview(loaded):
 
 
 def test_fleet_endpoint(tmp_path):
+    # [FUNCTION DOC] Meta reports the utilisation-overview capability false. The fleet endpoint
+    # with 16 buckets returns that bucket count and a positive lane count; 1 bucket returns 400.
     dump_dummy_telemetry(tmp_path)
     client = TestClient(make_app(MetricStore.load(tmp_path / "dashboard"), DumpReader(tmp_path)))
     meta = client.get("/api/meta").json()
@@ -162,6 +208,12 @@ def test_fleet_endpoint(tmp_path):
 
 
 def test_timeline_endpoints(tmp_path):
+    # [FUNCTION DOC] Through the test client: meta shows timeline and engine-series capabilities;
+    # topology returns one lane per gpu and 2 windows; phases for step 0's window include rollout,
+    # actor_train and train_wait; gpu with a 50 point cap returns every lane (cap of 1 gives
+    # 400); engine series for generation throughput covers the three engine addresses; bubbles
+    # count equals steps; gpu processes returns an empty list (the fixture emits none), and a
+    # reversed window returns 400.
     truth = dump_dummy_telemetry(tmp_path)
     client = TestClient(make_app(MetricStore.load(tmp_path / "dashboard"), DumpReader(tmp_path)))
 
@@ -193,6 +245,11 @@ def test_timeline_endpoints(tmp_path):
 
 
 def test_open_interval_clips_to_data_edge_and_closed_twin_wins(tmp_path):
+    # [FUNCTION DOC] Store with a gpu sample at t=500, an open "rollout" marker from t=100, and a
+    # "warmup" that has both an open marker and a closed event 10..40. Phases: the open rollout
+    # ends at 500 (clipped to the newest data), warmup ends at 40 and appears exactly once (the
+    # closed twin supersedes the open marker).
+    # KNOWN ISSUE: re-imports names already imported at module level.
     from miles.dashboard.store import GpuSample, Meta, PhaseEvent, Role
 
     writer = MetricStore(tmp_path)
