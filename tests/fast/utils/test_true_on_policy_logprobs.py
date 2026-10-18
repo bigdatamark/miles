@@ -1,3 +1,8 @@
+# [MODULE DOC] CPU unit tests for the true-on-policy log-probability and entropy computation:
+# truncation of padded vocabulary columns before the log-softmax, gathering of tensor-parallel
+# shards, chunked evaluation, gradient equivalence with an unchunked reference, and the backward
+# split of a replicated gradient across tensor-parallel ranks. Expected values are computed with
+# plain torch operations.
 import torch
 
 from miles.backends.training_utils.loss.hub.math_utils import (
@@ -9,6 +14,10 @@ from miles.backends.training_utils.loss.hub.math_utils import (
 
 
 def test_true_on_policy_logprobs_tp1_truncate_after_real_vocab():
+    # [FUNCTION DOC] Uses half-precision logits of width 6 with a real vocabulary size of 4 (the
+    # last two columns hold large padding values) and no parallel group. Asserts the selected
+    # token log-probs and the entropy equal those computed with a log-softmax over only the first
+    # four columns.
     logits = torch.tensor(
         [
             [1.0, 0.0, -1.0, 3.0, 40.0, 50.0],
@@ -35,6 +44,10 @@ def test_true_on_policy_logprobs_tp1_truncate_after_real_vocab():
 
 
 def test_true_on_policy_fake_tp_vocab_gather_truncates_before_log_softmax():
+    # [FUNCTION DOC] Builds two half-precision logit shards of width 4 each (padded columns hold
+    # large values), gathers them with a real vocabulary size of 6, and computes log-probs from
+    # the gathered logits. Asserts the gathered logits equal the concatenated shards truncated to
+    # 6 columns, and the selected log-probs match a log-softmax over those 6 columns.
     shard_0 = torch.tensor(
         [
             [5.0, 1.0, -2.0, 0.0],
@@ -68,6 +81,12 @@ def test_true_on_policy_fake_tp_vocab_gather_truncates_before_log_softmax():
 
 
 def test_true_on_policy_logprobs_honor_chunk_size(monkeypatch):
+    # [FUNCTION DOC] Computes reference log-probs and entropy for random 5 by 7 logits that
+    # require gradients. Patches the torch log-softmax (reverted at teardown) with a wrapper
+    # recording the row count of each call, then runs the public log-prob and entropy function in
+    # true-on-policy mode with chunk size 2 and entropy gradients disabled. Asserts the recorded
+    # chunk sizes are 2, 2 and 1, the log-probs require grad while the entropy does not, and both
+    # values match the references.
     logits = torch.randn(5, 7, dtype=torch.float32, requires_grad=True)
     tokens = torch.tensor([0, 1, 2, 3, 4], dtype=torch.long)
     expected_log_probs_full = torch.log_softmax(logits, dim=-1)
@@ -100,6 +119,10 @@ def test_true_on_policy_logprobs_honor_chunk_size(monkeypatch):
 
 
 def test_true_on_policy_chunked_entropy_preserves_gradients():
+    # [FUNCTION DOC] Computes log-probs and entropy with chunk size 2 and without chunking on a
+    # detached copy of random double-precision logits, back-propagates the sum of both outputs in
+    # each case, and asserts the values and the logit gradients agree between the chunked and
+    # unchunked runs.
     logits = torch.randn(5, 7, dtype=torch.float64, requires_grad=True)
     tokens = torch.tensor([0, 1, 2, 3, 4], dtype=torch.long)
     reference_logits = logits.detach().clone().requires_grad_(True)
@@ -126,6 +149,9 @@ def test_true_on_policy_chunked_entropy_preserves_gradients():
 
 
 def test_true_on_policy_replicated_loss_gather_backward_splits_without_tp_sum():
+    # [FUNCTION DOC] Takes a 2 by 6 gradient and splits it for rank 0 and rank 1 of a world of 2
+    # with local width 3. Asserts each rank gets its own contiguous column block unchanged (no
+    # summation across ranks, since the loss is replicated).
     grad_output = torch.arange(12, dtype=torch.float32).reshape(2, 6)
 
     rank0_grad = _split_replicated_loss_gather_grad(

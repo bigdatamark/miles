@@ -1,8 +1,19 @@
+# [MODULE DOC]
+# Tests for the multi-turn loss-mask generator in the mask utilities module, using the Qwen3
+# tokenizer-style chat template. Each test loads a pretrained tokenizer by model name (defaults to
+# Qwen3-8B; this needs network or cache access to the tokenizer files), generates token ids and
+# a parallel loss mask for a conversation, and checks the two have equal length and that the
+# number of text segments selected by the mask equals the number of assistant turns. Results are
+# also printed. Running the file as a script uses the Qwen3-Coder-30B-A3B-Instruct tokenizer.
 from miles.utils.mask_utils import MultiTurnLossMaskGenerator
 from miles.utils.processing_utils import load_tokenizer
 
 
 def test_loss_mask_qwen3_simple(model_name: str = "Qwen/Qwen3-8B"):
+    # [FUNCTION DOC] Single-turn case: system, user and assistant messages. Build the generator
+    # for the qwen3 tokenizer type, generate ids and mask, assert equal lengths and exactly one
+    # selected text, then print the decoded text, ids, mask and selected texts. The model name
+    # parameter selects the tokenizer.
     tokenizer = load_tokenizer(model_name)
     mask_generator = MultiTurnLossMaskGenerator(tokenizer, tokenizer_type="qwen3")
     messages = [
@@ -23,6 +34,11 @@ def test_loss_mask_qwen3_simple(model_name: str = "Qwen/Qwen3-8B"):
 
 
 def test_loss_mask_qwen3_tools(model_name: str = "Qwen/Qwen3-8B"):
+    # [FUNCTION DOC] Multi-turn case with tools: system and user messages, an assistant message with
+    # two tool calls, two tool result messages and a final assistant message, plus two tool
+    # definitions (a terminal tool and a read-file tool). Generate ids and mask with the tool
+    # definitions, assert equal lengths and exactly two selected texts (one per assistant turn),
+    # then print the details.
     tokenizer = load_tokenizer(model_name)
     mask_generator = MultiTurnLossMaskGenerator(tokenizer, tokenizer_type="qwen3")
     messages = [

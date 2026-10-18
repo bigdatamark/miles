@@ -1,3 +1,10 @@
+# [MODULE DOC] HELPER: Load-generator half of the session-server HTTP benchmark (a private
+# module of the manual benchmark). Defines the per-session driver, a single-event-loop driver
+# for many concurrent sessions, and a process entry point that runs one shard and returns its
+# results through a queue. Results are a pair: latency sample lists (chat reply latency, and
+# optionally records-read latency, in milliseconds) and an aggregate mapping of summed counters
+# (completed turns, classified server and transport errors for chat and for the records read,
+# sessions that completed without any chat error, and up to five first-error strings).
 """Multi-process load generator for the session-server HTTP benchmark.
 
 Lives beside `bench_session_server_overhead` so it is importable by qualified
@@ -43,6 +50,9 @@ _STATUS_KEYS = (
 
 
 def _transport_error_types() -> tuple:
+    # [FUNCTION DOC] HELPER: Lazily imports the HTTP client library and returns a tuple of its
+    # client-side failure classes: read, write, connect and remote-protocol errors plus pool,
+    # connect, read and write timeouts. Used as an exception filter.
     """Client-side connection/transport faults (NOT server non-2xx responses)."""
     import httpx
 
@@ -59,6 +69,10 @@ def _transport_error_types() -> tuple:
 
 
 async def _idempotent_request(client, method: str, url: str):
+    # [FUNCTION DOC] HELPER: Sends one body-less request through the client and returns the
+    # response. If a read error, connect error or remote-protocol error is raised, the identical
+    # request is sent exactly once more; a second failure propagates. Timeouts and non-2xx
+    # responses are not retried.
     """Issue an idempotent control-plane request, retrying ONCE on a connection-
     level transport fault with a fresh connection.
 
@@ -77,6 +91,8 @@ async def _idempotent_request(client, method: str, url: str):
 
 
 def _empty_status() -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Returns a fresh per-session status mapping with every counter key
+    # set to zero and a first-error entry set to none.
     st: dict[str, Any] = {k: 0 for k in _STATUS_KEYS}
     st["first_error"] = None
     return st
@@ -85,6 +101,21 @@ def _empty_status() -> dict[str, Any]:
 async def drive_one_session(
     client, base_url, request_bodies, samples, *, get_records, tool_interval=0.0
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] Drives one session lifecycle against the server. Steps: create the session
+    # (idempotent retry once; a transport fault or non-200 counts as a chat error and returns
+    # early, with the failure noted as the first error); read the session id from the response;
+    # for each prebuilt request body, post it to the session's chat-completions path with a JSON
+    # content type, record the elapsed milliseconds into the reply-latency sample list, stop on
+    # a transport fault or non-200 (counted as chat errors, the first-error text including the
+    # turn index and up to 120 characters of the body), otherwise count a completed turn and,
+    # except after the last turn, sleep for the tool interval when it is positive. Optionally
+    # fetch the session records (retry once), recording latency on 200 and counting ok or
+    # server or transport errors. Finally delete the session, ignoring transport faults.
+    # Inputs: client, base URL, list of body bytes, shared samples mapping, keyword flags for
+    # records fetch and tool interval seconds (default zero). Returns the status mapping; never
+    # raises for classified faults. Mutates the samples mapping.
+    # KNOWN ISSUE: a create failure is tallied under the chat error counters, not a separate one,
+    # and a non-200 delete response is ignored without being counted.
     """create -> N x chat (-> GET records) -> delete for one session, robustly.
 
     Never raises: returns a per-session status dict (completed turns + classified
@@ -156,6 +187,8 @@ async def drive_one_session(
 
 
 def _empty_agg() -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Returns a fresh aggregate mapping: every counter key zero, a
+    # sessions-ok count of zero and an empty list of first errors.
     agg: dict[str, Any] = {k: 0 for k in _STATUS_KEYS}
     agg["sessions_ok"] = 0
     agg["first_errors"] = []
@@ -163,6 +196,15 @@ def _empty_agg() -> dict[str, Any]:
 
 
 async def lg_drive_all(base_urls, request_bodies, num_sessions, get_records, tool_interval):
+    # [FUNCTION DOC] Creates the sample lists (reply latency, plus records latency when records
+    # are fetched) and one shared HTTP client with a 600 second timeout, connection limits of
+    # twice the session count (at least 2) for both total and keep-alive connections, and a
+    # keep-alive expiry of 2 seconds (shorter than the server's window so the client drops idle
+    # connections first). Sends a health request to every base URL, then runs all sessions
+    # concurrently, each choosing a random base URL. Aggregates: sums every counter over the
+    # per-session statuses, counts sessions with no chat server or transport errors as ok, and
+    # keeps the first-error text of at most the first five sessions that have one. Returns
+    # (samples, aggregate). Network side effects against the given servers.
     """Drive `num_sessions` sessions concurrently in ONE event loop/client.
 
     Each session picks one instance URL at create time and stays on it for its
@@ -212,6 +254,10 @@ async def lg_drive_all(base_urls, request_bodies, num_sessions, get_records, too
 
 
 def load_generator_entry(base_urls, request_bodies, num_sessions, get_records, tool_interval, result_queue) -> None:
+    # [FUNCTION DOC] Process entry point for one load-generator shard. Tries to set the process
+    # title to a benchmark load-generator label (any failure, including a missing library, is
+    # swallowed), runs the all-sessions driver in a new event loop, and puts the resulting
+    # (samples, aggregate) pair on the result queue. Returns nothing.
     """spawn `Process` target: drive a shard of sessions, put (samples, agg) on
     `result_queue`. Drives no tokenizer — it only replays pre-built request
     bodies — so generator startup is cheap."""

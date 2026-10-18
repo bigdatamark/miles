@@ -1,3 +1,6 @@
+# [MODULE DOC] Test for the preflight permission rule registry: the built in rule sets for the
+# chart, the chart service account, the chart RBAC objects and the workflow must equal an exact
+# expected mapping of resources to verbs.
 from miles.utils.external_utils.miles_workbench.preflight.rules import (
     CHART_RBAC_RULES,
     CHART_RULES,
@@ -7,7 +10,12 @@ from miles.utils.external_utils.miles_workbench.preflight.rules import (
 
 
 class TestBuiltinPermissionRules:
+    # [CLASS DOC] Test of the built in permission rules.
     def test_builtin_permission_rule_registry_is_complete(self) -> None:
+        # [FUNCTION DOC] The four rule constants taken together equal an expected mapping: chart
+        # (config maps, stateful sets, secrets), chart service account (service accounts), chart
+        # RBAC (roles and role bindings) and workflow (pods get and list, pod exec create and
+        # get, pod log get, stateful sets get list watch), each with their exact verb tuples.
         """The built-in registry contains exactly every externally required permission."""
         expected: dict[str, dict[str, tuple[str, ...]]] = {
             "chart": {

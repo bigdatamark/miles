@@ -1,3 +1,8 @@
+# [MODULE DOC] Test (and informal timing comparison) of the chunked parallel-scan generalized
+# advantage estimation against the serial reference implementation, on random float32 rewards
+# and values of shape batch by time, on GPU when available else CPU. Prints timing and error
+# lines (visible with output capture off). Note that the largest case allocates a 256 by 131072
+# float32 tensor pair and runs the serial reference, which is slow, especially on CPU.
 import time
 import pytest
 import torch
@@ -15,6 +20,13 @@ from miles.backends.training_utils.loss.hub.math_utils import chunked_gae, vanil
 )
 @pytest.mark.parametrize("chunk_size", [64, 128, 256])
 def test_gae_parallel_matches_serial(B, T, chunk_size):
+    # [FUNCTION DOC] Parametrized over three (batch, time) shapes and chunk sizes 64, 128, 256.
+    # Seeds the global generator with zero, draws random rewards and values, uses discount 0.99
+    # and lambda 0.95, runs the serial and the chunked estimators (synchronizing the GPU around
+    # each timing, wall-clock timed), and asserts both the advantages and the returns agree with
+    # a maximum absolute error under 1e-5. Then prints the shape, both times, the speedup ratio
+    # and the maximum errors.
+    # KNOWN ISSUE: the docstring mentions various dtypes, but only float32 is tested.
     """
     Test that chunked_gae (parallel-scan) matches vanilla_gae (batch-serial)
     under various shapes, chunk sizes and dtypes.

@@ -1,3 +1,10 @@
+# [MODULE DOC] Unit tests for the launch record of the Helm launcher: a JSON document describing
+# one launch (run id, release, namespace, state file, values file, worker argument vector,
+# orchestrator command, environment, and how other deployments reach this one), computed from a
+# launch plan and the values file path, with secrets redacted, written to a per-launch file under
+# the run directory, read back through the runtime's launcher report reader, and found again in an
+# installed manifest by the environment variable that points pods at it. Pure in-memory objects
+# and temporary directories.
 import json
 from pathlib import Path
 
@@ -15,6 +22,11 @@ VALUES_FILE = Path("/shared/miles-runs") / RUN_ID / "values" / "values-1.yaml"
 
 
 def _plan(**overrides) -> LaunchPlan:
+    # [FUNCTION DOC] HELPER: Builds a launch plan for the fixed run id with release
+    # "miles-run-<run id>", namespace "rl", a state file under the run's state folder, worker
+    # argument vector for 8 rollout GPUs, an orchestrator command running the training script with
+    # the same option, and environment with unbuffered Python output. Keyword overrides replace
+    # any of these fields.
     fields = dict(
         run_id=RUN_ID,
         release=f"miles-run-{RUN_ID}",
@@ -29,11 +41,17 @@ def _plan(**overrides) -> LaunchPlan:
 
 
 def _record(*, reachable_at=None, **overrides):
+    # [FUNCTION DOC] HELPER: Computes a launch record from a plan built with the overrides, the
+    # fixed values file path, and the given reachable-at mapping (default empty).
     return LaunchRecord.compute(plan=_plan(**overrides), values_file=VALUES_FILE, reachable_at=reachable_at or {})
 
 
 class TestComputeLaunchRecord:
+    # [CLASS DOC] Tests of the record computation: file names, redaction of secrets in the
+    # argument vectors and environment, and readability by the runtime reader.
     def test_names_the_files_this_launch_writes(self) -> None:
+        # [FUNCTION DOC] The record's state file ends with the plan's state file name and the
+        # values file equals the given values path as text.
         """The record is only joinable with a run's state and values if it names both."""
         record = _record()
 
@@ -41,6 +59,10 @@ class TestComputeLaunchRecord:
         assert record.values_file == str(VALUES_FILE)
 
     def test_hides_a_secret_flag_in_the_recorded_argv(self) -> None:
+        # [FUNCTION DOC] A worker vector with the weights-and-biases key flag and value, and an
+        # orchestrator command with the inline flag form, are redacted: the secret text appears
+        # nowhere in the JSON of both lists, and the worker value token carries the redacted
+        # digest prefix.
         """The record lands on a shared disk and in the wandb config, so a key in argv would leak twice."""
         record = _record(
             worker_argv=["--wandb-key", "s3cret"],
@@ -51,12 +73,18 @@ class TestComputeLaunchRecord:
         assert "redacted-sha256:" in record.worker_argv[1]
 
     def test_hides_a_secret_environment_variable(self) -> None:
+        # [FUNCTION DOC] A token environment variable value is not present in the recorded
+        # value, while an ordinary variable keeps its value "1".
         record = _record(env={"HF_TOKEN": "t0ken", "PYTHONUNBUFFERED": "1"})
 
         assert "t0ken" not in record.env["HF_TOKEN"]
         assert record.env["PYTHONUNBUFFERED"] == "1"
 
     def test_the_runtime_reads_back_the_record_it_is_pointed_at(self, tmp_path: Path) -> None:
+        # [FUNCTION DOC] Writes a record into a new "launches" folder in the temporary
+        # directory, reads it with the runtime launcher report reader given the path string, and
+        # asserts the report has the run id and the training script as the second word of the
+        # orchestrator command.
         """Pods are handed the path through --env-report, which is how it reaches the wandb config."""
         path = tmp_path / "launches" / "launch-1.json"
         _record().write(path=path)
@@ -68,7 +96,10 @@ class TestComputeLaunchRecord:
 
 
 class TestWriteLaunchRecord:
+    # [CLASS DOC] Tests of writing records to files.
     def test_writes_the_record_where_it_is_told_to(self, tmp_path: Path) -> None:
+        # [FUNCTION DOC] Writing to a path whose parent folder does not exist creates the file
+        # (and folders); its JSON has the release name of the plan.
         path = tmp_path / "launches" / "launch-1.json"
 
         _record().write(path=path)
@@ -76,6 +107,8 @@ class TestWriteLaunchRecord:
         assert json.loads(path.read_text())["release"] == f"miles-run-{RUN_ID}"
 
     def test_a_relaunch_does_not_overwrite_the_previous_record(self, tmp_path: Path) -> None:
+        # [FUNCTION DOC] Two records with different worker vectors written to two different
+        # files both keep their own content afterwards.
         """A restarted run is exactly the case the record exists for, so neither launch may be lost."""
         first, second = tmp_path / "launches" / "launch-1.json", tmp_path / "launches" / "launch-2.json"
 
@@ -86,13 +119,21 @@ class TestWriteLaunchRecord:
         assert json.loads(second.read_text())["worker_argv"] == ["--lr", "2"]
 
     def test_the_launcher_names_a_fresh_record_for_every_launch(self, tmp_path: Path) -> None:
+        # [FUNCTION DOC] Two new record file requests for the same run directory give different
+        # paths, and the parent folder is the run directory's "launches" folder.
         """One file per launch is what keeps a relaunched run's earlier launches readable."""
         assert RunFiles.new_record_file(run_directory=tmp_path) != RunFiles.new_record_file(run_directory=tmp_path)
         assert RunFiles.new_record_file(run_directory=tmp_path).parent == tmp_path / "launches"
 
 
 class TestInstalledLaunchRecordFile:
+    # [CLASS DOC] Test of finding the record path in an installed manifest.
     def test_finds_the_record_file_in_any_installed_container(self) -> None:
+        # [FUNCTION DOC] A manifest with an unrelated service first and then a stateful set
+        # whose first container has a similarly named variable (with the launcher report variable
+        # name plus a suffix, pointing at a wrong file) and whose second container has the exact
+        # variable pointing at "/records/launch.json": the lookup returns that path, i.e. it
+        # matches the exact variable name in any object and any container.
         """The record file is found outside the first manifest object and container."""
         manifest = Manifest(
             namespace="rl",
@@ -125,12 +166,17 @@ class TestInstalledLaunchRecordFile:
 
 
 class TestRecordsHowOtherDeploymentsReachThisOne:
+    # [CLASS DOC] Tests of the reachable-at field of the record, a mapping from a name to the
+    # address another deployment must dial.
     def test_a_trainer_release_records_the_address_the_driving_launch_has_to_be_given(self) -> None:
+        # [FUNCTION DOC] A record computed with a reachable-at mapping for "actor" keeps that
+        # mapping unchanged.
         """Nothing else prints it, and the digest in the name makes it impossible to derive by hand."""
         record = _record(reachable_at={"actor": "host-0.host.rl.svc.cluster.local:8000"})
 
         assert record.reachable_at == {"actor": "host-0.host.rl.svc.cluster.local:8000"}
 
     def test_a_release_nobody_dials_records_no_address(self) -> None:
+        # [FUNCTION DOC] With the default (no reachable-at), the record's mapping is empty.
         """A primary release is reached by nothing, so an address there would be a name without a reader."""
         assert _record().reachable_at == {}

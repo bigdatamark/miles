@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# End-to-end tests that typed values survive the real rpc wire in both directions: nested models,
+# sets, enums, dataclasses, datetimes with and without offsets, uuids, decimals, tuples, bytes,
+# optionals and unions, unicode and large payloads; special float values (not-a-number and
+# infinities); the python types the worker actually receives; and client-side rejection of
+# malformed complex arguments. All tests use the shared-server handle fixture and echo methods
+# of the test worker.
 import datetime
 import math
 import uuid
@@ -10,7 +17,11 @@ from tests.fast.utils.workers.e2e.e2e_worker import Colour, Item, Metric, Nested
 
 
 class TestComplexArgumentsAndResults:
+    # [CLASS DOC] Round-trip tests: send a value as an argument to an echo method and compare
+    # (and type-check) the returned value.
     async def test_nested_model_roundtrips(self, handle):
+        # [FUNCTION DOC] Echoes a nested model (item, mapping with an empty-values item, set of
+        # two tags) and asserts equality with the original.
         """A model containing models, dicts and sets survives the real wire both ways."""
         payload = Nested(
             item=Item(name="a", values=[1, 2]),
@@ -20,6 +31,8 @@ class TestComplexArgumentsAndResults:
         assert await handle.demo_nested_model(payload=payload) == payload
 
     async def test_nested_model_result_is_revived_as_models(self, handle):
+        # [FUNCTION DOC] Echoes a nested model and asserts the result and its inner items are
+        # model instances, not plain mappings.
         """The nested result arrives as model instances, not plain dicts."""
         payload = Nested(item=Item(name="a", values=[1]), lookup={"k": Item(name="b", values=[2])}, tags=set())
         result = await handle.demo_nested_model(payload=payload)
@@ -28,6 +41,8 @@ class TestComplexArgumentsAndResults:
         assert isinstance(result.lookup["k"], Item)
 
     async def test_set_field_is_revived_as_a_set(self, handle):
+        # [FUNCTION DOC] Echoes a model with a two-element tag set; asserts the tags equal the
+        # original set and are a real set.
         """A set field arrives as a set even though json carries a list."""
         payload = Nested(item=Item(name="a", values=[]), lookup={}, tags={"x", "y"})
         result = await handle.demo_nested_model(payload=payload)
@@ -35,17 +50,21 @@ class TestComplexArgumentsAndResults:
         assert isinstance(result.tags, set)
 
     async def test_enum_roundtrips_as_the_member(self, handle):
+        # [FUNCTION DOC] Echoes the blue enum member; asserts the result is the identical member.
         """An enum argument and result stay enum members across the wire."""
         result = await handle.demo_enum(colour=Colour.BLUE)
         assert result is Colour.BLUE
 
     async def test_dataclass_roundtrips_as_the_dataclass(self, handle):
+        # [FUNCTION DOC] Sends point (1, 2) to the method that swaps coordinates; asserts a point
+        # instance with x=2 and y=1.
         """A dataclass argument is revived worker-side and the result comes back as a dataclass."""
         result = await handle.demo_dataclass(point=Point(x=1, y=2))
         assert isinstance(result, Point)
         assert (result.x, result.y) == (2, 1)
 
     async def test_aware_datetime_keeps_its_offset(self, handle):
+        # [FUNCTION DOC] Echoes a utc datetime; asserts a datetime instance equal to the input.
         """A timezone-aware datetime keeps its instant and offset across the wire."""
         value = datetime.datetime(2026, 7, 27, 12, 30, tzinfo=datetime.timezone.utc)
         result = await handle.demo_datetime(when=value)
@@ -53,6 +72,8 @@ class TestComplexArgumentsAndResults:
         assert result == value
 
     async def test_non_utc_datetime_keeps_its_offset(self, handle):
+        # [FUNCTION DOC] Echoes a datetime with offset +5:30; asserts equality, the same utc
+        # offset, and the same local hour and minute (12:30).
         """A datetime with a non-zero utc offset arrives with that same offset, not normalised to utc."""
         tzinfo = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
         value = datetime.datetime(2026, 7, 27, 12, 30, tzinfo=tzinfo)
@@ -62,6 +83,8 @@ class TestComplexArgumentsAndResults:
         assert (result.hour, result.minute) == (12, 30)
 
     async def test_naive_datetime_stays_naive(self, handle):
+        # [FUNCTION DOC] Echoes a datetime without timezone; asserts equality and no timezone
+        # on the result.
         """A naive datetime does not acquire a timezone on the way through."""
         value = datetime.datetime(2026, 7, 27, 12, 30)
         result = await handle.demo_datetime(when=value)
@@ -69,6 +92,7 @@ class TestComplexArgumentsAndResults:
         assert result.tzinfo is None
 
     async def test_uuid_roundtrips_as_a_uuid(self, handle):
+        # [FUNCTION DOC] Echoes a random uuid; asserts a uuid instance equal to the input.
         """A uuid argument and result stay uuid objects, not strings."""
         value = uuid.uuid4()
         result = await handle.demo_uuid(value=value)
@@ -76,11 +100,14 @@ class TestComplexArgumentsAndResults:
         assert result == value
 
     async def test_decimal_keeps_precision(self, handle):
+        # [FUNCTION DOC] Echoes a 19-digit decimal; asserts exact equality.
         """A decimal keeps precision a float would lose."""
         value = Decimal("0.1234567890123456789")
         assert await handle.demo_decimal(value=value) == value
 
     async def test_tuple_roundtrips_as_a_tuple(self, handle):
+        # [FUNCTION DOC] Echoes an integer-string pair; asserts the result is a tuple equal to
+        # the input.
         """A tuple result comes back as a tuple even though json carries a list."""
         result = await handle.demo_tuple(pair=(1, "a"))
         assert isinstance(result, tuple)
@@ -88,15 +115,21 @@ class TestComplexArgumentsAndResults:
 
     @pytest.mark.parametrize("blob", [b"raw-bytes", b"", b"\x00\x80\xff", bytes(range(256))])
     async def test_bytes_roundtrip(self, handle, blob: bytes):
+        # [FUNCTION DOC] Parametrized over plain, empty, non-utf8 and all-256-values byte
+        # strings; asserts the echoed bytes are identical.
         """A bytes argument and result stay bytes across a text protocol, including non-utf8 payloads."""
         assert await handle.demo_bytes(blob=blob) == blob
 
     async def test_bytes_inside_a_list_roundtrips(self, handle):
+        # [FUNCTION DOC] Echoes a list of three byte strings (non-utf8 and empty); asserts
+        # equality.
         """Non-utf8 bytes nested in a container survive too."""
         blobs = [b"\x80", b"", b"\xff\xfe"]
         assert await handle.demo_bytes_list(blobs=blobs) == blobs
 
     async def test_list_of_models_roundtrips(self, handle):
+        # [FUNCTION DOC] Echoes a list of two item models; asserts equality and that every
+        # element is an item instance.
         """A list of models arrives as a list of model instances."""
         items = [Item(name="a", values=[1]), Item(name="b", values=[2, 3])]
         result = await handle.demo_model_list(items=items)
@@ -104,33 +137,45 @@ class TestComplexArgumentsAndResults:
         assert all(isinstance(item, Item) for item in result)
 
     async def test_empty_containers_roundtrip(self, handle):
+        # [FUNCTION DOC] Echoes an empty list of models; asserts an empty list comes back.
         """Empty containers survive rather than collapsing to null."""
         result = await handle.demo_model_list(items=[])
         assert result == []
 
     async def test_optional_present_and_absent(self, handle):
+        # [FUNCTION DOC] Echoes an optional integer both with value 7 and with no value; asserts
+        # both are preserved.
         """An optional argument roundtrips both with a value and with None."""
         assert await handle.demo_optional(value=7) == 7
         assert await handle.demo_optional(value=None) is None
 
     async def test_union_keeps_the_member_type(self, handle):
+        # [FUNCTION DOC] Echoes an integer-or-string union with 5 and with "five"; asserts each
+        # is returned equal.
         """A union result keeps the member type it was produced with."""
         assert await handle.demo_union(value=5) == 5
         assert await handle.demo_union(value="five") == "five"
 
     async def test_union_of_types_sharing_a_wire_form_resolves_to_str(self, handle):
+        # [FUNCTION DOC] Sends a datetime and then a plain string to a method with a
+        # datetime-or-string parameter that reports the received type name; asserts both are
+        # reported as "str" because both share one text wire form and the string member wins.
         """A datetime|str union shares one wire form, so the worker receives the str member."""
         when = datetime.datetime(2026, 7, 27, tzinfo=datetime.timezone.utc)
         assert await handle.report_union_argument_type(value=when) == "str"
         assert await handle.report_union_argument_type(value="plain") == "str"
 
     async def test_unicode_survives_the_wire(self, handle):
+        # [FUNCTION DOC] Echoes an item whose name has Chinese characters, an emoji, a
+        # backslash and quote characters; asserts the name is unchanged.
         """Non-ascii text roundtrips byte for byte."""
         text = "中文 🚀 \\ \" '"
         result = await handle.demo_model(item=Item(name=text, values=[]))
         assert result.name == text
 
     async def test_large_nested_payload_roundtrips(self, handle):
+        # [FUNCTION DOC] Echoes a nested model with 5000 values, 200 mapping entries and 200
+        # tags; asserts equality.
         """A large nested payload roundtrips without truncation."""
         payload = Nested(
             item=Item(name="big", values=list(range(5000))),
@@ -140,28 +185,38 @@ class TestComplexArgumentsAndResults:
         assert await handle.demo_nested_model(payload=payload) == payload
 
     async def test_none_result_roundtrips(self, handle):
+        # [FUNCTION DOC] Calls a method returning nothing; asserts the caller receives nothing.
         """A method declared to return None reports success carrying None."""
         assert await handle.demo_none_result() is None
 
 
 class TestNonFiniteFloats:
+    # [CLASS DOC] Tests that not-a-number and infinite floats are preserved in arguments and
+    # results, in several container shapes.
     async def test_nan_result_arrives_as_nan(self, handle):
+        # [FUNCTION DOC] Calls the method returning not-a-number; asserts the result is one.
         """A NaN result reaches the caller as NaN instead of being silently nulled."""
         assert math.isnan(await handle.demo_nan_result())
 
     @pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf, 0.0, 1.5])
     async def test_float_argument_and_result_roundtrip(self, handle, value: float):
+        # [FUNCTION DOC] Parametrized over five floats; echoes each and compares textual
+        # representations (needed because not-a-number is unequal to itself).
         """Every float, finite or not, survives both directions unchanged."""
         result = await handle.demo_float(value=value)
         assert repr(result) == repr(value)
 
     @pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf, None])
     async def test_optional_float_keeps_nan_distinct_from_none(self, handle, value: float | None):
+        # [FUNCTION DOC] Parametrized over three special floats and no value; echoes each
+        # through an optional float method and compares textual representations.
         """A NaN under an optional annotation is not confused with None."""
         result = await handle.demo_optional_float(value=value)
         assert repr(result) == repr(value)
 
     async def test_non_finite_floats_survive_a_loose_dict_result(self, handle):
+        # [FUNCTION DOC] Calls the method returning an untyped mapping with not-a-number loss,
+        # infinite grad_norm, negative infinite lr and step 3.0; asserts each value.
         """Non-finite floats inside an untyped dict result are not collapsed to None."""
         metrics = await handle.demo_float_metrics()
         assert math.isnan(metrics["loss"])
@@ -170,38 +225,54 @@ class TestNonFiniteFloats:
         assert metrics["step"] == 3.0
 
     async def test_non_finite_floats_survive_a_list_argument(self, handle):
+        # [FUNCTION DOC] Echoes a list of six floats (including special values, negative zero
+        # and 1e308); compares element textual representations.
         """A list mixing finite and non-finite floats roundtrips element by element."""
         values = [math.nan, math.inf, -math.inf, 0.0, -0.0, 1e308]
         result = await handle.demo_float_list(values=values)
         assert [repr(item) for item in result] == [repr(item) for item in values]
 
     async def test_non_finite_float_survives_a_model_field(self, handle):
+        # [FUNCTION DOC] Echoes a metric model whose value is not-a-number; asserts the name is
+        # kept and the value is still not-a-number.
         """A NaN inside a model field roundtrips as NaN."""
         result = await handle.demo_metric_model(metric=Metric(name="loss", value=math.nan))
         assert result.name == "loss"
         assert math.isnan(result.value)
 
     async def test_worker_receives_the_non_finite_argument(self, handle):
+        # [FUNCTION DOC] Asks the worker to report the textual form of the float it received;
+        # asserts "nan" for not-a-number and "-inf" for negative infinity.
         """The worker is handed a real NaN, not None and not the string 'nan'."""
         assert await handle.report_float_repr(value=math.nan) == "nan"
         assert await handle.report_float_repr(value=-math.inf) == "-inf"
 
 
 class TestWorkerSideTypes:
+    # [CLASS DOC] Tests that the worker process receives arguments revived into their declared
+    # python types.
     async def test_worker_receives_model_instances(self, handle):
+        # [FUNCTION DOC] Sends a nested model and asserts the worker reports type names Nested,
+        # Item, Item, set and int for the payload, its item, a mapping entry, its tags and the
+        # first value.
         """The worker is handed revived models, not the raw json dicts."""
         payload = Nested(item=Item(name="a", values=[1]), lookup={"k": Item(name="b", values=[])}, tags={"x"})
         assert await handle.report_nested_argument_types(payload=payload) == ["Nested", "Item", "Item", "set", "int"]
 
     async def test_worker_receives_a_dataclass_instance(self, handle):
+        # [FUNCTION DOC] Sends a point; asserts the worker reports the type name "Point".
         """A dataclass argument reaches the worker as the dataclass."""
         assert await handle.report_dataclass_argument_type(point=Point(x=1, y=2)) == "Point"
 
     async def test_worker_receives_the_enum_member(self, handle):
+        # [FUNCTION DOC] Sends the blue member; asserts the worker reports it was the identical
+        # member.
         """An enum argument reaches the worker as the member, comparable with is."""
         assert await handle.report_enum_argument_is_member(colour=Colour.BLUE) is True
 
     async def test_worker_receives_revived_scalars(self, handle):
+        # [FUNCTION DOC] Sends a datetime, uuid, decimal, bytes and tuple; asserts the worker
+        # reports type names datetime, UUID, Decimal, bytes, tuple in that order.
         """Scalars json cannot express reach the worker as their declared python types."""
         types = await handle.report_scalar_argument_types(
             when=datetime.datetime(2026, 7, 27, tzinfo=datetime.timezone.utc),
@@ -214,27 +285,37 @@ class TestWorkerSideTypes:
 
 
 class TestComplexTypeValidation:
+    # [CLASS DOC] Tests that malformed complex arguments are rejected by the client with a
+    # validation error before anything is sent.
     async def test_wrong_model_type_is_rejected_before_sending(self, handle):
+        # [FUNCTION DOC] Passes an incomplete mapping as a nested model; asserts a validation
+        # error.
         """A payload of the wrong shape is rejected client-side, not by the worker."""
         with pytest.raises(ValidationError):
             await handle.demo_nested_model(payload={"item": {"name": "a"}})
 
     async def test_unknown_enum_member_is_rejected(self, handle):
+        # [FUNCTION DOC] Passes the string "green" as a colour; asserts a validation error.
         """A value outside the enum is refused rather than sent as a bare string."""
         with pytest.raises(ValidationError):
             await handle.demo_enum(colour="green")
 
     async def test_wrong_tuple_arity_is_rejected(self, handle):
+        # [FUNCTION DOC] Passes a three-element tuple for a pair; asserts a validation error.
         """A tuple of the wrong arity is refused client-side."""
         with pytest.raises(ValidationError):
             await handle.demo_tuple(pair=(1, "a", 2))
 
     async def test_extra_model_field_is_rejected(self, handle):
+        # [FUNCTION DOC] Passes an item mapping with an undeclared extra key; asserts a
+        # validation error (strict model).
         """An unknown field inside a model argument is refused."""
         with pytest.raises(ValidationError):
             await handle.demo_model(item={"name": "a", "values": [], "extra": 1})
 
     async def test_worker_stays_usable_after_a_rejected_call(self, handle):
+        # [FUNCTION DOC] Makes a rejected call (bad enum value), then a valid enum echo with
+        # red; asserts the valid call returns the red member.
         """A client-side rejection does not consume anything server-side."""
         with pytest.raises(ValidationError):
             await handle.demo_enum(colour="green")

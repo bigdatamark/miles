@@ -1,3 +1,8 @@
+# [MODULE DOC] Unit tests for the logprob comparator of the run_megatron debug utility.
+# They exercise three layers: loading and merging per-rank JSON dumps from a directory, computing
+# difference statistics between a baseline and a target set of per-position log probabilities, and
+# the top-level comparison entry point that returns a pass/fail boolean. All tests use temporary
+# directories only and need no GPU or distributed setup.
 from __future__ import annotations
 
 import json
@@ -16,6 +21,9 @@ from miles.utils.debug_utils.run_megatron.logprob_comparator import (
 def _make_rank_json(
     entries_by_batch: list[list[dict]],
 ) -> str:
+    # [FUNCTION DOC] HELPER: Serializes a list (one item per batch) of lists of entry dictionaries
+    # into the JSON text of a rank dump, i.e. an object with a single "logprob_entries" key.
+    # Returns the JSON string; no I/O.
     return json.dumps({"logprob_entries": entries_by_batch})
 
 
@@ -24,6 +32,9 @@ def _write_rank_file(
     rank: int,
     entries_by_batch: list[list[dict]],
 ) -> Path:
+    # [FUNCTION DOC] HELPER: Writes a rank dump file named after the rank number with the json
+    # extension into the given directory, with content built from the per-batch entry lists.
+    # Returns the path of the written file. Side effect: creates or overwrites that file.
     path = directory / f"rank_{rank}.json"
     path.write_text(_make_rank_json(entries_by_batch))
     return path
@@ -35,6 +46,8 @@ def _entry(
     logprob: float,
     is_valid: bool = True,
 ) -> dict:
+    # [FUNCTION DOC] HELPER: Builds one dump entry dictionary with the four keys global position,
+    # token id, log probability and validity flag (valid by default). Returns the dictionary.
     return {
         "global_position": global_position,
         "token_id": token_id,
@@ -44,7 +57,11 @@ def _entry(
 
 
 class TestLoadAndMerge:
+    # [CLASS DOC] Tests for loading all rank dump files of a directory and merging them into one
+    # mapping keyed by (batch index, global position).
     def test_single_rank_single_batch(self, tmp_path: Path) -> None:
+        # [FUNCTION DOC] One rank file with one batch of two entries yields two keys (batch 0,
+        # positions 0 and 1) and the stored log probability of position 0 is preserved.
         _write_rank_file(
             tmp_path,
             rank=0,
@@ -59,6 +76,8 @@ class TestLoadAndMerge:
         assert result[(0, 0)].logprob == -1.0
 
     def test_multi_batch(self, tmp_path: Path) -> None:
+        # [FUNCTION DOC] Two batches in one rank file, both with global position 0, are kept
+        # apart: the batch index is the first part of the key and each keeps its own token id.
         _write_rank_file(
             tmp_path,
             rank=0,
@@ -74,6 +93,8 @@ class TestLoadAndMerge:
         assert result[(1, 0)].token_id == 200
 
     def test_is_valid_false_skipped(self, tmp_path: Path) -> None:
+        # [FUNCTION DOC] Entries flagged invalid are dropped from the merged result; only the
+        # valid entry at position 0 remains.
         _write_rank_file(
             tmp_path,
             rank=0,
@@ -90,6 +111,8 @@ class TestLoadAndMerge:
         assert (0, 1) not in result
 
     def test_tp_deduplication(self, tmp_path: Path) -> None:
+        # [FUNCTION DOC] Two ranks (as with tensor parallel replicas) dumping identical entries
+        # collapse into a single key, so the merged mapping has one element.
         entries = [_entry(0, 100, -1.0)]
         _write_rank_file(tmp_path, rank=0, entries_by_batch=[entries])
         _write_rank_file(tmp_path, rank=1, entries_by_batch=[entries])
@@ -97,15 +120,23 @@ class TestLoadAndMerge:
         assert len(result) == 1
 
     def test_empty_directory(self, tmp_path: Path) -> None:
+        # [FUNCTION DOC] A directory with no files gives an empty mapping.
         result = _load_and_merge(tmp_path)
         assert result == {}
 
     def test_no_matching_files(self, tmp_path: Path) -> None:
+        # [FUNCTION DOC] A directory holding only a file that does not follow the rank file
+        # naming pattern is ignored and gives an empty mapping.
         (tmp_path / "other.json").write_text("{}")
         result = _load_and_merge(tmp_path)
         assert result == {}
 
     def test_multi_rank_different_positions_merge_cp_scenario(self, tmp_path: Path) -> None:
+        # [FUNCTION DOC] Simulates context parallel zigzag slicing with sequence length 8 over
+        # two ranks: rank 0 dumps positions 0, 1, 6, 7 and rank 1 dumps positions 2 to 5, with
+        # token id 100 plus position and log probability -1.0 minus 0.1 times position. Asserts
+        # the merge holds all eight positions of batch 0 with the right token ids and
+        # (approximately) the right log probabilities.
         """CP zigzag: rank 0 has positions [0,1,6,7], rank 1 has [2,3,4,5] → merged has all 8."""
         _write_rank_file(
             tmp_path,
@@ -141,10 +172,17 @@ class TestLoadAndMerge:
 
 
 class TestComputeComparison:
+    # [CLASS DOC] Tests for the statistics computed over the keys common to baseline and target
+    # (pass flag against a threshold, max/mean/median absolute difference, count, and details of
+    # the worst position).
     def _make_entries(self, data: list[tuple[int, int, float]]) -> dict[tuple[int, int], _PositionLogprob]:
+        # [FUNCTION DOC] HELPER: Converts triples of (position, token id, log probability) into
+        # the mapping used by the comparator, all placed in batch 0. Returns that mapping.
         return {(0, pos): _PositionLogprob(global_position=pos, token_id=tid, logprob=lp) for pos, tid, lp in data}
 
     def test_identical_passes(self) -> None:
+        # [FUNCTION DOC] Comparing a set with itself passes with zero maximum difference and
+        # reports two compared positions.
         entries = self._make_entries([(0, 100, -1.0), (1, 101, -2.0)])
         result = _compute_comparison(
             baseline_entries=entries,
@@ -156,6 +194,8 @@ class TestComputeComparison:
         assert result.num_positions == 2
 
     def test_within_threshold_passes(self) -> None:
+        # [FUNCTION DOC] A difference of 0.0005 against a threshold of 0.001 passes and is
+        # reported as the maximum absolute difference.
         baseline = self._make_entries([(0, 100, -1.0)])
         target = self._make_entries([(0, 100, -1.0005)])
         result = _compute_comparison(
@@ -167,6 +207,8 @@ class TestComputeComparison:
         assert result.max_abs_diff == pytest.approx(0.0005)
 
     def test_exceeds_threshold_fails(self) -> None:
+        # [FUNCTION DOC] A difference of 0.1 against a threshold of 0.01 fails and the maximum
+        # absolute difference is reported as 0.1.
         baseline = self._make_entries([(0, 100, -1.0)])
         target = self._make_entries([(0, 100, -1.1)])
         result = _compute_comparison(
@@ -178,6 +220,8 @@ class TestComputeComparison:
         assert result.max_abs_diff == pytest.approx(0.1)
 
     def test_no_common_keys_passes(self) -> None:
+        # [FUNCTION DOC] When baseline and target share no key (different batch index), nothing
+        # is compared: the result passes vacuously with zero compared positions.
         baseline = self._make_entries([(0, 100, -1.0)])
         target: dict[tuple[int, int], _PositionLogprob] = {
             (1, 0): _PositionLogprob(global_position=0, token_id=200, logprob=-2.0)
@@ -191,6 +235,8 @@ class TestComputeComparison:
         assert result.num_positions == 0
 
     def test_statistics(self) -> None:
+        # [FUNCTION DOC] Three positions with differences 0.01, 0.02 and 0.03 under a loose
+        # threshold: asserts pass, three positions, maximum 0.03, and both mean and median 0.02.
         baseline = self._make_entries(
             [
                 (0, 100, -1.0),
@@ -217,6 +263,8 @@ class TestComputeComparison:
         assert result.median_abs_diff == pytest.approx(0.02)
 
     def test_worst_position_tracked(self) -> None:
+        # [FUNCTION DOC] With position 1 differing by 0.5 and position 0 identical, asserts the
+        # result records the worst position, its token id and its baseline and target values.
         baseline = self._make_entries(
             [
                 (0, 100, -1.0),
@@ -240,6 +288,8 @@ class TestComputeComparison:
         assert result.max_diff_target_logprob == pytest.approx(-2.5)
 
     def test_threshold_boundary_equal_passes(self) -> None:
+        # [FUNCTION DOC] A difference of about 0.001 with threshold 0.001 passes, i.e. the
+        # threshold comparison is inclusive (difference less than or equal to threshold).
         baseline = self._make_entries([(0, 100, -1.0)])
         target = self._make_entries([(0, 100, -1.001)])
         result = _compute_comparison(
@@ -251,7 +301,10 @@ class TestComputeComparison:
 
 
 class TestCompareLogprobs:
+    # [CLASS DOC] End-to-end tests of the top-level comparison between a baseline directory and a
+    # target directory of rank dumps, returning a boolean verdict.
     def test_both_have_data_passes(self, tmp_path: Path) -> None:
+        # [FUNCTION DOC] Identical dumps in both directories pass under a threshold of 0.001.
         baseline_dir = tmp_path / "baseline"
         target_dir = tmp_path / "target"
         baseline_dir.mkdir()
@@ -271,6 +324,8 @@ class TestCompareLogprobs:
         )
 
     def test_large_diff_fails(self, tmp_path: Path) -> None:
+        # [FUNCTION DOC] A difference of 1.0 in one position against a threshold of 0.01 makes
+        # the comparison return false.
         baseline_dir = tmp_path / "baseline"
         target_dir = tmp_path / "target"
         baseline_dir.mkdir()
@@ -301,6 +356,8 @@ class TestCompareLogprobs:
         )
 
     def test_empty_baseline_returns_true(self, tmp_path: Path) -> None:
+        # [FUNCTION DOC] If the baseline directory has no dumps but the target does, the
+        # comparison is skipped and returns true (default threshold used).
         baseline_dir = tmp_path / "baseline"
         target_dir = tmp_path / "target"
         baseline_dir.mkdir()
@@ -322,6 +379,8 @@ class TestCompareLogprobs:
         )
 
     def test_empty_target_returns_true(self, tmp_path: Path) -> None:
+        # [FUNCTION DOC] Mirror of the empty baseline case: an empty target directory with a
+        # populated baseline also returns true.
         baseline_dir = tmp_path / "baseline"
         target_dir = tmp_path / "target"
         baseline_dir.mkdir()
@@ -343,6 +402,8 @@ class TestCompareLogprobs:
         )
 
     def test_custom_threshold(self, tmp_path: Path) -> None:
+        # [FUNCTION DOC] The same pair of dumps (difference 0.05) fails with threshold 0.01 and
+        # passes with threshold 0.1, showing the threshold argument controls the verdict.
         baseline_dir = tmp_path / "baseline"
         target_dir = tmp_path / "target"
         baseline_dir.mkdir()

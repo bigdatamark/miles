@@ -1,3 +1,11 @@
+# [MODULE DOC] Unit tests for the routing replay support of the run_megatron worker (recording the
+# mixture-of-experts routing decisions to disk and loading them back for replay). Covered: slicing
+# a tensor evenly over tensor parallel ranks for sequence parallel regions, switching the global
+# routing replay manager into record or replay mode before the model is built, saving the replay
+# data from rank 0, loading it with validation of the file count, and the per-rank slicing applied
+# on load (sequence parallel and context parallel zigzag). The global routing replay manager and
+# the parallel rank lookup are replaced by mocks or simple namespaces, so no GPU or distributed
+# environment is needed; saved files are written to temporary directories.
 from __future__ import annotations
 
 from pathlib import Path
@@ -19,29 +27,42 @@ from miles.utils.debug_utils.run_megatron.worker.replay import (
 
 
 class TestSpSlice:
+    # [CLASS DOC] Tests for the helper that returns the contiguous equal-size chunk of a tensor
+    # belonging to one tensor parallel rank (first dimension split by tensor parallel size).
     def test_slices_evenly(self) -> None:
+        # [FUNCTION DOC] Eight elements, size 2, rank 0 give the first four elements.
         tensor = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8])
         result = _sp_slice(tensor, tp_size=2, tp_rank=0)
         assert result.tolist() == [1, 2, 3, 4]
 
     def test_second_rank(self) -> None:
+        # [FUNCTION DOC] Rank 1 of 2 gets the last four of eight elements.
         tensor = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8])
         result = _sp_slice(tensor, tp_size=2, tp_rank=1)
         assert result.tolist() == [5, 6, 7, 8]
 
     def test_not_divisible_raises(self) -> None:
+        # [FUNCTION DOC] Five elements cannot be split over 2 ranks: an assertion error whose
+        # message mentions "not divisible" is raised.
         tensor = torch.tensor([1, 2, 3, 4, 5])
         with pytest.raises(AssertionError, match="not divisible"):
             _sp_slice(tensor, tp_size=2, tp_rank=0)
 
     def test_single_rank_full(self) -> None:
+        # [FUNCTION DOC] With size 1 the whole tensor is returned.
         tensor = torch.tensor([1, 2, 3, 4])
         result = _sp_slice(tensor, tp_size=1, tp_rank=0)
         assert result.tolist() == [1, 2, 3, 4]
 
 
 class TestSetupReplayBeforeModel:
+    # [CLASS DOC] Tests that the pre-model setup toggles the (mocked) global routing replay
+    # manager: a dump path enables it in the record stage, a load path enables it in the
+    # replay-forward stage, and neither leaves it untouched. Each test starts with the manager
+    # disabled and in the fallthrough stage.
     def test_dump_enables_record(self) -> None:
+        # [FUNCTION DOC] With only a dump path configured the manager becomes enabled and its
+        # stage becomes record.
         script = make_script_args(routing_replay_dump_path=Path("/dump"))
         with patch("miles.utils.debug_utils.run_megatron.worker.replay.routing_replay_manager") as mock_mgr:
             mock_mgr.enabled = False
@@ -51,6 +72,8 @@ class TestSetupReplayBeforeModel:
             assert mock_mgr.stage == "record"
 
     def test_load_enables_replay_forward(self) -> None:
+        # [FUNCTION DOC] With only a load path configured the manager becomes enabled and its
+        # stage becomes replay_forward.
         script = make_script_args(routing_replay_load_path=Path("/load"))
         with patch("miles.utils.debug_utils.run_megatron.worker.replay.routing_replay_manager") as mock_mgr:
             mock_mgr.enabled = False
@@ -60,6 +83,8 @@ class TestSetupReplayBeforeModel:
             assert mock_mgr.stage == "replay_forward"
 
     def test_neither_noop(self) -> None:
+        # [FUNCTION DOC] With neither path configured the manager stays disabled in the
+        # fallthrough stage.
         script = make_script_args()
         with patch("miles.utils.debug_utils.run_megatron.worker.replay.routing_replay_manager") as mock_mgr:
             mock_mgr.enabled = False
@@ -70,8 +95,13 @@ class TestSetupReplayBeforeModel:
 
 
 class TestSaveReplayData:
+    # [CLASS DOC] Tests for saving the recorded routing indices of the mocked manager to the dump
+    # directory, using the manager's file name prefixed by the rank. Only rank 0 may save, and
+    # saving with no recorded entries is an error.
     @patch("miles.utils.debug_utils.run_megatron.worker.replay.routing_replay_manager")
     def test_saves_file(self, mock_mgr: MagicMock, tmp_path: Path) -> None:
+        # [FUNCTION DOC] One replay with one recorded tensor results in exactly one saved file
+        # in the dump directory, whose name contains "rank0".
         mock_mgr.filename = "routing_replay.pt"
         replay = SimpleNamespace(top_indices_list=[torch.tensor([1, 2])])
         mock_mgr.replays = [replay]
@@ -85,6 +115,9 @@ class TestSaveReplayData:
 
     @patch("miles.utils.debug_utils.run_megatron.worker.replay.routing_replay_manager")
     def test_saved_content_roundtrips(self, mock_mgr: MagicMock, tmp_path: Path) -> None:
+        # [FUNCTION DOC] The saved file holds a list with one element per replay, each a list of
+        # that replay's recorded tensors; loading it back (without the weights-only restriction)
+        # returns the original two tensors with equal values.
         mock_mgr.filename = "routing_replay.pt"
         original = [torch.tensor([10, 20]), torch.tensor([30, 40])]
         replay = SimpleNamespace(top_indices_list=original)
@@ -102,11 +135,14 @@ class TestSaveReplayData:
 
     @patch("miles.utils.debug_utils.run_megatron.worker.replay.routing_replay_manager")
     def test_noop_when_no_path(self, mock_mgr: MagicMock) -> None:
+        # [FUNCTION DOC] Without a dump path the call returns silently and writes nothing; the
+        # test has no explicit assertion (it passes if nothing is raised).
         script = make_script_args()
         save_replay_data(script, rank=0)
 
     @patch("miles.utils.debug_utils.run_megatron.worker.replay.routing_replay_manager")
     def test_asserts_rank_zero(self, mock_mgr: MagicMock, tmp_path: Path) -> None:
+        # [FUNCTION DOC] Calling with rank 1 while a dump path is set raises an assertion error.
         mock_mgr.filename = "routing_replay.pt"
         replay = SimpleNamespace(top_indices_list=[torch.tensor([1, 2])])
         mock_mgr.replays = [replay]
@@ -117,6 +153,7 @@ class TestSaveReplayData:
 
     @patch("miles.utils.debug_utils.run_megatron.worker.replay.routing_replay_manager")
     def test_empty_entries_asserts(self, mock_mgr: MagicMock, tmp_path: Path) -> None:
+        # [FUNCTION DOC] A replay with no recorded tensors makes saving raise an assertion error.
         mock_mgr.filename = "routing_replay.pt"
         replay = SimpleNamespace(top_indices_list=[])
         mock_mgr.replays = [replay]
@@ -127,13 +164,20 @@ class TestSaveReplayData:
 
 
 class TestLoadReplayData:
+    # [CLASS DOC] Tests for locating and loading the replay file from the load directory: no-op
+    # without a load path, a value error unless exactly one file with the manager's file name
+    # suffix is found, and population of the manager's replays on success.
     @patch("miles.utils.debug_utils.run_megatron.worker.replay.routing_replay_manager")
     def test_noop_when_no_path(self, mock_mgr: MagicMock) -> None:
+        # [FUNCTION DOC] Without a load path the call returns silently; nothing is asserted
+        # beyond that no exception occurs.
         script = make_script_args()
         load_replay_data(script, rank=0)
 
     @patch("miles.utils.debug_utils.run_megatron.worker.replay.routing_replay_manager")
     def test_no_file_raises(self, mock_mgr: MagicMock, tmp_path: Path) -> None:
+        # [FUNCTION DOC] An empty load directory raises a value error saying exactly 1 replay
+        # file was expected.
         mock_mgr.filename = "routing_replay.pt"
         script = make_script_args(routing_replay_load_path=tmp_path)
         with pytest.raises(ValueError, match="Expected exactly 1 replay file"):
@@ -141,6 +185,8 @@ class TestLoadReplayData:
 
     @patch("miles.utils.debug_utils.run_megatron.worker.replay.routing_replay_manager")
     def test_multiple_files_raises(self, mock_mgr: MagicMock, tmp_path: Path) -> None:
+        # [FUNCTION DOC] Two empty files whose names end with the manager's file name (so the
+        # match is by suffix) raise the same value error as the empty directory.
         mock_mgr.filename = "routing_replay.pt"
         (tmp_path / "a_routing_replay.pt").touch()
         (tmp_path / "b_routing_replay.pt").touch()
@@ -157,6 +203,9 @@ class TestLoadReplayData:
         mock_ranks: MagicMock,
         tmp_path: Path,
     ) -> None:
+        # [FUNCTION DOC] With all parallel sizes 1 and no sequence parallel region, a saved file
+        # holding one replay with two tensors is loaded into the mocked manager's single replay:
+        # its recorded list gets two elements and its forward and backward indices stay 0.
         mock_ranks.return_value = _ParallelRanks(cp_size=1, cp_rank=0, tp_size=1, tp_rank=0)
         mock_mgr.filename = "routing_replay.pt"
         mock_mgr.if_sp_region = False
@@ -177,11 +226,16 @@ class TestLoadReplayData:
 
 
 class TestLoadReplaySpSlicing:
+    # [CLASS DOC] Tests of the sequence parallel slicing in the file loader: when both the
+    # sequence parallel flag is on and the manager says it is a sequence parallel region, each
+    # loaded tensor is reduced to the tensor parallel rank's chunk.
     """Test _load_replay with SP (sequence parallel) slicing."""
 
     @patch("miles.utils.debug_utils.run_megatron.worker.replay._get_parallel_ranks")
     @patch("miles.utils.debug_utils.run_megatron.worker.replay.routing_replay_manager")
     def test_sp_slices_tensors(self, mock_mgr: MagicMock, mock_ranks: MagicMock, tmp_path: Path) -> None:
+        # [FUNCTION DOC] Tensor parallel size 2 and rank 0: a saved tensor of 0 to 7 is loaded
+        # as 0 to 3.
         mock_ranks.return_value = _ParallelRanks(cp_size=1, cp_rank=0, tp_size=2, tp_rank=0)
         mock_mgr.if_sp_region = True
 
@@ -201,6 +255,7 @@ class TestLoadReplaySpSlicing:
     @patch("miles.utils.debug_utils.run_megatron.worker.replay._get_parallel_ranks")
     @patch("miles.utils.debug_utils.run_megatron.worker.replay.routing_replay_manager")
     def test_sp_second_rank(self, mock_mgr: MagicMock, mock_ranks: MagicMock, tmp_path: Path) -> None:
+        # [FUNCTION DOC] Tensor parallel rank 1 of 2: the same tensor loads as 4 to 7.
         mock_ranks.return_value = _ParallelRanks(cp_size=1, cp_rank=0, tp_size=2, tp_rank=1)
         mock_mgr.if_sp_region = True
 
@@ -218,6 +273,8 @@ class TestLoadReplaySpSlicing:
     @patch("miles.utils.debug_utils.run_megatron.worker.replay._get_parallel_ranks")
     @patch("miles.utils.debug_utils.run_megatron.worker.replay.routing_replay_manager")
     def test_sp_disabled_no_slice(self, mock_mgr: MagicMock, mock_ranks: MagicMock, tmp_path: Path) -> None:
+        # [FUNCTION DOC] With the sequence parallel flag false, the tensor is loaded whole even
+        # though the manager reports a sequence parallel region and tensor parallel size is 2.
         mock_ranks.return_value = _ParallelRanks(cp_size=1, cp_rank=0, tp_size=2, tp_rank=0)
         mock_mgr.if_sp_region = True
 
@@ -235,11 +292,18 @@ class TestLoadReplaySpSlicing:
 
 
 class TestLoadReplayCpSlicing:
+    # [CLASS DOC] Tests of the context parallel slicing in the file loader: with context parallel
+    # size above 1 each loaded tensor is passed through the natural-to-zigzag slice function of
+    # the context parallel module (looked up at call time, hence patched at its home module); with
+    # size 1 no slicing happens.
     """Test _load_replay with CP (context parallel) zigzag slicing."""
 
     @patch("miles.utils.debug_utils.run_megatron.worker.replay.routing_replay_manager")
     @patch("miles.utils.debug_utils.run_megatron.worker.replay._get_parallel_ranks")
     def test_cp_calls_zigzag_slice(self, mock_ranks: MagicMock, mock_mgr: MagicMock, tmp_path: Path) -> None:
+        # [FUNCTION DOC] Context parallel size 2, rank 0, with the zigzag function patched to
+        # return a fixed tensor (0, 7, 1, 6): asserts it is called exactly once with keyword
+        # arguments dim 0, size 2 and rank 0, and that the loaded tensor is its return value.
         mock_ranks.return_value = _ParallelRanks(cp_size=2, cp_rank=0, tp_size=1, tp_rank=0)
         mock_mgr.if_sp_region = False
 
@@ -269,6 +333,8 @@ class TestLoadReplayCpSlicing:
     @patch("miles.utils.debug_utils.run_megatron.worker.replay.routing_replay_manager")
     @patch("miles.utils.debug_utils.run_megatron.worker.replay._get_parallel_ranks")
     def test_cp1_no_zigzag(self, mock_ranks: MagicMock, mock_mgr: MagicMock, tmp_path: Path) -> None:
+        # [FUNCTION DOC] With context parallel size 1 the saved tensor 0 to 3 is loaded
+        # unchanged.
         mock_ranks.return_value = _ParallelRanks(cp_size=1, cp_rank=0, tp_size=1, tp_rank=0)
         mock_mgr.if_sp_region = False
 
@@ -284,9 +350,13 @@ class TestLoadReplayCpSlicing:
 
 
 class TestLoadReplayMismatch:
+    # [CLASS DOC] Tests for validation that the number of replays in the file equals the number
+    # of replays in the model's manager.
     @patch("miles.utils.debug_utils.run_megatron.worker.replay._get_parallel_ranks")
     @patch("miles.utils.debug_utils.run_megatron.worker.replay.routing_replay_manager")
     def test_replay_count_mismatch_raises(self, mock_mgr: MagicMock, mock_ranks: MagicMock, tmp_path: Path) -> None:
+        # [FUNCTION DOC] A file with 1 replay loaded into a manager with 2 replays raises a
+        # value error whose message says the file has 1 replays but the model expects 2.
         mock_ranks.return_value = _ParallelRanks(cp_size=1, cp_rank=0, tp_size=1, tp_rank=0)
         mock_mgr.if_sp_region = False
         mock_mgr.replays = [

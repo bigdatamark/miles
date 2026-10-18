@@ -1,3 +1,8 @@
+# [MODULE DOC] Manual end-to-end session-server test for DeepSeek-V3.2 with the TITO path. Defines
+# a module-level model configuration (model name from an environment variable, default the
+# DeepSeek-V3.2 hub id; deepseek-v3 reasoning parser, deepseekv32 tool-call parser and TITO
+# model; 8 GPUs with tensor and expert parallel size 8; speculative decoding enabled) and one
+# test that passes it to the shared multi-role runner. Needs 8 GPUs and the model weights.
 import os
 
 from tests.e2e.sglang.test_session_server_multi_role._common import ModelConfig, run_one
@@ -15,6 +20,8 @@ CONFIG = ModelConfig(
 
 
 def test_deepseek_v32_session_tito():
+    # [FUNCTION DOC] Runs the shared one-model session-server scenario with the module config;
+    # pass/fail is determined entirely by the runner. Also invoked directly by the script entry.
     run_one(CONFIG)
 
 

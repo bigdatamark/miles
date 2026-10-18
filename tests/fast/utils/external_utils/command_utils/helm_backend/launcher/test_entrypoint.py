@@ -1,3 +1,12 @@
+# [MODULE DOC] Unit tests for the Helm launcher entrypoint functions. Covered: writing the Helm
+# values file (sorted keys, block style YAML, creating parent directories, round trip), making
+# sure a preallocated Weights-and-Biases run id reaches every pod's command line, a full
+# execute-train launch recorded through a fake process runner to verify CI release cleanup order
+# and labelling, the follow-until-finished loop (farewell hint, diagnosis collection, exit codes),
+# refusing a launch-record environment variable set by the user, and marking the superseded
+# orchestrator state file while deleting the pending uninstall job when a new generation is
+# launched. External programs (helm, kubectl) and heavy collaborators (spec computation, argument
+# parsing, observability, Mooncake planning) are replaced by fakes via monkeypatching.
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,12 +22,19 @@ from miles.utils.external_utils.command_utils.helm_backend.launcher.values.misc 
 
 
 def _infra_file(tmp_path: Path, name: str, values: dict[str, Any]) -> str:
+    # [FUNCTION DOC] HELPER: Writes the given values mapping as YAML into a file with the given
+    # name in the temporary directory and returns the file path as a string.
     path = tmp_path / name
     path.write_text(yaml.safe_dump(values))
     return str(path)
 
 
 def _stub_launch_inputs(monkeypatch, *, specs, colocate: bool = False) -> None:
+    # [FUNCTION DOC] HELPER: Replaces, on the entrypoint module, the spec computation (returns the
+    # given specs), the argument parser (returns a namespace with the given colocate flag, deploy
+    # component "all", no deploy instance id, empty argv, empty train env vars, no wandb and no
+    # wandb run id), the Mooncake plan of arguments (returns none) and the follow-until-finished
+    # step (does nothing), so a launch can run without real inputs.
     monkeypatch.setattr(entrypoint, "compute_specs", lambda args: specs)
     monkeypatch.setattr(
         entrypoint,
@@ -38,7 +54,10 @@ def _stub_launch_inputs(monkeypatch, *, specs, colocate: bool = False) -> None:
 
 
 class TestWriteHelmValues:
+    # [CLASS DOC] Tests for writing the values mapping to a YAML file for Helm.
     def test_orders_the_keys_so_a_relaunch_produces_the_same_file(self, tmp_path):
+        # [FUNCTION DOC] Keys of a nested mapping given in non-alphabetical order appear sorted
+        # in the written text: "commandJob" before "id" before "inferenceEngines".
         """The file is compared against what helm already holds, and dict order is not part of the values."""
         path = tmp_path / "values.yaml"
 
@@ -48,6 +67,8 @@ class TestWriteHelmValues:
         assert dumped.index("commandJob") < dumped.index("id") < dumped.index("inferenceEngines")
 
     def test_round_trips_through_yaml(self, tmp_path):
+        # [FUNCTION DOC] Reading the written file back as YAML gives a mapping equal to the
+        # input (including a list of mappings).
         """helm reads this file back, so anything yaml cannot express would be silently lost."""
         values = {"run": {"id": "260101-000000-000", "inferenceEngines": [{"name": "e", "replicas": 2}]}}
         path = tmp_path / "values.yaml"
@@ -57,6 +78,8 @@ class TestWriteHelmValues:
         assert yaml.safe_load(path.read_text()) == values
 
     def test_writes_a_block_style_document(self, tmp_path):
+        # [FUNCTION DOC] The written text contains no opening brace, i.e. no inline flow style
+        # mapping, even for nested mappings and lists.
         """A run's values are read by humans diagnosing a launch, and inline flow style is unreadable."""
         path = tmp_path / "values.yaml"
 
@@ -65,6 +88,8 @@ class TestWriteHelmValues:
         assert "{" not in path.read_text()
 
     def test_creates_the_run_directory_it_writes_into(self, tmp_path):
+        # [FUNCTION DOC] Writing to a path whose parent directories do not exist creates them
+        # and the file holds the values.
         """The launcher writes here before anything else has created the run's directory."""
         path = tmp_path / "miles-runs" / "260101-000000-000" / "values.yaml"
 
@@ -74,6 +99,11 @@ class TestWriteHelmValues:
 
 
 def _request(namespace: str, run_id: str) -> ExecuteTrainRequest:
+    # [FUNCTION DOC] HELPER: Builds a minimal train request: arguments for 8 rollout GPUs, 8 GPUs
+    # per node, no model type, train script "/repo/train.py", not the FSDP backend, no extra
+    # environment variables, a Megatron path, no pre-submit hook, no prepare commands and no extra
+    # manifests.
+    # KNOWN ISSUE: the namespace and run id parameters are accepted but not used.
     return ExecuteTrainRequest(
         train_args="--rollout-num-gpus 8",
         num_gpus_per_node=8,
@@ -89,7 +119,12 @@ def _request(namespace: str, run_id: str) -> ExecuteTrainRequest:
 
 
 class TestWandbRunIdReachesEveryPod:
+    # [CLASS DOC] Tests that a Weights-and-Biases run id is chosen once by the launcher and
+    # passed to all pods through the pod command line, unless the user already named one.
     def test_a_wandb_run_gets_one_preallocated_id_every_pod_is_told(self, monkeypatch):
+        # [FUNCTION DOC] With the id generator patched to return "preallocated0" and the
+        # use-wandb flag, the parsed arguments carry that id and the pod argument vector
+        # contains the run id option followed by it.
         """A pod that parses no run id joins no run, and the first metric it reports kills it mid-run."""
         monkeypatch.setattr(entrypoint, "_generate_wandb_run_id", lambda: "preallocated0")
 
@@ -99,6 +134,8 @@ class TestWandbRunIdReachesEveryPod:
         assert pod_argv[pod_argv.index("--wandb-run-id") + 1] == "preallocated0"
 
     def test_a_run_that_names_its_own_id_keeps_it(self, monkeypatch):
+        # [FUNCTION DOC] When the user passes the run id option "chosen0", it is kept (not
+        # replaced by the generated one) and appears exactly once in the pod argument vector.
         """Resuming a run means joining the id the operator named, not the one this launch would mint."""
         monkeypatch.setattr(entrypoint, "_generate_wandb_run_id", lambda: "preallocated0")
 
@@ -108,6 +145,8 @@ class TestWandbRunIdReachesEveryPod:
         assert pod_argv.count("--wandb-run-id") == 1
 
     def test_a_run_without_wandb_is_told_no_run_id(self, monkeypatch):
+        # [FUNCTION DOC] Without the use-wandb flag, the parsed run id is none and the pod
+        # argument vector has no run id option.
         """Minting an id for a run that tracks nothing would make every pod resume a run nobody created."""
         monkeypatch.setattr(entrypoint, "_generate_wandb_run_id", lambda: "preallocated0")
 
@@ -118,6 +157,12 @@ class TestWandbRunIdReachesEveryPod:
 
 
 def _compute_train_argv(monkeypatch: pytest.MonkeyPatch, train_args: str) -> tuple[list[str], Any]:
+    # [FUNCTION DOC] HELPER: Patches the Mooncake plan computation to return none, builds a train
+    # request whose arguments are a fixed FSDP training prefix (backend fsdp, rollout batch size 8,
+    # one rollout, 8 rollout GPUs) followed by the given extra argument text, and calls the
+    # entrypoint's train argument computation with run uuid "0123456789abcdef", release "r",
+    # namespace "rl" and an empty environment. Returns its result: the pod argument vector list
+    # and the parsed arguments object.
     monkeypatch.setattr(entrypoint, "_compute_mooncake_plan", lambda args: None)
     request = ExecuteTrainRequest(
         train_args=f"--train-backend fsdp --rollout-batch-size 8 --num-rollout 1 --rollout-num-gpus 8 {train_args}",
@@ -135,9 +180,20 @@ def _compute_train_argv(monkeypatch: pytest.MonkeyPatch, train_args: str) -> tup
 
 
 def _record_launch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, ci_run: bool) -> list[list[str]]:
+    # [FUNCTION DOC] HELPER: Runs a whole execute-train launch with all external effects faked.
+    # The process runner records each command (as strings) and returns success, with output
+    # '{"manifest": ""}' for commands containing the dry-run option and empty output otherwise;
+    # the manifest reader reports no existing release. An infra values file is written to the
+    # temporary directory declaring one host-path volume "cluster-storage" mounted at a path
+    # under the temporary directory and the runs root at that path. Launch inputs are stubbed
+    # with no specs. Executes with a minimal request, namespace "rl", run id
+    # "260101-000000-000", the infra file as the only Helm values file and the given CI flag.
+    # Returns only the recorded commands whose program is helm.
     commands: list[list[str]] = []
 
     def fake_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        # [FUNCTION DOC] HELPER: Records the command with all parts converted to strings and
+        # returns exit 0 with the dry-run manifest JSON for dry runs, else empty output.
         argv = [str(part) for part in command]
         commands.append(argv)
         rendered = '{"manifest": ""}' if "--dry-run" in argv else ""
@@ -172,7 +228,11 @@ def _record_launch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, ci_run: b
 
 
 class TestCiRunCleanup:
+    # [CLASS DOC] Tests of the CI-specific behavior of a full launch: cleanup of leftover CI
+    # releases before installing, only in CI runs, and labelling of the installed release.
     def test_removes_the_leftover_ci_releases_before_installing_this_one(self, monkeypatch, tmp_path):
+        # [FUNCTION DOC] In a CI launch, the Helm commands include a list subcommand, and the
+        # first list comes before the first upgrade (install).
         """A runner reuses one namespace, and installing first means the cleanup could uninstall the new run."""
         commands = _record_launch(monkeypatch, tmp_path, ci_run=True)
         verbs = [command[1] for command in commands]
@@ -181,6 +241,8 @@ class TestCiRunCleanup:
         assert verbs.index("list") < verbs.index("upgrade")
 
     def test_asks_only_for_the_ci_releases_of_this_namespace(self, monkeypatch, tmp_path):
+        # [FUNCTION DOC] The first Helm list command starts with helm and list and carries the
+        # namespace option "rl".
         """The same namespace holds human runs, and a broader listing would uninstall someone's experiment."""
         listing = [command for command in _record_launch(monkeypatch, tmp_path, ci_run=True) if command[1] == "list"]
 
@@ -188,6 +250,8 @@ class TestCiRunCleanup:
         assert listing[0][listing[0].index("--namespace") + 1] == "rl"
 
     def test_a_normal_launch_cleans_up_nothing(self, monkeypatch, tmp_path):
+        # [FUNCTION DOC] Without the CI flag there is no Helm list and no Helm uninstall
+        # command.
         """Outside CI the neighbouring releases are other people's runs, and none of them is ours to delete."""
         verbs = [command[1] for command in _record_launch(monkeypatch, tmp_path, ci_run=False)]
 
@@ -195,6 +259,8 @@ class TestCiRunCleanup:
         assert "uninstall" not in verbs
 
     def test_labels_the_release_it_installs_so_the_next_run_can_find_it(self, monkeypatch, tmp_path):
+        # [FUNCTION DOC] Among the upgrade commands that are not dry runs, the first has the
+        # labels option followed by the CI label equal to true.
         """The cleanup selects on this label, and an unlabelled CI release is one nothing will ever remove."""
         commands = _record_launch(monkeypatch, tmp_path, ci_run=True)
         installed = [command for command in commands if command[1] == "upgrade" and "--dry-run" not in command]
@@ -203,22 +269,35 @@ class TestCiRunCleanup:
 
 
 class _FakeObservability:
+    # [CLASS DOC] HELPER: Fake of the observability context manager: stores its keyword
+    # arguments, enters without effect and never suppresses exceptions on exit.
     def __init__(self, **kwargs: Any) -> None:
+        # [FUNCTION DOC] HELPER: Stores the keyword arguments.
         self.kwargs = kwargs
 
     def __enter__(self) -> None:
+        # [FUNCTION DOC] HELPER: Does nothing and returns none.
         return None
 
     def __exit__(self, *exc_info: Any) -> bool:
+        # [FUNCTION DOC] HELPER: Returns false so exceptions propagate.
         return False
 
 
 def _follow(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, outcome: Any, diagnosed: list[str]) -> None:
+    # [FUNCTION DOC] HELPER: Replaces on the entrypoint module the observability context manager
+    # (with the fake), the farewell text builder (returns "farewell hint"), the diagnosis
+    # collector (appends the given release to the diagnosed list) and the wait-for-run function
+    # (raises the outcome if it is an exception object, else returns it). Then calls the
+    # follow-until-finished function for release "r", namespace "rl" and a state file in the
+    # temporary directory. Exceptions from that call propagate.
     monkeypatch.setattr(entrypoint, "with_observability", _FakeObservability)
     monkeypatch.setattr(entrypoint, "farewell", lambda **kwargs: "farewell hint")
     monkeypatch.setattr(entrypoint, "_collect_diagnosis", lambda **kwargs: diagnosed.append(kwargs["release"]))
 
     def wait_for_run(**kwargs: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Fake wait: raises the configured outcome if it is an exception,
+        # otherwise returns it.
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
@@ -228,7 +307,12 @@ def _follow(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, outcome: Any, di
 
 
 class TestFollowUntilFinished:
+    # [CLASS DOC] Tests of the watch loop's ending behavior: the farewell hint is logged in
+    # every ending, a diagnosis is collected only for a failed run, a keyboard interrupt
+    # propagates, and a non-zero run exit code raises a run-exited error carrying that code.
     def test_prints_the_farewell_hint_when_ctrl_c_ends_the_watch(self, monkeypatch, tmp_path, caplog):
+        # [FUNCTION DOC] With the wait raising a keyboard interrupt, the interrupt propagates
+        # out of the call and the info log of the entrypoint contains "farewell hint".
         """The message above the watch tells the user ctrl+c is for exactly this, and the hint went missing."""
         diagnosed: list[str] = []
 
@@ -239,6 +323,7 @@ class TestFollowUntilFinished:
         assert "farewell hint" in caplog.text
 
     def test_diagnoses_nothing_when_the_user_stopped_watching(self, monkeypatch, tmp_path):
+        # [FUNCTION DOC] After a keyboard interrupt, no diagnosis was collected.
         """Ctrl+c stops the watch, not the run, so there is no failure to collect evidence about."""
         diagnosed: list[str] = []
 
@@ -248,6 +333,8 @@ class TestFollowUntilFinished:
         assert diagnosed == []
 
     def test_prints_the_farewell_hint_after_a_run_that_finished(self, monkeypatch, tmp_path, caplog):
+        # [FUNCTION DOC] With a run outcome of exit code 0, the call returns normally, the log
+        # contains "farewell hint" and nothing was diagnosed.
         """A finished run is still installed and still reconnectable, so its user needs the same commands."""
         diagnosed: list[str] = []
 
@@ -258,6 +345,8 @@ class TestFollowUntilFinished:
         assert diagnosed == []
 
     def test_prints_the_farewell_hint_after_a_run_that_failed(self, monkeypatch, tmp_path, caplog):
+        # [FUNCTION DOC] With a run outcome of exit code 3, a run-exited error is raised whose
+        # code is 3, and the log contains "farewell hint".
         """The failed run is what a user most needs the cleanup and reconnect commands for."""
         diagnosed: list[str] = []
 
@@ -269,6 +358,8 @@ class TestFollowUntilFinished:
         assert failure.value.code == 3
 
     def test_still_collects_a_diagnosis_of_a_run_that_failed(self, monkeypatch, tmp_path):
+        # [FUNCTION DOC] After a failed run (exit code 3) the diagnosis collector was called
+        # exactly once, for release "r".
         """Printing the hint from a finally block must not cost the evidence the failure is diagnosed from."""
         diagnosed: list[str] = []
 
@@ -279,7 +370,12 @@ class TestFollowUntilFinished:
 
 
 class TestTheLaunchRecordThePodsAreTold:
+    # [CLASS DOC] Tests that the launcher reserves the environment variable through which pods
+    # learn the launch record path, refusing a user-supplied value in the worker environment.
     def test_refuses_a_record_path_a_run_set_through_its_worker_environment(self, monkeypatch):
+        # [FUNCTION DOC] Training arguments setting the launcher report environment variable in
+        # the train environment variables option make the train argument computation raise an
+        # assertion error.
         """The serving entrypoint execs into this environment over the chart's value, so it wins."""
         with pytest.raises(AssertionError):
             _compute_train_argv(
@@ -287,12 +383,16 @@ class TestTheLaunchRecordThePodsAreTold:
             )
 
     def test_leaves_an_ordinary_worker_environment_alone(self, monkeypatch):
+        # [FUNCTION DOC] A train environment variables option with only an allocator
+        # configuration variable is accepted and the parsed arguments keep exactly that mapping.
         """--train-env-vars is how a run passes allocator settings, and none of that is a launch record."""
         _, args = _compute_train_argv(monkeypatch, '--train-env-vars \'{"PYTORCH_CUDA_ALLOC_CONF": "a:b"}\'')
 
         assert args.train_env_vars == {"PYTORCH_CUDA_ALLOC_CONF": "a:b"}
 
     def test_a_run_that_names_no_worker_environment_is_launched(self, monkeypatch):
+        # [FUNCTION DOC] Without the option, the computation succeeds and the pod argument vector
+        # has no train environment variables option.
         """Almost every launch names none, and the check may not stand in the way of those."""
         pod_argv, _ = _compute_train_argv(monkeypatch, "")
 
@@ -300,6 +400,9 @@ class TestTheLaunchRecordThePodsAreTold:
 
 
 def _defuse(monkeypatch: pytest.MonkeyPatch, *, superseded_state_file: Path | None, state_file: Path) -> list[str]:
+    # [FUNCTION DOC] HELPER: Replaces the kubectl job deletion with a recorder of job names, calls
+    # the entrypoint's defuse-previous-generation step for release "r" and namespace "rl" with the
+    # given superseded and new state files, and returns the list of deleted job names.
     deleted: list[str] = []
     monkeypatch.setattr(entrypoint.Kubectl, "delete_job", staticmethod(lambda name, **kwargs: deleted.append(name)))
 
@@ -310,7 +413,12 @@ def _defuse(monkeypatch: pytest.MonkeyPatch, *, superseded_state_file: Path | No
 
 
 class TestDefusingThePreviousGeneration:
+    # [CLASS DOC] Tests of the step that stops an older orchestrator from uninstalling a release
+    # a new generation is taking over: a superseded marker file next to the old state file naming
+    # the new state file, then deletion of the release's pending uninstall job.
     def test_marks_the_state_file_this_launch_supersedes(self, monkeypatch, tmp_path):
+        # [FUNCTION DOC] With an old and a new state file path, the marker file for the old
+        # state file contains the new state file path followed by a newline.
         """The orchestrator it replaces goes on to publish its verdict and re-create the uninstall job."""
         superseded = tmp_path / "state" / "orchestrator-old.state"
         state_file = tmp_path / "state" / "orchestrator-new.state"
@@ -320,6 +428,9 @@ class TestDefusingThePreviousGeneration:
         assert entrypoint.RunFiles.superseded_marker(state_file=superseded).read_text() == f"{state_file}\n"
 
     def test_writes_the_marker_before_it_defuses_the_job(self, monkeypatch, tmp_path):
+        # [FUNCTION DOC] Replaces job deletion with a function that records whether the marker
+        # file already exists at the time of deletion; asserts exactly one deletion happened and
+        # the marker existed then.
         """Between the two the old orchestrator may wake up, and only the marker stops it then."""
         superseded = tmp_path / "state" / "orchestrator-old.state"
         marked: list[bool] = []
@@ -340,12 +451,16 @@ class TestDefusingThePreviousGeneration:
         assert marked == [True]
 
     def test_a_launch_that_supersedes_nobody_marks_nothing(self, monkeypatch, tmp_path):
+        # [FUNCTION DOC] With no superseded state file (first install), no marker file with the
+        # superseded suffix exists anywhere under the temporary directory.
         """A first install has no previous generation, and a marker with no owner would defuse a live run."""
         _defuse(monkeypatch, superseded_state_file=None, state_file=tmp_path / "state" / "orchestrator-new.state")
 
         assert list(tmp_path.glob("**/*.superseded")) == []
 
     def test_the_pending_uninstall_job_is_deleted_either_way(self, monkeypatch, tmp_path):
+        # [FUNCTION DOC] Even with no superseded state file, the job deleted is exactly the
+        # release's uninstall job name from the run naming helper.
         """The job would uninstall the release this launch installs, marker or no marker."""
         deleted = _defuse(monkeypatch, superseded_state_file=None, state_file=tmp_path / "new.state")
 

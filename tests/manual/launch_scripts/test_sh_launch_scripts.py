@@ -1,3 +1,11 @@
+# [MODULE DOC] Snapshot tests for shell launch scripts. Each discovered script is executed in a
+# sandbox by the shell harness (external commands are intercepted and recorded rather than run),
+# and the return code plus the ordered list of intercepted invocations is compared with a golden
+# file under tests/snapshots/launch_scripts/sh/<script>.txt. Scripts that refuse to run without
+# explicit arguments or environment variables get a per-script table entry supplying them
+# (positional args such as mode, node rank and head node address; environment values where the
+# placeholder for the working directory is substituted by a sandbox path). Discovery tests keep
+# the script list and golden files in sync and verify uncovered shell scripts merely delegate.
 from dataclasses import dataclass, field
 
 import pytest
@@ -14,6 +22,9 @@ _SNAPSHOT_DIR = REPO_ROOT / "tests" / "snapshots" / "launch_scripts" / "sh"
 
 @dataclass(frozen=True)
 class LaunchScriptCase:
+    # [CLASS DOC] Immutable extra inputs for running one script: positional argument tuple
+    # (default empty) and a mapping of environment variable overrides (default empty) whose
+    # values may contain a working-directory placeholder.
     args: tuple[str, ...] = ()
     env: dict[str, str] = field(default_factory=dict)
 
@@ -56,6 +67,11 @@ _SCRIPTS = [script.relative_to(REPO_ROOT).as_posix() for script in iter_launch_s
 
 @pytest.fixture(params=_SCRIPTS, scope="module")
 def recorded(request, tmp_path_factory):
+    # [FUNCTION DOC] HELPER: Module-scoped parametrized fixture, one run per discovered script.
+    # Looks up the script's special-case inputs (or uses none), creates a fresh sandbox
+    # directory, runs the script through the harness with those args and environment (values
+    # formatted with a working-directory path inside the sandbox), and returns the script's
+    # repo-relative path with the run result.
     rel = request.param
     case = _SCRIPTS_REFUSING_TO_RUN_WITHOUT_EXPLICIT_INPUTS.get(rel, LaunchScriptCase())
     tmp_path = tmp_path_factory.mktemp("launch_script")
@@ -70,7 +86,10 @@ def recorded(request, tmp_path_factory):
 
 
 class TestEveryLaunchScript:
+    # [CLASS DOC] Per-script checks using the module-scoped run fixture.
     def test_invocations_match_snapshot(self, recorded):
+        # [FUNCTION DOC] Builds the actual text as a return-code header line, a blank line, and the
+        # formatted invocation list, then compares it with the script's golden file.
         """Every launch script must issue exactly the recorded sequence of external commands."""
         rel, run = recorded
         snapshot = _SNAPSHOT_DIR / f"{rel}.txt"
@@ -79,6 +98,10 @@ class TestEveryLaunchScript:
         assert_matches_snapshot(snapshot, actual, rel)
 
     def test_submits_exactly_one_ray_job(self, recorded):
+        # [FUNCTION DOC] Asserts the script exited with code zero and that the argument vector of
+        # the Ray job submit call has more than ten entries.
+        # KNOWN ISSUE: the name says "exactly one" but the check only requires a non-trivial
+        # argument vector; it does not count submissions.
         """A launch script that no longer reaches `ray job submit` is broken, whatever else it does."""
         _, run = recorded
         assert run.returncode == 0
@@ -86,7 +109,10 @@ class TestEveryLaunchScript:
 
 
 class TestDiscovery:
+    # [CLASS DOC] Consistency checks between discovered scripts and golden files.
     def test_every_discovered_script_has_a_snapshot_and_vice_versa(self):
+        # [FUNCTION DOC] Discovered script paths with a text suffix must equal the golden files
+        # found recursively, and more than thirty scripts must be discovered.
         """A script that stops matching the discovery filter would otherwise vanish silently."""
         discovered = {f"{rel}.txt" for rel in _SCRIPTS}
         recorded = {path.relative_to(_SNAPSHOT_DIR).as_posix() for path in _SNAPSHOT_DIR.rglob("*.txt")}
@@ -95,6 +121,11 @@ class TestDiscovery:
         assert len(discovered) > 30
 
     def test_a_shell_script_outside_the_snapshots_only_delegates(self):
+        # [FUNCTION DOC] Finds shell scripts under the repo scripts directory (recursively) whose
+        # file name matches no golden file stem and whose text lacks the Ray job submit phrase.
+        # For each, asserts at least one line mentions both a Python file and the python
+        # interpreter, i.e. the script delegates to a Python launcher. Files are read with
+        # undecodable bytes replaced.
         """Shell launchers stay Ray only, so the snapshots are their whole protection against drift."""
         recorded = {path.stem for path in _SNAPSHOT_DIR.rglob("*.txt")}
         undiscovered = [

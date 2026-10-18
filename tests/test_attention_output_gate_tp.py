@@ -1,3 +1,9 @@
+# [MODULE DOC] CPU-only smoke tests of the tensor-parallel slicing of the attention output gate
+# when the number of key-value heads is smaller than the tensor-parallel size. Tests simulate
+# the slicing arithmetic with random or labelled tensors and plain shape logic (no Megatron, no
+# distributed init): shape agreement of gate and query on every rank, the unfixed behavior
+# failing, per-rank content correctness, and a skipped source-inspection test of the patched
+# Megatron attention class. Tensor layouts are sequence, batch, heads, head dim.
 """
 Smoke tests for attention_output_gate + TP fix.
 
@@ -31,6 +37,15 @@ import torch
     ],
 )
 def test_gate_query_shape_match_after_tp_slice(num_attention_heads, num_kv_heads, head_dim, tp_size):
+    # [FUNCTION DOC] Parametrized over six head/TP configurations (four with fewer kv heads than
+    # TP ranks, two where the slice path is not entered). Uses sequence length 32 and batch 1.
+    # If kv heads are fewer than TP: one query group per partition and heads per partition equal
+    # heads per kv head; otherwise groups and heads are divided by the TP size. For each rank it
+    # draws random gate and query tensors of the grouped layout, reshapes both to heads by head
+    # dim; in the fewer-kv-heads case both are sliced to this rank's head range (ratio = TP over
+    # kv heads, offset = rank mod ratio, size = partition heads over ratio). The query is then
+    # flattened to sequence, batch, hidden; the gate must be viewable with that shape (a runtime
+    # error fails the test with a message) and the resulting shapes must be equal.
     """Simulate the gate/query slicing logic and verify shapes match."""
     sq, b = 32, 1  # sequence length, batch
 
@@ -87,6 +102,10 @@ def test_gate_query_shape_match_after_tp_slice(num_attention_heads, num_kv_heads
 
 
 def test_without_fix_gate_shape_mismatch():
+    # [FUNCTION DOC] Fixed config: 16 heads, 2 kv heads, head dim 256, TP 4. Builds an unsliced
+    # gate with 8 heads and a query sliced to 4 heads, flattened to 1024 hidden. Asserts the
+    # element counts differ (2048 vs 1024) and that viewing the gate in the query's shape raises
+    # a runtime error, demonstrating the original bug.
     """Verify that without slicing gate, shapes mismatch for num_kv_heads < TP."""
     num_attention_heads = 16
     num_kv_heads = 2
@@ -124,6 +143,12 @@ def test_without_fix_gate_shape_mismatch():
 
 
 def test_gate_numerical_correctness_per_rank():
+    # [FUNCTION DOC] Config: 16 heads, 2 kv heads, head dim 256, TP 4, sequence 4, batch 1. Builds
+    # a full gate whose head h is filled with the value h. For each rank: the kv group is rank
+    # divided by the TP/kv ratio (2); the group's gate is the 8 consecutive heads of that group;
+    # the rank's slice takes size 4 at offset (rank mod ratio) times 4; that must exactly equal
+    # the global heads [rank*4, rank*4+4). Asserts exact tensor equality, with the head values
+    # in the failure message.
     """Each TP rank should get the correct slice of gate matching its query heads."""
     num_attention_heads = 16
     num_kv_heads = 2
@@ -174,6 +199,9 @@ def test_gate_numerical_correctness_per_rank():
 
 @pytest.mark.skip(reason="Requires patched Megatron-LM; verified via patch file instead")
 def test_patched_attention_has_gate_slice():
+    # [FUNCTION DOC] Always skipped (needs patched Megatron-LM). When enabled, it imports the
+    # self-attention class, reads the source of its query-key-value method and asserts the source
+    # text contains the gate slicing statement, failing with "Patch not applied" otherwise.
     """Verify the patched SelfAttention.get_query_key_value_tensors has the gate slice."""
     import inspect
 

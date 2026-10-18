@@ -1,3 +1,8 @@
+# [MODULE DOC] HELPER: Shared test fixtures for the values tests. Defines a sample launch plan
+# constant (frozen run id, an orchestrator state file path, release name r, namespace rl, a
+# two-word orchestrator command and a two-word worker argv) and factory functions that build
+# worker specs: a router, an inference engine, a trainer, a session server and a session client.
+# All are pure constructors with no side effects.
 from miles.ray.specs.inference import POOL_CATEGORY_INFERENCE_ENGINE
 from miles.ray.specs.train import POOL_CATEGORY_TRAINER_ENGINE
 from miles.utils.external_utils.command_utils.helm_backend.launcher.values.misc import LaunchPlan
@@ -14,6 +19,9 @@ LAYOUT = LaunchPlan(
 
 
 def router() -> CommandWorkerSpec:
+    # [FUNCTION DOC] HELPER: Returns a command worker spec named inference router 0: one primary
+    # port fixed at 8000, no env vars, a single zero GPU worker, and a launch command running the
+    # router module bound to its own primary address host.
     return CommandWorkerSpec(
         name="inference-router-0",
         port_infos=[PortInfo(name="primary", static_port=8000)],
@@ -29,6 +37,14 @@ def engine(
     name: str = "inference-engine-0-0",
     gpu_offset: int = 0,
 ) -> CommandWorkerSpec:
+    # [FUNCTION DOC] HELPER: Returns an inference engine command worker spec. Inputs: number of
+    # cells (default 2), GPUs per engine (default 32), pool name (default inference engine 0 0) and
+    # GPU offset (default 0, used as the placement group slot offset). Workers per cell is the GPU
+    # count divided by 8 using integer division, at least 1; GPU slots per worker is the smaller
+    # of the GPU count and 8; 0.2 GPU per worker and 8 GPUs per node are fixed. Ports: primary
+    # 8000, master mode dist_init 9000, and engine info bootstrap 12000. Env: one var disabling
+    # NVSHMEM over NCCL. The launch command starts the sglang server with the worker's index in
+    # its cell as node rank, the dist init address and the first assigned GPU id as base GPU id.
     return CommandWorkerSpec(
         name=name,
         category=POOL_CATEGORY_INFERENCE_ENGINE,
@@ -55,6 +71,11 @@ def engine(
 
 
 def trainer(num_cells: int = 2, gpus_per_cell: int = 16) -> ServeWorkerSpec:
+    # [FUNCTION DOC] HELPER: Returns a trainer serve worker spec named trainer engine actor.
+    # Inputs: number of cells (default 2) and GPUs per cell (default 16, used as workers per
+    # cell). Fixed: 0.4 GPU per worker, 1 GPU slot per worker, 8 GPUs per node, master mode port
+    # 9000, an env var disabling NCCL cumem, the Megatron train actor worker class and empty
+    # constructor kwargs.
     return ServeWorkerSpec(
         name="trainer-engine-actor",
         category=POOL_CATEGORY_TRAINER_ENGINE,
@@ -73,6 +94,9 @@ def trainer(num_cells: int = 2, gpus_per_cell: int = 16) -> ServeWorkerSpec:
 
 
 def session_server(num_cells: int) -> CommandWorkerSpec:
+    # [FUNCTION DOC] HELPER: Returns a command worker spec named session server with the given
+    # number of cells, one worker per cell, no GPUs and no GPU slots, primary port 8000, no env
+    # vars, and a fixed launch command that runs the session server module.
     return CommandWorkerSpec(
         name="session-server",
         port_infos=[PortInfo(name="primary", static_port=8000)],
@@ -85,6 +109,10 @@ def session_server(num_cells: int) -> CommandWorkerSpec:
 
 
 def session_client() -> CommandWorkerSpec:
+    # [FUNCTION DOC] HELPER: Returns a single worker, zero GPU command spec named rollout
+    # executor with primary port 8100 and no env vars. Its launch command runs the executor module
+    # with a comma separated list of the primary addresses of every worker in the session server
+    # pool, read from the launch context's pool addresses at command build time.
     return CommandWorkerSpec(
         name="rollout-executor",
         port_infos=[PortInfo(name="primary", static_port=8100)],

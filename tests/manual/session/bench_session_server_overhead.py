@@ -1,3 +1,17 @@
+# [MODULE DOC] Command-line benchmark script (manual, needs a tokenizer checkpoint and the full
+# Miles stack). Flow: load a tokenizer and a token-in-token-out tokenizer wrapper, synthesize
+# per-turn request and response bodies (repeated single-token text of the requested sizes plus a
+# base64 filler blob standing in for routed-expert data, either accumulated over the sequence or
+# only the per-turn delta), spawn several mock backend processes and several real session
+# server processes on consecutive local ports, then replay the requests with one or more load
+# generator processes while a background sampler tracks peak resident memory of the server
+# process trees only. Prints a text report (latency percentiles, throughput, errors, memory)
+# and optionally writes the result mapping as JSON. All Miles imports are deferred into
+# functions so spawned child processes that re-import this module stay cheap. Flags: sessions,
+# turns, input/output tokens, r3 scale (bytes per token), incremental r3, checkpoint, tito
+# model, server implementation version, append role, chat template path, JSON output path,
+# raw-sample inclusion, server instance count, records fetch, inference and tool intervals,
+# mock backend process count, driver process count.
 """HTTP end-to-end benchmark for Session Server per-turn overhead.
 
 Stands up N independent single-process session servers (`run_session_server`,
@@ -65,6 +79,11 @@ BENCH_TOOL = {
 
 @dataclass(frozen=True)
 class TurnSpec:
+    # [CLASS DOC] HELPER: Immutable record of one synthetic conversation turn: the serialized
+    # request JSON bytes, the serialized backend response JSON bytes, the expected prompt token
+    # ids, counts of content input tokens, content output tokens and completion tokens, the
+    # number of routed-expert tokens carried this turn and for the full sequence, the raw byte
+    # size of that payload and its encoded character length.
     request_body: bytes
     response_body: bytes
     expected_prompt_token_ids: list[int]
@@ -78,6 +97,8 @@ class TurnSpec:
 
 
 def _positive_int(value: str) -> int:
+    # [FUNCTION DOC] HELPER: Command-line argument type. Parses an integer and rejects zero or
+    # negative values by raising the argument parser's type error naming the offending value.
     parsed = int(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
@@ -85,6 +106,8 @@ def _positive_int(value: str) -> int:
 
 
 def _non_negative_int(value: str) -> int:
+    # [FUNCTION DOC] HELPER: Command-line argument type. Parses an integer, rejecting negatives
+    # with the argument parser's type error.
     parsed = int(value)
     if parsed < 0:
         raise argparse.ArgumentTypeError(f"expected a non-negative integer, got {value!r}")
@@ -92,6 +115,8 @@ def _non_negative_int(value: str) -> int:
 
 
 def _non_negative_float(value: str) -> float:
+    # [FUNCTION DOC] HELPER: Command-line argument type. Parses a float, rejecting negatives
+    # with the argument parser's type error.
     parsed = float(value)
     if parsed < 0:
         raise argparse.ArgumentTypeError(f"expected a non-negative number, got {value!r}")
@@ -99,6 +124,9 @@ def _non_negative_float(value: str) -> float:
 
 
 def _pct(values: list[float], q: float) -> float:
+    # [FUNCTION DOC] HELPER: Nearest-rank percentile. Returns not-a-number for an empty list;
+    # otherwise sorts the values and returns the element at rank ceil(q times count) minus one,
+    # clamped into the valid index range. q is a fraction between 0 and 1.
     if not values:
         return float("nan")
     ordered = sorted(values)
@@ -107,6 +135,9 @@ def _pct(values: list[float], q: float) -> float:
 
 
 def _summary(values: list[float]) -> dict[str, float]:
+    # [FUNCTION DOC] HELPER: Returns a mapping with mean, median (50th), 95th and 99th percentile
+    # and maximum of the values, keyed with an "_ms" suffix (values are assumed milliseconds).
+    # Mean and maximum are not-a-number for an empty list.
     return {
         "mean_ms": statistics.mean(values) if values else float("nan"),
         "p50_ms": _pct(values, 0.50),
@@ -117,6 +148,10 @@ def _summary(values: list[float]) -> dict[str, float]:
 
 
 def _find_repeatable_token_id(tokenizer) -> int:
+    # [FUNCTION DOC] HELPER: Searches a fixed list of candidate texts (space-x, space-a,
+    # space-the, space-token, space-zero, capital A), encoding each without special tokens; for
+    # each resulting token id, decodes it (keeping special tokens) and re-encodes; the first id
+    # that round-trips to exactly itself is returned. Raises a runtime error if none does.
     for text in (" x", " a", " the", " token", " 0", "A"):
         for token_id in tokenizer.encode(text, add_special_tokens=False):
             decoded = tokenizer.decode([token_id], skip_special_tokens=False)
@@ -126,6 +161,10 @@ def _find_repeatable_token_id(tokenizer) -> int:
 
 
 def _make_text_with_token_count(tokenizer, token_id: int, token_count: int) -> tuple[str, list[int]]:
+    # [FUNCTION DOC] HELPER: Builds text that tokenizes to exactly the requested number of copies
+    # of one token. Zero gives an empty string and empty list. Otherwise decodes the repeated id
+    # list, re-encodes the text without special tokens, and raises a runtime error (reporting
+    # requested and actual counts) if the length changed. Returns (text, re-encoded ids).
     if token_count == 0:
         return "", []
     token_ids = [token_id] * token_count
@@ -140,6 +179,9 @@ def _make_text_with_token_count(tokenizer, token_id: int, token_count: int) -> t
 
 
 def _make_r3_blob(raw_bytes: int) -> str:
+    # [FUNCTION DOC] HELPER: Makes a filler payload. Zero bytes gives an empty string. Otherwise
+    # repeats the byte sequence 0..250 until at least the requested length, truncates to exactly
+    # raw_bytes and returns it base64-encoded as ASCII text (about 4/3 the raw size).
     if raw_bytes == 0:
         return ""
     pattern = bytes(range(251))
@@ -155,6 +197,11 @@ def _completion_token_ids(
     assistant_message: dict[str, Any],
     tools: list[dict[str, Any]] | None,
 ):
+    # [FUNCTION DOC] HELPER: Computes the token ids the assistant message adds to the prompt.
+    # Renders the prompt text (with generation prompt) and the full text with the assistant
+    # message appended (no generation prompt), both as text with the tokenizer's default template
+    # arguments for the given tools. Raises a runtime error if the full text does not start with
+    # the prompt text. Returns the encoding (no special tokens) of the remaining suffix.
     template_args = tito_tokenizer.default_template_args(tools)
     prompt_text = tito_tokenizer.apply_chat_template(
         messages, add_generation_prompt=True, tokenize=False, template_args=template_args
@@ -175,6 +222,11 @@ def _build_response_body(
     completion_token_ids: list[int],
     r3_blob: str,
 ) -> bytes:
+    # [FUNCTION DOC] HELPER: Serializes a fake chat-completion response to compact JSON bytes.
+    # One choice with the given assistant message, finish reason "stop" and meta info holding the
+    # completion token count, per-token [logprob, token id] pairs and the routed-experts blob.
+    # The synthetic logprob of the i-th token is minus ((i mod 1024) + 1) / 1024. Other fields
+    # are constants (id, object type, created zero, model name "synthetic").
     output_token_logprobs = [
         [-((idx % 1024) + 1) / 1024.0, token_id] for idx, token_id in enumerate(completion_token_ids)
     ]
@@ -209,6 +261,19 @@ def _build_turn_specs(
     incremental_r3: bool,
     tool_appends: bool,
 ):
+    # [FUNCTION DOC] HELPER: Generates the list of turn records for one synthetic conversation.
+    # Picks a repeatable token, then per turn: builds input and output text of the requested
+    # token counts; the input message is a user message, or for turns after the first in tool
+    # mode a tool message answering the previous call id (call ids are numbered with five
+    # digits); the assistant message carries a single no-argument tool call in tool mode. The
+    # request messages are copies of the history plus the input message; tools are declared (one
+    # fixed benchmark tool) only in tool mode. Computes prompt token ids (tokenized chat template
+    # with generation prompt) and completion token ids. Full-sequence routed-expert token count is
+    # max(0, prompt + completion - 1); in incremental mode the turn's count is the increase over
+    # the previous turn (a decrease raises a runtime error), otherwise the full count. Raw bytes
+    # are count times scale; the filler blob is generated; request body is compact JSON of the
+    # messages (plus tools when present), response body from the builder. History then grows by
+    # the request messages and the assistant message. Returns the list in turn order.
     token_id = _find_repeatable_token_id(tokenizer)
     history: list[dict[str, Any]] = []
     specs: list[TurnSpec] = []
@@ -291,6 +356,8 @@ def _build_turn_specs(
 
 
 def _fmt_ms_stats(stats: dict[str, float]) -> str:
+    # [FUNCTION DOC] HELPER: Formats a summary mapping as one line: mean, p50, p95, p99 and max,
+    # each with three decimals and a millisecond suffix.
     return (
         f"mean={stats['mean_ms']:.3f}ms  p50={stats['p50_ms']:.3f}ms  "
         f"p95={stats['p95_ms']:.3f}ms  p99={stats['p99_ms']:.3f}ms  max={stats['max_ms']:.3f}ms"
@@ -298,6 +365,9 @@ def _fmt_ms_stats(stats: dict[str, float]) -> str:
 
 
 def _write_json(result: dict[str, Any], path: str) -> None:
+    # [FUNCTION DOC] HELPER: Writes a copy of the result mapping to the path as indented JSON,
+    # first dropping the raw-samples entry if its value is none. Overwrites the file and prints
+    # a line naming the path. Raises on I/O failure or non-serializable values.
     payload = dict(result)
     if payload.get("raw_samples_ms") is None:
         payload.pop("raw_samples_ms", None)
@@ -331,6 +401,15 @@ def _build_server_config(
     instance_idx: int,
     backend_url: str,
 ) -> SessionServerConfig:
+    # [FUNCTION DOC] HELPER: Builds the server configuration for one instance. Inputs: parsed
+    # benchmark arguments, chat template path and kwargs (may be none), bind host, port, the
+    # instance index (instance id is "bench-i" plus the index) and the backend URL. Fixed
+    # choices: routing replay on, indexer replay and sampling-support replay off, no speculative
+    # algorithm, layers, router top-k, debug data or LoRA (rank zero, not train-only), 600 second
+    # timeout, strict session message matching, no sample picker or postprocessor, no top
+    # logprobs, "selected" sampling logprobs mode, temperature 1.0. From the benchmark arguments:
+    # checkpoint, tito model and server implementation; the pause mode is "in_place" when
+    # incremental routed-expert payloads are on, else "retract". Imports the config class lazily.
     """The config carrying exactly what one session-server instance reads.
 
     `use_rollout_routing_replay=True` makes the server inject
@@ -381,6 +460,13 @@ def _build_server_config(
 def _start_backend(
     response_bodies: list[bytes], ip: str, inference_interval: float = 0.0, procs: int = 1
 ) -> tuple[list[multiprocessing.process.BaseProcess], str]:
+    # [FUNCTION DOC] HELPER: Starts the mock backend. Finds a free port from 28000 upward, spawns
+    # the given number of non-daemon processes (spawn start method) all running the backend
+    # server with the response bodies, host, shared port and inference interval, then waits up to
+    # 120 seconds for the port to answer for each process. Returns the process list and the base
+    # URL of the form http plus host and port. Side effects: child processes, network listening.
+    # The backend module is imported by bare name, relying on the script directory being first
+    # on the module search path.
     """Spawn the mock R3 backend as `procs` processes; return (procs, base_url).
 
     All shards bind the same port via SO_REUSEPORT (see `run_mock_r3_backend`)
@@ -418,6 +504,9 @@ def _start_backend(
 
 
 def _proc_tree_rss_bytes(root_pids: list[int]) -> int:
+    # [FUNCTION DOC] HELPER: Sums resident set size in bytes over each root process and all its
+    # recursive children, counting each pid once. Roots that no longer exist are skipped; a
+    # process that vanishes or denies access while read contributes zero. Returns the total.
     """Summed RSS of each pid in `root_pids` and all its descendants.
 
     For OLD this is the single server process tree; for NEW it is the router
@@ -446,9 +535,15 @@ def _proc_tree_rss_bytes(root_pids: list[int]) -> int:
 
 
 class _RSSSampler:
+    # [CLASS DOC] HELPER: Context manager that records the peak summed memory of given process
+    # trees. Entering starts a daemon thread that samples every interval seconds (default 0.25);
+    # exiting stops it, waits up to 2 seconds, and takes one last sample. The result is the
+    # peak_bytes attribute (starts at zero).
     """Background thread sampling peak RSS of one or more process trees."""
 
     def __init__(self, root_pids: list[int], interval: float = 0.25):
+        # [FUNCTION DOC] HELPER: Stores the root pids (entries equal to none are dropped), the
+        # interval, a stop event, the not-yet-started thread and a zero peak.
         import threading
 
         self._root_pids = [p for p in root_pids if p is not None]
@@ -458,15 +553,20 @@ class _RSSSampler:
         self.peak_bytes = 0
 
     def _run(self) -> None:
+        # [FUNCTION DOC] HELPER: Thread body: until stopped, updates the peak with the current
+        # summed memory, then waits for the interval (waking early when stopped).
         while not self._stop.is_set():
             self.peak_bytes = max(self.peak_bytes, _proc_tree_rss_bytes(self._root_pids))
             self._stop.wait(self._interval)
 
     def __enter__(self) -> _RSSSampler:
+        # [FUNCTION DOC] HELPER: Starts the sampling thread and returns the sampler itself.
         self._thread.start()
         return self
 
     def __exit__(self, *exc) -> None:
+        # [FUNCTION DOC] HELPER: Signals the thread to stop, joins it with a 2 second timeout and
+        # takes a final sample into the peak. Does not suppress exceptions.
         self._stop.set()
         self._thread.join(timeout=2.0)
         # One final reading in case the peak landed between samples.
@@ -474,6 +574,9 @@ class _RSSSampler:
 
 
 def _merge_agg(into: dict[str, Any], src: dict[str, Any]) -> None:
+    # [FUNCTION DOC] HELPER: Adds the source aggregate into the destination in place. The
+    # first-errors list is appended only up to a total of ten entries (extra source entries
+    # dropped); every other key is added numerically, treating a missing destination key as zero.
     for k, v in src.items():
         if k == "first_errors":
             room = 10 - len(into["first_errors"])
@@ -492,6 +595,15 @@ def _drive_workload(
     tool_interval: float,
     driver_procs: int,
 ):
+    # [FUNCTION DOC] HELPER: Runs the load. With one driver process (or fewer) it runs all
+    # sessions in this process's event loop and returns the samples, aggregate and elapsed wall
+    # seconds. Otherwise it splits the session count into near-equal shards (the remainder spread
+    # one each over the first shards; empty shards dropped), spawns one non-daemon load generator
+    # per shard, collects exactly one result per shard from a queue (2400 second timeout each)
+    # before joining, merges latency samples and aggregates, joins with a 120 second timeout, and
+    # in a final block terminates every child. Wall time spans spawn to completion of joins.
+    # Raises the queue timeout error if a generator never reports. Generators are imported
+    # lazily by bare module name from the script directory.
     """Drive the HTTP workload; return (samples, agg, wall_s).
 
     `driver_procs == 1` runs all sessions in this process's event loop.
@@ -560,6 +672,22 @@ def _drive_workload(
 
 
 def run_http_bench(args) -> dict[str, Any]:
+    # [FUNCTION DOC] Orchestrates a full run from parsed arguments and returns the result mapping.
+    # Chat template selection: explicit path wins (no kwargs); tito model "default" uses none;
+    # otherwise the fixed template for the tito model is resolved. Loads the tokenizer (remote
+    # code trusted) and tito tokenizer, builds the turn specs, starts the mock backend, picks a
+    # free base port from 33000 and requires every further consecutive port to be free (else
+    # raises a runtime error), spawns one session server process per instance before waiting on
+    # any, waits up to 180 seconds per server, then drives the workload under the memory sampler
+    # that watches only the server processes. In a final block all server then backend processes
+    # are terminated. Totals: turns = sessions times turns; throughput token counts are scaled by
+    # the fraction of completed turns (zero when no turns) times sessions; the raw routed-expert
+    # byte estimate counts every turn for every session. The result holds configuration echoes,
+    # error counters, throughput per second (not-a-number if wall time is not positive), the
+    # memory peak, per-turn spec summaries, latency summaries per sample kind, and optionally the
+    # raw samples.
+    # KNOWN ISSUE: the total and retained routed-expert byte estimates are identical and are not
+    # scaled by the completed fraction, so they over-report when sessions fail.
     from miles.utils.chat_template_utils import get_tito_tokenizer, resolve_fixed_chat_template
     from miles.utils.http_utils import find_available_port, is_port_available, wait_for_server_ready
     from miles.utils.processing_utils import load_tokenizer
@@ -728,6 +856,9 @@ def run_http_bench(args) -> dict[str, Any]:
 
 
 def _terminate_proc(proc: multiprocessing.process.BaseProcess) -> None:
+    # [FUNCTION DOC] HELPER: Best-effort stop of a child process: if alive, sends terminate and
+    # waits up to 5 seconds; if still alive with a known pid, force-kills it and waits up to 2
+    # seconds. Value, lookup and attribute errors are swallowed (e.g. never-started processes).
     import signal as _signal
 
     try:
@@ -742,6 +873,12 @@ def _terminate_proc(proc: multiprocessing.process.BaseProcess) -> None:
 
 
 def _fmt_http_block(result: dict[str, Any]) -> str:
+    # [FUNCTION DOC] HELPER: Renders the result mapping as a multi-line report framed by
+    # 72-character rules: header with instance, driver and backend process counts; workload
+    # shape; interval and routed-expert settings; tokenizer; final-turn sizes; transfer estimate
+    # in MiB; session and turn success counts and chat error counts; records-fetch counts only if
+    # that option was on; up to five first errors if any; chat latency stats and (if sampled)
+    # records latency stats; wall clock; throughputs; peak memory in GiB. Returns the text.
     metrics = result["metrics"]
     last_spec = result["turn_specs"][-1]
     lines = [
@@ -792,6 +929,11 @@ def _fmt_http_block(result: dict[str, Any]) -> str:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Script entry point: defines and parses the command-line options (defaults:
+    # 32 sessions, 4 turns, 64 input and 64 output tokens, r3 scale 1000, checkpoint
+    # Qwen3-0.6B, tito model "qwen3", server version "v2", append role "user", 1 server
+    # instance, zero intervals, 8 mock backend processes, 1 driver process), runs the benchmark,
+    # prints the report, and writes JSON when an output path was given.
     parser = argparse.ArgumentParser(description="HTTP end-to-end Session Server overhead benchmark")
     parser.add_argument("--sessions", type=_positive_int, default=32, help="number of sessions to create")
     parser.add_argument("--turns", type=_positive_int, default=4, help="turns per session")

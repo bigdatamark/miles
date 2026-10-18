@@ -1,3 +1,8 @@
+# [MODULE DOC] Manual test (needs the training image with the Megatron bridge and transformers)
+# that LoRA target selection by Hugging Face parameter patterns resolves to the right Megatron
+# modules and that the resulting adapter only matches those modules. It builds tiny Qwen3 MoE or
+# Qwen3-Next configs and the matching bridge, picks a case-specific target pattern list, Megatron
+# module and parameter names, and exercises plain LoRA, canonical LoRA and multi-adapter LoRA.
 """Run in the Miles training image: pytest tests/manual/models/test_lora_target_resolution.py -v."""
 
 from types import SimpleNamespace
@@ -16,6 +21,15 @@ from miles.utils.hf_utils.weight_mapping import HfWeightMapping
 
 @pytest.fixture(params=["qkv", "experts", "gdn"])
 def target_case(request):
+    # [FUNCTION DOC] Parametrized fixture over three cases: fused query-key-value attention
+    # ("qkv"), mixture-of-experts first projection ("experts") and gated delta-net input
+    # projections ("gdn"). Builds a tiny model config (the Qwen3-Next type for gdn with
+    # alternating linear and full attention layers, else Qwen3 MoE; vocab 64, hidden 32, 2 layers,
+    # 4 heads, 2 kv heads, head dim 8, 2 experts, 1 expert per token) and the matching bridge.
+    # Chooses, per case, the Hugging Face target patterns, the Megatron module path and the
+    # Megatron parameter suffixes (experts use two per-expert weights). Returns a six-tuple: case
+    # name, all bridge weight mappings, a Hugging Face weight mapping built from the config,
+    # target patterns, module path and parameter suffix list.
     case = request.param
     config = AutoConfig.for_model(
         "qwen3_next" if case == "gdn" else "qwen3_moe",
@@ -67,10 +81,26 @@ def target_case(request):
 
 @pytest.mark.parametrize("mode", ["lora", "canonical_lora", "multi_lora"])
 def test_registry_to_adapter_matcher(target_case, mode):
+    # [FUNCTION DOC] For each case and LoRA mode (plain, canonical, multi-adapter): resolves the
+    # Hugging Face targets to Megatron targets and builds the adapter, then checks matching.
+    # Steps: for the qkv case in non-canonical mode, selecting only the query projection must
+    # raise an assertion error saying all targets are required, then the targets are replaced by
+    # query, key and value projections; for the gdn case, selecting only the first target must
+    # raise the same error. The resolved selection must equal the module path with the layer
+    # index replaced by a wildcard, except canonical qkv (the linear_q variant) and canonical
+    # experts (the module with gate and up suffixes). An adapter (multi-adapter factory for that
+    # mode, else the standard factory; rank 2, alpha 4, dropout 0, two adapters) is created and
+    # its match state initialized; a meta-device linear layer is matched against the module, a
+    # router path and the output layer. Only the module must match, and every selected target's
+    # recorded alias matches must be exactly the module.
     case, mappings, hf_mapping, targets, module, parameters = target_case
     canonical = mode == "canonical_lora"
 
     def resolve(selection):
+        # [FUNCTION DOC] HELPER: Resolves a list of Hugging Face target patterns to Megatron
+        # targets using the case's mappings, with the parameter names given explicitly as module
+        # path plus each suffix (so no distributed trainer is needed), the Hugging Face mapping,
+        # and the canonical flag. Returns the resolved targets; may raise an assertion error.
         # Explicit parameter fixtures exercise registry binding without constructing a distributed trainer.
         return resolve_megatron_lora_targets(
             selection,

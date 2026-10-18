@@ -1,3 +1,10 @@
+# [MODULE DOC] Manual GPU benchmark script (run with torchrun, two processes by default; it
+# re-executes itself under torchrun when launched without a rank variable). Compares one gated
+# delta-net layer's forward plus backward cost between a replicated reference implementation
+# and the head-sharded Megatron layer, under tensor parallelism across all ranks and optionally
+# sequence parallelism. Command line: mode word (sp or nosp), hidden size, key head count, value
+# head count, then one or more sequence lengths. Rank zero prints a table row per length with
+# wall milliseconds, GPU milliseconds, peak GiB for each variant and their ratios.
 """One GDN layer, fwd+bwd wall time, GPU time and peak memory: replicated (pre-sharding) vs head-sharded.
 
     torchrun --nproc_per_node=2 tests/manual/perf_gdn_head_sharded.py <sp|nosp> <hidden> <k_heads> <v_heads> <seq_len>...
@@ -29,6 +36,12 @@ from linear_attn_reference import ReplicatedGDN, build_layer, packed  # noqa: E4
 
 
 def bench(fn, iters=10):
+    # [FUNCTION DOC] HELPER: Measures a callable. Runs three warm-up calls, synchronizes the GPU,
+    # resets peak memory statistics, times the given number of iterations (default 10) by wall
+    # clock with synchronization, then runs the iterations again under the profiler collecting
+    # device activity. Returns a triple: mean wall time per iteration in milliseconds, mean
+    # summed self device time per iteration in milliseconds (profiler microseconds divided by
+    # 1000), and peak allocated GPU memory in GiB. Peak memory is read after the profiled runs.
     for _ in range(3):
         fn()
     torch.cuda.synchronize()
@@ -47,6 +60,19 @@ def bench(fn, iters=10):
 
 
 def main():
+    # [FUNCTION DOC] Entry point for each torchrun worker. Parses the mode word, hidden size,
+    # key and value head counts and sequence lengths from the command line; reads rank, world
+    # size and local rank from the environment and binds the GPU. Initializes the NCCL process
+    # group (120 second timeout) and model parallelism with tensor parallel size equal to the
+    # world size, seeds the model-parallel random state with 1234, and builds a one-layer bf16
+    # transformer config (16 attention heads). Creates the replicated reference layer and the
+    # head-sharded layer from it (head dim 128 for keys and values). For each sequence length
+    # (local length is length divided by world size under sequence parallelism): makes a random
+    # bf16 input that requires gradients and a single-sample cumulative length tensor, benchmarks
+    # the replicated path (all-gather input and scatter output when sequence parallel, batch-first
+    # transposes, sum backward) and the sharded path (packed sequence parameters, sum backward),
+    # and on rank zero prints both measurements and the old-over-new ratios. Ends with a barrier
+    # and tears down model parallelism and the process group. Requires GPUs; no return value.
     sequence_parallel = sys.argv[1] == "sp"
     hidden, k_heads, v_heads = (int(a) for a in sys.argv[2:5])
     seq_lens = [int(a) for a in sys.argv[5:]]
@@ -79,6 +105,11 @@ def main():
         cu = torch.tensor([0, seq_len], device="cuda", dtype=torch.int32)
 
         def replicated(x=x_sbh, cu=cu):
+            # [FUNCTION DOC] HELPER: One forward plus backward of the replicated reference layer
+            # bound to the current input and cumulative lengths. Gathers the sequence-parallel
+            # shards first when enabled, runs the layer batch-first and transposes back, scatters
+            # the output when sequence parallel, then backpropagates the float32 sum. Accumulates
+            # gradients into the input; returns nothing.
             full = (
                 gather_from_sequence_parallel_region(x, tensor_parallel_output_grad=False, group=tp_group)
                 if sequence_parallel

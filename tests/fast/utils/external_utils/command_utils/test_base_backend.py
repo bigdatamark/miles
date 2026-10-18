@@ -1,3 +1,12 @@
+# [MODULE DOC] Tests for the command backend base module: hardware resolution (auto detection
+# writes to stderr without touching logging configuration, explicit supported values bypass
+# detection, unsupported values are rejected), merging extra environment variables (config values
+# override the caller's), building the default launcher config from script environment variables
+# (prefix based names, space split repeatable options, boolean spellings, numbers, one variable per
+# config field matching the command line binding, unique run id per call), refusal of hot restart
+# outside the Kubernetes backend, the connection-only config class, selection of the config passed
+# to execute_train, the run uuid and deploy flags appended to the train args, and the Ray api
+# server host. An autouse fixture removes every script environment variable.
 import dataclasses
 import inspect
 import logging
@@ -23,6 +32,9 @@ from miles.utils.workers.types import ClusterBackend, DeployComponent
 
 @pytest.fixture(autouse=True)
 def bare_environment(monkeypatch):
+    # [FUNCTION DOC] HELPER: Autouse fixture; removes from the process environment every variable
+    # whose name starts with the script environment prefix (undone at teardown), so tests do not
+    # depend on what the invoking shell exported.
     """No test may read a variable the shell that started pytest happened to export."""
     for name in [name for name in os.environ if name.startswith(SCRIPT_ENV_VAR_PREFIX)]:
         monkeypatch.delenv(name, raising=False)
@@ -30,14 +42,22 @@ def bare_environment(monkeypatch):
 
 @dataclass
 class _HardwareConfig(ExecuteTrainConfig):
+    # [CLASS DOC] HELPER: Train config extended with a hardware field whose allowed values are
+    # auto and H100 (default auto), used to exercise hardware resolution.
     hardware: Literal["auto", "H100"] = "auto"
 
 
 class TestResolveHardware:
+    # [CLASS DOC] Tests of the hardware resolution function.
     @pytest.mark.parametrize("configured", [False, True])
     def test_hardware_detection_is_visible_without_changing_logging(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], configured: bool
     ) -> None:
+        # [FUNCTION DOC] Parametrized over whether the root logger already has a handler. The root
+        # logger's handlers (empty or one null handler) and level (warning) are patched, and the
+        # detector is faked to report H100. Resolving an auto config returns H100, standard error
+        # holds exactly the line saying detected hardware H100 and standard output is empty, and
+        # the root logger's handlers list object, contents and level are all unchanged.
         """Hardware detection writes to stderr without changing application logging."""
         root = logging.getLogger()
         handlers = [logging.NullHandler()] if configured else []
@@ -55,10 +75,14 @@ class TestResolveHardware:
         assert root.level == logging.WARNING
 
     def test_supported_explicit_value_bypasses_detection_while_auto_uses_it(self, monkeypatch):
+        # [FUNCTION DOC] With a counting fake detector returning H100: an explicit H100 config
+        # resolves to H100 without calling the detector; an auto config resolves to H100 and calls
+        # the detector exactly once.
         """Explicit hardware bypasses detection, while auto resolves to a supported detected profile."""
         detected: list[None] = []
 
         def detect_hardware() -> str:
+            # [FUNCTION DOC] HELPER: Fake detector; records the call and returns H100.
             detected.append(None)
             return "H100"
 
@@ -76,6 +100,9 @@ class TestResolveHardware:
     def test_unsupported_explicit_or_detected_value_is_rejected(
         self, configured_hardware: str, detected_hardware: str, monkeypatch
     ):
+        # [FUNCTION DOC] Parametrized over (explicit unsupported value with a supported detection)
+        # and (auto with an unsupported detected value). Resolving raises an assertion error saying
+        # there is no verified profile.
         """Neither explicit nor detected hardware may escape the config's supported profile literal."""
         monkeypatch.setattr(base_backend, "detect_hardware", lambda: detected_hardware)
 
@@ -84,7 +111,11 @@ class TestResolveHardware:
 
 
 class TestResolveExtraEnvVars:
+    # [CLASS DOC] Tests of merging caller and config extra environment variables.
     def test_config_extra_env_vars_override_the_callers_values(self):
+        # [FUNCTION DOC] A config string with two assignments and a caller mapping with one
+        # shared and one caller-only name resolve to a mapping where the shared name has the
+        # config's value and the caller-only and config-only names are kept.
         """Parsed config variables override duplicates while preserving caller-only variables."""
         config = ExecuteTrainConfig(extra_env_vars="SHARED=from_config CONFIG_ONLY=kept")
 
@@ -101,23 +132,32 @@ class TestResolveExtraEnvVars:
 
 
 class TestAScriptReadsItsLauncherConfigFromTheEnvironment:
+    # [CLASS DOC] Tests of the default config builder, which reads script prefixed environment
+    # variables (each test starts with none because of the autouse fixture).
     def test_an_unset_environment_leaves_every_default_alone(self, monkeypatch):
+        # [FUNCTION DOC] With only a pinned run id variable set, the default config equals a train
+        # config built with just that run id.
         """A ray run sets nothing, so reading the environment must not change what it used to get."""
         monkeypatch.setenv("MILES_SCRIPT_RUN_ID", "pinned")
 
         assert default_config() == ExecuteTrainConfig(run_id="pinned")
 
     def test_each_launch_is_stamped_with_its_own_run_id(self):
+        # [FUNCTION DOC] Two default configs built with no environment have different run ids.
         """Two runs installed from one namespace under one name would be one run."""
         assert default_config().run_id != default_config().run_id
 
     def test_the_backend_is_chosen_by_one_variable(self, monkeypatch):
+        # [FUNCTION DOC] The cluster backend variable set to kubernetes gives the Kubernetes
+        # backend enum value in the default config.
         """This is the whole point: the same e2e script has to reach either cluster without being edited."""
         monkeypatch.setenv("MILES_SCRIPT_CLUSTER_BACKEND", "kubernetes")
 
         assert default_config().cluster_backend is ClusterBackend.KUBERNETES
 
     def test_a_repeatable_option_is_split_the_way_the_command_line_splits_it(self, monkeypatch):
+        # [FUNCTION DOC] The helm values variable set to two space separated paths gives a tuple
+        # of those two paths.
         """The variable feeds the same click option the script path parses, so one list has one shape."""
         monkeypatch.setenv("MILES_SCRIPT_HELM_VALUES", "/a/infra.yaml /b/infra.yaml")
 
@@ -125,6 +165,8 @@ class TestAScriptReadsItsLauncherConfigFromTheEnvironment:
 
     @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
     def test_a_flag_is_true_for_every_spelling_a_command_line_accepts(self, value: str, monkeypatch):
+        # [FUNCTION DOC] Parametrized over 1, true, TRUE, yes and on: the CI run variable gives a
+        # true value in the default config.
         """An operator who types what click accepts must not silently get the opposite."""
         monkeypatch.setenv("MILES_SCRIPT_CI_RUN", value)
 
@@ -132,12 +174,16 @@ class TestAScriptReadsItsLauncherConfigFromTheEnvironment:
 
     @pytest.mark.parametrize("value", ["0", "false", "no", "off"])
     def test_a_flag_is_false_for_every_spelling_a_command_line_accepts(self, value: str, monkeypatch):
+        # [FUNCTION DOC] Parametrized over 0, false, no and off: the CI run variable gives a false
+        # value in the default config.
         """`MILES_SCRIPT_CI_RUN=false` reading as true is the failure this rules out."""
         monkeypatch.setenv("MILES_SCRIPT_CI_RUN", value)
 
         assert default_config().ci_run is False
 
     def test_a_flag_that_is_neither_is_refused_rather_than_guessed(self, monkeypatch):
+        # [FUNCTION DOC] The CI run variable set to maybe makes the default config builder raise
+        # the command line library's bad parameter error.
         """Guessing would install a backend nobody asked for, and a run is expensive to discover that on."""
         monkeypatch.setenv("MILES_SCRIPT_CI_RUN", "maybe")
 
@@ -145,6 +191,7 @@ class TestAScriptReadsItsLauncherConfigFromTheEnvironment:
             default_config()
 
     def test_a_number_arrives_as_a_number(self, monkeypatch):
+        # [FUNCTION DOC] The node count variable set to the text 4 gives the integer 4.
         """num_nodes reaches arithmetic, and a string would only fail much later."""
         monkeypatch.setenv("MILES_SCRIPT_NUM_NODES", "4")
 
@@ -152,8 +199,14 @@ class TestAScriptReadsItsLauncherConfigFromTheEnvironment:
 
     @pytest.mark.parametrize("field", [field.name for field in dataclasses.fields(ExecuteTrainConfig)])
     def test_every_field_answers_to_the_variable_the_command_line_binds(self, field: str):
+        # [FUNCTION DOC] Parametrized over every field name of the train config. A dummy command
+        # line function taking the config is decorated with the dataclass command line decorator;
+        # the environment variable bound to the field's option (read from the parameter annotation
+        # metadata) must equal the script prefix followed by the upper case field name.
         """The variable a test sets and the one a script's own option reads are the same one."""
 
+        # [FUNCTION DOC] HELPER: The one line function defined next (train) is a dummy command that
+        # does nothing; only its decorated signature is inspected.
         @dataclass_cli
         def train(args: ExecuteTrainConfig) -> None: ...
 
@@ -163,11 +216,18 @@ class TestAScriptReadsItsLauncherConfigFromTheEnvironment:
 
 
 def _refuse_shell_command(*args, **kwargs):
+    # [FUNCTION DOC] HELPER: Stand-in for backend command methods; always raises an assertion
+    # error stating the test must never reach a shell, showing the arguments it got.
     raise AssertionError(f"this test must never reach a shell ({args=}, {kwargs=})")
 
 
 class TestAHotRestartIsRefusedOutsideKubernetes:
+    # [CLASS DOC] Tests of the hot restart option on the Ray backend.
     def test_the_ray_backend_refuses_a_hot_restart_before_it_cleans_anything_up(self, monkeypatch):
+        # [FUNCTION DOC] A Ray backend whose config asks for hot restart of orchestration and the
+        # rollout executor has its three command execution methods replaced by the refusing stand
+        # in. Running execute train raises an assertion error saying hot restart is only supported
+        # on the Kubernetes backend, before any command stand-in is reached.
         """Its first act is to pkill every sglang, miles and ray process, i.e. exactly what the flag keeps alive."""
         backend = ExecuteTrainConfig(
             cluster_backend=ClusterBackend.RAY, hot_restart="orchestration,rollout_executor"
@@ -179,6 +239,7 @@ class TestAHotRestartIsRefusedOutsideKubernetes:
             backend.execute_train(train_args="--train-backend fsdp", num_gpus_per_node=8, megatron_model_type=None)
 
     def test_an_ordinary_ray_config_asks_for_no_hot_restart_at_all(self):
+        # [FUNCTION DOC] A plain Ray config's parsed hot restart list is empty.
         """The refusal reads this answer, so a launch without the flag must not present a restart to it."""
         config = ExecuteTrainConfig(cluster_backend=ClusterBackend.RAY)
 
@@ -186,7 +247,10 @@ class TestAHotRestartIsRefusedOutsideKubernetes:
 
 
 class TestCommandUtilConfig:
+    # [CLASS DOC] Tests of the connection-only config class.
     def test_backend_config_only_contains_connection_fields(self):
+        # [FUNCTION DOC] The config class fields are exactly cluster backend, namespace, helm
+        # values and CI run, in that order.
         """Launch-only fields must remain on ExecuteTrainConfig rather than every command backend."""
         assert [field.name for field in dataclasses.fields(CommandUtilConfig)] == [
             "cluster_backend",
@@ -196,15 +260,21 @@ class TestCommandUtilConfig:
         ]
 
     def test_backend_rejects_an_unrelated_config_type(self):
+        # [FUNCTION DOC] Constructing a Ray command backend from a plain object raises an
+        # assertion error mentioning the connection config class.
         """A backend must not retain an object that lacks its cluster connection fields."""
         with pytest.raises(AssertionError, match="CommandUtilConfig"):
             RayCommandBackend(object())
 
 
 class TestExecuteTrainConfigSelection:
+    # [CLASS DOC] Tests of which config execute_train uses.
     def test_an_explicit_config_for_another_backend_is_refused_before_launch(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # [FUNCTION DOC] A Ray backend given an explicit Kubernetes config raises an assertion
+        # error saying it was built to talk to ray, and no shell command was run (the base
+        # module's shell runner is replaced by a recorder).
         """A launch for another cluster must be refused before the backend performs any action."""
         commands: list[str] = []
         monkeypatch.setattr(base_backend, "run_shell_command", lambda command, **kwargs: commands.append(command))
@@ -222,6 +292,9 @@ class TestExecuteTrainConfigSelection:
         assert commands == []
 
     def test_explicit_config_overrides_the_backend_default(self, monkeypatch):
+        # [FUNCTION DOC] The Ray backend's private inner train method is replaced by a recorder of
+        # (request, config). A backend built from a default config, called with an explicit config
+        # for the trainer component, records exactly that config object.
         """A caller can launch a different deployment through an existing cluster backend."""
         recorded: list[tuple[ExecuteTrainRequest, ExecuteTrainConfig]] = []
         monkeypatch.setattr(
@@ -242,6 +315,8 @@ class TestExecuteTrainConfigSelection:
         assert recorded[0][1] is launch_config
 
     def test_omitted_config_uses_the_backend_execute_train_config(self, monkeypatch):
+        # [FUNCTION DOC] With the same recorder, a backend built from a trainer component config
+        # and called without a config records that same config object.
         """Existing launchers can keep constructing a backend and calling execute_train without config."""
         recorded: list[tuple[ExecuteTrainRequest, ExecuteTrainConfig]] = []
         monkeypatch.setattr(
@@ -258,6 +333,8 @@ class TestExecuteTrainConfigSelection:
         assert recorded[0][1] is config
 
     def test_omitted_config_refuses_a_connection_only_backend(self):
+        # [FUNCTION DOC] A backend created from the connection-only config and called without a
+        # config raises an assertion error mentioning the train config class.
         """A backend without launch fields cannot guess the execute_train configuration."""
         backend = CommandUtilConfig().create_backend()
 
@@ -266,6 +343,10 @@ class TestExecuteTrainConfigSelection:
 
 
 def _launched_train_argv(monkeypatch, *, train_args: str, config: ExecuteTrainConfig) -> list[str]:
+    # [FUNCTION DOC] HELPER: Replaces the Ray backend's private inner train method with a recorder
+    # of requests, then launches with the given train args (8 GPUs per node, no model type)
+    # through a backend created from the config. Returns the recorded request's train args split
+    # on whitespace.
     recorded: list[ExecuteTrainRequest] = []
     monkeypatch.setattr(
         RayCommandBackend, "_execute_train_inner", lambda self, *, request, config: recorded.append(request)
@@ -277,7 +358,10 @@ def _launched_train_argv(monkeypatch, *, train_args: str, config: ExecuteTrainCo
 
 
 class TestTheRunUuidALaunchDrives:
+    # [CLASS DOC] Tests of the flags appended to the train args by the Ray backend's launch.
     def test_the_configured_run_uuid_reaches_the_pods(self, monkeypatch):
+        # [FUNCTION DOC] A config with a run uuid yields train args where the value after the run
+        # uuid flag is that uuid.
         """Only --deploy-component and --deploy-instance-id were appended, so an unsplit run minted a second uuid."""
         argv = _launched_train_argv(
             monkeypatch,
@@ -288,12 +372,15 @@ class TestTheRunUuidALaunchDrives:
         assert argv[argv.index("--run-uuid") + 1] == "0123456789abcdef"
 
     def test_a_launch_that_names_no_run_leaves_the_arguments_alone(self, monkeypatch):
+        # [FUNCTION DOC] A default config (no run uuid) yields train args with no run uuid flag.
         """Every existing ray launch names none, and an empty flag would be worse than no flag."""
         argv = _launched_train_argv(monkeypatch, train_args="--train-backend fsdp", config=ExecuteTrainConfig())
 
         assert "--run-uuid" not in argv
 
     def test_train_arguments_that_already_name_this_run_are_accepted(self, monkeypatch):
+        # [FUNCTION DOC] Train args already carrying the same run uuid as the config are accepted,
+        # and the resulting args contain the flag twice (the user's and the appended one).
         """The helm launcher sets the flag itself, and a launch agreeing with it is not a conflict."""
         argv = _launched_train_argv(
             monkeypatch,
@@ -304,6 +391,8 @@ class TestTheRunUuidALaunchDrives:
         assert argv.count("--run-uuid") == 2
 
     def test_refuses_train_arguments_that_name_another_run(self, monkeypatch):
+        # [FUNCTION DOC] Train args carrying a different run uuid than the config raise an
+        # assertion error mentioning the run uuid flag.
         """The uuid is what joins the parts of a split run, so two of them are two runs."""
         with pytest.raises(AssertionError, match="--run-uuid"):
             _launched_train_argv(
@@ -313,6 +402,9 @@ class TestTheRunUuidALaunchDrives:
             )
 
     def test_the_component_and_instance_flags_are_still_appended_beside_it(self, monkeypatch):
+        # [FUNCTION DOC] A config with a run uuid, the trainer component and an instance id named
+        # actor yields train args where the deploy component flag is trainer, the deploy instance
+        # id flag is actor and the run uuid flag is the config uuid.
         """The run uuid joins a split run, and these two are what tell its halves apart."""
         argv = _launched_train_argv(
             monkeypatch,
@@ -328,7 +420,9 @@ class TestTheRunUuidALaunchDrives:
 
 
 class TestApiServerHost:
+    # [CLASS DOC] Test of the api server host for the Ray backend.
     def test_the_ray_api_server_is_reached_on_localhost(self) -> None:
+        # [FUNCTION DOC] A Ray backend's api server host for its config is the text localhost.
         """The default backend must keep fault-tolerance clients on the local API server."""
         config = ExecuteTrainConfig(cluster_backend=ClusterBackend.RAY)
 

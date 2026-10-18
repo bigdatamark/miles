@@ -1,3 +1,16 @@
+# [MODULE DOC] Tests for RayWorkerManager with command workers, run against a fake in-memory ray
+# cluster (fixture fake_ray_cluster from the shared fake_ray helper) that records actor creation,
+# actor method calls, kills and ordering of events. Covered behavior: the launch entry point and
+# its well-known actor name; the init pipeline (create actors, look up node addresses, allocate
+# ports, probe static ports, resolve local gpu ids, start commands) with global barriers between
+# phases and rollback on failure; port allocation rules (dynamic blocks, static ports, per-cell
+# offsets, master-mode ports owned by worker 0 of a cell, per-node tracking, ipv6 bracketing,
+# external addresses); address publication (a worker or cell is unreadable or not alive until all
+# its ports are assigned); gpu and placement-group scheduling; cell lifecycle (stop, start,
+# idempotence, generations and worker hashes, rollback of failed starts, bounded graceful
+# shutdown followed by a kill); queries (worker infos, cell infos, addresses); and fault injection.
+# Tests are async and rely on the project's asyncio test mode; the file's helpers build specs,
+# placement-group info, a launch-command recorder and gates that pause port allocation.
 from __future__ import annotations
 
 import asyncio
@@ -20,13 +33,19 @@ from miles.utils.workers.worker_spec import CommandWorkerSpec, LaunchCommandCont
 
 @dataclass
 class _LaunchRecorder:
+    # [CLASS DOC] HELPER: Collects the launch contexts handed to a spec's launch-command callable,
+    # so tests can inspect what each worker was told (indices, addresses, gpu ids).
     contexts: list[LaunchCommandContext] = field(default_factory=list)
 
     def command(self, ctx: LaunchCommandContext) -> str:
+        # [FUNCTION DOC] HELPER: Launch-command callable for a spec. Stores the context and returns
+        # the text "run-<cell index>-<worker index>".
         self.contexts.append(ctx)
         return f"run-{ctx.cell_index}-{ctx.worker_in_cell_index}"
 
     def context_of(self, *, cell_index: int, worker_in_cell_index: int) -> LaunchCommandContext:
+        # [FUNCTION DOC] HELPER: Returns the single recorded context for the given cell and worker
+        # index; fails an assertion if zero or several match.
         matches = [
             ctx
             for ctx in self.contexts
@@ -50,6 +69,12 @@ def _make_spec(
     pg_slot_offset: int = 0,
     pin_to_head: bool = False,
 ) -> CommandWorkerSpec:
+    # [FUNCTION DOC] HELPER: Builds a command worker spec with the given name and scheduling shape
+    # (cell count, workers per cell, gpu fraction and slot count, placement group name and slot
+    # offset, head pinning). Defaults: one dynamic-capable port named primary with static port 8000
+    # when no port list is given (an explicit empty list means no ports); an environment callable
+    # returning a copy of the given variables (empty by default); a launch command returning a
+    # fixed sleep command unless a callable is given.
     return CommandWorkerSpec(
         name=name,
         port_infos=(
@@ -70,6 +95,11 @@ def _make_spec(
 
 
 def _make_pgs(*, num_slots: int = 8, first_gpu_id: int = 0) -> dict[str, PlacementGroupInfo]:
+    # [FUNCTION DOC] HELPER: Builds a mapping with one placement group named rollout, with a fake
+    # group object, a scrambled bundle-index order (slot times 3 plus 1, modulo the slot count)
+    # and consecutive gpu ids starting at first_gpu_id (default 0), for num_slots slots (default 8).
+    # KNOWN ISSUE: the scramble is only a permutation when the slot count is not a multiple of 3;
+    # for 3, 6 or 9 slots indices repeat. Current callers use 8 or 10 slots.
     return {
         "rollout": PlacementGroupInfo(
             pg="fake-pg",
@@ -82,6 +112,9 @@ def _make_pgs(*, num_slots: int = 8, first_gpu_id: int = 0) -> dict[str, Placeme
 async def _launch(
     specs: list[CommandWorkerSpec], pgs: dict[str, PlacementGroupInfo] | None = None
 ) -> RayWorkerManager:
+    # [FUNCTION DOC] HELPER: Creates a manager and runs its init with the shared test arguments, the
+    # given specs, the given placement groups (empty mapping by default) and the ray communication
+    # backend. Returns the initialised manager; init errors propagate.
     manager = RayWorkerManager()
     await manager.init(
         worker_manager_args(), specs, pgs if pgs is not None else {}, comm_backend=WorkerCommBackend.RAY
@@ -94,15 +127,23 @@ _GATE_MAX_YIELDS = 200
 
 @dataclass
 class _AllocPortsGate:
+    # [CLASS DOC] HELPER: Pauses port allocation for the workers selected by a predicate until the
+    # test sets the release event, and records which workers finished allocating. Events: blocked
+    # is set when a selected worker reaches the gate; release lets blocked workers continue.
     should_block: Callable[[_BaseActorManager], bool]
     blocked: asyncio.Event = field(default_factory=asyncio.Event)
     release: asyncio.Event = field(default_factory=asyncio.Event)
     allocated_names: list[str] = field(default_factory=list)
 
     def install(self, patched: pytest.MonkeyPatch) -> None:
+        # [FUNCTION DOC] HELPER: Replaces the command actor manager's port allocation method (through
+        # the given monkeypatch) with a gated wrapper; returns nothing.
         original_alloc_ports = _CommandActorManager.alloc_ports
 
         async def gated_alloc_ports(actor: _BaseActorManager) -> None:
+            # [FUNCTION DOC] HELPER: If the predicate selects this worker, sets the blocked event and
+            # waits (5 second timeout, raising a timeout error) for release. Then runs the original
+            # allocation and appends the worker's name to the allocated list.
             if self.should_block(actor):
                 self.blocked.set()
                 await asyncio.wait_for(self.release.wait(), timeout=5)
@@ -112,6 +153,9 @@ class _AllocPortsGate:
         patched.setattr(_CommandActorManager, "alloc_ports", gated_alloc_ports)
 
     async def wait_until_allocated(self, *, worker_names: list[str]) -> None:
+        # [FUNCTION DOC] HELPER: Waits (5 seconds) until some worker is blocked at the gate, then
+        # yields to the event loop up to 200 times until every named worker has finished allocating.
+        # Raises an assertion error listing the names and the allocated ones if that never happens.
         await asyncio.wait_for(self.blocked.wait(), timeout=5)
         for _ in range(_GATE_MAX_YIELDS):
             if set(worker_names) <= set(self.allocated_names):
@@ -121,7 +165,10 @@ class _AllocPortsGate:
 
 
 class TestLaunchEntryPoint:
+    # [CLASS DOC] Tests of the manager's static launch and lookup entry points.
     async def test_the_manager_is_registered_under_its_well_known_name(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Launches with no specs; asserts the fake actor was created with the name
+        # "ray_worker_manager", the actor class is the manager, and the only call made was init.
         """Consumers find the manager by a fixed actor name, so it must be launched under that name."""
         handle = RayWorkerManager.launch(worker_manager_args(), [], {}, comm_backend=WorkerCommBackend.RAY)
 
@@ -130,6 +177,9 @@ class TestLaunchEntryPoint:
         assert [call.method for call in fake_ray_cluster.calls] == ["init"]
 
     async def test_launch_waits_for_init_to_finish(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Launches with one spec; asserts init was called once with exactly the
+        # arguments passed (args, specs, placement groups) and that its result reference was
+        # resolved before launch returned.
         """Returning before init completes would expose a manager whose workers have no addresses yet."""
         specs = [_make_spec("router")]
         pgs: dict = {}
@@ -143,6 +193,8 @@ class TestLaunchEntryPoint:
         assert fake_ray_cluster.resolved_refs == ["init"]
 
     async def test_launch_propagates_an_init_failure(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Makes the fake init call fail with a runtime error and asserts launch
+        # re-raises it.
         """A pool that failed to come up must not look like a successful launch."""
         fake_ray_cluster.method_errors["init"] = RuntimeError("init exploded")
 
@@ -152,6 +204,8 @@ class TestLaunchEntryPoint:
             )
 
     async def test_get_handle_resolves_the_same_well_known_name(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] After a launch, asserts get_handle returns the very handle registered under
+        # the well-known name in the fake cluster.
         """The lookup helper and the launcher must agree on the actor name."""
         RayWorkerManager.launch(worker_manager_args(), [], {}, comm_backend=WorkerCommBackend.RAY)
 
@@ -159,7 +213,10 @@ class TestLaunchEntryPoint:
 
 
 class TestInitLaunchesWorkers:
+    # [CLASS DOC] Tests of the actor-creation part of init and the phase ordering.
     async def test_creates_one_command_actor_per_worker_of_every_cell(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Specs: engine with 2 cells of 2 workers and a single-worker router. Asserts
+        # 5 actors, all of the command actor class, each constructed without extra keyword args.
         """Every cell of every spec gets its own actor per worker slot."""
         await _launch([_make_spec("engine", num_cells=2, num_workers_per_cell=2), _make_spec("router")])
 
@@ -168,23 +225,30 @@ class TestInitLaunchesWorkers:
         assert fake_ray_cluster.ctor_kwargs == [{} for _ in range(5)]
 
     async def test_a_spec_without_cells_launches_nothing(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] A spec with zero cells creates no actor.
         """A disabled spec contributes no workers instead of an idle one."""
         await _launch([_make_spec("session-server", num_cells=0)])
 
         assert fake_ray_cluster.handles == []
 
     async def test_duplicate_pool_names_are_rejected(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Two specs with the same name make init fail with an assertion error.
         """Two specs sharing a name would collide in the worker registry, so init fails fast."""
         with pytest.raises(AssertionError):
             await _launch([_make_spec("router"), _make_spec("router")])
 
     async def test_the_specs_env_vars_become_the_actors_runtime_env(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] A spec with one environment variable; asserts the actor's creation options
+        # carry a runtime environment whose environment-variable mapping equals it.
         """The spec's env vars are handed to ray as the actor's runtime env."""
         await _launch([_make_spec("router", env_var={"MILES_TEST_VAR": "7"})])
 
         assert fake_ray_cluster.handles[0].options["runtime_env"] == {"env_vars": {"MILES_TEST_VAR": "7"}}
 
     async def test_each_phase_completes_for_all_workers_before_the_next_starts(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Asserts in the fake cluster's event log that the last actor creation
+        # precedes the first node-address lookup, and the last free-port-block request precedes the
+        # first command run (global barriers between phases).
         """Launching, port allocation and command start are global barriers, so every worker sees complete state."""
         await _launch([_make_spec("engine", num_cells=2, num_workers_per_cell=2), _make_spec("router")])
 
@@ -192,10 +256,13 @@ class TestInitLaunchesWorkers:
         assert fake_ray_cluster.last_event_index("_get_free_port_block") < fake_ray_cluster.first_event_index("run")
 
     async def test_a_failing_phase_stops_the_pipeline(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Patches port allocation to raise a runtime error "no ports" for a 2-worker
+        # spec; asserts init raises it, both actors were created, and no command was ever run.
         """A worker that cannot allocate its ports must not leave other workers starting their commands."""
         spec = _make_spec("engine", num_workers_per_cell=2)
 
         async def failing_alloc(self) -> None:
+            # [FUNCTION DOC] HELPER: Replacement allocation that always raises a runtime error.
             raise RuntimeError("no ports")
 
         manager = RayWorkerManager()
@@ -209,7 +276,11 @@ class TestInitLaunchesWorkers:
 
 
 class TestInitAllocatesPorts:
+    # [CLASS DOC] Tests of port assignment during init: dynamic and static ports, blocks, per-cell
+    # offsets, per-node tracking and the shape of advertised addresses.
     async def test_dynamic_ports_of_one_node_never_overlap(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] 2 cells of 2 workers on one node; asserts the four primary ports are
+        # distinct.
         """Workers sharing a node must be handed distinct ports."""
         manager = await _launch([_make_spec("engine", num_cells=2, num_workers_per_cell=2)])
 
@@ -223,6 +294,8 @@ class TestInitAllocatesPorts:
         assert len(set(ports)) == 4
 
     async def test_a_consecutive_port_block_is_reserved_as_a_whole(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Two workers each ask for a block of 5 consecutive ports; asserts the second
+        # worker's port is at least 5 above the first's and both block requests asked for count 5.
         """A worker asking for a port block leaves the whole block out of the next worker's reach."""
         spec = _make_spec(
             "engine",
@@ -237,6 +310,9 @@ class TestInitAllocatesPorts:
         assert [call.kwargs["count"] for call in fake_ray_cluster.calls_of("_get_free_port_block")] == [5, 5]
 
     async def test_static_ports_bypass_the_allocator(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] A spec with one fixed port 7777 and one dynamic port; asserts the fixed
+        # port is used verbatim, only one free-port-block request happened (for the dynamic one) and
+        # the fixed port was probed for availability exactly once with port 7777.
         """A port the worker cannot choose is taken from the spec verbatim, without asking the allocator."""
         spec = _make_spec(
             "router",
@@ -252,6 +328,8 @@ class TestInitAllocatesPorts:
         assert [call.kwargs["port"] for call in fake_ray_cluster.calls_of("_is_port_available")] == [7777]
 
     async def test_a_static_port_already_taken_on_the_node_fails_the_launch(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Marks port 7777 as occupied on node 10.0.0.1 and launches a spec pinned to
+        # it; expects an assertion error saying 7777 on 10.0.0.1 is already in use.
         """A stale listener on the pinned port would otherwise be mistaken for our own worker."""
         fake_ray_cluster.occupy_ports("10.0.0.1", 7777)
         spec = _make_spec("router", port_infos=[PortInfo(name="primary", static_port=7777, allow_dynamic=False)])
@@ -260,6 +338,8 @@ class TestInitAllocatesPorts:
             await _launch([spec])
 
     async def test_static_ports_marked_offset_by_cell_advance_per_cell(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] 3 cells with a fixed port 7000 flagged offset-by-cell; asserts the cells'
+        # primary ports are 7000, 7001, 7002.
         """Cells sharing one pinned base port would bind the same address twice on a node."""
         spec = _make_spec(
             "session-server",
@@ -276,6 +356,8 @@ class TestInitAllocatesPorts:
         ] == [7000, 7001, 7002]
 
     async def test_ports_are_tracked_per_node(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Two workers land on different nodes (10.0.0.1 and 10.0.0.2); asserts their
+        # hosts differ accordingly while their port numbers are equal (reuse across nodes is fine).
         """Workers on different nodes may reuse the same port number."""
         fake_ray_cluster.use_node_ips("10.0.0.1", "10.0.0.2")
         manager = await _launch([_make_spec("engine", num_workers_per_cell=2)])
@@ -286,6 +368,8 @@ class TestInitAllocatesPorts:
         assert first.port == second.port
 
     async def test_the_worker_addr_host_is_the_node_the_actor_landed_on(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] The fake node address is 10.1.2.3; asserts the worker's advertised host
+        # equals it.
         """Addresses advertise the actor's own node, not the driver's."""
         fake_ray_cluster.use_node_ips("10.1.2.3")
         manager = await _launch([_make_spec("router")])
@@ -293,6 +377,10 @@ class TestInitAllocatesPorts:
         assert manager.get_worker_addrs("router-00000-00000")["primary"].host == "10.1.2.3"
 
     async def test_the_node_reported_external_address_reaches_the_worker_addr(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Two cells on two nodes; only the first node reports an external address
+        # 100.64.0.1. Asserts the first worker's address has that external host and an external
+        # network location of host:port, while the second's external host is unset and its external
+        # network location equals its ordinary one.
         """Each worker carries the external address its own node reported; a node that
         reported none leaves the field unset and the placed address serves both views."""
         fake_ray_cluster.use_node_ips("10.0.0.1", "10.0.0.2")
@@ -311,6 +399,8 @@ class TestInitAllocatesPorts:
         assert without_external.external_netloc == without_external.netloc
 
     async def test_ipv6_hosts_are_bracketed(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] A node reporting an ipv6 address; asserts the advertised host is that
+        # address wrapped in square brackets.
         """An ipv6 node address is advertised in url-safe bracketed form."""
         fake_ray_cluster.use_node_ips("2001:db8::7")
         manager = await _launch([_make_spec("router")])
@@ -319,9 +409,13 @@ class TestInitAllocatesPorts:
 
 
 class TestStaticPortsAreProbedBeforeUse:
+    # [CLASS DOC] Tests that fixed ports are checked for availability on the worker's own node
+    # before use, which ports are checked, and that a refusal rolls the launch back.
     async def test_the_probe_asks_for_the_cell_offset_port_rather_than_the_spec_base(
         self, fake_ray_cluster: FakeRayCluster
     ):
+        # [FUNCTION DOC] 3 cells with an offset-by-cell fixed base port 7000; asserts the probes are
+        # made for ports 7000, 7001, 7002 (the offset ports, not the base three times).
         """Probing the spec's base port would leave every cell but the first checking an address it never binds."""
         spec = _make_spec(
             "session-server",
@@ -333,6 +427,8 @@ class TestStaticPortsAreProbedBeforeUse:
         assert [call.kwargs["port"] for call in fake_ray_cluster.calls_of("_is_port_available")] == [7000, 7001, 7002]
 
     async def test_an_occupied_cell_offset_port_refuses_the_launch(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Port 7002 occupied on the node while 3 cells use offsets from 7000; expects
+        # an assertion error stating port 7002 on 10.0.0.1 is already in use.
         """A stale listener on a later cell's offset port must be caught too, not only one on the base port."""
         fake_ray_cluster.occupy_ports("10.0.0.1", 7002)
         spec = _make_spec(
@@ -345,6 +441,9 @@ class TestStaticPortsAreProbedBeforeUse:
             await _launch([spec])
 
     async def test_the_probe_runs_on_the_node_the_worker_landed_on(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Two workers on nodes .1 and .2 with port 7777 occupied only on .2; expects
+        # the assertion error naming node .2, and asserts the probes were issued through the two
+        # workers' own actors, whose node addresses are .1 then .2.
         """A port is only contended on the node that binds it, so the probe must go through the worker's own actor."""
         fake_ray_cluster.use_node_ips("10.0.0.1", "10.0.0.2")
         fake_ray_cluster.occupy_ports("10.0.0.2", 7777)
@@ -365,6 +464,8 @@ class TestStaticPortsAreProbedBeforeUse:
     async def test_a_port_occupied_on_an_unrelated_node_does_not_block_the_launch(
         self, fake_ray_cluster: FakeRayCluster
     ):
+        # [FUNCTION DOC] Port 7777 occupied only on 10.0.0.2 while the worker runs on 10.0.0.1; the
+        # launch succeeds and the worker gets 7777.
         """Refusing a port because another machine uses it would make every run hostage to unrelated nodes."""
         fake_ray_cluster.occupy_ports("10.0.0.2", 7777)
         spec = _make_spec("router", port_infos=[PortInfo(name="primary", static_port=7777, allow_dynamic=False)])
@@ -376,6 +477,8 @@ class TestStaticPortsAreProbedBeforeUse:
     async def test_a_master_static_port_is_probed_only_by_the_worker_that_reserves_it(
         self, fake_ray_cluster: FakeRayCluster
     ):
+        # [FUNCTION DOC] 2 cells of 3 workers with a fixed master-mode port 9000 and a dynamic
+        # primary port; asserts only two probes happened (one per cell, by worker 0), both for 9000.
         """Peers that never bind the cell's master port would otherwise refuse a port their own worker 0 is serving."""
         spec = _make_spec(
             "engine",
@@ -391,6 +494,7 @@ class TestStaticPortsAreProbedBeforeUse:
         assert [call.kwargs["port"] for call in fake_ray_cluster.calls_of("_is_port_available")] == [9000, 9000]
 
     async def test_dynamic_ports_are_never_probed_by_the_static_check(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Only dynamic ports are declared; asserts no availability probe was made.
         """The allocator already hands out a free port, and re-probing its own reservation would refuse it."""
         spec = _make_spec(
             "engine",
@@ -408,6 +512,8 @@ class TestStaticPortsAreProbedBeforeUse:
     async def test_the_refusal_names_the_worker_and_the_endpoint_it_could_not_serve(
         self, fake_ray_cluster: FakeRayCluster
     ):
+        # [FUNCTION DOC] An occupied fixed port for an endpoint named prometheus; expects an
+        # assertion error mentioning worker router-00000-00000 and its prometheus endpoint.
         """An operator hunting the stale process needs to know which worker wanted which endpoint."""
         fake_ray_cluster.occupy_ports("10.0.0.1", 7777)
         spec = _make_spec("router", port_infos=[PortInfo(name="prometheus", static_port=7777, allow_dynamic=False)])
@@ -416,6 +522,8 @@ class TestStaticPortsAreProbedBeforeUse:
             await _launch([spec])
 
     async def test_a_refused_port_rolls_the_cell_back_before_any_command_runs(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] A 2-worker cell whose fixed port is occupied; expects an assertion error,
+        # no command run, and both created actors killed.
         """A refusal that let the commands start would add our own processes to the stale ones already there."""
         fake_ray_cluster.occupy_ports("10.0.0.1", 7777)
         spec = _make_spec(
@@ -432,7 +540,11 @@ class TestStaticPortsAreProbedBeforeUse:
 
 
 class TestPortAllocationDetails:
+    # [CLASS DOC] Finer points of port allocation: where blocks are requested, ordering of the
+    # declared ports and uniqueness across specs.
     async def test_the_allocator_probes_the_workers_own_actor_on_its_own_node(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Two workers on two nodes; asserts the free-port-block requests went to the
+        # workers' own actor handles, in order, on nodes .1 and .2.
         """Ports must be probed on the node that will bind them, through that worker's own actor."""
         fake_ray_cluster.use_node_ips("10.0.0.1", "10.0.0.2")
         await _launch([_make_spec("engine", num_workers_per_cell=2)])
@@ -442,6 +554,9 @@ class TestPortAllocationDetails:
         assert [probe.handle.node_ip for probe in probes] == ["10.0.0.1", "10.0.0.2"]
 
     async def test_every_declared_port_is_allocated_in_spec_order(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Three dynamic ports are declared (primary, nccl, engine_info_bootstrap);
+        # asserts the worker's launch context lists its addresses in that order with three distinct
+        # port numbers.
         """A worker is launched with an address for every port name its spec declares."""
         recorder = _LaunchRecorder()
         spec = _make_spec(
@@ -460,6 +575,8 @@ class TestPortAllocationDetails:
         assert len({addr.port for addr in addrs.values()}) == 3
 
     async def test_workers_of_different_specs_never_share_a_port(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] A router spec with 2 workers and an engine spec with 2 cells; asserts the
+        # four primary ports are all distinct.
         """One allocator serves the whole pool, so specs cannot hand out the same port twice."""
         manager = await _launch([_make_spec("router", num_workers_per_cell=2), _make_spec("engine", num_cells=2)])
 
@@ -471,7 +588,11 @@ class TestPortAllocationDetails:
 
 
 class TestInitStartsCommands:
+    # [CLASS DOC] Tests of the command-start phase of init.
     async def test_every_worker_runs_the_command_rendered_for_it(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] An engine with 2 cells and a recording launch command; asserts the run
+        # calls carry the commands "exec run-0-0" and "exec run-1-0" (the manager prefixes exec) and
+        # an empty environment mapping each.
         """Each worker's actor execs the command its own launch context rendered, so no shell sits in between."""
         recorder = _LaunchRecorder()
         await _launch([_make_spec("engine", num_cells=2, launch_command=recorder.command)])
@@ -483,6 +604,9 @@ class TestInitStartsCommands:
     async def test_the_launch_context_carries_the_workers_own_indices_and_addrs(
         self, fake_ray_cluster: FakeRayCluster
     ):
+        # [FUNCTION DOC] 2 cells of 2 workers; asserts the recorded contexts cover exactly the four
+        # (cell, worker) index pairs and each context's own primary address equals the address the
+        # manager reports for that worker.
         """A worker's launch context describes that worker: its cell, its slot and its own addresses."""
         recorder = _LaunchRecorder()
         spec = _make_spec("engine", num_cells=2, num_workers_per_cell=2, launch_command=recorder.command)
@@ -506,7 +630,10 @@ class TestInitStartsCommands:
 
 
 class TestSpecEnvVars:
+    # [CLASS DOC] Tests of how a spec's environment callable becomes each actor's runtime env.
     async def test_each_spec_contributes_its_own_env_to_its_own_workers(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] A router and a 2-cell engine with different variables; asserts the three
+        # actors' runtime environments, in creation order, hold only their own spec's variables.
         """Env vars are per spec, so one spec's variables must not leak into another spec's workers."""
         await _launch(
             [
@@ -522,10 +649,15 @@ class TestSpecEnvVars:
         ]
 
     async def test_the_env_of_a_spec_is_resolved_once_per_worker(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Uses a spec whose environment callable counts its calls and returns the
+        # running count; with 2 cells asserts it was called exactly twice and the two actors got the
+        # values "1" and "2".
         """The spec's env callable is what the manager stores, evaluated per worker rather than cached globally."""
         calls: list[int] = []
 
         def _env(_ctx) -> dict[str, str]:
+            # [FUNCTION DOC] HELPER: Records the call and returns a mapping with the call count so
+            # far as the value of a CALL_INDEX variable.
             calls.append(len(calls))
             return {"CALL_INDEX": str(len(calls))}
 
@@ -546,7 +678,9 @@ class TestSpecEnvVars:
 
 
 class TestActorResources:
+    # [CLASS DOC] Tests of the cpu request of command actors.
     async def test_every_worker_reserves_a_fraction_of_a_cpu(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Asserts the actor's creation options request 0.2 cpus.
         """Workers are launchers, not compute, so they must not each claim a whole cpu."""
         await _launch([_make_spec("router")])
 
@@ -554,11 +688,16 @@ class TestActorResources:
 
 
 class TestFailureModes:
+    # [CLASS DOC] Tests that an early failure prevents later init phases.
     async def test_a_failed_worker_launch_stops_before_any_port_is_allocated(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Patches actor launching to raise a runtime error "no capacity" for a
+        # 2-cell spec; asserts init raises it and neither a port block request nor a command run
+        # happened.
         """Nothing downstream may run when the pool could not even be created."""
         from miles.utils.workers.ray_worker_manager import _CommandActorManager
 
         async def failing_launch(self) -> None:
+            # [FUNCTION DOC] HELPER: Replacement actor launch that always raises a runtime error.
             raise RuntimeError("no capacity")
 
         with pytest.raises(RuntimeError, match="no capacity"):
@@ -570,9 +709,12 @@ class TestFailureModes:
         assert fake_ray_cluster.calls_of("run") == []
 
     async def test_a_command_that_cannot_be_rendered_starts_nothing(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] A 2-cell spec whose launch command raises a value error; asserts init
+        # raises it and no command was run on any worker.
         """A spec whose launch command raises must not leave half of the pool running."""
 
         def _explode(ctx: LaunchCommandContext) -> str:
+            # [FUNCTION DOC] HELPER: Launch-command callable that always raises a value error.
             raise ValueError("cannot render")
 
         with pytest.raises(ValueError, match="cannot render"):
@@ -582,7 +724,10 @@ class TestFailureModes:
 
 
 class TestGetWorkerAddrs:
+    # [CLASS DOC] Tests of the per-worker address lookup.
     async def test_names_are_the_pool_with_the_cell_and_worker_index(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] For 2 cells of 2 workers, each name of the form pool-cell-worker (five-digit
+        # zero-padded indices) resolves to an address map whose primary port is positive.
         """Workers are addressable under ``<spec>-<cell>-<worker>``."""
         manager = await _launch([_make_spec("engine", num_cells=2, num_workers_per_cell=2)])
 
@@ -590,6 +735,8 @@ class TestGetWorkerAddrs:
             assert manager.get_worker_addrs(name)["primary"].port > 0
 
     async def test_an_unknown_worker_name_fails_loudly(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Looking up a worker in a cell index that does not exist raises an assertion
+        # error.
         """Looking up a worker that does not exist must not silently return an arbitrary address."""
         manager = await _launch([_make_spec("engine", num_cells=2)])
 
@@ -597,12 +744,18 @@ class TestGetWorkerAddrs:
             manager.get_worker_addrs("engine-00002-00000")["primary"]
 
     async def test_nothing_is_published_until_every_port_is_allocated(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Patches the static-port availability check with an observer that records
+        # the worker's published address map (or none) each time it runs; the spec has two fixed
+        # ports, so it runs twice. Asserts both observations were "nothing published yet", and that
+        # afterwards the worker's map holds both ports.
         """Allocation crosses an await per port and the manager answers reads in between, so a map
         published as it fills lets a reader take the endpoints not there yet for endpoints the
         worker does not have -- which is how a restarting engine is read as having no primary."""
         observed: list[dict | None] = []
 
         async def observe(self, port: int, *, port_name: str, node_ip: str) -> None:
+            # [FUNCTION DOC] HELPER: Replacement availability check; appends a copy of the actor's
+            # current published address map, or none, and does no probing.
             observed.append(None if self.self_addrs is None else dict(self.self_addrs))
 
         spec = _make_spec(
@@ -621,6 +774,8 @@ class TestGetWorkerAddrs:
     async def test_a_worker_without_its_ports_yet_is_refused_rather_than_answered(
         self, fake_ray_cluster: FakeRayCluster
     ):
+        # [FUNCTION DOC] Resets one launched worker's published address map to none; asserts the
+        # lookup raises an assertion error saying it has not been given its ports yet.
         """Returning nothing would be read as a worker that has no endpoints at all."""
         manager = await _launch([_make_spec("engine")])
         manager._find_actor("engine-00000-00000").self_addrs = None
@@ -630,9 +785,13 @@ class TestGetWorkerAddrs:
 
 
 class TestPinToHead:
+    # [CLASS DOC] Tests of the head-node pinning option of a spec.
     async def test_a_pinned_worker_keeps_its_resources_and_gains_head_affinity(
         self, fake_ray_cluster: FakeRayCluster, monkeypatch: pytest.MonkeyPatch
     ):
+        # [FUNCTION DOC] Replaces the head-pinning options function with one returning a marker
+        # scheduling strategy; for a pinned router with one environment variable asserts the actor
+        # options contain that strategy, the 0.2 cpu request and the runtime environment.
         """Pinning adds the head-affinity strategy without dropping the other actor options."""
         monkeypatch.setattr(
             ray_worker_manager,
@@ -649,9 +808,14 @@ class TestPinToHead:
     async def test_an_unpinned_worker_never_resolves_the_head_node(
         self, fake_ray_cluster: FakeRayCluster, monkeypatch: pytest.MonkeyPatch
     ):
+        # [FUNCTION DOC] Replaces the head-pinning options function with one that fails an
+        # assertion if called; launches an unpinned router and asserts it was never called and the
+        # actor options have no scheduling strategy.
         """Unpinned workers must not even look the head node up, let alone all land on it."""
 
         def _fail() -> dict:
+            # [FUNCTION DOC] HELPER: Replacement head-pinning options function that always fails an
+            # assertion.
             raise AssertionError("the head node must not be resolved for unpinned workers")
 
         monkeypatch.setattr(ray_worker_manager, "compute_ray_pin_head_options", _fail)
@@ -661,7 +825,12 @@ class TestPinToHead:
 
 
 class TestSpecAddrs:
+    # [CLASS DOC] Tests of the pool-wide address book given to launch commands.
     async def test_every_worker_sees_the_addresses_of_all_specs(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] An inference router and a 2-cell session server (recording launch commands);
+        # asserts every recorded context's pool address book has exactly both pool names, the
+        # router's single entry equals the manager's address for it, and the session server's
+        # entries are its two cells' addresses in cell order.
         """Cross-spec wiring works because each command is rendered with the whole pool's addresses."""
         recorder = _LaunchRecorder()
         manager = await _launch(
@@ -684,7 +853,11 @@ class TestSpecAddrs:
 
 
 class TestGetAddrs:
+    # [CLASS DOC] Tests of the manager's full address listing, a mapping from pool name to a list
+    # of per-worker address maps.
     async def test_groups_are_listed_in_cell_then_worker_order(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] For 2 cells of 2 workers, asserts the engine list's primary addresses
+        # equal the per-worker lookups in cell-major, worker-minor order.
         """Consumers index this map positionally, so the order must follow cells and then workers."""
         recorder = _LaunchRecorder()
         manager = await _launch(
@@ -701,6 +874,8 @@ class TestGetAddrs:
         assert [addr["primary"] for addr in manager.get_addrs()["engine"]] == expected
 
     async def test_a_disabled_group_is_listed_as_empty(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] A spec with zero cells appears with an empty list while the router has one
+        # entry.
         """A spec with no cells is still visible to consumers, with no addresses."""
         manager = await _launch([_make_spec("router"), _make_spec("session-server", num_cells=0)])
 
@@ -709,7 +884,12 @@ class TestGetAddrs:
 
 
 class TestMasterPorts:
+    # [CLASS DOC] Tests of master-mode ports, which exist once per cell, owned by worker 0, and are
+    # shared with the cell's other workers through their launch contexts.
     async def test_a_master_port_is_allocated_once_per_cell(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] 2 cells of 3 workers with a master-mode dynamic block of 5 ports; asserts
+        # exactly two block requests of count 5 and that only each cell's worker 0 lists the
+        # dist_init port in the published address listing.
         """Only worker 0 reserves the cell's master port, so peers cannot each take their own."""
         spec = _make_spec(
             "engine",
@@ -734,6 +914,9 @@ class TestMasterPorts:
         ]
 
     async def test_a_static_master_port_is_recorded_only_on_worker_zero(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] A 2-worker cell with a fixed master port 9123; asserts worker 0 lists
+        # dist_init with port 9123, worker 1 does not list it, and there were two block requests
+        # (one dynamic primary port per worker).
         """A pinned master port is not allocated, and still belongs to worker 0 alone."""
         spec = _make_spec(
             "engine",
@@ -751,6 +934,8 @@ class TestMasterPorts:
         assert len(fake_ray_cluster.calls_of("_get_free_port_block")) == 2
 
     async def test_every_worker_of_a_cell_launches_with_that_cells_master_addr(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] 2 cells of 2 workers; from the recorded launch contexts asserts both
+        # workers of a cell see the same dist_init address while the two cells' addresses differ.
         """All ranks of a cell must be told the same master endpoint, and never another cell's."""
         recorder = _LaunchRecorder()
         spec = _make_spec(
@@ -777,6 +962,8 @@ class TestMasterPorts:
         assert masters[(0, 0)] != masters[(1, 0)]
 
     async def test_a_master_addr_keeps_rank_zeros_host_on_another_node(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Two workers on nodes .1 and .2; asserts worker 1's launch context has its
+        # primary host .2 but its dist_init host .1 (rank 0's node).
         """A peer on a second node must dial rank 0's host, not its own, or torch.distributed hangs."""
         fake_ray_cluster.use_node_ips("10.0.0.1", "10.0.0.2")
         recorder = _LaunchRecorder()
@@ -796,6 +983,8 @@ class TestMasterPorts:
         assert peer["dist_init"].host == "10.0.0.1"
 
     async def test_a_master_addr_does_not_overwrite_a_workers_own_ports(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] 2-worker cell with a master port; asserts each worker's launch-context
+        # primary address equals the manager's address for that worker.
         """Merging the cell's master addr must leave each worker's own addresses intact."""
         recorder = _LaunchRecorder()
         spec = _make_spec(
@@ -820,7 +1009,13 @@ class TestMasterPorts:
 
 
 class TestConcurrentPhases:
+    # [CLASS DOC] Tests that within a phase cells and workers are processed concurrently, using a
+    # barrier that only opens once three allocations are in flight.
     async def test_all_cells_of_a_phase_run_concurrently(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Wraps port allocation so it records the cell index and waits for a release
+        # event that is set when the third allocation arrives (5 second wait; whole launch limited
+        # to 10 seconds). With 3 cells asserts the entered cells are 0, 1, 2 (so none was serialised
+        # behind another) and the three primary ports are distinct.
         """Cells are configured concurrently, so a large pool does not start up one cell at a time."""
         from miles.utils.workers.ray_worker_manager import _CommandActorManager
 
@@ -829,6 +1024,8 @@ class TestConcurrentPhases:
         release = asyncio.Event()
 
         async def gated_alloc(self) -> None:
+            # [FUNCTION DOC] HELPER: Allocation wrapper; records the cell index, opens the barrier on
+            # the third arrival, waits for it, then runs the original allocation.
             entered.append(self.parent.cell_index)
             if len(entered) == 3:
                 release.set()
@@ -851,6 +1048,9 @@ class TestConcurrentPhases:
         )
 
     async def test_workers_within_one_cell_run_each_phase_concurrently(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Same barrier technique as the cells test, but with one cell of 3 workers;
+        # asserts worker indices 0, 1, 2 all entered allocation before any finished, and their
+        # three primary ports are distinct.
         """The ranks of one engine configure together; serialising them adds a full setup per rank."""
         from miles.utils.workers.ray_worker_manager import _CommandActorManager
 
@@ -859,6 +1059,8 @@ class TestConcurrentPhases:
         release = asyncio.Event()
 
         async def gated_alloc(self) -> None:
+            # [FUNCTION DOC] HELPER: Allocation wrapper; records the worker index, opens the barrier
+            # on the third arrival, waits for it, then runs the original allocation.
             entered.append(self.worker_in_cell_index)
             if len(entered) == 3:
                 release.set()

@@ -1,3 +1,8 @@
+# [MODULE DOC] HELPER: Mock upstream chat-completions server used by the session-server
+# benchmark. Provides a function building a small web app (health check, chat endpoint that
+# replays prebuilt response bytes chosen purely from the request's message count, and a
+# catch-all returning an ok status) and a process entry point that serves it with uvicorn on a
+# socket bound with address and port reuse so several processes can share one port.
 """A minimal mock SGLang chat-completions backend for the session-server bench.
 
 Unlike `miles.utils.test_utils.mock_sglang_server.MockSGLangServer` (which
@@ -32,6 +37,15 @@ from starlette.responses import Response
 
 
 def build_mock_app(response_bodies: list[bytes], inference_interval: float = 0.0) -> FastAPI:
+    # [FUNCTION DOC] Builds the app. Routes: a health GET returning a fixed ok JSON body; a chat
+    # POST that parses the request JSON, takes the message list (empty if missing), computes the
+    # turn index as (message count minus one) integer-halved and clamps it to the last response
+    # (note a count of zero gives index minus one halved, i.e. the last element via negative
+    # indexing), sleeps asynchronously for the inference interval when positive, then returns the
+    # chosen bytes as JSON; and a catch-all for GET, POST, PUT, DELETE and PATCH returning the
+    # fixed ok body. Stateless; the response list must be non-empty.
+    # KNOWN ISSUE: an empty message list yields a negative index that silently selects the last
+    # body rather than the first.
     """A FastAPI app that returns `response_bodies[turn_index]` per chat.
 
     `response_bodies` is the per-turn list of fully-serialized chat-completion
@@ -49,10 +63,13 @@ def build_mock_app(response_bodies: list[bytes], inference_interval: float = 0.0
 
     @app.get("/health")
     async def health() -> Response:
+        # [FUNCTION DOC] HELPER: Returns a fixed JSON body reporting status ok.
         return Response(content=b'{"status":"ok"}', media_type="application/json")
 
     @app.post("/v1/chat/completions")
     async def chat(request: Request) -> Response:
+        # [FUNCTION DOC] HELPER: Chat handler: picks the prebuilt response by message count (see
+        # the app builder), optionally delays, and returns it unchanged as JSON.
         payload = json.loads(await request.body())
         messages = payload.get("messages", [])
         # turn k carries 2*k + 1 messages; clamp to the last spec defensively.
@@ -64,12 +81,17 @@ def build_mock_app(response_bodies: list[bytes], inference_interval: float = 0.0
     # The bench drives only chat; a catch-all keeps a stray proxy from 404-ing.
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
     async def catch_all(path: str) -> Response:
+        # [FUNCTION DOC] HELPER: Returns the fixed ok JSON body for any other path and method.
         return Response(content=b'{"status":"ok"}', media_type="application/json")
 
     return app
 
 
 def run_mock_r3_backend(response_bodies: list[bytes], host: str, port: int, inference_interval: float = 0.0) -> None:
+    # [FUNCTION DOC] Process entry point; blocks serving until terminated. Sets the process title,
+    # builds the app, binds a TCP socket with address reuse and port reuse enabled to the given
+    # host and port (so several backend processes can share the port), and runs uvicorn on that
+    # socket with warning log level and a 600 second keep-alive timeout. Raises on bind failure.
     """`multiprocessing.Process` target: serve the mock backend on host:port.
 
     `inference_interval` (seconds) is the simulated per-chat generation delay

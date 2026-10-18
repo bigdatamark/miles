@@ -1,3 +1,6 @@
+# [MODULE DOC] Unit test for the debug train-data dump: among the ranks sharing a data and context
+# parallel shard, only the rank with tensor-parallel rank zero on the last pipeline stage writes
+# the file. A fake parallel state is installed into the parallel module for the test.
 """`save_debug_train_data` must write exactly one file per (dp, cp) shard."""
 
 from types import SimpleNamespace
@@ -11,6 +14,9 @@ from miles.utils.ft_utils.process_group_utils import GroupInfo
 
 
 def _parallel_state(*, tp_rank: int, is_pp_last_stage: bool) -> parallel.ParallelState:
+    # [FUNCTION DOC] HELPER: Builds a parallel state where every group is trivial (rank 0, size 1,
+    # no process group) except tensor parallel, which has the given rank and size 2, and the
+    # pipeline-last-stage flag is the given value. Returns it; no side effects.
     trivial = GroupInfo(rank=0, size=1, group=None)
     return parallel.ParallelState(
         intra_dp=trivial,
@@ -31,6 +37,12 @@ def _parallel_state(*, tp_rank: int, is_pp_last_stage: bool) -> parallel.Paralle
     ids=["tp0_last_stage_writes", "tp_peer_skips", "earlier_pp_stage_skips"],
 )
 def test_only_one_rank_per_shard_writes(tmp_path, monkeypatch, tp_rank, is_pp_last_stage, writes):
+    # [FUNCTION DOC] Parametrized over (tp rank 0, last stage: writes), (tp rank 1: skips) and
+    # (earlier pipeline stage: skips). Patches the module-level parallel state and the global
+    # distributed rank (fixed to 5), builds arguments whose dump path template uses rollout id and
+    # rank in a temporary directory, calls the dump with rollout id 3 and a minimal rollout data
+    # mapping, and asserts the file for rollout 3 and rank 5 exists exactly when a write is
+    # expected.
     monkeypatch.setattr(
         parallel, "_parallel_state", _parallel_state(tp_rank=tp_rank, is_pp_last_stage=is_pp_last_stage)
     )

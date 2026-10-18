@@ -215,6 +215,8 @@ class TestToCliArgs:
         assert "--sample-optional-float 0.9" in cli
 
     def test_skips_none_and_false(self) -> None:
+        # [FUNCTION DOC] Serializes an instance with only the required fields set; asserts the string
+        # omits the flag option (false boolean) and all three optional options (none values).
         instance: _SampleArgs = _SampleArgs(
             mandatory_str="test",
             mandatory_int=1,
@@ -229,6 +231,8 @@ class TestToCliArgs:
         assert "--sample-optional-float" not in cli
 
     def test_no_prefix_serialization(self) -> None:
+        # [FUNCTION DOC] With the no-prefix bridge, an instance with name "foo" and debug true
+        # serializes to a string containing "--name foo" and the bare debug option.
         instance: _NoPrefixArgs = _NoPrefixArgs(name="foo", debug=True)
         cli: str = _NO_PREFIX_BRIDGE.to_cli_args(instance)
 
@@ -237,7 +241,11 @@ class TestToCliArgs:
 
 
 class TestRoundTrip:
+    # [CLASS DOC] Tests that serializing then parsing then rebuilding yields an equal instance.
     def test_to_cli_args_then_parse_back(self) -> None:
+        # [FUNCTION DOC] A fully populated instance is serialized to a string, split on whitespace,
+        # parsed by a fresh parser with the fields registered, and rebuilt; the result equals the
+        # original.
         original: _SampleArgs = _SampleArgs(
             mandatory_str="roundtrip",
             mandatory_int=99,
@@ -261,6 +269,8 @@ class TestRoundTrip:
         assert restored == original
 
     def test_round_trip_with_defaults(self) -> None:
+        # [FUNCTION DOC] Same round trip for an instance with only required fields set (defaults and
+        # none optionals elsewhere); the rebuilt instance equals the original.
         original: _SampleArgs = _SampleArgs(
             mandatory_str="minimal",
             mandatory_int=1,
@@ -278,13 +288,20 @@ class TestRoundTrip:
 
 
 class TestValidation:
+    # [CLASS DOC] Tests of input validation by the bridge.
     def test_rejects_non_dataclass(self) -> None:
+        # [FUNCTION DOC] Constructing the bridge with a non-dataclass type (the string type) raises a
+        # type error matching "not a dataclass".
         with pytest.raises(TypeError, match="not a dataclass"):
             DataclassArgparseBridge(str, prefix="x")
 
     def test_rejects_unsupported_type(self) -> None:
+        # [FUNCTION DOC] A dataclass with a list-of-strings field constructs a bridge fine, but
+        # registering it on a parser raises a type error matching "Unsupported field type".
         @dataclasses.dataclass(frozen=True)
         class _Bad:
+            # [CLASS DOC] HELPER: Frozen dataclass with one list-of-strings field (default empty
+            # list), a type the bridge does not support.
             data: list[str] = dataclasses.field(default_factory=list)
 
         bridge: DataclassArgparseBridge[_Bad] = DataclassArgparseBridge(_Bad, prefix="bad")
@@ -295,7 +312,10 @@ class TestValidation:
 
 
 class TestInplaceModifyArgs:
+    # [CLASS DOC] Tests of the in-place override context manager on a namespace.
     def test_overrides_inside_and_restores_on_exit(self) -> None:
+        # [FUNCTION DOC] Overrides two boolean attributes to false; inside the block they are false
+        # and an untouched attribute keeps its value; after the block the originals (true) are back.
         """Overridden attributes are visible inside the block and restored afterwards."""
         args = argparse.Namespace(no_load_optim=True, finetune=True, lr=1.0)
 
@@ -308,6 +328,8 @@ class TestInplaceModifyArgs:
         assert args.finetune is True
 
     def test_restores_on_exception(self) -> None:
+        # [FUNCTION DOC] A runtime error raised inside the block propagates and the original value
+        # (true) is restored.
         """Originals are restored even when the block raises."""
         args = argparse.Namespace(flag=True)
 
@@ -318,6 +340,8 @@ class TestInplaceModifyArgs:
         assert args.flag is True
 
     def test_empty_overrides_is_noop(self) -> None:
+        # [FUNCTION DOC] With an empty override mapping the attribute is unchanged inside and after
+        # the block.
         """An empty override dict changes nothing."""
         args = argparse.Namespace(flag=True)
 
@@ -327,6 +351,8 @@ class TestInplaceModifyArgs:
         assert args.flag is True
 
     def test_unknown_attribute_raises(self) -> None:
+        # [FUNCTION DOC] Overriding an attribute missing from an empty namespace raises an attribute
+        # error when entering the block.
         """Overriding an attribute the namespace does not have fails loudly."""
         args = argparse.Namespace()
 
@@ -335,6 +361,8 @@ class TestInplaceModifyArgs:
                 pass
 
     def test_mutation_inside_block_fails_on_exit(self) -> None:
+        # [FUNCTION DOC] Overrides a flag to false and then sets it back to true inside the block;
+        # leaving the block raises an assertion error matching "modified inside".
         """An attribute mutated inside the block is detected instead of silently clobbered."""
         args = argparse.Namespace(flag=True)
 
