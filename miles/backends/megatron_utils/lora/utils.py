@@ -229,6 +229,7 @@ def save_lora_checkpoint(
     # shards still saved). Global rank is zero when torch distributed is not initialized.
     # KNOWN ISSUE: the publisher is typed optional and is dereferenced in non-raw mode without a
     # check, so a none publisher is silently swallowed by the exception handler as a failed export.
+    """Collectively save native adapter shards, training state, and optional HF adapter weights."""
     global_rank = dist.get_rank() if dist.is_initialized() else 0
 
     def write_shards(checkpoint_dir: Path):

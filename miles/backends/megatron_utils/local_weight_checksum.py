@@ -52,6 +52,7 @@ def dump_local_weight_checksums(
     # Returns immediately unless the save-local-weight-checksum flag is set. Otherwise asserts the
     # audit event logger has been initialized, computes the checksum state for the model chunks and
     # optimizer, and logs it as a local-weight-checksum event (without printing it to the console).
+    """Compute and dump weight checksums if enabled."""
 
     if not args.save_local_weight_checksum:
         return
