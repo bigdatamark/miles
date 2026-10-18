@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Builds a realistic default argument mapping for unit tests from the real miles argument parser, so
+# tests never hand-maintain a defaults dictionary. Two module constants layer on top of the parsed
+# defaults: arguments owned by the megatron parser that miles code reads (param buffer cpu backup off,
+# no warmup iterations, no load path), and arguments the real parser leaves unset and resolves after
+# parsing (offload flags off, eval snapshots off, engines started, an all-zero run uuid of the
+# configured length). The single public entry point is the parser defaults function.
 from __future__ import annotations
 
 import argparse
@@ -32,6 +39,9 @@ _RESOLVED_AFTER_PARSING: dict[str, Any] = dict(
 
 @contextlib.contextmanager
 def _with_relaxed_parser_required_args(parser: argparse.ArgumentParser) -> Iterator[None]:
+    # [FUNCTION DOC] HELPER: Context manager. On entry, marks every required action of the parser as not
+    # required (touching a private parser attribute); on exit, even after an error, marks exactly those
+    # actions required again. Yields nothing. Mutates the parser temporarily.
     required = [action for action in parser._actions if action.required]
     for action in required:
         action.required = False
@@ -44,6 +54,12 @@ def _with_relaxed_parser_required_args(parser: argparse.ArgumentParser) -> Itera
 
 @functools.cache
 def parser_defaults() -> dict[str, Any]:
+    # [FUNCTION DOC] Returns (cached for the process, so the same mapping object is shared by all
+    # callers and must not be mutated) the default value of every argument of the miles extra-args
+    # parser. Steps: create a parser, apply the miles extra-args provider, parse an empty argument list
+    # leniently (unknown arguments ignored, required arguments relaxed, the process argv temporarily
+    # replaced by a single dummy program name), then merge, with later entries winning: the megatron
+    # defaults constant, the parsed values, and the resolved-after-parsing constant.
     # a hand-written defaults dict falls behind the moment production reads a new argument, and the
     # test then dies on AttributeError somewhere deep instead of on the thing it was written for
     parser = argparse.ArgumentParser()

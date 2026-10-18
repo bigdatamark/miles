@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Test that the nemo-gym workplace example launcher submits its training through the configured ray
+# command backend.
 import runpy
 from pathlib import Path
 
@@ -7,6 +10,11 @@ from miles.utils.external_utils.command_utils.ray_backend.backend import RayComm
 
 
 def test_workplace_launch_uses_the_configured_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    # [FUNCTION DOC] Replaces the ray backend's train execution with a recorder of its keyword
+    # arguments, runs the example launcher file as a script via path (executing its top level, without
+    # running its main guard) and builds default script args from the loaded namespace. Calls its
+    # execute function and asserts exactly one backend call, whose config is the same args object and
+    # whose train script is the async trainer.
     """The workplace recipe submits through its backend instead of removed module exports."""
     calls: list[dict[str, object]] = []
     monkeypatch.setattr(RayCommandBackend, "execute_train", lambda self, **kwargs: calls.append(kwargs))

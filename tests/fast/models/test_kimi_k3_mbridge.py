@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Test (skipped when the mbridge package is missing) of the Kimi K3 mbridge weight conversion: the
+# kda recurrent state parameters must stay float32 even when the bridge dtype is bfloat16, while
+# ordinary projection weights follow the bridge dtype.
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +13,11 @@ from miles_plugins.mbridge.kimi_k3 import KimiK3Bridge  # noqa: E402
 
 @pytest.mark.parametrize("name", ("q_conv1d.weight", "k_conv1d.weight", "v_conv1d.weight", "A_log", "dt_bias"))
 def test_kda_state_stays_fp32_against_the_bridge_dtype(name):
+    # [FUNCTION DOC] Parametrized over the q, k, v convolution weights, the A log and the dt bias. Builds
+    # a bridge object without running its constructor, with bfloat16 dtype and a config of one kda head,
+    # and converts a one-element float32 weight to mcore format under the linear attention name. Asserts
+    # the result is float32 and exactly equal to the input. Then sets no vocab-size divisor and converts
+    # a q projection weight under the linear attention name, asserting it comes out bfloat16.
     """Losing the fp32 override silently downcasts the KDA state during conversion."""
     bridge = object.__new__(KimiK3Bridge)
     bridge.dtype = torch.bfloat16

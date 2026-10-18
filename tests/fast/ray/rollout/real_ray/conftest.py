@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Fixtures and helpers for tests that run the mock sglang engine as a real ray actor in local mode: a
+# placement group factory, a builder of configured server cells, async start and synchronous kill
+# helpers for cells, and fixtures that expose the unwrapped mock engine class and patch it into the
+# server cell module. Constants: per-engine cpu and gpu fractions (0.2 each), matching what the
+# production launcher requests for its actor options.
 """Fixtures for tests that drive ``MockSGLangEngine`` as a real Ray actor."""
 
 from __future__ import annotations
@@ -13,11 +19,16 @@ _PER_ENGINE_NUM_GPUS = 0.2
 
 @pytest.fixture
 def placement_group_factory(ray_local_mode):
+    # [FUNCTION DOC] HELPER: Fixture yielding a factory function. The factory takes an engine count,
+    # creates a packed placement group with that many bundles of 0.2 cpu and 0.2 gpu, waits until it is
+    # ready, remembers it, and returns a tuple of the group, the bundle indices 0 to n-1, and gpu ids
+    # 0 to n-1 (the same list contents). On teardown removes every created group, ignoring errors.
     """Yields ``make(num_engines) -> (pg, bundle_indices, gpu_ids)`` matching
     what ``ServerGroup.pg`` expects. PGs are torn down on teardown."""
     created: list = []
 
     def _make(num_engines: int) -> tuple:
+        # [FUNCTION DOC] HELPER: The factory described by the enclosing fixture.
         bundles = [{"CPU": _PER_ENGINE_NUM_CPUS, "GPU": _PER_ENGINE_NUM_GPUS} for _ in range(num_engines)]
         pg = ray.util.placement_group(bundles, strategy="PACK")
         ray.get(pg.ready())
@@ -46,6 +57,13 @@ def build_cells(
     update_weights: bool = True,
     model_path: str | None = None,
 ):
+    # [FUNCTION DOC] HELPER: Builds num cells server cells (ids cell-0, cell-1, ...) sharing one
+    # placement group tuple. Args come from the rollout test args factory with 8 gpus per node and the
+    # given debug-train-only flag. Nodes per engine is computed from gpus per engine and 8 gpus per
+    # node; the per-node gpu count is the smaller of gpus per engine and 8. Cell i gets rank offset
+    # rank_offset + i * nodes per engine and gpu offset gpu_offset + i * nodes per engine * per-node
+    # gpus. Worker type, offload need, update-weights flag and model path pass through. Cells are only
+    # constructed, not started.
     """Build configured cells for one placement group.
 
     ``rank_offset`` is a global rank (engines of several groups share it), while
@@ -78,6 +96,8 @@ def build_cells(
 
 
 async def start_cells(cells, allocator=None, *, mark_alive: bool = False):
+    # [FUNCTION DOC] HELPER: Uses the given allocator or a new port allocator, starts all cells'
+    # engines concurrently with it, and if requested marks every cell alive (private call).
     """Start every cell's engines through one shared allocator."""
     import asyncio
 
@@ -91,6 +111,8 @@ async def start_cells(cells, allocator=None, *, mark_alive: bool = False):
 
 
 def kill_cells(cells) -> None:
+    # [FUNCTION DOC] HELPER: For each cell that is allocated, kills each of its actor handles with ray,
+    # ignoring errors. Cells that are not allocated are skipped.
     for cell in cells:
         if cell.is_allocated:
             for actor_handle in cell.actor_handles:
@@ -102,6 +124,8 @@ def kill_cells(cells) -> None:
 
 @pytest.fixture
 def mock_engine_class(ray_local_mode):
+    # [FUNCTION DOC] HELPER: Fixture returning the underlying (not ray-wrapped) class of the mock
+    # sglang engine actor.
     """Unwrapped MockSGLangEngine class.
 
     Production wraps via ``ray.remote(CommandActor)``; substituting the
@@ -114,6 +138,8 @@ def mock_engine_class(ray_local_mode):
 
 @pytest.fixture
 def patched_sglang_engine(monkeypatch, mock_engine_class):
+    # [FUNCTION DOC] HELPER: Fixture. Replaces the command actor name in the server cell module with
+    # the unwrapped mock engine class for the test (undone by the monkeypatch). Returns nothing.
     """Replace the engine CommandActor with the mock; the real addr allocator runs, and
     each mock engine serves HTTP on the port it is allocated, so the urls
     the cell derives from the allocator actually serve requests."""

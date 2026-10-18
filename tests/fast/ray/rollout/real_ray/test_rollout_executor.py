@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Tests of the rollout executor actor class (run in ray local mode with low-level collaborators
+# patched out). Covers process setup (http client, router and session server resolution), rollout
+# function construction and loading (including debug replay), generation (dp split, weight version
+# checks, custom conversion and reward hooks, delayed split), checkpoint save and load fan-out,
+# evaluation, weight versions, debug recorded data replay and injection, the legacy rollout protocol,
+# lifecycle disposal, epoch length, and checkpointing without a train rollout function. Fixtures patch
+# module-level helpers of the executor module; test doubles record calls.
 from __future__ import annotations
 
 import logging
@@ -24,6 +32,8 @@ from miles.utils.weight_version import max_rollouts_without_published_weight_ver
 
 @pytest.fixture
 def http_client_calls(monkeypatch) -> list[str]:
+    # [FUNCTION DOC] HELPER: Fixture. Replaces the executor module's http client initializer with a
+    # function that appends a marker string to a list, and returns that list.
     import miles.ray.rollout.rollout_executor as rexec
 
     recorded: list[str] = []
@@ -33,6 +43,9 @@ def http_client_calls(monkeypatch) -> list[str]:
 
 @pytest.fixture
 def own_args_resolutions(monkeypatch) -> list[tuple[str, object]]:
+    # [FUNCTION DOC] HELPER: Fixture. Replaces the executor module's router address resolver and session
+    # server readiness waiter with async recorders that append (name, args) to a list and return an
+    # empty mapping. Returns the list.
     import miles.ray.rollout.rollout_executor as rexec
 
     recorded: list[tuple[str, object]] = []
@@ -52,6 +65,10 @@ def own_args_resolutions(monkeypatch) -> list[tuple[str, object]]:
 
 @pytest.fixture
 def patch_low_level(monkeypatch, http_client_calls, own_args_resolutions):
+    # [FUNCTION DOC] HELPER: Fixture. Replaces the executor module's logger configuration, tracking
+    # initialization, function loaders, rollout and eval logging, and debug data saving with no-op
+    # functions (loaders return a no-op callable). Also depends on the http client and resolution
+    # recorders so they are active. Returns nothing.
     import miles.ray.rollout.rollout_executor as rexec
 
     monkeypatch.setattr(rexec, "configure_logger", lambda *a, **kw: None)
@@ -64,11 +81,16 @@ def patch_low_level(monkeypatch, http_client_calls, own_args_resolutions):
 
 
 class _NeverUsedProvider:
+    # [CLASS DOC] HELPER: Address provider stub that fails if asked for an address.
     async def get_addrs(self, worker_name: str):
+        # [FUNCTION DOC] HELPER: Always raises an assertion error saying the stubbed resolution must not
+        # query the provider.
         raise AssertionError("the stubbed resolution must not ask the provider for an address")
 
 
 async def _make_executor(args):
+    # [FUNCTION DOC] HELPER: Builds a rollout executor with one never-used router provider, no session
+    # server provider and a never-used inference controller provider, awaits its init, and returns it.
     executor = RolloutExecutor(
         args=args,
         router_providers=[_NeverUsedProvider()],
@@ -80,6 +102,8 @@ async def _make_executor(args):
 
 
 def _make_test_args(**overrides):
+    # [FUNCTION DOC] HELPER: Builds test args with router ip 127.0.0.1, port 30000, and wandb,
+    # tensorboard, mlflow and distributed post logging all off; overrides pass through.
     return make_args(
         sglang_router_ip="127.0.0.1",
         sglang_router_port=30000,

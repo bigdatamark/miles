@@ -1,3 +1,5 @@
+# [MODULE DOC]
+# Fixture helper that builds a session server config with test-friendly defaults.
 from __future__ import annotations
 
 from typing import Any
@@ -6,6 +8,12 @@ from miles.rollout.session.config import SessionServerConfig
 
 
 def make_session_server_config(**overrides: Any) -> SessionServerConfig:
+    # [FUNCTION DOC] Returns a session server config built from defaults updated by the keyword
+    # overrides (unknown names are rejected by the config constructor). Defaults: localhost, port 0, no
+    # instance id, backend url on localhost port 0, timeout 30, no checkpoint or chat template, tito model
+    # default, strict message matching, all replay and lora options off or empty, no speculative
+    # algorithm, no pause generation mode or custom pickers, zero top logprobs in selected mode, and
+    # rollout temperature 1.0.
     defaults: dict[str, Any] = dict(
         host="127.0.0.1",
         port=0,

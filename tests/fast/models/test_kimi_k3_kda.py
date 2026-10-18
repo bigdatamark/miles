@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Gpu tests (skipped without cuda or the fla package) of the KDA recurrence used by Kimi K3: packed
+# sequence boundaries must be honored through the cumulative sequence lengths, and the forward must not
+# mutate its inputs. Constants fix the kernel construction: 4 heads, head dim 128, gate lower bound -5.
 """Boundary and aliasing contracts of the KDA recurrence (``kda_recurrence``, which Kimi K3 runs).
 
 Both cases guard failure modes that are silent in training: the run keeps
@@ -23,9 +27,15 @@ _KDA_LOWER_BOUND = -5.0
 
 
 def _kda_inputs(seq_len: int, seed: int) -> dict[str, torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Seeds the global torch generator, then builds on the cuda device a mapping
+    # with: q, k, v, g as bfloat16 normal values scaled by 0.5 with shape 1, seq len, heads, head dim;
+    # beta logits as the logit of uniform values in [0,1] (clipped away from the ends by 1e-4), float32,
+    # shape 1, seq len, heads; A log as float32 normal per head; and dt bias as float32 normal of size
+    # heads times head dim. Side effect: reseeds the global generator.
     torch.manual_seed(seed)
 
     def activation() -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Returns one bfloat16 cuda tensor of normal values times 0.5.
         return torch.randn(1, seq_len, _KDA_HEADS, _KDA_HEAD_DIM, device="cuda", dtype=torch.bfloat16) * 0.5
 
     return {
@@ -40,6 +50,9 @@ def _kda_inputs(seq_len: int, seed: int) -> dict[str, torch.Tensor]:
 
 
 def _run_kda(inputs: dict[str, torch.Tensor], cu_seqlens: torch.Tensor | None) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Calls the recurrence with the mapping's tensors, the gate lower bound
+    # constant, the given cumulative sequence lengths (none means no boundaries) and no context-parallel
+    # context. Returns the output tensor.
     return kda_recurrence(
         inputs["q"],
         inputs["k"],
@@ -55,16 +68,25 @@ def _run_kda(inputs: dict[str, torch.Tensor], cu_seqlens: torch.Tensor | None) -
 
 
 def _require_kda() -> None:
+    # [FUNCTION DOC] HELPER: Skips the test if no cuda device is available or the fla kda ops module
+    # cannot be imported.
     if not torch.cuda.is_available():
         pytest.skip("CUDA device required to run the KDA kernels")
     pytest.importorskip("fla.ops.kda")
 
 
 def _relative_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    # [FUNCTION DOC] HELPER: Returns the l2 norm of the difference divided by the l2 norm of the
+    # expected tensor, computed in float32, as a python float.
     return ((actual - expected).float().norm() / expected.float().norm()).item()
 
 
 def test_kda_applies_packed_sequence_boundaries() -> None:
+    # [FUNCTION DOC] Packs two sequences of lengths 96 and 160 and runs the recurrence with boundaries
+    # 0, 96, 256. For each sequence, slices the inputs (per-head vectors with one dimension are shared),
+    # runs it alone, and asserts exact equality (zero tolerance) with the matching slice of the packed
+    # output. Then runs without boundaries and asserts the second sequence's output differs by more than
+    # 0.1 relative l2 (so the check is not vacuous) while the first sequence's output is exactly equal.
     """A packed batch must reproduce, per sequence, what that sequence produces alone.
 
     The rule routes boundaries through one of two mutually exclusive channels
@@ -104,6 +126,8 @@ def test_kda_applies_packed_sequence_boundaries() -> None:
 
 
 def test_kda_does_not_mutate_its_inputs() -> None:
+    # [FUNCTION DOC] Builds inputs of length 256 (seed 1), clones them, runs the recurrence with one
+    # sequence boundary pair, and asserts every input tensor is exactly equal to its clone.
     """The forward must leave q/k/v/g/beta_logits untouched.
 
     SGLang's vendored ``chunk_kda`` overwrote its ``v`` buffer with a WY-representation

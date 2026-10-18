@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Helpers for score-centering integration tests: a tiny tokenizer stand-in, a full argument namespace
+# with score-centering defaults, a builder of one fully populated completed sample with rollout top
+# logprobs, and a builder of a mock engine meta info mapping. All names are module private.
 """Small deterministic samples for score-centering integration tests."""
 
 from argparse import Namespace
@@ -9,11 +13,19 @@ from miles.utils.types import Sample
 
 
 class _Tokenizer:
+    # [CLASS DOC] HELPER: Minimal tokenizer stand-in that only supports decoding.
     def decode(self, tokens: list[int]) -> str:
+        # [FUNCTION DOC] HELPER: Returns the text form of the token id list (its printed list form),
+        # not a real detokenization.
         return str(tokens)
 
 
 def _args(**overrides: object) -> Namespace:
+    # [FUNCTION DOC] HELPER: Returns a namespace of defaults for a score-centering loss run (loss type
+    # score centering, three rollout top logprobs in selected mode, no opd, importance sampling none with
+    # truncated clip 2.0 and mismatch bounds 0.5 to 5.0, rollout temperature 0.7, top-p 1, top-k -1,
+    # grpo advantage without normalization, thd qkv format, log-prob chunk size 2, vocab size 8, zero
+    # entropy coefficient, no kl loss, and other flags off). Keyword overrides replace or add entries.
     values = dict(
         ci_test=False,
         loss_type="score_centering",
@@ -48,6 +60,13 @@ def _args(**overrides: object) -> Namespace:
 
 
 def _turn(prompt: list[int], output: list[int], probabilities: list[float]) -> Sample:
+    # [FUNCTION DOC] HELPER: Builds one completed sample (index 0, group 0, reward 1.0). Tokens are the
+    # prompt followed by the output; response length is the output length; response text is the printed
+    # output list; rollout log probs are the natural log of the given per-token probabilities (so the
+    # lists must have equal length, else an error is raised by the strict zip); loss mask is all ones
+    # over the output. Then builds an engine-style meta mapping where every output position lists the
+    # same full row of (logprob, token, none) entries as its top logprobs, and appends top logprobs for
+    # three ranks to the sample via the rollout top-logprobs utility (mutating the sample). Returns it.
     logps = np.log(probabilities).tolist()
     sample = Sample(
         tokens=prompt + output,
@@ -73,6 +92,9 @@ def _turn(prompt: list[int], output: list[int], probabilities: list[float]) -> S
 
 
 def _meta(output: list[int], probabilities: list[float]) -> dict:
+    # [FUNCTION DOC] HELPER: Builds an engine meta info mapping: output token logprobs as a list of
+    # (log probability, token, none) triples; output top logprobs repeating that whole list once per
+    # output token; and a finish reason of type stop. Lengths must match (strict pairing raises).
     entries = [(float(np.log(p)), token, None) for p, token in zip(probabilities, output, strict=True)]
     return {
         "output_token_logprobs": entries,

@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Fixtures and helpers for testing generate functions (old sglang rollout, single turn, multi turn and
+# agentic tool call variants) against a mock sglang server. Provides: command line assembly per
+# variant, a sample factory, an environment dataclass and result dataclass, a synchronous runner that
+# invokes the variant's generate function, a parsed-arguments factory, a context manager that starts
+# a session server in a background thread, and the pytest fixture that wires the mock server, the
+# arguments and (for agentic variants) module-level knobs of the mock tools module. Constants: default
+# model name, default mock response text (a boxed answer), default sampling parameters, and a mapping
+# from variant name to the dotted path of its generate function.
 """
 Fixtures to test custom-generate-function
 """
@@ -47,6 +56,13 @@ def extra_argv_for_variant(
     generate_execute_tool_function_path: str = "miles.utils.test_utils.mock_tools.execute_tool_call",
     custom_agent_function_path: str = "miles.utils.test_utils.mock_tools.run_agentic_tool_call",
 ) -> list[str]:
+    # [FUNCTION DOC] Builds the variant-specific command line tokens. Always starts with the custom
+    # generate function path flag, valued by the override if given, else the variant's mapped path (an
+    # unknown variant without an override raises a key error). For multi turn, appends the max turns
+    # (as text), tool specs path, execute-tool function path and tool call parser flags. For agentic tool
+    # call, appends the custom agent function path, forces the agent function mode to inline (the mock
+    # agent is steered through module state a subprocess could not see), and enables the session server
+    # at version v2 with the qwen3 tito model. Other variants add nothing. Returns the token list.
     argv = [
         "--custom-generate-function-path",
         custom_generate_function_path or VARIANT_TO_GENERATE_FN_PATH[variant],
@@ -72,6 +88,8 @@ def extra_argv_for_variant(
 
 
 def listify(x):
+    # [FUNCTION DOC] HELPER: Returns the input unchanged if it is a list, otherwise a new one-element
+    # list containing it (tuples are wrapped, not converted).
     return x if isinstance(x, list) else [x]
 
 
@@ -84,6 +102,10 @@ def make_sample(
     status: Sample.Status = Sample.Status.PENDING,
     multimodal_inputs: dict | None = None,
 ) -> Sample:
+    # [FUNCTION DOC] HELPER: Builds a sample from keyword-only arguments: prompt (text or chat message
+    # list, default a short arithmetic question), token ids (none becomes an empty list), response text,
+    # response length, status (default pending) and optional multimodal inputs. All other sample fields
+    # keep their defaults.
     return Sample(
         prompt=prompt,
         tokens=tokens or [],
@@ -96,12 +118,16 @@ def make_sample(
 
 @dataclass
 class GenerateEnv:
+    # [CLASS DOC] HELPER: Environment yielded by the generation fixture: the parsed arguments and the
+    # mock sglang server object (exposing a request log, a url and a port).
     args: Namespace
     mock_server: Any
 
 
 @dataclass
 class GenerateResult:
+    # [CLASS DOC] HELPER: Outcome of one generate run: the resulting sample or list of samples, and the
+    # list of request payloads the mock server received during that run.
     sample: Sample | list[Sample]
     requests: list[dict]
 
@@ -113,6 +139,10 @@ def run_generate(
     *,
     variant: str = "single_turn",
 ) -> GenerateResult:
+    # [FUNCTION DOC] Clears the mock server's request log, runs the async call helper to completion with
+    # the environment's args, the sample and the sampling params (default: the module default params),
+    # and returns a result with the generated sample(s) and a copy of the requests logged during the
+    # run. Side effects: mutates the sample in place (via the generate function) and the mock log.
     env.mock_server.request_log.clear()
     result_sample = run(
         _call_generate(
@@ -132,6 +162,10 @@ async def _call_generate(
     *,
     variant: str = "single_turn",
 ) -> Sample:
+    # [FUNCTION DOC] HELPER: Loads the variant's generate function by its dotted path, creates a
+    # generation state from the args, wraps the sample and a copy of the sampling params in a generate
+    # input (not evaluation), awaits the function and returns the output's samples field (a sample, or a
+    # list of samples for multi sample variants, despite the single-sample return annotation).
     generate_fn = load_generate_function(VARIANT_TO_GENERATE_FN_PATH[variant])
     state = GenerateState(args)
     input = GenerateFnInput(state=state, sample=sample, sampling_params=sampling_params.copy(), evaluation=False)
@@ -157,6 +191,16 @@ def make_args(
     num_layers: int | None = None,
     moe_router_topk: int | None = None,
 ) -> Namespace:
+    # [FUNCTION DOC] Builds a parsed argument namespace for a generation test. Steps: assemble a command
+    # line with fixed values (program name pytest, fsdp train backend, ci test mode, batch and rollout
+    # counts of one, one rollout gpu and one gpu per engine, the model as hf checkpoint, a null prompt
+    # data path, math reward type, router ip 127.0.0.1 with the given port, response length 16); add the
+    # optional chat template path, routing replay flag, speculative algorithm and max context length; add
+    # the variant tokens (see the variant command line helper; generate tool settings are forwarded);
+    # append any extra tokens; then parse with the real parser while the process argv is temporarily
+    # patched. Afterwards sets the num layers and moe router topk attributes directly when given (they are
+    # not command line flags in production), and initializes the global http client from the args
+    # (side effect). Returns the namespace.
     argv = [
         "pytest",
         "--train-backend",
@@ -225,6 +269,7 @@ def make_args(
 
 @contextmanager
 def _noop_port(port: int):
+    # [FUNCTION DOC] HELPER: Context manager that does nothing and yields the port.
     """No-op context manager that just yields the given port."""
     yield port
 
@@ -236,6 +281,13 @@ def with_session_server(
     *,
     port: int,
 ):
+    # [FUNCTION DOC] Context manager that runs a session server proxying to the backend url on
+    # localhost at the given port, and yields the port. Steps: set an instance id from the run uuid with
+    # a zero suffix; publish a single session server instance record (address and id) on the args; compute
+    # the server config from the args (the host, port, instance id and backend url); build the server and
+    # start its web app in a background uvicorn thread; yield; on exit (even on error) stop the thread.
+    # Side effect: mutates the args. Any decode-shape args must be set before this runs, since the config
+    # is computed here.
     # Mirror wait_session_server_ready (router_manager.py): publish the instance record,
     # id included, that OpenAIEndpointTracer.create picks from.
     instance_id = f"{args.run_uuid}-0"
@@ -263,6 +315,17 @@ def with_session_server(
 
 @pytest.fixture
 def generation_env(request, variant):
+    # [FUNCTION DOC] Pytest fixture that yields a generation environment. It needs a variant fixture
+    # from the requesting test and optionally an indirect parameter mapping with an args-kwargs mapping
+    # (forwarded to the args factory except model name and agentic return metadata, which are consumed
+    # here) and a process-fn-kwargs mapping (mock response text, finish reason, cached tokens, weight
+    # version, routed experts and speculative decoding counters). Steps: import the mock tools module
+    # lazily; clear all singleton instances; start the mock sglang server with a process function
+    # building its response from those kwargs; pick the router port (a free port from 31000 for agentic
+    # variants, else the mock server port); build the args; for agentic variants run a session server in
+    # front of the mock and set the mock tools module's max turns and return metadata globals; yield the
+    # environment. Teardown resets those two globals to none and clears singletons again. Nested
+    # function: process function that maps the kwargs to a process result.
     # tests/conftest.py imports this fixture for every test; load the tokenizer-backed helper only when it is used.
     from miles.utils.test_utils import mock_tools
 
@@ -273,6 +336,10 @@ def generation_env(request, variant):
     custom_generate_function_path = VARIANT_TO_GENERATE_FN_PATH[variant]
 
     def process_fn(_):
+        # [FUNCTION DOC] HELPER: Ignores the request payload and returns a process result built from
+        # the process-fn-kwargs mapping: text (default the module response text), finish reason
+        # (default stop), cached tokens (default 0), and meta info with weight version, routed experts
+        # and the three speculative decoding counters (all default none).
         x = params.get("process_fn_kwargs", {})
         return ProcessResult(
             text=x.get("response_text", RESPONSE_TEXT),

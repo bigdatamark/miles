@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Unit tests for the solver/verifier multi-policy example module: verifier reward scoring, verdict
+# parsing, gsm8k answer extraction and correctness, verifier sample construction, question
+# extraction from chat prompts, router url computation, the end-to-end generate function with a
+# faked single-turn generate, the launcher's prompt format, and per-policy eval data splitting.
+# Constants: the solver and verifier generate urls matching the fake router table. Helpers: a fake
+# generate callable recording calls, an input builder, a run helper, and eval args/samples builders.
 from argparse import Namespace
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,10 +24,15 @@ VERIFIER_URL = "http://verifier-host:2222/generate"
 
 @dataclass
 class _FakeGenerate:
+    # [CLASS DOC] HELPER: Fake replacement for the single-turn generate function. Holds a mapping from
+    # url to the canned response text, and a list of recorded (url, sample) calls in call order.
     responses: dict[str, str]
     calls: list[tuple[str, Sample]] = field(default_factory=list)
 
     async def __call__(self, input: GenerateFnInput, url: str | None = None) -> GenerateFnOutput:
+        # [FUNCTION DOC] HELPER: Records the url and the input's sample, sets the sample's response to the
+        # canned text for that url (a missing url raises a key error) and its status to completed, and
+        # returns a generate output wrapping that same sample object (mutated in place).
         sample = input.sample
         self.calls.append((url, sample))
         sample.response = self.responses[url]
@@ -29,6 +41,11 @@ class _FakeGenerate:
 
 
 def _make_input(*, prompt: str | list[dict[str, str]], label: str) -> GenerateFnInput:
+    # [FUNCTION DOC] HELPER: Builds a generate input. Args are a namespace with an encoded megatron
+    # config naming the two policies solver and verifier, no critic, and a router table mapping solver
+    # to host solver-host port 1111 and verifier to verifier-host port 2222. The sample has group index
+    # 3, index 7, the given prompt (raw string or message list) and label; sampling params are empty
+    # and evaluation is off.
     args = Namespace(
         megatron_config=encode_megatron_config("solver", "verifier"),
         use_critic=False,
@@ -40,11 +57,17 @@ def _make_input(*, prompt: str | list[dict[str, str]], label: str) -> GenerateFn
 
 @dataclass(frozen=True)
 class _RunResult:
+    # [CLASS DOC] HELPER: Immutable result of a helper run: the fake generate used (with its recorded
+    # calls) and the list of samples returned by the generate function.
     fake: _FakeGenerate
     samples: list[Sample]
 
 
 async def _run(monkeypatch, *, solver_response: str, verifier_response: str) -> _RunResult:
+    # [FUNCTION DOC] HELPER: Installs a fake generate (canned responses for the solver and verifier urls)
+    # in place of the module's single-turn generate via the monkeypatch, then runs the module's generate
+    # function on a one-message prompt asking what nine plus nine is, with label "#### 18". Returns the
+    # fake and the output samples.
     fake = _FakeGenerate(responses={SOLVER_URL: solver_response, VERIFIER_URL: verifier_response})
     monkeypatch.setattr(solver_verifier, "single_turn_generate", fake)
     output = await solver_verifier.generate(
@@ -54,8 +77,13 @@ async def _run(monkeypatch, *, solver_response: str, verifier_response: str) -> 
 
 
 class TestComputeVerifierReward:
+    # [CLASS DOC] Tests of the verifier score function, which maps (solver correct, verdict, verifier
+    # correct) to a pair of score and outcome label. Scores: full credit for agreeing with a right
+    # solver or for catching and fixing a wrong one, half for catching without fixing, otherwise zero.
     @pytest.mark.parametrize("verifier_correct", [False, True])
     def test_agreeing_with_a_right_solver_is_the_only_full_credit_case(self, verifier_correct):
+        # [FUNCTION DOC] Parametrized over verifier correctness. A right solver with an agree verdict
+        # scores 1.0 labelled right-solver-agreed regardless of the verifier's own answer.
         """The solver was right and the verifier said so, so its own answer never enters the score."""
         assert solver_verifier._compute_verifier_score(
             solver_correct=True, verdict=_Verdict.AGREE, verifier_correct=verifier_correct
@@ -63,6 +91,8 @@ class TestComputeVerifierReward:
 
     @pytest.mark.parametrize("verifier_correct", [False, True])
     def test_calling_a_right_solver_wrong_scores_zero(self, verifier_correct):
+        # [FUNCTION DOC] Parametrized over verifier correctness. Right solver with a wrong verdict scores
+        # 0.0 labelled right-solver-called-wrong.
         """A false accusation is worthless however good the verifier's replacement answer is."""
         assert solver_verifier._compute_verifier_score(
             solver_correct=True, verdict=_Verdict.WRONG, verifier_correct=verifier_correct
@@ -70,18 +100,24 @@ class TestComputeVerifierReward:
 
     @pytest.mark.parametrize("verifier_correct", [False, True])
     def test_agreeing_with_a_wrong_solver_scores_zero(self, verifier_correct):
+        # [FUNCTION DOC] Parametrized over verifier correctness. Wrong solver with an agree verdict
+        # scores 0.0 labelled wrong-solver-agreed.
         """Endorsing a wrong solution is the failure the verifier exists to avoid."""
         assert solver_verifier._compute_verifier_score(
             solver_correct=False, verdict=_Verdict.AGREE, verifier_correct=verifier_correct
         ) == (0.0, "wrong_solver_agreed")
 
     def test_catching_a_wrong_solver_without_fixing_it_scores_half(self):
+        # [FUNCTION DOC] Wrong solver, wrong verdict, incorrect verifier answer: scores 0.5 labelled
+        # wrong-solver-caught-not-fixed.
         """Spotting the error is worth partial credit even when the replacement answer is wrong."""
         assert solver_verifier._compute_verifier_score(
             solver_correct=False, verdict=_Verdict.WRONG, verifier_correct=False
         ) == (0.5, "wrong_solver_caught_not_fixed")
 
     def test_catching_a_wrong_solver_and_fixing_it_scores_full(self):
+        # [FUNCTION DOC] Wrong solver, wrong verdict, correct verifier answer: scores 1.0 labelled
+        # wrong-solver-caught-and-fixed.
         """Both halves of the verifier's job were done."""
         assert solver_verifier._compute_verifier_score(
             solver_correct=False, verdict=_Verdict.WRONG, verifier_correct=True
@@ -90,6 +126,8 @@ class TestComputeVerifierReward:
     @pytest.mark.parametrize("solver_correct", [False, True])
     @pytest.mark.parametrize("verifier_correct", [False, True])
     def test_an_unparseable_verdict_scores_zero(self, solver_correct, verifier_correct):
+        # [FUNCTION DOC] Parametrized over all four combinations of solver and verifier correctness. A
+        # missing (none) verdict scores 0.0 labelled invalid-verdict in every case.
         """A verdict nobody can read teaches the solver nothing, whatever the verifier meant."""
         assert solver_verifier._compute_verifier_score(
             solver_correct=solver_correct, verdict=None, verifier_correct=verifier_correct
@@ -97,100 +135,141 @@ class TestComputeVerifierReward:
 
 
 class TestParseVerdict:
+    # [CLASS DOC] Tests of the verdict parser: it reads a single line consisting of the uppercase
+    # marker word verdict, a colon, optional spaces, then exactly AGREE or WRONG with nothing else on
+    # the line and no leading indentation. Zero or several such lines give none.
     def test_the_verdict_line_the_prompt_asks_for_is_read(self):
+        # [FUNCTION DOC] A reply ending with the verdict agree line parses to the agree verdict.
         """The happy path the verifier prompt asks for."""
         assert solver_verifier._parse_verdict("The arithmetic checks out.\nVERDICT: AGREE") is _Verdict.AGREE
 
     def test_a_marker_inside_the_reasoning_is_not_a_verdict(self):
+        # [FUNCTION DOC] Marker words appearing in prose or on a bare line without the verdict prefix
+        # produce no verdict (none).
         """Otherwise 'I cannot decide: AGREE or WRONG' scores as if the verifier had ruled."""
         assert solver_verifier._parse_verdict("I would AGREE, but the sum is off.\nWRONG\n#### 18") is None
 
     def test_two_verdict_lines_are_unparseable(self):
+        # [FUNCTION DOC] Two conflicting verdict lines produce none.
         """A reply that rules twice never made up its mind, and picking one of them invents a decision."""
         response = "VERDICT: AGREE\nOn reflection:\nVERDICT: WRONG"
 
         assert solver_verifier._parse_verdict(response) is None
 
     def test_a_lowercase_verdict_is_not_a_verdict(self):
+        # [FUNCTION DOC] A fully lowercase verdict line gives none; matching is case sensitive.
         """Strict markers keep prose such as 'I agree with the setup' from scoring."""
         assert solver_verifier._parse_verdict("verdict: agree") is None
 
     def test_a_longer_word_containing_the_marker_is_not_a_verdict(self):
+        # [FUNCTION DOC] A verdict line whose value is a longer word that merely starts with agree gives
+        # none.
         """The verdict line holds the marker alone, so 'AGREEMENT' cannot be read as one."""
         assert solver_verifier._parse_verdict("VERDICT: AGREEMENT") is None
 
     def test_a_response_without_any_marker_is_unparseable(self):
+        # [FUNCTION DOC] An empty response gives none.
         """An empty or rambling reply has no verdict to score."""
         assert solver_verifier._parse_verdict("") is None
 
     def test_the_wrong_verdict_line_is_read(self):
+        # [FUNCTION DOC] A verdict wrong line in the middle of a reply, followed by an answer line,
+        # parses to the wrong verdict.
         """The other half of the protocol, and the only path that lets the verifier earn credit on a bad solution."""
         assert solver_verifier._parse_verdict("The sum is off.\nVERDICT: WRONG\n#### 18") is _Verdict.WRONG
 
     @pytest.mark.parametrize("response", ["VERDICT:AGREE", "VERDICT:   AGREE   "])
     def test_spacing_around_the_marker_is_tolerated(self, response):
+        # [FUNCTION DOC] Parametrized over no space after the colon, and many spaces after the colon
+        # plus trailing spaces. Both parse to the agree verdict.
         """Models are inconsistent about the space after the colon, and that is not a decision."""
         assert solver_verifier._parse_verdict(response) is _Verdict.AGREE
 
     def test_an_indented_verdict_line_is_not_a_verdict(self):
+        # [FUNCTION DOC] A verdict line indented by leading spaces gives none.
         """The prompt asks for a line of its own, so an indented one is quoted text rather than a ruling."""
         assert solver_verifier._parse_verdict("Example:\n    VERDICT: AGREE") is None
 
     def test_trailing_text_on_the_verdict_line_is_not_a_verdict(self):
+        # [FUNCTION DOC] Extra words after the value on the verdict line give none.
         """'VERDICT: AGREE with reservations' is a sentence, and reading it as a ruling invents certainty."""
         assert solver_verifier._parse_verdict("VERDICT: AGREE with reservations") is None
 
     def test_the_same_verdict_twice_is_still_unparseable(self):
+        # [FUNCTION DOC] Two identical verdict lines still give none: lines are counted, not distinct
+        # values.
         """Counting lines, not distinct values, keeps a repeated ruling from looking more decided than it is."""
         assert solver_verifier._parse_verdict("VERDICT: AGREE\nVERDICT: AGREE") is None
 
 
 class TestExtractAnswer:
+    # [CLASS DOC] Tests of the answer extractor: takes the text after the last four-hash marker if any,
+    # normalized (currency symbol, thousand separators and trailing period removed, sign kept);
+    # without a marker falls back to the last number in the text; none if there is no number.
     def test_the_gsm8k_marker_is_read(self):
+        # [FUNCTION DOC] A reply with the marker followed by 18 extracts the string 18.
         """Both the dataset label and the prompted reply end with '#### <answer>'."""
         assert solver_verifier._extract_answer("Half of 36 is 18.\n#### 18") == "18"
 
     def test_the_last_marker_wins(self):
+        # [FUNCTION DOC] With two markers (17 then 18) the later one is extracted.
         """A reply that reconsiders itself is scored on its final answer."""
         assert solver_verifier._extract_answer("#### 17\nOn reflection:\n#### 18") == "18"
 
     def test_a_marked_answer_is_normalized(self):
+        # [FUNCTION DOC] A marked answer with a dollar sign, a thousands comma and a trailing period
+        # normalizes to the plain digits 1234.
         """Currency, thousand separators and a trailing period are formatting, not the answer."""
         assert solver_verifier._extract_answer("#### $1,234.") == "1234"
 
     def test_a_reply_without_the_marker_falls_back_to_its_last_number(self):
+        # [FUNCTION DOC] Without a marker the last number in the text (18) is extracted.
         """The solver prompt comes from the dataset, so it need not ask for the marker."""
         assert solver_verifier._extract_answer("First 9, then 9, so the total is 18") == "18"
 
     def test_a_reply_without_any_number_has_no_answer(self):
+        # [FUNCTION DOC] A reply with no digits extracts none.
         """Nothing to compare against the ground truth."""
         assert solver_verifier._extract_answer("I cannot tell") is None
 
     def test_a_negative_marked_answer_keeps_its_sign(self):
+        # [FUNCTION DOC] A marked negative number is extracted with its minus sign.
         """gsm8k answers can be negative, and dropping the sign would score a wrong reply as right."""
         assert solver_verifier._extract_answer("#### -5") == "-5"
 
     def test_the_fallback_reads_the_last_number_not_the_first(self):
+        # [FUNCTION DOC] An unmarked reply with several numbers extracts the last one.
         """An unmarked reply states its result last, after restating the operands."""
         assert solver_verifier._extract_answer("From 20 we subtract 2, so 18") == "18"
 
     def test_the_marker_wins_over_a_later_bare_number(self):
+        # [FUNCTION DOC] When a marked answer is followed by text containing another number, the marked
+        # answer is still the one extracted.
         """Trailing prose such as a page reference must not overwrite the answer the model marked."""
         assert solver_verifier._extract_answer("#### 18\nsee step 3") == "18"
 
 
 class TestIsCorrect:
+    # [CLASS DOC] Tests of the correctness check, which extracts the answer from a reply and compares it
+    # with a normalized ground truth; a missing ground truth is never correct.
     def test_a_label_without_an_answer_never_matches(self):
+        # [FUNCTION DOC] With a ground truth of none the check returns false even for a marked reply.
         """A dataset row with no parseable answer must fail closed rather than reward everything."""
         assert not solver_verifier._is_correct("#### 18", ground_truth=None)
 
     def test_both_sides_are_normalized_before_comparing(self):
+        # [FUNCTION DOC] A reply with a currency-formatted marked number matches the plain ground truth
+        # 1234.
         """The label and the reply format the same number differently, and formatting is not a wrong answer."""
         assert solver_verifier._is_correct("#### $1,234.", ground_truth="1234")
 
 
 class TestBuildVerifierSample:
+    # [CLASS DOC] Tests of the verifier sample builder, which derives a new sample from a solver sample
+    # that already has a response.
     def test_the_verifier_sample_keeps_the_identity_of_the_solver_sample(self):
+        # [FUNCTION DOC] Builds a verifier sample from a solver sample with group index 3, index 7,
+        # rollout id 2 and a label; asserts the same group index, index, rollout id and label carry over.
         """Both samples belong to one trajectory, and the group is what advantage is computed over."""
         solver = Sample(group_index=3, index=7, rollout_id=2, prompt=[dict(role="user", content="q")], label="#### 18")
         solver.response = "#### 18"
@@ -201,6 +280,8 @@ class TestBuildVerifierSample:
         assert verifier.label == "#### 18"
 
     def test_the_metadata_is_copied_rather_than_shared(self):
+        # [FUNCTION DOC] Mutates the verifier sample's metadata and asserts the solver sample's metadata
+        # is unchanged, i.e. the mapping was copied.
         """The two samples are scored and dumped separately, so one must not write into the other's metadata."""
         solver = Sample(prompt=[dict(role="user", content="q")], metadata={"source": "gsm8k"})
         solver.response = "#### 18"
@@ -211,6 +292,7 @@ class TestBuildVerifierSample:
         assert solver.metadata == {"source": "gsm8k"}
 
     def test_the_routing_key_is_carried_over(self):
+        # [FUNCTION DOC] Asserts the verifier sample has the same routing key as the solver sample.
         """Consistent hashing routes both samples of a trajectory to the same engine."""
         solver = Sample(prompt=[dict(role="user", content="q")], routing_key="key-1")
         solver.response = "#### 18"
@@ -219,13 +301,18 @@ class TestBuildVerifierSample:
 
 
 class TestExtractQuestion:
+    # [CLASS DOC] Tests of question extraction from a message-list prompt: exactly one user message is
+    # the question and other roles are ignored.
     def test_a_system_message_is_not_quoted_as_the_question(self):
+        # [FUNCTION DOC] With a system message and a user message, only the user message content is
+        # returned.
         """Only the user turn holds the problem; quoting the system prompt would confuse the verifier."""
         prompt = [dict(role="system", content="Be brief."), dict(role="user", content="What is 9 + 9?")]
 
         assert solver_verifier._extract_question(prompt) == "What is 9 + 9?"
 
     def test_several_user_messages_are_refused(self):
+        # [FUNCTION DOC] With two user messages, extraction raises a value error.
         """This example assumes one question per sample, and silently picking one would mis-state the task."""
         prompt = [dict(role="user", content="a"), dict(role="user", content="b")]
 
@@ -234,7 +321,10 @@ class TestExtractQuestion:
 
 
 class TestComputeRouterUrl:
+    # [CLASS DOC] Tests of the router url computation from the router table in the args.
     def test_the_url_points_at_the_router_of_that_policy(self):
+        # [FUNCTION DOC] With a router table holding the solver at solver-host port 1111, the url for
+        # model id solver is the http url with that host and port and the generate path.
         """Nothing else routes by model id, so a wrong url would silently train one policy on the other's tokens."""
         args = Namespace(sglang_model_routers={"solver": ("solver-host", 1111)})
 
@@ -242,7 +332,13 @@ class TestComputeRouterUrl:
 
 
 class TestGenerate:
+    # [CLASS DOC] Async tests of the module's generate function with a faked single-turn generate. The
+    # function generates a solver sample, builds and generates a verifier sample, scores both, and
+    # returns the two samples in order solver then verifier.
     async def test_the_verifier_prompt_quotes_the_question_and_the_solver_answer(self, monkeypatch):
+        # [FUNCTION DOC] Runs the pipeline and inspects the second recorded call's prompt: it is a list
+        # whose first message has the user role and content containing both the question and the solver's
+        # full reply.
         """The verifier only sees the solver's work through the prompt this function assembles."""
         result = await _run(monkeypatch, solver_response="It is 18.\n#### 18", verifier_response="VERDICT: AGREE")
 
@@ -253,6 +349,8 @@ class TestGenerate:
         assert "It is 18.\n#### 18" in verifier_prompt[0]["content"]
 
     async def test_a_raw_string_prompt_is_refused(self, monkeypatch):
+        # [FUNCTION DOC] Fakes generate, passes a plain string prompt, and expects an assertion error
+        # whose message mentions chat templating.
         """A string prompt may already be chat templated, so quoting it as the question would leak tokens."""
         fake = _FakeGenerate(responses={SOLVER_URL: "#### 18", VERIFIER_URL: "VERDICT: AGREE"})
         monkeypatch.setattr(solver_verifier, "single_turn_generate", fake)
@@ -261,12 +359,15 @@ class TestGenerate:
             await solver_verifier.generate(_make_input(prompt="What is 9 + 9?", label="#### 18"))
 
     async def test_each_policy_is_generated_against_its_own_router(self, monkeypatch):
+        # [FUNCTION DOC] Asserts the recorded urls are the solver url first and the verifier url second.
         """Nothing routes by trainer_model_id, so the generate function picks the url itself."""
         result = await _run(monkeypatch, solver_response="#### 18", verifier_response="VERDICT: AGREE")
 
         assert [url for url, _ in result.fake.calls] == [SOLVER_URL, VERIFIER_URL]
 
     async def test_both_samples_are_returned_bound_to_their_own_policy(self, monkeypatch):
+        # [FUNCTION DOC] Asserts the returned solver sample has trainer model id solver and the verifier
+        # sample has verifier.
         """trainer_model_id is filled on return, and it is what sends each sample to its trainer."""
         result = await _run(monkeypatch, solver_response="#### 18", verifier_response="VERDICT: AGREE")
 
@@ -275,6 +376,8 @@ class TestGenerate:
         assert verifier_sample.trainer_model_id == "verifier"
 
     async def test_a_right_solver_endorsed_by_the_verifier_rewards_both(self, monkeypatch):
+        # [FUNCTION DOC] Right solver answer plus an agree verdict: solver reward is value 1.0 with
+        # outcome solver-correct; verifier reward is value 1.0 with outcome right-solver-agreed.
         """The end to end path of the full credit row of the reward matrix."""
         result = await _run(monkeypatch, solver_response="#### 18", verifier_response="Checks out.\nVERDICT: AGREE")
 
@@ -283,6 +386,8 @@ class TestGenerate:
         assert verifier_sample.reward == {"reward_value": 1.0, "outcome": "right_solver_agreed"}
 
     async def test_a_wrong_solver_corrected_by_the_verifier_rewards_only_the_verifier(self, monkeypatch):
+        # [FUNCTION DOC] Solver answers 17 (wrong), verifier says wrong and answers 18: solver reward 0.0
+        # with outcome solver-wrong; verifier reward 1.0 with outcome caught-and-fixed.
         """The solver is scored against the label, the verifier against what it did about the solver."""
         result = await _run(monkeypatch, solver_response="#### 17", verifier_response="VERDICT: WRONG\n#### 18")
 
@@ -294,6 +399,8 @@ class TestGenerate:
         }
 
     async def test_a_wrong_solver_caught_but_not_fixed_rewards_half(self, monkeypatch):
+        # [FUNCTION DOC] Solver answers 17, verifier says wrong and answers 16: verifier reward is 0.5
+        # with outcome caught-not-fixed.
         """The verifier's own answer is graded against the same ground truth."""
         result = await _run(monkeypatch, solver_response="#### 17", verifier_response="VERDICT: WRONG\n#### 16")
 
@@ -303,6 +410,8 @@ class TestGenerate:
         }
 
     async def test_a_run_naming_one_policy_is_refused(self, monkeypatch):
+        # [FUNCTION DOC] Replaces the input's megatron config with one naming only the solver and expects
+        # an assertion error saying the example pairs one solver policy with one verifier policy.
         """This example needs a solver and a verifier, and it must not silently train one of them twice."""
         fake = _FakeGenerate(responses={})
         monkeypatch.setattr(solver_verifier, "single_turn_generate", fake)
@@ -314,7 +423,13 @@ class TestGenerate:
 
 
 class TestTheLauncherLeavesThePromptAsMessages:
+    # [CLASS DOC] Tests that the prompt stays a message list end to end: the launcher must not request
+    # dataset-time chat templating, and the question extractor refuses templated strings.
     def test_the_e2e_test_does_not_ask_the_dataset_to_apply_the_chat_template(self):
+        # [FUNCTION DOC] Reads the launcher script source (found four directory levels above this test
+        # file, under the examples directory), drops lines that are comments, and asserts the remaining
+        # text contains the custom generate function flag with this module's generate path, and does not
+        # contain the apply-chat-template flag.
         """--apply-chat-template renders the messages into one templated string at dataset build time.
         This example quotes the question into a second prompt, which a string carrying special tokens
         cannot be used for, and a list prompt is chat templated at generation anyway. Getting this wrong
@@ -329,11 +444,14 @@ class TestTheLauncherLeavesThePromptAsMessages:
         assert "--apply-chat-template" not in launched
 
     def test_a_templated_string_prompt_is_refused_rather_than_quoted(self):
+        # [FUNCTION DOC] Passing a chat-templated string with special tokens to question extraction
+        # raises an assertion error saying the dataset must use messages.
         """The refusal is what keeps a prompt full of special tokens out of the verifier's question."""
         with pytest.raises(AssertionError, match="the dataset must use messages"):
             solver_verifier._extract_question("<|im_start|>user\nWhat is 9 + 9?<|im_end|>\n")
 
     def test_a_message_prompt_gives_up_its_question(self):
+        # [FUNCTION DOC] A system plus user message list yields the user message content.
         """The other half: the shape the launcher now preserves is the one this reads."""
         question = solver_verifier._extract_question(
             [dict(role="system", content="be terse"), dict(role="user", content="What is 9 + 9?")]
@@ -343,7 +461,13 @@ class TestTheLauncherLeavesThePromptAsMessages:
 
 
 class TestSplitEvalDataByPolicy:
+    # [CLASS DOC] Tests of the eval log hook that splits each eval dataset entry into one entry per
+    # policy, in place, keyed by dataset name plus slash plus the trainer model id.
     def test_a_mixed_eval_dataset_is_split_into_one_dataset_per_policy(self):
+        # [FUNCTION DOC] Builds one dataset with a solver and a verifier sample, calls the hook, and
+        # asserts it returns false (the default logging is suppressed), the mapping now has exactly the
+        # per-policy keys, and rewards and truncated flags are split to the matching policy (the verifier
+        # sample is the truncated one).
         """A mean over solver and verifier rewards together is a number no policy's learning can be read from."""
         data = {"gsm8k": dict(rewards=[1.0, 0.0], truncated=[False, True], samples=_eval_samples())}
 
@@ -357,6 +481,8 @@ class TestSplitEvalDataByPolicy:
         assert data["gsm8k/verifier"]["truncated"] == [True]
 
     def test_an_unattributed_sample_is_refused_rather_than_scored_under_a_guessed_policy(self):
+        # [FUNCTION DOC] With the first sample's trainer model id cleared, the hook raises an assertion
+        # error saying the sample carries no trainer model id.
         """A reward silently counted for the wrong policy would bend that policy's eval curve, not fail."""
         samples = _eval_samples()
         samples[0].trainer_model_id = None
@@ -367,10 +493,15 @@ class TestSplitEvalDataByPolicy:
 
 
 def _eval_args() -> Namespace:
+    # [FUNCTION DOC] HELPER: Returns a namespace with no eval reward key and the reward key
+    # reward_value.
     return Namespace(eval_reward_key=None, reward_key="reward_value")
 
 
 def _eval_samples() -> list[Sample]:
+    # [FUNCTION DOC] HELPER: Returns two eval samples of group 0 index 0: a completed solver sample
+    # with reward value 1.0, and a truncated verifier sample with reward value 0.5, each tagged with its
+    # trainer model id.
     solver_sample = Sample(group_index=0, index=0, prompt="p", label="#### 18")
     solver_sample.reward = {"reward_value": 1.0, "outcome": "solver_correct"}
     solver_sample.status = Sample.Status.COMPLETED
