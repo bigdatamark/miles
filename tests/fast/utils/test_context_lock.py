@@ -2185,6 +2185,8 @@ class TestEnforceLockDiscipline:
             # [CLASS DOC] HELPER: Enforced class with a class-level lock and a locked class method.
             context_lock = ContextLock("classmethod")
 
+            # [FUNCTION DOC] HELPER: Empty constructor marked exempt from locking so instances can be
+            # created without holding the lock. Takes no arguments, does nothing.
             @lock_exempt
             def __init__(self) -> None: ...
 

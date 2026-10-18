@@ -308,6 +308,8 @@ class TestWithLogs:
         """The cls field reflects the actual runtime instance, not where the method was defined."""
 
         class SubActor(FakeActor):
+            # [CLASS DOC] HELPER: Empty subclass of the fake actor, used to check that the logged
+            # class name comes from the runtime instance.
             pass
 
         with caplog.at_level(logging.INFO):
@@ -346,6 +348,8 @@ class TestWithLogs:
         """Cancelling an async call emits an info end line with cancelled=true and no traceback."""
 
         async def run() -> None:
+            # [FUNCTION DOC] HELPER: Starts the fake actor's wait-forever coroutine as a task, yields
+            # once to the loop so it begins, cancels it, and awaits it expecting a cancellation error.
             task = asyncio.ensure_future(FakeActor().wait_forever())
             await asyncio.sleep(0)
             task.cancel()

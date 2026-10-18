@@ -163,6 +163,9 @@ class TestTheRecorderCoversEveryBackendTheEnvironmentCanChoose:
             class SlurmCommandBackend(base_backend.BaseCommandBackend):
                 # [CLASS DOC] HELPER: Deliberately invalid backend subclass used only to trigger the
                 # definition-time check.
+                # [FUNCTION DOC] HELPER: Placeholder override of the public GPU-command method with an
+                # empty body; its mere presence in the subclass is what the definition-time check
+                # rejects. Never called.
                 def exec_command_gpu(self, cmd, capture_output=False, num_gpus_per_node=None): ...
 
 

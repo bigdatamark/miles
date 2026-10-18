@@ -121,6 +121,8 @@ class TestWriteTokenIdsToTmpfile:
 
 
 class TestGenerateTokenIds:
+    # [CLASS DOC] Tests of token-id generation from a prompt configuration, using a real tokenizer
+    # loaded through a class-scoped fixture (see the docstring below).
     """Uses real Qwen3-0.6B tokenizer."""
 
     @pytest.fixture(scope="class")

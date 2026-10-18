@@ -97,6 +97,9 @@ def test_true_on_policy_logprobs_honor_chunk_size(monkeypatch):
     original_log_softmax = torch.log_softmax
 
     def record_chunk_rows(input_: torch.Tensor, dim: int) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Wrapper around the original log-softmax that appends the number of
+        # rows (size of the first dimension) of each input to the recorded list, then delegates to
+        # the original with the same dimension and returns its result unchanged.
         chunk_rows.append(input_.size(0))
         return original_log_softmax(input_, dim=dim)
 

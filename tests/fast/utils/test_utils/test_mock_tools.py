@@ -75,6 +75,8 @@ class TestApplyChatTemplateWithTools:
 
 
 class TestSGLangFunctionCallParser:
+    # [CLASS DOC] Tests that pin the behaviors of the SGLang function-call parser that this
+    # repository relies on, so upstream breaking changes are detected.
     """Test to demonstrate and ensure SGLang function call parser have features we need without breaking changes."""
 
     @pytest.mark.parametrize(

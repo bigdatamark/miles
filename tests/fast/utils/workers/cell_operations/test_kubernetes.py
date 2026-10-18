@@ -213,6 +213,8 @@ class TestWatching:
         operations = _operations({"trainer-engine-actor-0": _info()})
 
         async def scenario():
+            # [FUNCTION DOC] HELPER: Lists cells of the trainer-engine-actor pool twice, then suspends
+            # the cell trainer-engine-actor-0, sequentially.
             await operations.cell_infos(pool_ids=["trainer-engine-actor"])
             await operations.cell_infos(pool_ids=["trainer-engine-actor"])
             await operations.suspend(cell_id="trainer-engine-actor-0")
@@ -228,6 +230,8 @@ class TestWatching:
         operations = _operations({"trainer-engine-actor-0": _info()}, start_delay=0.05)
 
         async def scenario():
+            # [FUNCTION DOC] HELPER: Issues three concurrent listings of the trainer-engine-actor pool
+            # and waits for all of them.
             await asyncio.gather(*[operations.cell_infos(pool_ids=["trainer-engine-actor"]) for _ in range(3)])
 
         asyncio.run(scenario())
