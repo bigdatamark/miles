@@ -1,3 +1,10 @@
+# [MODULE DOC] Image preprocessing for the Inkling vision tower without Hugging Face dependencies.
+# Images are optionally upscaled (long edge doubled, capped at 2048 unless already larger), cut into
+# square patches (rows rounded up, columns floor(width/patch)+1, so there is always one padded
+# column), normalized per channel with CLIP mean/std, and out-of-image cells are filled with a
+# normalized pad value (-1/255 raw). Output patches are bfloat16 with a size-2 axis (the same patch
+# repeated, as an expanded view) in the layout (patches, 2, height, width, channels). An optional
+# numba kernel computes the patches; otherwise a numpy version with identical math is used.
 from __future__ import annotations
 
 import io
@@ -21,6 +28,10 @@ def _scaled_image_dimensions(
     rescale_image_frac: float | None,
     rescale_image_max_upscaled_long_edge: int | None,
 ) -> tuple[int, int]:
+    # [FUNCTION DOC] HELPER: Returns (width, height) after rescaling. No scaling when the fraction is
+    # none, the long edge is zero, or the resulting ratio is exactly one. Target long edge is long edge
+    # times fraction, capped at max(cap, long edge) when a cap is given (so images already larger than
+    # the cap are never shrunk). Each side is scaled by the ratio, rounded half up, minimum 1.
     if rescale_image_frac is None:
         return width, height
     long_edge = max(width, height)
@@ -35,12 +46,18 @@ def _scaled_image_dimensions(
         return width, height
 
     def scale(value: int) -> int:
+        # [FUNCTION DOC] HELPER: Scales one side by the ratio, rounding half up, at least 1.
         return max(1, math.floor(float(value) * ratio + 0.5))
 
     return scale(width), scale(height)
 
 
 def _load_image_bytes(image) -> bytes:
+    # [FUNCTION DOC] HELPER: Bytes-like input is returned as bytes. Strings: URLs and data URIs raise
+    # a value error (must be resolved upstream); otherwise a path (file:// prefix stripped) read from
+    # disk. Other inputs (imaging-library image, tensor, or array) are converted: tensors move to host
+    # and are cast to unsigned bytes, arrays become images, non-RGB images are converted to RGB, then
+    # encoded as PNG in memory. Returns the bytes.
     """Coerce a single image input into raw PNG/JPEG bytes for preprocessing."""
     if isinstance(image, (bytes, bytearray, memoryview)):
         return bytes(image)
@@ -76,6 +93,11 @@ def _fill_patches_numpy(
     std: np.ndarray,
     pad_norm: np.ndarray,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Fills the preallocated output (patch count, size, size, 3) in place.
+    # Builds a float32 canvas of whole patches pre-filled with the pad value, normalizes the image as
+    # raw times 1/255, minus mean, over std, copies it into the top-left (truncating columns beyond the
+    # canvas), then reshapes into row-major patches. Patch rows = ceil(height / size), patch columns =
+    # floor(width / size) + 1.
     """Same math as the serving-side numba kernel: normalize in-image pixels,
     pad-fill out-of-image cells; float32 throughout (bit-equal op order:
     raw*inv255 -> -mean -> /std per channel)."""
@@ -99,6 +121,9 @@ try:
 
     @njit(cache=True)
     def _fill_patches_numba(arr, patch_size, patches, mean, std, pad_norm):  # pragma: no cover
+        # [FUNCTION DOC] HELPER: Compiled (cached) loop version of the same fill: for each patch index,
+        # for each pixel, writes the normalized value if the pixel lies inside the image, else the pad
+        # value, per channel. Writes into the output in place.
         h = arr.shape[0]
         w = arr.shape[1]
         nph = (h + patch_size - 1) // patch_size
@@ -129,6 +154,10 @@ except ImportError:  # pragma: no cover
 
 
 def encode_image_bytes(image_bytes: bytes, patch_size: int) -> torch.Tensor:
+    # [FUNCTION DOC] Raises a value error for non-positive patch size. Decodes the image to RGB,
+    # rescales (Lanczos resampling) per the module constants when the size changes, converts to an
+    # unsigned byte array, fills a float32 patch array, and returns a bfloat16 tensor of shape
+    # (patches, 2, size, size, 3) where the size-2 axis is an expanded (non-copied) repeat.
     if patch_size <= 0:
         raise ValueError("patch_size must be greater than zero")
 
@@ -161,12 +190,18 @@ def encode_image_bytes(image_bytes: bytes, patch_size: int) -> torch.Tensor:
 
 
 class InklingImagePatchifier:
+    # [CLASS DOC] Converts images to patch tensors with a fixed patch size (default 40).
     """images -> {vision_patches_bthwc, num_patches, num_tokens} (dict, no HF deps)."""
 
     def __init__(self, patch_size: int = 40):
+        # [FUNCTION DOC] Stores the patch size.
         self.patch_size = patch_size
 
     def preprocess(self, images: list | object) -> dict:
+        # [FUNCTION DOC] Accepts one image or a list/tuple; each is loaded to bytes and encoded.
+        # Returns a mapping: "vision_patches_bthwc" (all images' patches concatenated along dim 0; an
+        # empty 1-D tensor if no images), "num_patches" (per-image patch counts) and "num_tokens" (a
+        # copy of the counts; one token per patch).
         if not isinstance(images, (list, tuple)):
             images = [images]
 

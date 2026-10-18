@@ -1,3 +1,12 @@
+# [MODULE DOC] Transformer building blocks for the Inkling model on Megatron. Attention: per-layer
+# global or sliding-window attention with grouped keys/values, per-head relative-position logits
+# (a learned projection from a small relative feature to a bias over relative offsets), RMS-normed
+# queries/keys, optional short causal convolutions (sconv) on keys, values and the attention output,
+# four backends (generic bias-based Transformer-Engine attention, flex attention, fa4 kernel) and
+# context-parallel variants that all-gather keys/values. Router: sigmoid scoring with expert bias, joint
+# log-sigmoid softmax over selected routed experts plus shared experts, route scale and global scale,
+# stashing the shared-expert weights on the config. Shared experts module, MoE layer and dense MLP with
+# optional sconv residual. Settings are read from an "inkling" sub-config on the transformer config.
 """Inkling transformer layers: attention (dual global/SWA + rel bias + sconv), router
 (sigmoid + shared-expert joint renorm + global_scale), shared experts, MoE/dense MLP."""
 
@@ -35,7 +44,12 @@ _seqlens_from_packed = seqlens_from_packed
 
 
 class _Sconv(nn.Module):
+    # [CLASS DOC] HELPER: Depthwise short causal convolution with one weight per channel (shape
+    # channels, 1, kernel), applied per sequence segment, computed in float32 by a kernel chosen by
+    # name (default triton); a packed flag selects the packed-sequence kernel mode.
     def __init__(self, channels, kernel, dtype, impl="triton", packed=False):
+        # [FUNCTION DOC] HELPER: Creates a zero-initialized weight (checkpoint supplies values) and
+        # stores kernel size, implementation name and packed flag.
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(channels, 1, kernel, dtype=dtype))
         self.k = kernel
@@ -43,16 +57,34 @@ class _Sconv(nn.Module):
         self.packed = packed
 
     def forward(self, x, seqlens=None):
+        # [FUNCTION DOC] HELPER: Applies the convolution to x using the optional per-segment lengths
+        # so that it does not mix across segment boundaries; delegates to the ops kernel wrapper.
         return inkling_sconv_fp32_packed(x, self.weight, seqlens, impl=self.impl, packed=self.packed)
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        # [FUNCTION DOC] HELPER: Checkpoint hook: exposes the weight as a replicated (not tensor
+        # parallel sharded) tensor under the given prefix and offsets.
         from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 
         return make_sharded_tensors_for_checkpoint({"weight": self.weight}, prefix, sharded_offsets=sharded_offsets)
 
 
 class InklingSelfAttention(SelfAttention):
+    # [CLASS DOC] Self-attention whose layer kind (local sliding-window versus global) comes from the
+    # inkling sub-config's local layer ids. Local layers use their own head counts, head dim and
+    # window; the relative-position extent is the window for local layers. Scale is 1 over head dim
+    # (not its square root). Input/output sequence-major, single batch of packed tokens.
     def __init__(self, config, submodules, layer_number, attn_mask_type=AttnMaskType.causal, **kw):
+        # [FUNCTION DOC] Calls the base constructor, then reads layer kind and sizes from the inkling
+        # sub-config; local heads are divided by tensor parallel size (kv heads at least 1). Replaces
+        # the qkv projection with a layer-norm-fused column-parallel linear producing queries, keys,
+        # values and per-head relative features in one output (q+2kv+rel widths), and the output
+        # projection with a row-parallel linear; builds query and key RMS norms (Transformer Engine),
+        # a frozen zero relative projection (rel feature dim by extent), the attention window (left
+        # window minus one, none right for local layers; unbounded otherwise), a Transformer-Engine
+        # dot-product attention module (sbhd format, no dropout), a block-mask cache dictionary, and, if
+        # sconv is used, key and value convolutions (tensor-parallel flagged, partitioned on dim 0) and
+        # an attention-output convolution; else those are none.
         super().__init__(config, submodules, layer_number, attn_mask_type=attn_mask_type, **kw)
         t = config.inkling
         self.is_local = (layer_number - 1) in t.local_layer_ids
@@ -129,6 +161,18 @@ class InklingSelfAttention(SelfAttention):
         packed_seq_params=None,
         **kw,
     ):
+        # [FUNCTION DOC] Casts hidden states to the parameter dtype, flattens to tokens by features,
+        # applies the fused qkv projection and splits into queries, keys, values and relative
+        # features (local-per-rank sizes). Without context parallelism: segment lengths come from the
+        # packed parameters; they are stored on the inkling sub-config (side effect, read later by the
+        # MLP convolutions); key/value convolutions; queries and keys RMS-normed per head; relative
+        # features reshaped; attend. With context parallelism: keys and values are all-gathered across
+        # the cp group first (so keys span the full sequence, queries stay local), lengths computed for
+        # the full length, and the cp variant of attention is used with this rank's query offset (rank
+        # times local token count; contiguous layout assumed). Flex backend uses the flex variant. The
+        # output goes through the output projection (singleton batch dim added), and the attention
+        # output convolution is applied via the sequence-parallel-aware residual conv helper if enabled.
+        # Returns (output, bias). Mask, inference context, rotary and bias arguments are ignored.
         if hidden_states.dtype != self.config.params_dtype:
             hidden_states = hidden_states.to(self.config.params_dtype)
         sq = hidden_states.shape[0]
@@ -173,6 +217,10 @@ class InklingSelfAttention(SelfAttention):
         return proj_out, proj_bias
 
     def _attend(self, q, k, v, r, seqlens):
+        # [FUNCTION DOC] HELPER: Dispatch by backend name: fa4 computes float32 relative logits (token,
+        # head, extent) from the relative features and calls the fa4 kernel with window, locality flag,
+        # scale and extent, returning (tokens, heads times head dim); flex uses the flex path; any
+        # other value uses the generic bias path.
         if self.attn_backend == "fa4":
             from miles_plugins.models.inkling.ops import inkling_fa4_attention as _fa4
 
@@ -185,6 +233,12 @@ class InklingSelfAttention(SelfAttention):
         return self._seg(q, k, v, r, seqlens)
 
     def _seg(self, q, k, v, r, seqlens=None):
+        # [FUNCTION DOC] HELPER: Generic attention with a dense additive bias. Relative logits (float32)
+        # are gathered into a (heads, T, T) bias at relative offset query minus key where the offset is
+        # in [0, extent), zero elsewhere; with more than one segment, cross-segment pairs get a large
+        # negative value (-1e9). Calls the Transformer-Engine attention (batch dim 1, causal mask,
+        # configured window, post-scale bias). Memory is quadratic in token count. Returns
+        # (T, heads times head dim).
         T, nh_l, hd = q.shape
         rl = torch.einsum("thd,de->the", r.float(), self.rel_proj.float())
         RE = rl.shape[-1]
@@ -213,6 +267,11 @@ class InklingSelfAttention(SelfAttention):
         return ctx.reshape(T, nh_l * hd)
 
     def _seg_cp(self, q, k, v, r, seqlens, q_off, T_full):
+        # [FUNCTION DOC] HELPER: Context-parallel version of the dense-bias path: local queries (global
+        # offset q_off) against full-length keys. Bias is the relative bias as above with offsets from
+        # global query positions; a mask (future keys, keys beyond the local window, and cross-segment
+        # pairs) is folded into the bias as -1e9 and the attention call uses no mask type. Returns
+        # (local tokens, heads times head dim).
         T_loc, nh_l, hd = q.shape
         rl = torch.einsum("thd,de->the", r.float(), self.rel_proj.float())
         RE = rl.shape[-1]
@@ -242,11 +301,16 @@ class InklingSelfAttention(SelfAttention):
         return ctx.reshape(T_loc, nh_l * hd)
 
     def _seg_id(self, seqlens, T, device):
+        # [FUNCTION DOC] HELPER: Returns a per-token segment index vector built from segment lengths,
+        # or none when there is at most one segment (no masking needed). T is unused.
         if seqlens is None or len(seqlens) <= 1:
             return None
         return torch.repeat_interleave(torch.arange(len(seqlens), device=device), torch.tensor(seqlens, device=device))
 
     def _block_mask(self, mask_mod, q_len, kv_len, key, device):
+        # [FUNCTION DOC] HELPER: Returns a compiled flex-attention block mask from a per-instance cache
+        # keyed by the given key; on a miss builds it (no batch/head dims, compiled) and stores it,
+        # first clearing the whole cache if it holds more than 128 entries.
         bm = self._bm_cache.get(key)
         if bm is None:
             if len(self._bm_cache) > 128:
@@ -264,6 +328,12 @@ class InklingSelfAttention(SelfAttention):
         return bm
 
     def _seg_flex(self, q, k, v, r, seqlens=None):
+        # [FUNCTION DOC] HELPER: Flex-attention path. Relative logits are laid out (heads, T, extent);
+        # the score modifier adds the logit at clamped offset (query minus key) where the offset is in
+        # [0, extent); the mask modifier allows causal pairs within the same segment and, for local
+        # layers, within the window. Block mask cached by (T, segment tuple, locality). Runs the
+        # compiled flex kernel with scale 1/head dim and grouped-query support on tensors permuted to
+        # (1, heads, tokens, dim). Returns (T, heads times head dim).
         T, nh_l, hd = q.shape
         RE, W, is_local = self.rel_extent, self.window[0], self.is_local
         rl = torch.einsum("thd,de->the", r.float(), self.rel_proj.float())
@@ -271,6 +341,8 @@ class InklingSelfAttention(SelfAttention):
         seg_id = self._seg_id(seqlens, T, q.device)
 
         def score_mod(score, b, h, q_idx, kv_idx):
+            # [FUNCTION DOC] HELPER: Adds the head's relative logit at the clamped offset when the
+            # offset is within the extent; otherwise leaves the score unchanged.
             rd = q_idx - kv_idx
             idx = torch.clamp(rd, 0, RE - 1)
             bias = rel_logits[h, q_idx, idx]
@@ -278,6 +350,8 @@ class InklingSelfAttention(SelfAttention):
             return torch.where(valid, score + bias.to(score.dtype), score)
 
         def mask_mod(b, h, q_idx, kv_idx):
+            # [FUNCTION DOC] HELPER: True where the key is not after the query, in the same segment (if
+            # segments exist), and within the window (local layers).
             m = q_idx >= kv_idx
             if seg_id is not None:
                 m = m & (seg_id[q_idx] == seg_id[kv_idx])
@@ -301,6 +375,10 @@ class InklingSelfAttention(SelfAttention):
         return out.squeeze(0).permute(1, 0, 2).reshape(T, nh_l * hd)
 
     def _seg_cp_flex(self, q, k, v, r, seqlens, q_off, T_full):
+        # [FUNCTION DOC] HELPER: Context-parallel flex path: same as the flex path but local query
+        # index q_idx maps to global position q_off plus q_idx against full-length keys; the block mask
+        # cache key additionally includes the local length, full length and offset. Returns
+        # (local tokens, heads times head dim).
         T_loc, nh_l, hd = q.shape
         RE, W, is_local = self.rel_extent, self.window[0], self.is_local
         rl = torch.einsum("thd,de->the", r.float(), self.rel_proj.float())
@@ -308,6 +386,8 @@ class InklingSelfAttention(SelfAttention):
         seg = self._seg_id(seqlens, T_full, q.device)
 
         def score_mod(score, b, h, q_idx, kv_idx):
+            # [FUNCTION DOC] HELPER: As the non-cp score modifier but offset uses the global query
+            # position; the relative logits are indexed by the local query index.
             rd = (q_off + q_idx) - kv_idx
             idx = torch.clamp(rd, 0, RE - 1)
             bias = rel_logits[h, q_idx, idx]
@@ -315,6 +395,7 @@ class InklingSelfAttention(SelfAttention):
             return torch.where(valid, score + bias.to(score.dtype), score)
 
         def mask_mod(b, h, q_idx, kv_idx):
+            # [FUNCTION DOC] HELPER: Causal (by global position), same-segment, and window mask.
             gq = q_off + q_idx
             rd = gq - kv_idx
             m = rd >= 0
@@ -346,6 +427,12 @@ class InklingSelfAttention(SelfAttention):
         return out.squeeze(0).permute(1, 0, 2).reshape(T_loc, nh_l * hd)
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        # [FUNCTION DOC] Takes the base sharded state; replaces the fused qkv weight entry (if present)
+        # with a factory that on build splits the local weight along dim 0 into named q, k, v and r
+        # components, each a tensor-parallel-sharded tensor with the same offsets plus a tp axis at
+        # the prepend position; on merge concatenates components back along dim 0. If sconv is on,
+        # replaces the key and value convolution weight entries with tensor-parallel (axis 0) sharded
+        # tensors. Returns the mapping.
         from megatron.core.dist_checkpointing import ShardedTensor
         from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory
         from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
@@ -363,6 +450,9 @@ class InklingSelfAttention(SelfAttention):
             def _qkvr_build(
                 key, t, replica_id, flattened_range, _s=splits, _so=so, _p=prepend, _tr=tp_rank, _ts=tp_size
             ):
+                # [FUNCTION DOC] HELPER: Factory build hook (defaults bind splits/offsets/ranks).
+                # Splits the tensor and returns a list of sharded tensors named key.q/k/v/r. The
+                # flattened range argument is ignored.
                 comps = torch.split(t, _s, dim=0)
                 return [
                     ShardedTensor.from_rank_offsets(
@@ -372,6 +462,7 @@ class InklingSelfAttention(SelfAttention):
                 ]
 
             def _qkvr_merge(sub):
+                # [FUNCTION DOC] HELPER: Factory merge hook: concatenates the component tensors on dim 0.
                 return torch.cat(list(sub), dim=0)
 
             sd[qkey] = ShardedTensorFactory(
@@ -388,7 +479,14 @@ class InklingSelfAttention(SelfAttention):
 
 
 class InklingRouter(TopKRouter):
+    # [CLASS DOC] Top-k router that scores routed experts with a sigmoid plus expert bias, and gives
+    # weights by a softmax over log-sigmoid of the selected routed logits jointly with logits from a
+    # learned shared-expert gate, so routed and shared weights are renormalized together. Has a
+    # one-entry cache so a second call on the same input returns the first result.
     def __init__(self, *args, **kw):
+        # [FUNCTION DOC] Calls the base constructor; adds a zero shared-gate matrix (shared experts by
+        # hidden size, parameter dtype), a float32 global scale parameter initialized to one (kept in
+        # float32), and empty cache fields.
         super().__init__(*args, **kw)
         H = self.config.hidden_size
         ns = self.config.inkling.n_shared_experts
@@ -399,6 +497,17 @@ class InklingRouter(TopKRouter):
         self._cache = None
 
     def forward(self, input, padding_mask=None, input_ids=None, packed_seq_params=None):
+        # [FUNCTION DOC] Returns (routing probabilities over routed experts, boolean routing map). If
+        # the cache holds a result for the same input (device pointer and shape), returns it and clears
+        # the cache. Otherwise: maintains the float32 expert bias; routed logits from the gating layer
+        # (float32) and shared logits from the shared gate; selection score = sigmoid of logits plus
+        # expert bias; top-k expert ids chosen through the routing replay manager (record/replay
+        # aware); selected raw logits concatenated with shared logits, log-sigmoid, softmax across them,
+        # times route scale and global scale; routed part scattered into a dense probability matrix and
+        # the map; the shared part stored on the inkling sub-config (side effect, read by the shared
+        # experts); expert bias handling applied to the map with the padding mask. Output probabilities
+        # are cast to the input dtype unless the router dtype is float32/float64. Input ids and packed
+        # parameters are unused.
         key = (input.data_ptr(), tuple(input.shape))
         if self._cache_key == key and self._cache is not None:
             probs, routing_map = self._cache
@@ -431,7 +540,12 @@ class InklingRouter(TopKRouter):
 
 
 class InklingSharedExperts(MegatronModule):
+    # [CLASS DOC] A list of shared expert MLPs, each applied to all tokens and weighted per token by
+    # the weights the router stashed on the config; outputs are summed in float32.
     def __init__(self, config, submodules=None, gate=False, pg_collection=None, name=None):
+        # [FUNCTION DOC] Builds one MLP per shared expert from a shallow copy of the config whose
+        # ffn hidden size is the inkling intermediate size, using the tensor-parallel group of the
+        # collection if given. The gate argument is unused.
         super().__init__(config=config)
         ns = config.inkling.n_shared_experts
         inter = config.inkling.intermediate_size
@@ -454,6 +568,11 @@ class InklingSharedExperts(MegatronModule):
         )
 
     def forward(self, hidden_states):
+        # [FUNCTION DOC] Reads the shared weights stashed by the router (must have run first),
+        # reshapes to (sequence, batch, experts), gathers over the sequence-parallel group when
+        # sequence parallel and tensor parallel size is above one. For each expert: first linear, fused
+        # swiglu in float32 with a per-token scale equal to that expert's weight, second linear. Returns
+        # the float32-accumulated sum over experts.
         sw = self.config.inkling._shared_w
         s, b, h = hidden_states.shape
         sw_ = sw.view(s, b, -1)
@@ -469,6 +588,10 @@ class InklingSharedExperts(MegatronModule):
         return inkling_sum_fp32(ys)
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        # [FUNCTION DOC] Takes the base state and, per expert, re-registers the first linear weight as a
+        # tensor-parallel (axis 0) sharded tensor wrapped in the swiglu factory (honoring the metadata's
+        # singleton-local-shards flag) and the second linear weight as tensor-parallel axis 1. Returns
+        # the mapping.
         sd = super().sharded_state_dict(prefix, sharded_offsets, metadata)
         from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
         from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
@@ -490,7 +613,13 @@ class InklingSharedExperts(MegatronModule):
 
 
 class InklingMoELayer(MoELayer):
+    # [CLASS DOC] MoE layer that computes routing before the shared experts (so the router's shared
+    # weights exist) and caches it for the later routed pass, and optionally applies a residual short
+    # convolution (sconv) to the layer output using segment lengths recorded by attention.
     def __init__(self, *args, **kw):
+        # [FUNCTION DOC] Calls the base constructor and builds the output convolution over hidden size
+        # (kernel, implementation and packed mode from the inkling sub-config) when sconv is enabled,
+        # else none.
         super().__init__(*args, **kw)
         t = self.config.inkling
         self.mlp_sconv = (
@@ -506,6 +635,9 @@ class InklingMoELayer(MoELayer):
         )
 
     def shared_experts_compute(self, hidden_states):
+        # [FUNCTION DOC] When shared experts are used without overlap, runs the router now and stores
+        # its result and the input identity (device pointer and shape) in the router's cache so the
+        # later routing call returns it without recomputation. Then returns the base class result.
         if self.use_shared_expert and not self.shared_expert_overlap:
             probs, routing_map = self.router(hidden_states)
             self.router._cache_key = (hidden_states.data_ptr(), tuple(hidden_states.shape))
@@ -513,6 +645,9 @@ class InklingMoELayer(MoELayer):
         return super().shared_experts_compute(hidden_states)
 
     def forward(self, hidden_states, *args, **kw):
+        # [FUNCTION DOC] Casts input to the parameter dtype, runs the base MoE forward, then applies
+        # the sconv residual convolution (with segment lengths from the config, if recorded) when
+        # enabled. Returns (output, bias).
         if hidden_states.dtype != self.config.params_dtype:
             hidden_states = hidden_states.to(self.config.params_dtype)
         out, bias = super().forward(hidden_states, *args, **kw)
@@ -523,7 +658,12 @@ class InklingMoELayer(MoELayer):
 
 
 class InklingDenseMLP(MLP):
+    # [CLASS DOC] Dense MLP using a float32 fused swiglu, an optional learned scalar output scale
+    # (when the sub-config enables global scale), and the optional residual sconv.
     def __init__(self, *args, **kw):
+        # [FUNCTION DOC] Calls the base constructor; builds the sconv (as in the MoE layer) and, if
+        # enabled in the sub-config (default off), a single-element scale parameter initialized to one
+        # in the parameter dtype.
         super().__init__(*args, **kw)
         t = self.config.inkling
         self.mlp_sconv = (
@@ -544,6 +684,9 @@ class InklingDenseMLP(MLP):
         )
 
     def forward(self, hidden_states, *args, **kw):
+        # [FUNCTION DOC] Casts input to the parameter dtype; first linear; fused float32 swiglu;
+        # second linear; multiplies by the global scale if present; applies the sconv residual with
+        # recorded segment lengths if enabled. Returns (output, bias).
         if hidden_states.dtype != self.config.params_dtype:
             hidden_states = hidden_states.to(self.config.params_dtype)
         fc1_out, _ = self.linear_fc1(hidden_states)
@@ -557,6 +700,8 @@ class InklingDenseMLP(MLP):
         return out, bias
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        # [FUNCTION DOC] Base state plus, when a global scale exists, that parameter registered as a
+        # replicated sharded tensor. Returns the mapping.
         sd = super().sharded_state_dict(prefix, sharded_offsets, metadata)
         if self.global_scale is not None:
             from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint

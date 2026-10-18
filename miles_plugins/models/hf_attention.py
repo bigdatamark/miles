@@ -1,3 +1,9 @@
+# [MODULE DOC] Base class for attention layers that delegate computation to a Hugging Face style
+# implementation (for example linear attention) inside Megatron. Handles sequence-parallel gathering,
+# context-parallel relayout (either native "hybrid" CP where the inner module does its own state
+# passing, or a gather-everything fallback that runs the inner module on the full sequence and
+# re-slices into the zigzag layout), and the batch-major permutation the inner module expects. Also
+# provides a custom all-gather for duplicated computation and a helper that configures hybrid CP.
 import logging
 from abc import ABC, abstractmethod
 
@@ -16,6 +22,9 @@ logger = logging.getLogger(__name__)
 
 
 class _AllGatherForDuplicatedComputation(torch.autograd.Function):
+    # [CLASS DOC] HELPER: Autograd function: forward all-gathers a tensor over a group and returns a
+    # tuple with one tensor per rank; backward returns only the gradient of this rank's own entry
+    # (no cross-rank reduction), correct when downstream computation is duplicated on every rank.
     """All-gather whose backward just returns the local gradient slice (no reduce).
 
     Use this instead of ``dist.nn.all_gather`` when the computation after the
@@ -27,6 +36,8 @@ class _AllGatherForDuplicatedComputation(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, group):
+        # [FUNCTION DOC] HELPER: Saves group and rank on the context, allocates one empty tensor per
+        # rank, runs a blocking all-gather of the contiguous input, returns the tuple of gathered tensors.
         ctx.group = group
         ctx.rank = dist.get_rank(group=group)
         out = [torch.empty_like(x) for _ in range(dist.get_world_size(group=group))]
@@ -35,10 +46,15 @@ class _AllGatherForDuplicatedComputation(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *grads):
+        # [FUNCTION DOC] HELPER: Returns this rank's gradient entry for the input and none for group.
         return grads[ctx.rank], None
 
 
 class HuggingfaceAttention(MegatronModule, ABC):
+    # [CLASS DOC] Abstract Megatron attention module. Subclasses implement the hook that maps
+    # batch-major hidden states (batch, sequence, hidden) plus packed sequence parameters to an
+    # output of the same layout. The class flag hybrid_cp (default false) says the inner module
+    # handles context parallelism natively.
     """Attention layer abstract class.
 
     This layer only contains common modules required for the "self attn" and
@@ -58,6 +74,10 @@ class HuggingfaceAttention(MegatronModule, ABC):
         pg_collection=None,
         name: str | None = None,
     ):
+        # [FUNCTION DOC] Stores args, config, the one-based Megatron layer number and the zero-based
+        # Hugging Face layer index; loads the HF config from the checkpoint path in args (file I/O) and
+        # sets its attention implementation to flash attention 2 (hard coded). The communication type,
+        # process-group collection and name arguments are unused.
         super().__init__(config=config)
         self.args = args
         self.config = config
@@ -84,6 +104,22 @@ class HuggingfaceAttention(MegatronModule, ABC):
         *,
         inference_params: BaseInferenceContext | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC] Input (sequence, batch, hidden) with required packed sequence parameters
+        # (assertion); only the query cumulative lengths are used, all other arguments ignored.
+        # (1) With sequence parallel: gather the sequence over the tensor-parallel group, with the
+        # backward splitting rather than reduce-scattering (inner module is duplicated). (2) With
+        # context parallel size above one and hybrid CP: unless the all-gather-CP data layout is in
+        # use (already contiguous shards), convert from zigzag to packed contiguous shards. (3) With CP
+        # and not hybrid: all-gather every rank's hidden states (duplicated-computation gather), then
+        # per sequence reassemble the global order: for each sequence take, in rank order, each rank's
+        # first half-chunk, followed by the second half-chunks in reverse rank order, and concatenate.
+        # (4) Permute to batch-major, call the hook, permute back. (5) Reverse the CP relayout:
+        # hybrid converts packed shards back to zigzag (unless all-gather CP); non-hybrid slices each
+        # sequence into twice cp-size chunks and keeps chunk rank and chunk (2*cp-1-rank). (6) With
+        # sequence parallel, scatter back along the sequence. Returns (output, none).
+        # KNOWN ISSUE: the non-hybrid path assumes every sequence length is divisible by twice the cp
+        # size and takes lengths from tensor elements (host synchronization per sequence); a todo in
+        # the code notes this. An unused local (chunk size) is computed in the output re-slicing loop.
         assert packed_seq_params is not None
         cu_seqlens = packed_seq_params.cu_seqlens_q
 
@@ -178,10 +214,16 @@ class HuggingfaceAttention(MegatronModule, ABC):
 
     @abstractmethod
     def hf_forward(self, hidden_states, packed_seq_params):
+        # [FUNCTION DOC] Abstract hook: takes batch-major hidden states and packed sequence parameters,
+        # returns the attention output in the same layout.
         """Huggingface forward function"""
 
 
 def detect_and_setup_hybrid_cp(model: nn.Module, cp_group: dist.ProcessGroup, cp_rank: int, cp_world_size: int) -> int:
+    # [FUNCTION DOC] Walks all submodules; for each HF attention wrapper that has a linear-attention
+    # submodule attribute, stores the cp group, rank and world size on that submodule and sets the
+    # wrapper's hybrid flag true (instance attribute). Logs the count at info level when positive and
+    # returns the count. Mutates modules.
     """Scan for GatedDeltaNet modules and configure them for native fla CP."""
     count = 0
     for module in model.modules():

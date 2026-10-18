@@ -1,3 +1,9 @@
+# [MODULE DOC] Multimodal tower modules for Inkling and the logic that wires them into the language
+# model's forward. Towers: an audio encoder (embedding table over mel-bin and bin-value pairs, summed
+# over mel bins, optional RMS norm) and a vision encoder wrapper around the hierarchical-MLP patch
+# encoder. Helpers load tower weights from Hugging Face safetensors shards and construct the towers
+# (frozen unless training), and a wiring function wraps the model's forward so that, on the first
+# pipeline stage, tower outputs replace the embeddings at given token positions before the decoder runs.
 from __future__ import annotations
 
 import json
@@ -9,7 +15,13 @@ from miles_plugins.models.inkling.vision_encoder import HMLPPatchEncoder, Inklin
 
 
 class InklingAudioEncoder(nn.Module):
+    # [CLASS DOC] Discrete-mel audio encoder: embeds each (mel bin index, quantized value) pair from a
+    # single table of mel bins times vocabulary rows, sums the embeddings over mel bins per frame, and
+    # optionally RMS-normalizes. Output width is the decoder model dimension.
     def __init__(self, audio_cfg: dict):
+        # [FUNCTION DOC] Asserts the audio mode is dmel (default). Reads mel bin count, vocabulary
+        # size and decoder width from the mapping (missing keys raise key errors); the norm is built
+        # unless use_audio_norm is false (epsilon 1e-6).
         super().__init__()
         assert audio_cfg.get("audio_mode", "dmel") == "dmel"
         self.n_mel_bins = audio_cfg["n_mel_bins"]
@@ -20,6 +32,9 @@ class InklingAudioEncoder(nn.Module):
         )
 
     def forward(self, dmel: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] Input (frames, mel bins) integer bin values; asserts the mel dimension. Row
+        # index per element is mel position times vocabulary size plus the value; looks up embeddings,
+        # sums over the mel axis, and applies the norm if present. Returns (frames, decoder width).
         assert dmel.shape[1] == self.n_mel_bins
         idx = (torch.arange(self.n_mel_bins, device=dmel.device) * self.mel_vocab_size).unsqueeze(0) + dmel.to(
             torch.int32
@@ -29,16 +44,25 @@ class InklingAudioEncoder(nn.Module):
 
 
 class InklingVisionEncoder(nn.Module):
+    # [CLASS DOC] Thin wrapper holding the hierarchical-MLP patch encoder as submodule vision_encoder
+    # (so checkpoint keys match).
     def __init__(self, vision_cfg: dict):
+        # [FUNCTION DOC] Asserts the encoder type is hmlp (default) and builds the encoder from the
+        # config mapping.
         super().__init__()
         assert vision_cfg.get("vision_encoder_type", "hmlp") == "hmlp"
         self.vision_encoder = HMLPPatchEncoder(InklingVisionConfig(vision_cfg))
 
     def forward(self, patches: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] Returns the patch encoder output, one embedding row per input patch.
         return self.vision_encoder(patches)
 
 
 def _load_tower_tensors(hf_checkpoint: str) -> dict[str, torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Reads the checkpoint's weight index, selects names starting with visual. or
+    # audio. (optionally prefixed with model.), groups them by shard file, opens each shard once and
+    # loads those tensors to host. Returns a mapping from the normalized name (model. prefix removed)
+    # to tensor. File I/O; the index file handle is left to garbage collection.
     """Read tower tensors from HF safetensors, normalizing keys to visual.* / audio.*."""
     from safetensors import safe_open
 
@@ -60,6 +84,10 @@ def _load_tower_tensors(hf_checkpoint: str) -> dict[str, torch.Tensor]:
 def build_mm_towers(
     hf_checkpoint: str, device, dtype, train: bool = False
 ) -> tuple[nn.Module | None, nn.Module | None]:
+    # [FUNCTION DOC] Reads config.json and tower tensors. Builds the visual tower if the config has a
+    # vision section and visual weights exist, loading them strictly (prefix stripped); same for audio.
+    # Each built tower is moved to the device and dtype, gradients enabled only if training, and put in
+    # eval mode when not training. Returns (visual, audio) with none for absent modalities.
     """Construct + HF-load both towers; None when the checkpoint has no config for a modality."""
     cfg = json.load(open(f"{hf_checkpoint}/config.json"))
     weights = _load_tower_tensors(hf_checkpoint)
@@ -84,6 +112,14 @@ def build_mm_towers(
 
 
 def wire_mm_towers(model, hf_checkpoint: str, train: bool = False) -> None:
+    # [FUNCTION DOC] Replaces the model's forward (mutates the model). Stages that are not first in the
+    # pipeline get a pass-through that swallows the six multimodal keyword arguments and calls the
+    # original. The first stage builds the towers on the current GPU in the model's parameter dtype,
+    # stores them in the model's raw attribute dictionary (so they are not registered submodules and
+    # are not in its state dict or parameters), and installs a forward that: validates that positions
+    # and features have equal counts; computes text embeddings; runs the vision and/or audio tower on
+    # the features (with gradients only when training) and scatters results into the embeddings at the
+    # given positions; passes the result as the decoder input to the original forward.
     """Wrap an InklingGPTModel's forward for multimodal training (pre_process builds+merges;
     later stages pass through). train=True trains the towers instead of freezing them
     (weight-sync/ckpt for tower params is not wired yet)."""
@@ -103,6 +139,8 @@ def wire_mm_towers(model, hf_checkpoint: str, train: bool = False) -> None:
             mm_audio_num_tokens=None,
             **kw,
         ):
+            # [FUNCTION DOC] HELPER: Ignores the six multimodal keyword arguments and calls the
+            # original forward with the remaining arguments.
             return _orig_forward(*a, **kw)
 
         model.forward = _mm_passthrough
@@ -113,6 +151,12 @@ def wire_mm_towers(model, hf_checkpoint: str, train: bool = False) -> None:
     model.__dict__["_mm_towers"] = (visual, audio)
 
     def _scatter(decoder_input, embeds, positions):
+        # [FUNCTION DOC] HELPER: Returns the decoder input unchanged if there are no embeddings or
+        # positions. Under sequence parallel with tensor parallel size above one, positions are global
+        # and decoder_input holds this rank's sequence shard, so positions are shifted by rank times
+        # shard length and only those inside the shard (and their embeddings) are kept. Clones the
+        # decoder input (sequence, batch, hidden) and writes the embeddings (cast to its dtype) at the
+        # selected sequence positions in batch index 0. Returns the new tensor.
         if embeds is None or positions is None or positions.numel() == 0:
             return decoder_input
         s_local = decoder_input.shape[0]
@@ -138,6 +182,15 @@ def wire_mm_towers(model, hf_checkpoint: str, train: bool = False) -> None:
         mm_audio_num_tokens=None,
         **kw,
     ):
+        # [FUNCTION DOC] HELPER: Replacement forward for the first pipeline stage. Takes input ids from
+        # the keyword or first positional argument and position ids from the keyword. Asserts that each
+        # provided feature tensor has a matching positions tensor with the same row count. Computes
+        # embeddings; vision features (moved to the embeddings' device) go through the visual tower and
+        # audio frames through the audio tower, under gradient mode only when training; outputs are
+        # scattered into the embeddings at their positions. Sets the decoder input keyword and calls the
+        # original forward. The per-image patch counts and per-clip token counts are unused here.
+        # KNOWN ISSUE: if a feature is provided but the corresponding tower is absent (none), calling
+        # it fails with a type error.
         input_ids = kw.get("input_ids", a[0] if a else None)
         position_ids = kw.get("position_ids")
         if mm_vision_patches is not None:

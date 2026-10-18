@@ -1,3 +1,12 @@
+# [MODULE DOC] Native low-rank adaptation (LoRA) for Kimi K3. Adapter parameters live in per-module
+# holder objects (skipped by distributed checkpointing) and are applied by wrapping module forwards
+# so that scale (alpha over rank) times the adapter output is added to the base output. Covered
+# targets are fixed: attention output projection (both attention kinds), latent query and key/value
+# down projections (MLA only), dense MLP and shared experts, and routed experts (gate/up always; down
+# optional), using adapters shared across experts for the outer matrices ("shared outer" layout).
+# Replicated adapter gradients are flagged for summation over tensor or expert parallel groups.
+# Also: target resolution, attach to a model, provider wrapper, and a generator exporting adapters
+# in Hugging Face layout using flat all-gathers. Duplicates parts of the Inkling LoRA module.
 from __future__ import annotations
 
 import logging
@@ -33,13 +42,18 @@ _OPTIONAL_TARGET_SUFFIXES = {"block_sparse_moe.experts.*.w2"}
 
 
 class KimiK3LoRAAdapter(nn.Module):
+    # [CLASS DOC] Holder of one module's adapter parameters with a kind label (kda_attention,
+    # mla_attention, dense_mlp, shared_experts, experts), the Hugging Face key prefix, and an
+    # include-fc2 flag (experts only). Contributes nothing to distributed checkpoints.
     def __init__(self, kind: str, hf_prefix: str) -> None:
+        # [FUNCTION DOC] Stores kind and prefix; include-fc2 defaults to true.
         super().__init__()
         self.kind = kind
         self.hf_prefix = hf_prefix
         self.include_fc2 = True  # experts only: _apply_expert_lora overrides per target set
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        # [FUNCTION DOC] Checkpoint hook: returns an empty mapping so adapters are skipped.
         del prefix, sharded_offsets, metadata
         return {}
 
@@ -52,6 +66,12 @@ def _new_param(
     grad_sum_group: str | None = None,
     expert: bool = False,
 ) -> nn.Parameter:
+    # [FUNCTION DOC] HELPER: Allocates a tensor like the reference weight's dtype and device. Init
+    # "zero" zero-fills; "xavier" applies Xavier-uniform (per leading slice for tensors above 2-D); any
+    # other name raises a value error. Marks the parameter as not tensor-parallel; expert parameters are
+    # excluded from data-parallel all-reduce. Group "tp" flags the parameter so Megatron sums its
+    # gradient across the tp domain; group "ep" (asserted to be the only other allowed value) attaches a
+    # marker for the separate expert-parallel reduction step. Returns the parameter.
     tensor = torch.empty(*shape, dtype=ref_weight.dtype, device=ref_weight.device)
     if init == "zero":
         tensor.zero_()
@@ -90,6 +110,8 @@ def _register_param(
     grad_sum_group: str | None = None,
     expert: bool = False,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Creates a parameter (initialization method is required here) and
+    # registers it on the adapter under the name.
     adapter.register_parameter(
         name,
         _new_param(
@@ -103,12 +125,17 @@ def _register_param(
 
 
 def _dropout(inputs: torch.Tensor, probability: float, training: bool) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Dropout only when probability is nonzero and training is on; else the input.
     if probability and training:
         return F.dropout(inputs, p=probability, training=True)
     return inputs
 
 
 def _grouped_linear(inputs: torch.Tensor, weights: torch.Tensor, tokens_per_expert: list[int]) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Per-local-expert matmul over tokens permuted so each expert's tokens are
+    # contiguous; weights (experts, out, in). GPU: one grouped matmul using cumulative 32-bit offsets
+    # from the counts. CPU: split by counts, multiply each by its expert's weight, concatenate.
+    # Returns (tokens, out).
     if inputs.is_cuda:
         offsets = torch.as_tensor(tokens_per_expert, device=inputs.device, dtype=torch.int32).cumsum(
             0, dtype=torch.int32
@@ -119,6 +146,11 @@ def _grouped_linear(inputs: torch.Tensor, weights: torch.Tensor, tokens_per_expe
 
 
 def resolve_kimi_k3_adapter_targets(targets, *, canonical, experts_shared_outer_loras):
+    # [FUNCTION DOC] Strips the layer prefix from each target and compares with the supported set: any
+    # unsupported suffix, or any missing one other than the optional routed-expert down projection,
+    # raises a not-implemented error listing both. Asserts canonical LoRA is off; raises not-implemented
+    # unless shared-outer expert LoRA is on. Returns the targets with the per-expert wildcard path
+    # segment replaced by a plain experts segment (the expert dimension is inside each tensor).
     suffixes = {target.removeprefix("language_model.model.layers.*.") for target in targets}
     unsupported = suffixes - _SUPPORTED_TARGET_SUFFIXES
     missing = _SUPPORTED_TARGET_SUFFIXES - suffixes - _OPTIONAL_TARGET_SUFFIXES
@@ -135,10 +167,15 @@ def resolve_kimi_k3_adapter_targets(targets, *, canonical, experts_shared_outer_
 
 
 def _enable_full_recompute_input_grads(model) -> None:
+    # [FUNCTION DOC] HELPER: When full recomputation is on and the model owns the embedding (first
+    # stage), registers a forward hook on the embedding that, in training mode, marks its output as
+    # requiring gradients (type error if the output is not a tensor), so checkpointed layers see an
+    # input requiring grad even though base parameters are frozen. Otherwise does nothing.
     if model.config.recompute_granularity != "full" or not model.pre_process:
         return
 
     def enable_grad(module, _inputs, output):
+        # [FUNCTION DOC] HELPER: The hook described above; returns the output.
         if module.training:
             if not isinstance(output, torch.Tensor):
                 raise TypeError(f"Kimi K3 embedding returned {type(output)}, expected torch.Tensor")
@@ -149,6 +186,15 @@ def _enable_full_recompute_input_grads(model) -> None:
 
 
 def _apply_attention_lora(attention, args, layer_idx: int, scale: float, dropout: float) -> None:
+    # [FUNCTION DOC] HELPER: Creates an adapter (kind by attention type, prefix self_attn of the layer)
+    # and sets it on the attention module. Output projection (the delta-attention out projection or the
+    # MLA o projection): A (rank by its input width, xavier) and B (hidden by rank, zero; tp-summed
+    # gradient for delta attention). Patched forward: delta attention (plain module returning a tensor)
+    # adds scale times B(A(dropped input)); MLA (returns output and bias, row parallel) reduces the
+    # local A product over tensor parallel before B. For MLA only, also adapts the two latent down
+    # projections (query and key/value-with-extra): A (rank by hidden) and B (output by rank) with the
+    # patched forward adding scale times B(A(dropped input)); both are replicated (no gradient flags here
+    # because the transformer-engine column backward and the attention module handle the reduction).
     from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
 
     rank = int(args.lora_rank)
@@ -180,12 +226,14 @@ def _apply_attention_lora(attention, args, layer_idx: int, scale: float, dropout
     if attention.is_kda:
 
         def o_proj_forward(inputs):
+            # [FUNCTION DOC] HELPER: Patched delta-attention output projection (plain tensor return).
             local = F.linear(_dropout(inputs, dropout, o_proj.training), adapter.o_lora_A)
             return torch.add(original_o_proj(inputs), F.linear(local, adapter.o_lora_B), alpha=scale)
 
     else:
 
         def o_proj_forward(inputs, *forward_args, **forward_kwargs):
+            # [FUNCTION DOC] HELPER: Patched MLA output projection (returns output and bias).
             output, bias = original_o_proj(inputs, *forward_args, **forward_kwargs)
             local = F.linear(_dropout(inputs, dropout, o_proj.training), adapter.o_lora_A)
             reduced = reduce_from_tensor_model_parallel_region(local, group=attention.tp_group)
@@ -228,6 +276,8 @@ def _apply_attention_lora(attention, args, layer_idx: int, scale: float, dropout
                 _b=lora_b,
                 **forward_kwargs,
             ):
+                # [FUNCTION DOC] HELPER: Patched latent down-projection forward (defaults bind the
+                # module, original forward and adapter matrices): original output plus scaled delta.
                 output, bias = _original(inputs, *forward_args, **forward_kwargs)
                 delta = F.linear(F.linear(_dropout(inputs, dropout, _module.training), _a), _b)
                 # the TE column backward reduces the latent dgrad over TP; KimiK3Attention reduces the key-extra slice
@@ -248,6 +298,13 @@ def _apply_dense_mlp_lora(
     adapter_kind: str = "dense_mlp",
     hf_prefix: str | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Used for dense MLPs and for shared experts (adapter kind and prefix are
+    # parameters). Creates: first-layer A (rank by hidden, tp-summed gradient) and B (local fused gate-up
+    # rows by rank); second-layer A (rank by local intermediate) and B (hidden by rank; tp-summed gradient
+    # only when sequence parallel). Patched first-layer forward: gathers the input over the sequence
+    # group when sequence parallel, dropout, A then B, scaled delta added to output. Patched
+    # second-layer forward: A on local input, reduce-scatter (sequence parallel) or all-reduce over tp,
+    # then B, scaled delta added. Sets the adapter on the module.
     from megatron.core.tensor_parallel.mappings import (
         gather_from_sequence_parallel_region,
         reduce_from_tensor_model_parallel_region,
@@ -297,6 +354,7 @@ def _apply_dense_mlp_lora(
     original_fc1 = fc1.forward
 
     def fc1_forward(inputs, *forward_args, **forward_kwargs):
+        # [FUNCTION DOC] HELPER: Patched first-layer forward (see enclosing function).
         output, bias = original_fc1(inputs, *forward_args, **forward_kwargs)
         adapter_inputs = gather_from_sequence_parallel_region(inputs, group=tp_group) if sequence_parallel else inputs
         delta = F.linear(
@@ -309,6 +367,7 @@ def _apply_dense_mlp_lora(
     original_fc2 = fc2.forward
 
     def fc2_forward(inputs, *forward_args, **forward_kwargs):
+        # [FUNCTION DOC] HELPER: Patched second-layer forward (see enclosing function).
         output, bias = original_fc2(inputs, *forward_args, **forward_kwargs)
         local = F.linear(_dropout(inputs, dropout, fc2.training), adapter.fc2_lora_A)
         reduced = (
@@ -332,6 +391,14 @@ def _apply_expert_lora(
     *,
     include_fc2: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Raises not-implemented unless expert tensor parallel size is one. Creates
+    # an "experts" adapter with: gate (w1) and up (w3) A matrices shared by all experts (rank by the
+    # MoE latent size; expert-parallel flagged with ep-summed gradient), per-local-expert B matrices
+    # (experts, intermediate, rank). If include-fc2: down (w2) A per local expert (experts, rank,
+    # intermediate) and a shared B (latent size by rank, ep-summed). Patched first-layer forward (takes
+    # per-expert token counts): shared A of both concatenated, split into gate and up halves, grouped B
+    # for each, concatenated, scaled and added. Patched second-layer forward (only if include-fc2):
+    # grouped A per expert then shared B, scaled and added. Sets the adapter on the experts.
     experts = moe.experts
     if (moe.config.expert_tensor_parallel_size or 1) != 1:
         raise NotImplementedError("Kimi K3 native expert LoRA currently requires ETP=1")
@@ -404,6 +471,10 @@ def _apply_expert_lora(
     original_fc1 = fc1.forward
 
     def expert_fc1_forward(inputs, tokens_per_expert, *forward_args, **forward_kwargs):
+        # [FUNCTION DOC] HELPER: Patched expert first-layer forward (see enclosing function).
+        # KNOWN ISSUE: the shared product is split in two along the last dim, which assumes the rank
+        # is split evenly between gate and up as concatenated; this holds because both A matrices have
+        # equal rank, so the halves are the gate and up pieces.
         output, bias = original_fc1(inputs, tokens_per_expert, *forward_args, **forward_kwargs)
         adapter_inputs = _dropout(inputs, dropout, fc1.training)
         shared = F.linear(
@@ -422,6 +493,7 @@ def _apply_expert_lora(
         original_fc2 = fc2.forward
 
         def expert_fc2_forward(inputs, tokens_per_expert, *forward_args, **forward_kwargs):
+            # [FUNCTION DOC] HELPER: Patched expert second-layer forward (see enclosing function).
             output, bias = original_fc2(inputs, tokens_per_expert, *forward_args, **forward_kwargs)
             inner = _grouped_linear(
                 _dropout(inputs, dropout, fc2.training),
@@ -436,6 +508,13 @@ def _apply_expert_lora(
 
 
 def apply_kimi_k3_lora(model, args):
+    # [FUNCTION DOC] Raises a value error unless rank is positive. Scale = alpha / rank; dropout from
+    # args (none treated as 0). Freezes all base parameters, installs the full-recompute input-grad hook,
+    # then per decoder layer: raises a type error for unexpected attention classes; attaches attention
+    # adapters; dense MLP gets dense adapters; MoE layers get expert adapters (down projection included
+    # only if the Hugging Face target list contains the routed-expert w2 target) and shared-expert
+    # adapters (runtime error if the layer has no shared experts); any other MLP type raises a type
+    # error. Logs trainable and total parameter counts and returns the model.
     from megatron.core.transformer.mlp import MLP
     from megatron.core.transformer.moe.moe_layer import MoELayer
 
@@ -496,31 +575,45 @@ def apply_kimi_k3_lora(model, args):
 
 
 def wrap_model_provider_with_kimi_k3_lora(provider_func, args):
+    # [FUNCTION DOC] Returns a provider that builds a model with the given provider and attaches LoRA.
     def wrapped(*provider_args, **provider_kwargs):
+        # [FUNCTION DOC] HELPER: The wrapped provider: build then apply adapters, return the model.
         return apply_kimi_k3_lora(provider_func(*provider_args, **provider_kwargs), args)
 
     return wrapped
 
 
 class _GatherBatch:
+    # [CLASS DOC] HELPER: Collects gather requests (local tensor plus concatenation dim) for the
+    # tensor and expert parallel groups and resolves them with one flat all-gather per group. Each
+    # request returns a token whose getter yields the full tensor after the flush.
     class _Token:
+        # [CLASS DOC] HELPER: Handle for one queued request.
         def __init__(self, batch: _GatherBatch, kind: str, index: int) -> None:
+            # [FUNCTION DOC] HELPER: Stores batch, group kind and position.
             self.batch = batch
             self.kind = kind
             self.index = index
 
         def get(self) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Returns the resolved tensor; only valid after the flush.
             return self.batch.resolved[self.kind][self.index]
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates empty request and result lists for both groups.
         self.requests: dict[str, list[tuple[torch.Tensor, int]]] = {"tp": [], "ep": []}
         self.resolved: dict[str, list[torch.Tensor]] = {"tp": [], "ep": []}
 
     def add(self, kind: str, local: torch.Tensor, dim: int) -> _Token:
+        # [FUNCTION DOC] HELPER: Queues a request and returns its token.
         self.requests[kind].append((local, dim))
         return self._Token(self, kind, len(self.requests[kind]) - 1)
 
     def flush(self) -> int:
+        # [FUNCTION DOC] HELPER: For each group with requests: world size one means the local tensors
+        # are the results; otherwise raises a type error if dtypes are mixed, concatenates flattened
+        # tensors, runs one all-gather (collective), and per request concatenates each rank's slice
+        # along the request's dim. Returns the number of collectives launched.
         from megatron.core import parallel_state
 
         groups = {
@@ -563,6 +656,8 @@ class _GatherBatch:
 
 
 def _unwrap_model_chunks(model_chunks):
+    # [FUNCTION DOC] HELPER: Generator yielding each chunk after following its inner-module attribute
+    # until none remains.
     for chunk in model_chunks:
         while hasattr(chunk, "module"):
             chunk = chunk.module
@@ -570,6 +665,10 @@ def _unwrap_model_chunks(model_chunks):
 
 
 def _validate_adapter_layout(models, adapters: list[KimiK3LoRAAdapter]) -> None:
+    # [FUNCTION DOC] HELPER: Builds the expected multiset of (kind, prefix) pairs: per layer, one
+    # attention entry (delta or latent kind), then for layers whose MLP has experts an experts entry and
+    # a shared-experts entry, else a dense-MLP entry. Compares with the actual multiset; raises a runtime
+    # error with counts and the first few missing/unexpected entries on mismatch.
     expected = []
     for model in models:
         for layer in model.decoder.layers:
@@ -615,6 +714,9 @@ def _validate_adapter_layout(models, adapters: list[KimiK3LoRAAdapter]) -> None:
 
 
 def _export_attention(adapter: KimiK3LoRAAdapter):
+    # [FUNCTION DOC] HELPER: Returns a list of (Hugging Face name, tensor or deferred getter). For MLA:
+    # the latent query and key/value down projection A and B as is. Output projection: A gathered over
+    # tp along columns (dim 1), B as is. Flushes the gather before returning (so getters are ready).
     batch = _GatherBatch()
     plans: list[tuple[str, torch.Tensor | Callable[[], torch.Tensor]]] = []
     prefix = adapter.hf_prefix
@@ -633,6 +735,9 @@ def _export_attention(adapter: KimiK3LoRAAdapter):
 
 
 def _export_dense_mlp(adapter: KimiK3LoRAAdapter):
+    # [FUNCTION DOC] HELPER: The fused first-layer B is split in two halves along rows (gate then up)
+    # and each gathered over tp along rows; the shared first-layer A is exported under both the gate
+    # and up names; down A is gathered along columns; down B as is. Flushes before returning.
     batch = _GatherBatch()
     prefix = adapter.hf_prefix
     fc1_a = adapter.fc1_lora_A
@@ -653,6 +758,9 @@ def _export_dense_mlp(adapter: KimiK3LoRAAdapter):
 
 
 def _export_experts(adapter: KimiK3LoRAAdapter):
+    # [FUNCTION DOC] HELPER: Shared gate/up A get a leading singleton dim; per-expert gate/up B (and
+    # down A if included) are gathered over the expert group along the expert dim; shared down B (if
+    # included) gets a leading singleton dim. Flushes before returning the plan list.
     batch = _GatherBatch()
     prefix = adapter.hf_prefix
     w1_a = adapter.w1_lora_A
@@ -676,6 +784,11 @@ def _export_experts(adapter: KimiK3LoRAAdapter):
 
 
 def export_kimi_k3_lora_hf_chunks(model_chunks):
+    # [FUNCTION DOC] Generator. Unwraps the chunks, collects all adapter holders (runtime error if
+    # none), validates the layout against the model structure, then for each adapter builds its export
+    # plan by kind (unknown kinds raise a value error) and yields a list of (Hugging Face name,
+    # detached contiguous bfloat16 tensor) pairs. Gathers are collectives, so all ranks must iterate
+    # in lockstep.
     models = list(_unwrap_model_chunks(model_chunks))
     adapters: list[KimiK3LoRAAdapter] = []
     for model in models:

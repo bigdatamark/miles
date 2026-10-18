@@ -1,3 +1,12 @@
+# [MODULE DOC] Assembly of the Inkling model on Megatron. Builds a transformer config from the
+# Hugging Face text config (sigmoid router with expert bias, grouped GEMM, shared experts, RMS norm,
+# gated MLP, no rotary or learned position embedding), attaches an "inkling" extras object, builds
+# per-layer specs (MoE layers and leading dense layers) and the block spec, defines a GPT model
+# subclass that patches embedding norm, final-layernorm dtype handling, logits scaling and global-scale
+# freezing, and provides the spec entry point plus the text and multimodal model providers.
+# Environment variables (read when the extras object is built): MILES_INKLING_ATTN_BACKEND (flex, te
+# or fa4; default flex), MILES_INKLING_SCONV_IMPL (triton or torch), MILES_INKLING_SCONV_PACKED ("1"
+# enables), MILES_INKLING_FREEZE_GLOBAL_SCALE (all, router or none; default all).
 """Inkling model assembly: TransformerConfig construction, layer/block specs, and the
 GPTModel subclass + provider that miles' custom-model-provider path loads."""
 
@@ -27,7 +36,17 @@ logger = logging.getLogger(__name__)
 
 
 class InklingExtra:
+    # [CLASS DOC] Plain attribute bag of Inkling-specific settings copied from the Hugging Face text
+    # config mapping (attention head/kv/head-dim for global and sliding-window layers, window size,
+    # relative feature dim and extent, local layer ids as a set, short-conv settings, expert counts,
+    # routing scale, sizes, norm epsilon, dense layer boundary and sizes, optional logits width
+    # multiplier, route norm, global scale usage) plus debug knobs from the environment. Also used as a
+    # scratch area by layers (segment lengths, shared expert weights are set on it at run time).
     def __init__(self, t: dict):
+        # [FUNCTION DOC] Required keys raise key errors when missing. Defaults: relative extent 1024,
+        # dense layer index 0, dense intermediate size equal to the intermediate size, optional fields
+        # none, global scale usage false. Attention backend default flex, short-conv implementation
+        # default triton, packed short-conv off, global-scale freezing default "all".
         self.num_attention_heads = t["num_attention_heads"]
         self.num_key_value_heads = t["num_key_value_heads"]
         self.head_dim = t["head_dim"]
@@ -77,6 +96,18 @@ def build_inkling_config(
     pp_first_stage_layers=None,
     pp_last_stage_layers=None,
 ) -> TransformerConfig:
+    # [FUNCTION DOC] Builds a Megatron transformer config: dimensions from the text config (kv channels
+    # from head dim, grouped query count from kv heads, dense FFN size from the dense intermediate
+    # size); parallel sizes and first/last pipeline stage layer counts from arguments; sequence
+    # parallel, variable sequence lengths, fp32 residual and MoE permute fusion flags; MoE with routed
+    # expert count, top-k, MoE FFN size equal to the intermediate size, shared expert size equal to it
+    # when there are shared experts; sigmoid score function with expert bias (update rate zero),
+    # pre-softmax, seq-aux-loss balancing with zero coefficient, float32 router, grouped GEMM, all-to-all
+    # dispatcher; no bias; RMS norm with the epsilon; QK layernorm flag on; gated linear unit;
+    # dtype bfloat16 or float32 per the bf16 flag for params and pipeline. Then attaches the extras
+    # object, turns on float32 activation and combine in MoE, sets per-layer MoE frequency as dense
+    # (zero) for the first dense-index layers and MoE for the rest, and marks heterogeneous
+    # distributed checkpointing (the misspelled attribute name is as in the code).
     inter = text_cfg["intermediate_size"]
     ns = text_cfg["n_shared_experts"]
     denseI = int(text_cfg.get("dense_intermediate_size", inter))
@@ -132,6 +163,11 @@ def build_inkling_config(
 
 
 def get_inkling_layer_spec(config) -> ModuleSpec:
+    # [FUNCTION DOC] Starts from Megatron's Transformer Engine layer spec for the config's expert count
+    # and grouped GEMM flag (QK layernorm off in the base spec since attention does its own). Replaces
+    # the self-attention with the Inkling attention (causal mask) reusing the base submodules; replaces
+    # the router with the Inkling router, the shared experts with the Inkling shared experts (reusing
+    # their submodules), and the MLP with the Inkling MoE layer. Returns the layer spec.
     spec = get_gpt_layer_with_transformer_engine_spec(
         num_experts=config.num_moe_experts, moe_grouped_gemm=config.moe_grouped_gemm, qk_layernorm=False
     )
@@ -147,6 +183,8 @@ def get_inkling_layer_spec(config) -> ModuleSpec:
 
 
 def get_inkling_dense_layer_spec(config) -> ModuleSpec:
+    # [FUNCTION DOC] Like the MoE layer spec but with no experts: Inkling attention (causal) and the
+    # Inkling dense MLP wrapped as an MLP submodule factory. The config argument is unused.
     spec = get_gpt_layer_with_transformer_engine_spec(qk_layernorm=False)
     attn = spec.submodules.self_attention
     spec.submodules.self_attention = ModuleSpec(
@@ -159,6 +197,11 @@ def get_inkling_dense_layer_spec(config) -> ModuleSpec:
 
 
 def get_inkling_block_spec(config, vp_stage=None):
+    # [FUNCTION DOC] Gets the base block submodules from Megatron for this stage using the MoE layer
+    # spec. If the dense layer boundary is zero or less, returns it. Otherwise, using the stage's
+    # global layer offset, builds a per-local-layer list choosing the dense spec for global indices
+    # below the boundary and the MoE spec elsewhere, and returns block submodules with that list and
+    # the base final layer norm.
     from megatron.core.transformer.transformer_block import TransformerBlockSubmodules, _get_block_submodules
     from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 
@@ -175,6 +218,12 @@ def get_inkling_block_spec(config, vp_stage=None):
 
 
 def get_inkling_spec(args, config, vp_stage=None):
+    # [FUNCTION DOC] Reads the text sub-config from config.json in the checkpoint directory (file
+    # I/O; the file handle is not closed explicitly), sets the extras object on the given config, forces
+    # float32 router dtype, zero router bias update rate, no top-k scaling factor, and float32 MoE
+    # activation and combine. Returns the MoE layer spec for every layer.
+    # KNOWN ISSUE: unlike the provider path, this returns a single layer spec and ignores the
+    # dense-layer boundary and the virtual pipeline stage, so leading dense layers are not handled here.
     """--spec entry for the miles standard provider path."""
     import json
 
@@ -189,7 +238,19 @@ def get_inkling_spec(args, config, vp_stage=None):
 
 
 class InklingGPTModel(GPTModel):
+    # [CLASS DOC] GPT model with Inkling tweaks applied in the constructor by patching forwards of
+    # submodules: embedding output norm (first stage, if configured), cast of the final-layernorm input
+    # back to the parameter dtype when residuals are float32 (last stage), division of the head input by
+    # the logits width multiplier (last stage, if configured), and freezing of global-scale parameters.
     def __init__(self, *args, **kw):
+        # [FUNCTION DOC] Builds the base model, then: on the first stage with the embed-norm flag,
+        # adds an RMS norm to the embedding and wraps its forward to normalize the output (with float32
+        # residuals: manual float32 RMS norm, rounded through bfloat16, returned as float32). On the last
+        # stage with float32 residuals and a final layernorm present, wraps it to cast input to the
+        # parameter dtype. On the last stage with a width multiplier, wraps the output layer to divide
+        # its input by it. Finally freezes global scales.
+        # KNOWN ISSUE: the float32-residual embedding path rounds through bfloat16 regardless of the
+        # configured parameter dtype.
         super().__init__(*args, **kw)
         if getattr(self, "pre_process", False) and getattr(self.config.inkling, "use_embed_norm", False):
             emb = self.embedding
@@ -201,6 +262,8 @@ class InklingGPTModel(GPTModel):
             _fp32res = bool(getattr(self.config, "fp32_residual_connection", False))
 
             def _emb_forward(*a, _orig=_orig_emb_forward, _norm=emb.embed_norm, _fp32=_fp32res, **k):
+                # [FUNCTION DOC] HELPER: Calls the original embedding forward, then normalizes the
+                # result (see enclosing constructor for the float32-residual variant).
                 out = _orig(*a, **k)
                 if _fp32:
                     h = out.float()
@@ -216,6 +279,8 @@ class InklingGPTModel(GPTModel):
                 _pdt = self.config.params_dtype
 
                 def _fln_forward(x, *a, _orig=_orig_fln, _dt=_pdt, **k):
+                    # [FUNCTION DOC] HELPER: Casts the input to the parameter dtype if different,
+                    # then calls the original final layernorm forward.
                     return _orig(x.to(_dt) if x.dtype != _dt else x, *a, **k)
 
                 fln.forward = _fln_forward
@@ -226,12 +291,18 @@ class InklingGPTModel(GPTModel):
             _mup = float(mup)
 
             def _ol_forward(x, *a, _orig=_orig_ol_forward, _m=_mup, **k):
+                # [FUNCTION DOC] HELPER: Divides the input by the width multiplier, then calls the
+                # original output layer forward.
                 return _orig(x / _m, *a, **k)
 
             _ol.forward = _ol_forward
         self._freeze_global_scale()
 
     def _freeze_global_scale(self):
+        # [FUNCTION DOC] HELPER: Mode none does nothing. Otherwise, for each parameter whose last name
+        # component is global_scale, if the mode is all, or router and the name contains the router
+        # global scale path, and it currently requires gradients, disables gradients and counts it.
+        # Logs the count at info level when positive.
         """Freeze per-layer global_scale params per config.inkling.freeze_global_scale
         (all | router | none; router = the MoE gate scale only)."""
         mode = getattr(self.config.inkling, "freeze_global_scale", "all")
@@ -253,6 +324,14 @@ class InklingGPTModel(GPTModel):
 
 
 def inkling_model_provider(pre_process=True, post_process=True, vp_stage=None, *, mm_towers=False):
+    # [FUNCTION DOC] Reads the global training args. With context parallel size above one, asserts the
+    # all-gather CP layout flag is set (zigzag unsupported). Loads the text config from the checkpoint,
+    # builds the transformer config from arguments (parallel sizes, bf16, sequence parallel, expert
+    # tensor parallel size default 1, variable sequence lengths default true, MoE permute fusion, fp32
+    # residual, first/last pipeline stage layer counts), then the Inkling GPT model with the block spec
+    # for this stage, vocabulary size from the text config, max positions from args, no position
+    # embedding, untied embeddings and output. If mm_towers, wires the multimodal towers from the
+    # checkpoint (frozen). Returns the model.
     import json
 
     from megatron.training import get_args
@@ -295,6 +374,7 @@ def inkling_model_provider(pre_process=True, post_process=True, vp_stage=None, *
 
 
 def inkling_mm_model_provider(pre_process=True, post_process=True, vp_stage=None):
+    # [FUNCTION DOC] Calls the text provider with multimodal towers enabled and returns its model.
     """Multimodal provider: the text model plus the frozen HF vision/audio towers.
 
     A separate entry point instead of a CLI switch -- multimodal launch scripts pass

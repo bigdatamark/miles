@@ -1,3 +1,12 @@
+# [MODULE DOC] HELPER: Custom operations for the Inkling model. (1) Context/sequence-parallel helpers:
+# world info, contiguous-layout all-gather, and a residual short convolution that gathers the sequence
+# before convolving and slices back. (2) Packed-sequence segment lengths from cumulative lengths.
+# (3) Precision-aligned float32 ops matching the serving engine: fused swiglu, multi-tensor sum, and
+# the residual depthwise causal convolution in several implementations (triton kernel, per-segment
+# torch, or a packed full-length conv with exact boundary recomputation). (4) Attention backends with
+# Inkling's relative-position bias: a lazily compiled flex-attention handle, a Transformer-Engine
+# dense-bias reference, and a flash-attention-4 forward (custom score modifier through the optional
+# cutlass CUTE interface) whose backward recomputes through the TE reference.
 """Inkling custom ops in one place: CP/SP helpers, precision-aligned fp32 ops (the triton kernels
 live in miles.kernels.activation), and the attention backends (flex / TE reference / FA4 with
 Inkling's relative position bias)."""
@@ -24,6 +33,8 @@ except Exception:  # pragma: no cover
 
 
 def cp_world():
+    # [FUNCTION DOC] HELPER: Returns (size, rank, group) of context parallelism from Megatron's
+    # parallel state; when size is one or less returns (1, 0, none).
     """(cp_size, cp_rank, cp_group) — cp_size 1 means no context parallelism."""
     cp = ps.get_context_parallel_world_size()
     if cp <= 1:
@@ -32,6 +43,11 @@ def cp_world():
 
 
 def cp_all_gather(x, group, world):
+    # [FUNCTION DOC] HELPER: Blocking all-gather of the contiguous input from every rank in the group,
+    # concatenated along dim 0 in rank order (so the result is in natural token order only for
+    # contiguous sharding). Not differentiable through the collective as written (plain gather).
+    # KNOWN ISSUE: the plain all-gather collective has no autograd support, so gradients do not flow
+    # back to other ranks' inputs through this gather.
     """all-gather [s, ...] -> [s*world, ...] in CP-rank order. Assumes CONTIGUOUS CP sharding
     (rank r holds tokens [r*s,(r+1)*s)) -> REQUIRES --allgather-cp (miles' default CP layout is
     zigzag/load-balanced; the provider asserts allgather_cp when cp>1)."""
@@ -41,6 +57,12 @@ def cp_all_gather(x, group, world):
 
 
 def inkling_sp_residual_conv(config, conv, x_sbh, seqlens):
+    # [FUNCTION DOC] HELPER: Input (sequence, batch, hidden), possibly sharded by sequence parallel
+    # (tensor parallel) and/or context parallel. Gathers over the tensor-parallel group when sequence
+    # parallel is on (backward not reduced), then over the cp group; applies the convolution module to
+    # the flattened (sequence times batch, hidden) rows with the segment lengths; slices back this cp
+    # rank's contiguous part; scatters over sequence parallel if it was gathered. Returns the shard in
+    # the input layout. The convolution is residual, which is why slicing after gathering is exact.
     """Residual depthwise sconv on [s,b,h]. Under SP/CP the sequence is sharded, so a local-shard
     causal conv misses the left context -> gather -> conv on the full sequence -> take this rank's
     slice. Exact because the conv is residual. seqlens must be the FULL-sequence segment lengths."""
@@ -58,6 +80,12 @@ def inkling_sp_residual_conv(config, conv, x_sbh, seqlens):
 
 
 def seqlens_from_packed(packed_seq_params, T):
+    # [FUNCTION DOC] HELPER: Returns none if the packed parameters or query cumulative lengths are
+    # absent. Otherwise converts consecutive differences to a host list (device synchronization),
+    # dropping empty segments, and accumulates whole segments while they fit in T; the first segment
+    # that overflows is truncated to the remaining length (if any remains) and stops the scan; if the
+    # total is still below T, the remainder is appended as one extra trailing segment. Returns a list
+    # of positive lengths summing to T.
     """THD packing: per-segment token lengths (over the full post-SP-gather length T) from
     cu_seqlens_q, so attention/sconv/rel-bias never cross packed-sequence boundaries. Clip to T:
     keep whole segments, split the boundary one, trailing pad as its own segment."""
@@ -81,27 +109,37 @@ def seqlens_from_packed(packed_seq_params, T):
 
 
 def _maybe_compile(fn):
+    # [FUNCTION DOC] HELPER: Wraps a function with the tensor compiler using dynamic shapes (always
+    # compiles; the name notwithstanding there is no condition).
     return torch.compile(fn, dynamic=True)
 
 
 def inkling_swiglu_fp32(fc1_out: torch.Tensor, per_token_scale: torch.Tensor | None = None) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Delegates to the triton float32 swiglu kernel (gate and up halves of the
+    # first-layer output, optional per-token scale), rounding once back to the input dtype.
     """fp32 swiglu, one round back to bf16 (triton, bit-identical to serving silu_and_mul)."""
     return swiglu_fp32(fc1_out, per_token_scale)
 
 
 @_maybe_compile
 def _sum2_fwd(a, b):
+    # [FUNCTION DOC] HELPER: Compiled sum of two tensors in float32, rounded back to a's dtype.
     return (a.float() + b.float()).to(a.dtype)
 
 
 @_maybe_compile
 def _sum3_fwd(a, b, c):
+    # [FUNCTION DOC] HELPER: Compiled sum of three tensors in float32, rounded back to a's dtype.
     return (a.float() + b.float() + c.float()).to(a.dtype)
 
 
 class _SumFP32Func(torch.autograd.Function):
+    # [CLASS DOC] HELPER: Autograd function summing any number of same-shape tensors in float32 with a
+    # single rounding; backward gives every input the same unchanged output gradient.
     @staticmethod
     def forward(ctx, *ys: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Records the count; uses compiled kernels for two or three inputs, else
+        # a float32 loop; result in the first input's dtype.
         ctx.n = len(ys)
         if len(ys) == 2:
             return _sum2_fwd(*ys)
@@ -114,16 +152,21 @@ class _SumFP32Func(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
+        # [FUNCTION DOC] HELPER: Returns a tuple repeating the output gradient once per input.
         return (grad_out,) * ctx.n
 
 
 def inkling_sum_fp32(ys: list[torch.Tensor]) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Functional wrapper over the autograd function for a list of tensors.
     """Σ ys in fp32, single round back (SGLang `_sum_dim0` parity)."""
     return _SumFP32Func.apply(*ys)
 
 
 @_maybe_compile
 def _sconv_fwd(x, weight):
+    # [FUNCTION DOC] HELPER: Compiled residual depthwise causal convolution. Input (tokens, channels)
+    # and weight (channels, 1, kernel): in float32, left-pads the token axis by kernel minus one, runs a
+    # per-channel 1-D convolution, adds the original input (residual), casts to the input dtype.
     C = x.shape[1]
     xp = F.pad(x.float().t().unsqueeze(0), (weight.shape[-1] - 1, 0))
     y = x.float() + F.conv1d(xp, weight.float(), groups=C).squeeze(0).t()
@@ -131,6 +174,7 @@ def _sconv_fwd(x, weight):
 
 
 def inkling_sconv_fp32(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Single-sequence convolution; delegates to the compiled function.
     """Residual depthwise causal conv on [T, C] in fp32, single round back (SGLang sconv parity)."""
     return _sconv_fwd(x, weight)
 
@@ -138,6 +182,14 @@ def inkling_sconv_fp32(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 def inkling_sconv_fp32_packed(
     x: torch.Tensor, weight: torch.Tensor, seqlens, impl: str = "triton", packed: bool = False
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Dispatch. On GPU with the triton implementation: the triton kernel with
+    # segment lengths. Else if there is at most one segment: the single-sequence conv. Else if not
+    # packed: splits by segment lengths, convolves each, concatenates. Else packed mode: convolves the
+    # whole stream at once in float32, then fixes the first (kernel minus one) rows of every segment
+    # after the first, which wrongly saw the previous segment's tokens: for each, recomputes using only
+    # tokens inside the segment (a small per-offset weight table, with rows beyond the segment length
+    # masked out), and overwrites them via indexed put. Segment lengths shorter than the kernel are
+    # handled by the mask. Returns the input dtype.
     """Packed-sequence sconv. impl=triton is bit-identical to serving; packed runs the whole
     batch as one full-length conv + exact boundary re-compute instead of per-segment convs."""
     if x.is_cuda and impl == "triton":
@@ -189,6 +241,12 @@ else:
 
 @cache
 def get_inkling_relative_attention_score_mod(rel_extent: int) -> Callable:
+    # [FUNCTION DOC] HELPER: Memoized per extent. Raises an import error (chained to the original
+    # failure) if the cutlass CUTE or flash-attention interface is unavailable. Returns a jit-compiled
+    # score modifier that adds, to each attention score, the relative bias taken from the first
+    # auxiliary tensor (shape tokens, heads, extent) at [global query index, head, relative distance],
+    # where distance is (query index plus key-length minus query-length offset) minus key index; the
+    # bias applies only when the distance lies in [0, extent), else zero.
     if cute is None or Float32 is None or SeqlenInfoQK is None:
         raise ImportError(
             "Inkling relative attention requires the vendored FA4 CUTE interface."
@@ -204,6 +262,7 @@ def get_inkling_relative_attention_score_mod(rel_extent: int) -> Callable:
         seqlen_info: SeqlenInfoQK,
         aux_tensors: list[cute.Tensor],
     ) -> cute.TensorSSA:
+        # [FUNCTION DOC] HELPER: Jit score modifier described by the enclosing function.
         rel_logits = aux_tensors[0]
 
         seqlen_local_offset = seqlen_info.seqlen_k - seqlen_info.seqlen_q
@@ -225,6 +284,9 @@ _FLEX_COMPILED = None
 
 
 def flex_compiled():
+    # [FUNCTION DOC] HELPER: Lazily creates and caches (module global) a compiled flex-attention
+    # function (dynamic shapes, max-autotune without cuda graphs). Asserts flex attention exists. Raises
+    # the dynamo recompile cache limits to 1024 (global side effect on first call). Returns the handle.
     global _FLEX_COMPILED
     if _FLEX_COMPILED is None:
         assert flex_attention is not None, "flex_attention needs torch>=2.5 + inductor"
@@ -235,6 +297,13 @@ def flex_compiled():
 
 
 def inkling_te_attention(q, k, v, rel_logits, seqlens, window_left, is_local, scale):
+    # [FUNCTION DOC] HELPER: Reference attention with dense additive bias via Transformer Engine
+    # (module created on every call). Inputs: queries (tokens, heads, dim), keys/values (tokens, kv
+    # heads, dim), relative logits (tokens, heads, extent), segment lengths or none, left window, local
+    # flag, softmax scale. Builds a (1, heads, T, T) bias holding the relative logit at offset
+    # query minus key where in [0, extent), zero elsewhere; cross-segment pairs get -1e9; attention is
+    # causal with window (left window, 0) for local layers, else unbounded. Returns (tokens, heads,
+    # dim). Quadratic memory.
     import transformer_engine.pytorch as te
 
     T, nh, hd = q.shape
@@ -275,6 +344,11 @@ def inkling_te_attention(q, k, v, rel_logits, seqlens, window_left, is_local, sc
 
 
 def _fa4_fwd(q, k, v, rel_logits, seqlens, window_left, is_local, scale, rel_extent):
+    # [FUNCTION DOC] HELPER: Builds 32-bit cumulative lengths from segment lengths (one segment of the
+    # full length if none) and calls the flash-attention-4 variable-length function (imported lazily)
+    # with causal masking, the window for local layers, the relative-bias score modifier for the extent,
+    # and the float32 contiguous relative logits as auxiliary tensor. If the result is a tuple, takes
+    # the first element. Returns (tokens, heads, dim).
     from flash_attn.cute.interface import flash_attn_varlen_func
 
     T = q.shape[0]
@@ -302,8 +376,14 @@ def _fa4_fwd(q, k, v, rel_logits, seqlens, window_left, is_local, scale, rel_ext
 
 
 class _InklingFA4Attention(torch.autograd.Function):
+    # [CLASS DOC] HELPER: Autograd function: forward uses the FA4 kernel without gradient tracking;
+    # backward recomputes attention with the TE reference under gradient mode on detached copies and
+    # differentiates it to obtain gradients for queries, keys, values and relative logits (the other
+    # inputs get none). The reference and kernel are assumed numerically close enough for gradients.
     @staticmethod
     def forward(ctx, q, k, v, rel_logits, seqlens, window_left, is_local, scale, rel_extent):
+        # [FUNCTION DOC] HELPER: Runs the FA4 forward under no-grad, saves q, k, v, relative logits and
+        # the metadata (segment lengths as tuple, window, local flag, scale, extent). Returns output.
         with torch.no_grad():
             out = _fa4_fwd(q, k, v, rel_logits, seqlens, window_left, is_local, scale, rel_extent)
         ctx.save_for_backward(q, k, v, rel_logits)
@@ -312,6 +392,9 @@ class _InklingFA4Attention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
+        # [FUNCTION DOC] HELPER: Recomputes the TE reference attention on detached copies requiring
+        # gradients and returns (grad q, grad k, grad v, grad relative logits) followed by five none
+        # entries. Uses dense bias so memory is quadratic in token count.
         q, k, v, rel_logits = ctx.saved_tensors
         seqlens, window_left, is_local, scale, rel_extent = ctx.meta
         sl = list(seqlens) if seqlens else None
@@ -326,5 +409,7 @@ class _InklingFA4Attention(torch.autograd.Function):
 
 
 def inkling_fa4_attention(q, k, v, rel_logits, seqlens, window_left, is_local, scale, rel_extent):
+    # [FUNCTION DOC] HELPER: Functional entry for the autograd function above; returns attention
+    # output (tokens, heads, dim).
     """q [T,nh,hd] / k,v [T,nkv,hd] / rel_logits [T,nh,RE] fp32 -> [T,nh,hd]; fwd = sglang FA4, bwd recompute."""
     return _InklingFA4Attention.apply(q, k, v, rel_logits, seqlens, window_left, is_local, scale, rel_extent)
