@@ -1,3 +1,12 @@
+# [MODULE DOC] Backend-independent core of the command utilities. Defines the launch configuration
+# dataclasses (a base config selecting the cluster backend, and a training config with run
+# identity, deploy component, hot restart and environment options), the validated training request
+# model, the abstract command backend (training launch with argument checks, checkpoint
+# conversion with a version-stamped cache, ray worker startup over ssh, dataset download, fp8 to
+# bf16 casting, command execution entry points that always delegate to protected inner methods),
+# and helpers for file-lock serialization, hardware resolution and conflict checks between launch
+# config and train arguments. A conversion version constant invalidates cached checkpoint
+# conversions when weight layouts change.
 from __future__ import annotations
 
 import fcntl
@@ -41,6 +50,9 @@ CONVERSION_VERSION = "5"
 
 @dataclass
 class CommandUtilConfig:
+    # [CLASS DOC] Base launch configuration. Fields: cluster_backend (default Ray), namespace
+    # (Kubernetes namespace, empty by default), helm_values (tuple of values file paths, empty),
+    # ci_run flag (default false).
     cluster_backend: ClusterBackend = ClusterBackend.RAY
     namespace: str = ""
     helm_values: tuple[str, ...] = ()
@@ -48,9 +60,16 @@ class CommandUtilConfig:
 
     @classmethod
     def from_env(cls, **kwargs: Any) -> CommandUtilConfig:
+        # [FUNCTION DOC] Class method: builds the config from environment variables via the shared
+        # loader, with the keyword arguments as explicit overrides.
         return dataclass_from_env(cls, overrides=kwargs)
 
     def create_backend(self) -> BaseCommandBackend:
+        # [FUNCTION DOC] Creates the backend for the configured cluster backend, importing its
+        # module lazily: Kubernetes gives the helm-based backend, Ray gives the Ray backend, each
+        # constructed with this config.
+        # KNOWN ISSUE: the match has no default branch, so any other cluster backend value would
+        # return none silently.
         match self.cluster_backend:
             case ClusterBackend.KUBERNETES:
                 from miles.utils.external_utils.command_utils.helm_backend.backend import KubernetesCommandBackend
@@ -65,6 +84,12 @@ class CommandUtilConfig:
 # This class can be extended by concrete scripts
 @dataclass
 class ExecuteTrainConfig(CommandUtilConfig):
+    # [CLASS DOC] Training launch configuration (extendable by concrete scripts). Adds: cuda_core_dump
+    # (default off), num_nodes (default from the SLURM_JOB_NUM_NODES environment variable, else
+    # 1), extra_env_vars (a string, json or space-separated key=value pairs; empty), output_dir
+    # (default /root/shared_data), deploy_component (default all), optional deploy_instance_id,
+    # hot_restart (string spec, empty), run_id (default generated), optional run_uuid,
+    # skip_upgrade_check and external_mooncake flags (default off).
     cuda_core_dump: bool = False
     num_nodes: int = field(default_factory=lambda: int(os.environ.get("SLURM_JOB_NUM_NODES", "1")))
     extra_env_vars: str = ""
@@ -79,14 +104,23 @@ class ExecuteTrainConfig(CommandUtilConfig):
 
     @property
     def parsed_hot_restart(self) -> list[HotRestartComponent]:
+        # [FUNCTION DOC] Property: the hot restart spec string parsed into a list of components.
         return parse_hot_restart(self.hot_restart)
 
 
 def default_config(config_class: type = ExecuteTrainConfig) -> ExecuteTrainConfig:
+    # [FUNCTION DOC] Builds an instance of the given config class (default the training config)
+    # from environment variables with the shared loader.
     return dataclass_from_env(config_class)
 
 
 class ExecuteTrainRequest(FrozenStrictBaseModel):
+    # [CLASS DOC] Immutable, strictly validated request passed to a backend's train launch.
+    # Fields: the final train argument string, GPUs per node, Megatron model type (none for
+    # non-Megatron runs), absolute train script path, flag for the non-Megatron (FSDP) backend,
+    # extra environment variables, Megatron path, optional callback to run before a Ray job is
+    # submitted, job lifetime (independent by default, or tied to the launcher), a mapping from
+    # role to preparation command, and a list of extra manifests.
     train_args: str
     num_gpus_per_node: int
     megatron_model_type: str | None
@@ -112,7 +146,15 @@ _DELEGATING_METHODS = ("execute_train", "exec_command_cpu", "exec_command_gpu", 
 
 
 class BaseCommandBackend(ABC):
+    # [CLASS DOC] Abstract command backend. Public methods (execute_train, exec_command_cpu,
+    # exec_command_gpu, exec_command_multi_node) are defined only here and delegate to protected
+    # "_inner" hooks that subclasses implement, so that one place can intercept every command; a
+    # subclass defining one of those public names fails at class creation. Other helpers
+    # (checkpoint conversion, ray workers over ssh, dataset download, fp8 cast) are built from the
+    # command methods. Holds the launch config.
     def __init__(self, config: CommandUtilConfig) -> None:
+        # [FUNCTION DOC] Asserts the config is a command config, configures the process logger
+        # under the name "launcher" (side effect on logging), and stores the config.
         from miles.utils.logging_utils import configure_logger_raw
 
         assert isinstance(config, CommandUtilConfig), "config must be a CommandUtilConfig"
@@ -120,6 +162,9 @@ class BaseCommandBackend(ABC):
         self.config = config
 
     def __init_subclass__(cls, **kwargs: object) -> None:
+        # [FUNCTION DOC] Class-creation hook: asserts the new subclass does not define, in its own
+        # namespace, any of the four delegating public methods (message tells it to implement the
+        # inner variant). Inherited definitions from intermediate subclasses are not checked.
         super().__init_subclass__(**kwargs)
         for name in _DELEGATING_METHODS:
             assert name not in vars(cls), (
@@ -142,6 +187,21 @@ class BaseCommandBackend(ABC):
         extra_manifests: list[str] | None = None,
         config: ExecuteTrainConfig | None = None,
     ) -> None:
+        # [FUNCTION DOC] Validates and completes a training launch, then hands a request to the
+        # backend hook. Inputs: train argument string, GPUs per node, Megatron model type, script
+        # (default train.py, made absolute against the repository root if relative), optional
+        # pre-submit callback, extra env vars (default empty), Megatron path (default
+        # /root/Megatron-LM), job lifetime (independent or launcher), preparation commands per role
+        # (only the trainer role is allowed), extra manifests, and an optional config (default the
+        # backend's own, which must then be a training config). Checks (assertions unless noted):
+        # config's cluster backend equals the backend's; job lifetime valid; raises a value error if
+        # the removed MILES_ROUTER_EXTERNAL_HOST variable appears in the process environment or the
+        # resolved extra env vars; hot restart only on Kubernetes; Megatron model type given exactly
+        # when the train backend flag (last occurrence, default Megatron) is Megatron; train args do
+        # not name a different cluster backend, deploy component, or (when set) run uuid. Then
+        # appends the deploy component flag, the deploy instance id flag if set, and the run uuid
+        # flag if set, and calls the inner hook with a request whose FSDP flag is the opposite of the
+        # Megatron check.
         if config is None:
             assert isinstance(
                 self.config, ExecuteTrainConfig
@@ -218,6 +278,17 @@ class BaseCommandBackend(ABC):
         hf_checkpoint: str | None = None,
         megatron_path: str = "/root/Megatron-LM",
     ):
+        # [FUNCTION DOC] Converts a HuggingFace checkpoint to Megatron torch-dist format, cached.
+        # Destination = dir_dst (default /root) + "/<model_name>_torch_dist"; source defaults to
+        # /root/models/<model_name>. Under an exclusive file lock on the destination: skips if the
+        # destination's latest-iteration tracker says "release" and its version stamp equals the
+        # current conversion version; logs a redo if the tracker says release but the stamp is
+        # missing or different. Otherwise runs the conversion tool under torchrun with the model
+        # arguments, source, destination and extra args, through the GPU command method, or, for
+        # multinode, the multi-node method with placeholders for master address, node count and node
+        # rank (master port 23456), using the given node count. Python path includes the repository,
+        # the Megatron path and the existing path. Afterwards writes the version stamp (creating
+        # directories).
         hf_checkpoint = hf_checkpoint or f"/root/models/{model_name}"
 
         # TODO shall we make it in host-mapped folder and thus can cache it to speedup CI
@@ -267,6 +338,12 @@ class BaseCommandBackend(ABC):
         hostfile: str = "/root/mpi_rack_hostfile",
         head_host: str | None = None,
     ):
+        # [FUNCTION DOC] Runs one local CPU shell command that loops over the first column of the
+        # hostfile (default /root/mpi_rack_hostfile), skips the head host (default the master
+        # address), and for each other host starts, in the background over ssh as root, a remote
+        # command that force-kills sglang and miles processes, stops ray, and starts a ray worker
+        # joining master_address:6379 with the given GPU count and the host's own address; waits for
+        # all to finish. Failures of individual ssh commands are not detected.
         """Join every host in an MPI-style hostfile to the ray cluster over ssh, in parallel.
 
         Ray itself cannot bring up the workers: the head is already running locally and the
@@ -286,10 +363,17 @@ class BaseCommandBackend(ABC):
         )
 
     def hf_download_dataset(self, full_name: str, data_dir: str = "/root/datasets"):
+        # [FUNCTION DOC] Downloads a dataset repository named "owner/name" with the hf command line
+        # tool into data_dir/name (default data_dir /root/datasets), via the CPU command method. A
+        # name without exactly one slash raises a value error from unpacking.
         _, partial_name = full_name.split("/")
         self.exec_command_cpu(f"hf download --repo-type dataset {full_name} --local-dir {data_dir}/{partial_name}")
 
     def fp8_cast_bf16(self, path_src, path_dst):
+        # [FUNCTION DOC] Casts an fp8 HuggingFace checkpoint to bf16, cached. Under an exclusive
+        # lock on the destination, skips if the destination already has the safetensors index file;
+        # otherwise runs the repository's cast tool with the source and destination via the GPU
+        # command method.
         with exclusive_path_lock(path_dst):
             sentinel = Path(path_dst) / "model.safetensors.index.json"
             if sentinel.exists():
@@ -303,17 +387,25 @@ class BaseCommandBackend(ABC):
             )
 
     def api_server_host(self, config: ExecuteTrainConfig) -> str:
+        # [FUNCTION DOC] Host name where the run's api server can be reached; the default is
+        # "localhost" and ignores the config. Backends override.
         return "localhost"
 
     @abstractmethod
+    # [FUNCTION DOC] Abstract hook (comment placed above because the body is on the signature line):
+    # performs the actual training launch for a validated request and its config; returns nothing.
     def _execute_train_inner(self, *, request: ExecuteTrainRequest, config: ExecuteTrainConfig) -> None: ...
 
     def exec_command_cpu(self, cmd: str, capture_output: bool = False) -> str | None:
+        # [FUNCTION DOC] Runs a shell command that needs no GPU; delegates to the inner hook and
+        # returns its result (captured output text if requested, else none).
         return self._exec_command_cpu_inner(cmd, capture_output=capture_output)
 
     def exec_command_gpu(
         self, cmd: str, capture_output: bool = False, num_gpus_per_node: int | None = None
     ) -> str | None:
+        # [FUNCTION DOC] Runs a shell command on one node with GPUs; delegates to the inner hook
+        # with the capture flag and optional GPUs per node; returns the captured output or none.
         return self._exec_command_gpu_inner(cmd, capture_output=capture_output, num_gpus_per_node=num_gpus_per_node)
 
     def exec_command_multi_node(
@@ -323,19 +415,30 @@ class BaseCommandBackend(ABC):
         num_nodes: int | None = None,
         num_gpus_per_node: int | None = None,
     ) -> list[str | None]:
+        # [FUNCTION DOC] Runs a shell command on several nodes; delegates to the inner hook with
+        # the capture flag, node count and GPUs per node; returns one entry per node (captured
+        # output or none).
         return self._exec_command_multi_node_inner(
             cmd, capture_output=capture_output, num_nodes=num_nodes, num_gpus_per_node=num_gpus_per_node
         )
 
     def _exec_command_cpu_inner(self, cmd: str, capture_output: bool = False) -> str | None:
+        # [FUNCTION DOC] HELPER: Default implementation: runs the command locally through the
+        # shared shell runner (bash, failing on non-zero exit) and returns its captured stdout if
+        # requested.
         return run_shell_command(cmd, capture_output=capture_output)
 
     @abstractmethod
+    # [FUNCTION DOC] HELPER: Abstract hook (comment placed above because the body is on the
+    # signature line): runs a command on a GPU node; returns captured output if requested.
     def _exec_command_gpu_inner(
         self, cmd: str, capture_output: bool = False, num_gpus_per_node: int | None = None
     ) -> str | None: ...
 
     @abstractmethod
+    # [FUNCTION DOC] HELPER: Abstract hook (comment placed above because the body is on the
+    # signature line): runs a command on several nodes; returns a list with one captured output
+    # (or none) per node.
     def _exec_command_multi_node_inner(
         self,
         cmd: str,
@@ -346,6 +449,8 @@ class BaseCommandBackend(ABC):
 
 
 def resolve_extra_env_vars(extra_env_vars: dict[str, str], config: ExecuteTrainConfig) -> dict[str, str]:
+    # [FUNCTION DOC] Merges the explicit mapping with the variables parsed from the config's
+    # extra-env string; the config's entries win on conflict. Returns a new mapping.
     return {
         **extra_env_vars,
         **_parse_extra_env_vars(config.extra_env_vars),
@@ -354,6 +459,10 @@ def resolve_extra_env_vars(extra_env_vars: dict[str, str], config: ExecuteTrainC
 
 @contextmanager
 def exclusive_path_lock(path_dst: str):
+    # [FUNCTION DOC] Context manager holding an exclusive advisory file lock on a sibling file
+    # named after the destination with ".lock" appended (parent directories are created, the file
+    # is created/truncated). Blocks until the lock is available; released when the file closes at
+    # exit. Works between processes on the same host (or shared file system with lock support).
     """Serialize prepare steps racing on a cache dir shared between runners on one host."""
     path = Path(path_dst)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -363,6 +472,11 @@ def exclusive_path_lock(path_dst: str):
 
 
 def resolve_hardware(config: ExecuteTrainConfig) -> str:
+    # [FUNCTION DOC] Reads the config's hardware field: "auto" runs the hardware detector and
+    # prints the result to standard error; anything else is used as given. Asserts the result is
+    # one of the allowed values declared in the type annotation of that field. Returns it.
+    # KNOWN ISSUE: the training config class itself has no hardware field; this only works for
+    # subclasses that declare one (otherwise attribute or key errors).
     """`auto` asks the node the launcher runs on; anything explicit overrides it."""
     if config.hardware == "auto":
         hardware = detect_hardware()
@@ -375,6 +489,8 @@ def resolve_hardware(config: ExecuteTrainConfig) -> str:
 
 
 def _assert_train_args_name_no_other_deploy_component(train_argv: list[str], *, deploy_component: str) -> None:
+    # [FUNCTION DOC] HELPER: Asserts that every deploy-component flag value in the train argv
+    # equals the launch's component (repeating the same value is fine).
     conflicting = sorted(set(ArgvManipulator.get(train_argv, _DEPLOY_COMPONENT_FLAG)) - {deploy_component})
     assert not conflicting, (
         f"This launch deploys the {deploy_component} part of the run, and everything it installs is named after "
@@ -384,6 +500,8 @@ def _assert_train_args_name_no_other_deploy_component(train_argv: list[str], *, 
 
 
 def _assert_train_args_name_no_other_run_uuid(train_argv: list[str], *, run_uuid: str) -> None:
+    # [FUNCTION DOC] HELPER: Asserts that every run-uuid flag value in the train argv equals the
+    # launch's run uuid.
     conflicting = sorted(set(ArgvManipulator.get(train_argv, _RUN_UUID_FLAG)) - {run_uuid})
     assert (
         not conflicting
@@ -391,10 +509,13 @@ def _assert_train_args_name_no_other_run_uuid(train_argv: list[str], *, run_uuid
 
 
 def _declared_cluster_backends(train_argv: list[str]) -> list[str]:
+    # [FUNCTION DOC] HELPER: All values given for the cluster-backend flag in the argv, in order.
     return ArgvManipulator.get(train_argv, CLUSTER_BACKEND_FLAG)
 
 
 def _assert_train_args_name_no_other_backend(train_argv: list[str], *, cluster_backend: str) -> None:
+    # [FUNCTION DOC] HELPER: Asserts that every cluster-backend flag value in the train argv equals
+    # the backend the launch targets.
     conflicting = sorted(set(_declared_cluster_backends(train_argv)) - {cluster_backend})
     assert not conflicting, (
         f"This run is launched onto {cluster_backend}, so its pods have to be told {CLUSTER_BACKEND_FLAG} "

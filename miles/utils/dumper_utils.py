@@ -1,3 +1,11 @@
+# [MODULE DOC] Glue between miles and sglang's tensor dumper. SGLang side: builds the environment
+# variables for engine processes and, once engines have registered with the router, configures
+# the dumper on each over HTTP. Megatron side: DumperMegatronUtil configures the dumper per
+# phase and rollout, optionally registers hooks, wraps the forward step to advance the dumper per
+# micro-batch, and at the end dumps weights and gradients. Phases: inference, forward-only and
+# forward-backward; each has key-value override options on args, with a global enable flag.
+# Dump files go under the dumper directory option; only effective data-parallel rank 0 writes
+# files; stale directories are removed by global rank 0 of cell 0.
 from __future__ import annotations
 
 import asyncio
@@ -26,6 +34,8 @@ _WORKER_REGISTRATION_TIMEOUT_SECONDS = 120.0
 
 
 class DumperPhase(enum.Enum):
+    # [CLASS DOC] Phases that can be dumped; the string values (inference, fwd_only, fwd_bwd) are
+    # used in option names (dumper_<value>) and directory names.
     INFERENCE = "inference"
     FWD_ONLY = "fwd_only"
     FWD_BWD = "fwd_bwd"
@@ -35,6 +45,11 @@ class DumperPhase(enum.Enum):
 
 
 def get_sglang_env(args: Namespace) -> dict[str, str]:
+    # [FUNCTION DOC] Returns an empty mapping unless the inference phase is enabled. Otherwise a
+    # mapping with the dumper server port set to "reuse", plus the non-intrusive mode (as text)
+    # when the inference overrides set it, plus the source patcher config: the dedicated
+    # inference option wins, else the override value (as text) if set. These must be present at
+    # engine start because hooks are registered during model loading.
     if not _is_phase_enabled(args, DumperPhase.INFERENCE):
         return {}
 
@@ -56,6 +71,12 @@ def get_sglang_env(args: Namespace) -> dict[str, str]:
 
 
 async def configure_sglang(args: Namespace) -> None:
+    # [FUNCTION DOC] Does nothing unless the inference phase is enabled. Otherwise waits until the
+    # router lists enough engines, deletes the "engines" dump directory (cell 0 rank 0 only),
+    # then concurrently posts to each engine's dumper configure endpoint a body with enable true,
+    # the dump directory, experiment name "engines/engine_<index>" and the inference overrides
+    # (which can override the earlier keys). Engine index follows the URL list order. Logs the
+    # engine count. Network and filesystem side effects; request errors propagate.
     if not _is_phase_enabled(args, DumperPhase.INFERENCE):
         return
 
@@ -82,11 +103,17 @@ async def configure_sglang(args: Namespace) -> None:
 
 
 async def _wait_registered_worker_urls(args: Namespace) -> list[str]:
+    # [FUNCTION DOC] HELPER: Expected count = number of server cells of the first model in the
+    # resolved sglang config. Repeatedly fetches worker urls from the router (retrying on
+    # assertion failure, up to 120 seconds) until at least that many are reported; returns the
+    # list (may be longer than expected). The rollout module is imported lazily.
     from miles.rollout.inference_rollout.inference_rollout_train import get_worker_urls
 
     expected_worker_count = resolve_sglang_config(args).models[0].num_server_cells
 
     async def _attempt(_remaining_seconds: float) -> list[str]:
+        # [FUNCTION DOC] HELPER: One retry attempt: fetch urls and assert at least the expected
+        # number is present (assertion message shows found/expected); returns them.
         worker_urls = await get_worker_urls(args)
         assert (
             len(worker_urls) >= expected_worker_count
@@ -105,6 +132,10 @@ async def _wait_registered_worker_urls(args: Namespace) -> list[str]:
 
 
 class DumperMegatronUtil:
+    # [CLASS DOC] Per-phase, per-rollout dumper controller for Megatron training. Attributes:
+    # phase, rollout id, the phase's override options, and enabled (whether the phase's overrides
+    # enable dumping). Usage: construct before the step, wrap the forward step function, call
+    # finalize after the step.
     def __init__(
         self,
         args: Namespace,
@@ -114,6 +145,11 @@ class DumperMegatronUtil:
         rollout_id: int,
         store_prefix: str = "",
     ) -> None:
+        # [FUNCTION DOC] Stores phase and rollout id, computes the override options, and
+        # configures the dumper (see the configure helper; may delete directories and hit
+        # barriers). If enabled, registers non-intrusive dumping hooks on the single model chunk
+        # (assertion if there is more than one chunk). store_prefix (default empty) is added to the
+        # experiment name.
         self.phase = phase
         self.rollout_id = rollout_id
         self.overrides = _get_phase_override_configs(args, phase)
@@ -124,12 +160,20 @@ class DumperMegatronUtil:
             dumper.register_non_intrusive_dumper(self._extract_model(model))
 
     def wrap_forward_step(self, forward_step_func: Callable) -> Callable:
+        # [FUNCTION DOC] Returns the function unchanged when disabled; otherwise a wrapper that
+        # advances the dumper step before every call except the first.
         if not self.enabled:
             return forward_step_func
 
         return _wrap_forward_step_with_stepping(forward_step_func)
 
     def finalize(self, model: Sequence[torch.nn.Module]) -> None:
+        # [FUNCTION DOC] Does nothing when disabled. Otherwise, for the forward-backward phase
+        # with the model-grad override set, logs gradient coverage and builds a getter that
+        # returns fully gathered gradients. Then resets the dumper, reconfigures it without
+        # cleaning previous output (so activations from this rollout survive), dumps the model
+        # weights (and gradients via the getter), advances one step, and disables the dumper.
+        # Weights and gradients therefore land at step 0 of the reset dumper.
         if not self.enabled:
             return
 
@@ -150,6 +194,8 @@ class DumperMegatronUtil:
 
     @staticmethod
     def _extract_model(model: Sequence[torch.nn.Module]) -> torch.nn.Module:
+        # [FUNCTION DOC] HELPER: Static. Asserts exactly one model chunk (virtual pipeline
+        # parallelism unsupported) and returns it.
         assert (
             len(model) == 1
         ), f"Dumper does not yet support virtual pipeline parallelism (got {len(model)} model chunks)"
@@ -164,6 +210,14 @@ class DumperMegatronUtil:
         store_prefix: str = "",
         overrides: dict[str, Any] | None = None,
     ) -> bool:
+        # [FUNCTION DOC] HELPER: Static. Uses the given overrides or computes them; returns false
+        # if they do not enable dumping. Otherwise builds a config: directory from args,
+        # experiment name "<phase>/<store_prefix>rollout_<id>", console output off by default,
+        # then the overrides on top. On ranks whose effective data-parallel rank is not 0, file
+        # and console output are forced off (they still join collectives). Validates by building
+        # the dumper config object, resets the dumper, deletes the whole phase directory when the
+        # rollout id is 0 and the experiment directory always (both only by global rank 0 of
+        # cell 0), synchronizes ranks and cells, and applies the config. Returns true.
         if overrides is None:
             overrides = _get_phase_override_configs(args, phase)
         if not overrides.get("enable"):
@@ -203,6 +257,15 @@ class DumperMegatronUtil:
 def _build_full_grad_getter(
     model_chunk: torch.nn.Module,
 ) -> Callable[[torch.nn.Parameter], torch.Tensor | None]:
+    # [FUNCTION DOC] HELPER: Collective over the optimizer-instance groups. For every gradient
+    # bucket group (regular and expert) that uses the distributed optimizer, and each of its
+    # buckets: if the optimizer instance size is above 1, allocates a buffer like the bucket's
+    # gradient data, takes this rank's owned equal shard, and all-gathers shards into the buffer
+    # (reading, not mutating, the bucket); otherwise uses the bucket data directly. Maps every
+    # parameter in the bucket to its slice of the flattened buffer, reshaped to the parameter
+    # shape. Returns a getter: the gathered gradient if the parameter was mapped, else the
+    # parameter's grad, else its main grad, else none. Gathered views reference the temporary
+    # buffers, kept alive by the getter.
     """Build get_grad(param): all-gather distributed-optimizer grad shards into a
     fresh buffer (grad_data is read, not mutated) and return per-param views."""
     grad_map: dict[torch.nn.Parameter, torch.Tensor] = {}
@@ -239,6 +302,8 @@ def _build_full_grad_getter(
                 grad_map[param] = flat[start:end].view(param.shape)
 
     def get_grad(param: torch.nn.Parameter) -> torch.Tensor | None:
+        # [FUNCTION DOC] HELPER: Looks the parameter up in the gathered map; falls back to its grad
+        # attribute, then its main-grad attribute, then none.
         reduced = grad_map.get(param)
         if reduced is not None:
             return reduced
@@ -249,6 +314,9 @@ def _build_full_grad_getter(
 
 
 def _log_model_grad_coverage(model: torch.nn.Module) -> None:
+    # [FUNCTION DOC] HELPER: Over trainable parameters, counts those with a grad (grad attribute
+    # or main grad) and collects names of those without. Logs at info level the rank (distributed
+    # rank if initialized, else the dumper's rank), counts, and the first 20 missing names.
     missing: list[str] = []
     with_grad = 0
     total = 0
@@ -276,9 +344,13 @@ def _log_model_grad_coverage(model: torch.nn.Module) -> None:
 
 
 def _wrap_forward_step_with_stepping(forward_step_func: Callable) -> Callable:
+    # [FUNCTION DOC] HELPER: Returns a wrapper that, on every call after the first, advances the
+    # dumper by one step before delegating with the same arguments and returning the result (so
+    # each micro-batch gets its own step index).
     is_first_call = True
 
     def _wrapped(*args: Any, **kwargs: Any) -> Any:
+        # [FUNCTION DOC] HELPER: The wrapper described above.
         nonlocal is_first_call
         if not is_first_call:
             dumper.step()
@@ -292,6 +364,9 @@ def _wrap_forward_step_with_stepping(forward_step_func: Callable) -> Callable:
 
 
 def _cleanup_dump_dir(dump_dir: Path, *, indep_dp_rank: int) -> None:
+    # [FUNCTION DOC] HELPER: Recursively deletes the directory, only when the dumper rank is 0,
+    # the independent data-parallel (cell) rank is 0 and the directory exists. An operating
+    # system error during deletion is logged as a warning and swallowed.
     # Only cell 0's rank 0 deletes — avoids race when multiple cells' rank 0
     # all see _get_rank()==0 and try to rmtree the same directory.
     # Best-effort: stale handles from a peer that crashed (NFS .nfsXXXX stubs)
@@ -305,6 +380,10 @@ def _cleanup_dump_dir(dump_dir: Path, *, indep_dp_rank: int) -> None:
 
 
 def _barrier_after_dump_dir_cleanup() -> None:
+    # [FUNCTION DOC] HELPER: Barrier on the default group if distributed is initialized. Then, if
+    # there is a cross-cell group, logs a structured start event, runs a barrier on that group and
+    # logs a success end event. If that barrier raises (a dead peer aborted the group), logs an
+    # error event marked degraded and continues without raising.
     if dist.is_initialized():
         dist.barrier()
 
@@ -353,13 +432,19 @@ def _barrier_after_dump_dir_cleanup() -> None:
 
 
 def _get_phase_override_configs(args: Namespace, phase: DumperPhase) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Reads the phase's key-value option (attribute dumper_<phase>) and
+    # converts it with the dumper config's parser into a mapping; returns it with the global
+    # dumper enable flag first, so an "enable" key in the phase options overrides the global flag.
     raw = getattr(args, f"dumper_{phase.value}")
     return {"enable": args.dumper_enable, **DumperConfig._kv_pairs_to_dict(raw)}
 
 
 def _is_phase_enabled(args: Namespace, phase: DumperPhase) -> bool:
+    # [FUNCTION DOC] HELPER: The enable value from the phase's overrides (global flag unless the
+    # phase options set it), false if absent.
     return _get_phase_override_configs(args, phase).get("enable", False)
 
 
 def _get_dir(args: Namespace) -> Path:
+    # [FUNCTION DOC] HELPER: The dumper directory option as a path.
     return Path(args.dumper_dir)

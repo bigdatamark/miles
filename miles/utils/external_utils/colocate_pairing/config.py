@@ -1,3 +1,8 @@
+# [MODULE DOC] Immutable, strictly validated (unknown fields rejected) configuration models for
+# the pairing controller: the geometry of one inference pool relative to the trainer (checked so
+# that every inference pod lies inside a single trainer pod's GPUs), a named inference pool, and
+# the whole config (namespace, release, trainer pool id, at least one inference pool, no two pools
+# claiming the same trainer GPU). Validation rules are written as assertions inside validators.
 from __future__ import annotations
 
 from pydantic import Field, model_validator
@@ -6,6 +11,11 @@ from miles.utils.pydantic_utils import FrozenStrictBaseModel
 
 
 class PairingLayout(FrozenStrictBaseModel):
+    # [CLASS DOC] Geometry of one inference pool. Fields (all integers; counts at least 1, GPU
+    # offset at least 0): number of inference cells and trainer cells, pods per inference cell and
+    # per trainer cell, GPUs per node, GPUs per inference pod, and gpu_offset (the index, in the
+    # trainer's flat GPU numbering, where this pool's first GPU sits). The flat numbering runs over
+    # trainer cells, then pods in a cell, then GPUs of the node.
     num_inference_cells: int = Field(ge=1)
     num_trainer_cells: int = Field(ge=1)
     num_pods_per_inference_cell: int = Field(ge=1)
@@ -16,18 +26,31 @@ class PairingLayout(FrozenStrictBaseModel):
 
     @property
     def gpus_per_inference_cell(self) -> int:
+        # [FUNCTION DOC] Property: pods per inference cell times GPUs per inference pod.
         return self.num_pods_per_inference_cell * self.num_gpus_per_inference_pod
 
     @property
     def total_inference_gpus(self) -> int:
+        # [FUNCTION DOC] Property: inference cells times pods per cell times GPUs per inference
+        # pod.
         return self.num_inference_cells * self.num_pods_per_inference_cell * self.num_gpus_per_inference_pod
 
     @property
     def total_trainer_gpus(self) -> int:
+        # [FUNCTION DOC] Property: trainer cells times pods per trainer cell times GPUs per node
+        # (assumes each trainer pod uses a whole node's GPUs).
         return self.num_trainer_cells * self.num_pods_per_trainer_cell * self.num_gpus_per_node
 
     @model_validator(mode="after")
     def _assert_inference_pods_pair(self) -> PairingLayout:
+        # [FUNCTION DOC] HELPER: Post-construction validator, fails (as a validation error, from
+        # assertions) unless: an inference cell has no more pods than a trainer cell; the trainer
+        # cell's pod count is a multiple of the inference cell's pod count; the GPU offset is a
+        # multiple of GPUs per inference cell; GPUs per node is a multiple of GPUs per inference
+        # pod; and the offset plus total inference GPUs does not exceed total trainer GPUs.
+        # Returns the model.
+        # KNOWN ISSUE: checks are plain assertions, so they are skipped when Python runs with
+        # assertions disabled.
         assert self.num_pods_per_inference_cell <= self.num_pods_per_trainer_cell, (
             f"An inference cell of {self.num_pods_per_inference_cell} pods cannot fit in a trainer cell of "
             f"{self.num_pods_per_trainer_cell}; colocate needs every inference worker to sit on a trainer's node"
@@ -53,11 +76,15 @@ class PairingLayout(FrozenStrictBaseModel):
 
 
 class InferencePool(FrozenStrictBaseModel):
+    # [CLASS DOC] One inference pool: its pool id (matches the pool label of its pods) and its
+    # layout.
     pool_id: str
     layout: PairingLayout
 
 
 class PairingConfig(FrozenStrictBaseModel):
+    # [CLASS DOC] Whole controller config: namespace to watch, release (helm release name, used as
+    # the instance label value), trainer pool id, and a non-empty list of inference pools.
     namespace: str
     release: str
     trainer_pool_id: str
@@ -65,6 +92,10 @@ class PairingConfig(FrozenStrictBaseModel):
 
     @model_validator(mode="after")
     def _assert_pools_claim_distinct_gpus(self) -> PairingConfig:
+        # [FUNCTION DOC] HELPER: Post-construction validator. Each pool claims the trainer GPU
+        # indices from its offset for its total inference GPU count; asserts no index is claimed by
+        # two pools (message names both pools and the GPU). Returns the model. Like the layout
+        # checks, relies on assertions.
         owner_of_gpu: dict[int, str] = {}
         for pool in self.inference_pools:
             span = range(pool.layout.gpu_offset, pool.layout.gpu_offset + pool.layout.total_inference_gpus)

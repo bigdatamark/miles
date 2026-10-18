@@ -1,3 +1,8 @@
+# [MODULE DOC] Planning of hot restarts: restarting the orchestration script together with the
+# rollout executor of an already installed run by stamping a restart time onto their stateful sets
+# (so the pods are rolled) while permitting only those objects to differ from the installed
+# manifest. Without a hot restart request, the stamp found on the installed manifest is carried
+# over so a later plain upgrade does not undo or re-trigger it.
 from __future__ import annotations
 
 import datetime
@@ -19,6 +24,9 @@ _COMPONENT_NAMES = {
 
 
 class HotRestartPlan(FrozenStrictBaseModel):
+    # [CLASS DOC] Immutable plan: the restart timestamp text (none if no restart stamp), the set of
+    # component names that carry the stamp, and the set of manifest object keys that may differ
+    # from the installed manifest (all default empty or none).
     restart_at: str | None = None
     stamped_components: frozenset[str] = frozenset()
     allow_diff_object_keys: frozenset[ManifestObjectKey] = frozenset()
@@ -31,6 +39,14 @@ def plan_hot_restart(
     release: str,
     installed_manifest: Manifest | None,
 ) -> HotRestartPlan:
+    # [FUNCTION DOC] Keyword-only. With no components requested, returns the plan that carries the
+    # installed stamp (see the carry helper). Otherwise asserts: the request names exactly the
+    # orchestration script and the rollout executor (no subset); the release being deployed carries
+    # the orchestration script; and a release is already installed (a hot restart takes over a live
+    # run). Then returns a plan whose restart time is the current UTC time in ISO format with
+    # microseconds, whose stamped components are the stateful set names of the requested
+    # components, and whose allowed-difference keys are the stateful set object keys of those
+    # components in the release.
     if not components:
         return _carry_installed_stamp(installed_manifest, release=release)
 
@@ -59,14 +75,22 @@ def plan_hot_restart(
 
 
 def compute_orchestrator_object_key(release: str) -> ManifestObjectKey:
+    # [FUNCTION DOC] The manifest object key (stateful set kind plus component name) of the
+    # release's orchestrator.
     return _stateful_set_key(release, naming.ORCHESTRATOR_COMPONENT)
 
 
 def _stateful_set_key(release: str, component: str) -> ManifestObjectKey:
+    # [FUNCTION DOC] HELPER: The object key of the component's stateful set: kind stateful set and
+    # the component object name derived from the release and component.
     return ManifestObjectKey(kind=STATEFUL_SET_KIND, name=naming.component_name(release, component))
 
 
 def _carry_installed_stamp(installed_manifest: Manifest | None, *, release: str) -> HotRestartPlan:
+    # [FUNCTION DOC] HELPER: Returns an empty plan if nothing is installed or the installed
+    # orchestrator has no restart stamp. Otherwise reads the restart stamp of both components'
+    # objects from the installed manifest and returns a plan with the orchestrator's stamp and the
+    # set of components whose stamp equals it; no differences are allowed.
     if installed_manifest is None:
         return HotRestartPlan()
 

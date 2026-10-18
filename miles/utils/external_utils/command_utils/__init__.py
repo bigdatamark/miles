@@ -1,3 +1,10 @@
+# [PACKAGE DOC] Command utilities used by launch scripts and tests to run training and helper
+# commands on a chosen cluster backend (Ray or Kubernetes through helm). This package re-exports
+# the public surface: the backend configuration and request types, config loading from the
+# environment, hardware detection and tables, run-id and environment-variable helpers, wandb and
+# mooncake argument builders, pseudo-file encoding, the rsync command builder and the command-line
+# dataclass decorator. Submodules: base_backend (abstract backend and shared launch checks), common
+# (stateless helpers), helm_backend (Kubernetes implementation).
 from miles.utils.external_utils.command_utils.base_backend import (
     CommandUtilConfig,
     ExecuteTrainConfig,

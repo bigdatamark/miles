@@ -1,3 +1,7 @@
+# [MODULE DOC] The Kubernetes command backend. Training launches go to the launcher entrypoint;
+# one-off commands run as Kubernetes jobs (one completion per node) through the command-job
+# module, after checking that the chart's scheduling constraints can place the requested number of
+# nodes. Also computes the in-cluster host name of the run's api server.
 from __future__ import annotations
 
 from pathlib import Path
@@ -18,12 +22,16 @@ _HOSTNAME_LABEL = "kubernetes.io/hostname"
 
 
 class KubernetesCommandBackend(BaseCommandBackend):
+    # [CLASS DOC] Backend implementing the protected hooks of the base backend for Kubernetes.
     def _execute_train_inner(self, *, request: ExecuteTrainRequest, config: ExecuteTrainConfig) -> None:
+        # [FUNCTION DOC] Delegates the whole launch to the launcher entrypoint's train function.
         entrypoint.execute_train(request=request, config=config)
 
     def _exec_command_gpu_inner(
         self, cmd: str, capture_output: bool = False, num_gpus_per_node: int | None = None
     ) -> str | None:
+        # [FUNCTION DOC] Runs the command as a single-node job via the public multi-node method
+        # (node count 1) and returns the first (only) entry.
         return self.exec_command_multi_node(
             cmd, capture_output=capture_output, num_nodes=1, num_gpus_per_node=num_gpus_per_node
         )[0]
@@ -35,6 +43,11 @@ class KubernetesCommandBackend(BaseCommandBackend):
         num_nodes: int | None = None,
         num_gpus_per_node: int | None = None,
     ) -> list[str | None]:
+        # [FUNCTION DOC] Asserts a namespace is configured and the node count is given (it cannot be
+        # inferred on Kubernetes). Checks the requested nodes are schedulable for the chart, then
+        # runs the command as a job with one completion per node, GPUs per pod defaulting to 1 when
+        # unspecified, the configured helm values files and step name "command"; returns the
+        # per-node outputs (captured logs or none).
         assert self.config.namespace, "Set CommandUtilConfig.namespace to run a command somewhere"
         assert (
             num_nodes is not None
@@ -55,6 +68,11 @@ class KubernetesCommandBackend(BaseCommandBackend):
         )
 
     def _assert_requested_nodes_schedulable(self, *, num_nodes: int, chart: Path) -> None:
+        # [FUNCTION DOC] HELPER: Does nothing for one node or fewer. Otherwise loads the chart's
+        # infrastructure values with the configured values files. Raises an assertion error if the
+        # node selector pins the deployment to a single host name (extra nodes would stay pending
+        # forever). Also asserts that, when required node affinity restricts host names to a finite
+        # set, that set has at least the requested number of hosts.
         if num_nodes <= 1:
             return
 
@@ -75,6 +93,10 @@ class KubernetesCommandBackend(BaseCommandBackend):
         )
 
     def api_server_host(self, config: ExecuteTrainConfig) -> str:
+        # [FUNCTION DOC] Asserts the config has a run id and namespace, and that the deploy
+        # component is not a split deployment (split runs have no api server). Returns the
+        # in-cluster host name of the orchestrator pod, computed from the serialized release name
+        # (run id, deploy component, deploy instance id) and the namespace.
         assert config.run_id and config.namespace, (
             "The api server of a kubernetes run answers on the orchestrator's pod, which is named after the "
             "release; set the launch config's run_id and namespace before asking where that pod is"
@@ -95,6 +117,11 @@ class KubernetesCommandBackend(BaseCommandBackend):
 
 
 def _required_affinity_hostnames(scheduling: Scheduling | None) -> set[str] | None:
+    # [FUNCTION DOC] HELPER: Returns the set of host names that required node affinity allows, or
+    # none if no host restriction applies. None when there is no scheduling, no affinity, no node
+    # affinity requirement, or any selector term lacks an "In" expression on the hostname label
+    # (an unrestricted term means any host). Otherwise the union over non-empty terms of the
+    # intersection of that term's hostname "In" value sets. Empty terms are skipped.
     if scheduling is None or not scheduling.affinity:
         return None
     affinity = scheduling.affinity.get("nodeAffinity") or {}

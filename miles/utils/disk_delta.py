@@ -125,6 +125,7 @@ def make_tensor_reader(ckpt_dir: str):
         expected_dtype: str | None = None,
         expected_shape: tuple[int, ...] | None = None,
     ) -> np.ndarray:
+        # [FUNCTION DOC] HELPER: See the enclosing function; reads one tensor's bytes.
         path, offset, nbytes, dtype, shape = locations[name]
         if (expected_dtype is not None and dtype != expected_dtype) or (
             expected_shape is not None and shape != expected_shape

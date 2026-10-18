@@ -1,3 +1,7 @@
+# [MODULE DOC] Helpers for torch distributed: a lazily created global gloo (CPU) group, a
+# context manager that serializes a code block across ranks, a copy of torch's process group
+# initialization that permits several "main" groups in one process, and a whitening function that
+# uses statistics aggregated over a process group. Module state: the gloo group handle.
 from contextlib import contextmanager
 from datetime import timedelta
 from typing import Any
@@ -21,6 +25,8 @@ GLOO_GROUP = None
 
 
 def init_gloo_group():
+    # [FUNCTION DOC] Creates, once, a new gloo-backend group over all ranks and stores it in the
+    # module global (collective on first call); later calls return the stored group.
     """Initialize Gloo group for distributed communication."""
     global GLOO_GROUP
     if GLOO_GROUP is None:
@@ -29,6 +35,10 @@ def init_gloo_group():
 
 
 def get_gloo_group():
+    # [FUNCTION DOC] Returns the stored gloo group; raises a runtime error if it was never
+    # initialized.
+    # KNOWN ISSUE: the error message names a function "_init_gloo_group", which does not exist
+    # (the real one is init_gloo_group).
     """Get the Gloo group for distributed communication."""
     global GLOO_GROUP
     if GLOO_GROUP is None:
@@ -38,6 +48,11 @@ def get_gloo_group():
 
 @contextmanager
 def one_rank_at_a_time():
+    # [FUNCTION DOC] Context manager that makes ranks execute the managed block one after another
+    # in rank order. Loops over ranks 0..world-1; the matching rank yields (runs its block), and
+    # after each step all ranks meet at a barrier on the gloo group. So rank r runs its block only
+    # after ranks below it finished. Requires the gloo group. If a block raises, that rank skips
+    # its barrier and the other ranks will hang.
     for rank in range(dist.get_world_size()):
         if rank == dist.get_rank():
             yield
@@ -56,6 +71,17 @@ def init_process_group(
     group_name: str = None,
     pg_options: Any | None = None,
 ):
+    # [FUNCTION DOC] Creates and returns a process group without registering it as the default
+    # (copied from torch to allow several main groups). Exactly one of store or init_method may be
+    # given (assertion otherwise). With a store: world size must be positive and rank non-negative.
+    # With neither: init method defaults to environment-variable rendezvous. Backend defaults to
+    # undefined, timeout to torch's default. Without a store, runs the rendezvous to get a store,
+    # rank and world size, sets the store timeout and wraps the store in a prefix store keyed by the
+    # group name. Passes the backend options under the keyword name that matches the torch version
+    # (renamed in 2.6). Registers an identity mapping from group rank to global rank in torch's
+    # private world table (side effect on torch internals).
+    # KNOWN ISSUE: group_name defaults to none, but the prefix store requires a string, so the
+    # rendezvous path fails unless a name is passed.
     assert (store is None) or (init_method is None), "Cannot specify both init_method and store."
 
     if store is not None:
@@ -109,6 +135,13 @@ def distributed_masked_whiten(
     shift_mean: bool = True,
     epsilon: float = 1e-8,
 ):
+    # [FUNCTION DOC] Computes masked sum, sum of squares and mask count locally, sums these three
+    # numbers across the given process group (a group-aware utility is chosen from the group) in
+    # float32, and raises a value error if the global mask count is zero. Mean is sum over count;
+    # variance is mean of squares minus squared mean, multiplied by count/(count-1) when the count
+    # is at least 2. Returns (values minus mean) times the inverse square root of (variance plus
+    # epsilon); if shift_mean is false the mean is added back (modifying the result in place).
+    # The mask is not applied to the output.
     """
     Performs whitening on a tensor using global statistics from all participating GPUs.
 

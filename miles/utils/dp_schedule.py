@@ -1,3 +1,10 @@
+# [MODULE DOC] Computes, on the rollout side, how the samples of a training batch are split into
+# steps, packed into micro-batches and assigned to data-parallel ranks. Rollouts (groups of
+# samples that must be trained together) are counted toward the global batch size. Packing is
+# either dynamic (token budget, first-fit or FLOPs-balanced) or static (fixed micro-batch size),
+# micro-batch counts are aligned to the data-parallel (and virtual-pipeline) layout, and
+# micro-batches are distributed round-robin or balanced by tokens/FLOPs. The config key tuple
+# lists the parallel settings the training backend must report.
 """Per-rollout DP/microbatch scheduling (pack first, distribute second), computed on the rollout side."""
 
 from __future__ import annotations
@@ -18,6 +25,9 @@ SCHEDULE_CONFIG_KEYS = ("dp_size", "cp_size", "vpp_size", "microbatch_group_size
 
 
 def has_full_schedule_config(train_parallel_config: dict | None) -> bool:
+    # [FUNCTION DOC] False for a missing or empty mapping; otherwise true only if all four keys
+    # (dp size, cp size, vpp size, microbatch group size per vp stage) are present (values may be
+    # none).
     """True when the backend advertised every field build_dp_schedule needs."""
     if not train_parallel_config:
         return False
@@ -25,6 +35,8 @@ def has_full_schedule_config(train_parallel_config: dict | None) -> bool:
 
 
 def _calculate_workloads(step_lengths, args):
+    # [FUNCTION DOC] HELPER: Returns, for each sequence length, the estimated forward FLOPs of a
+    # single sequence of that length under the model settings in args.
     return [calculate_fwd_flops([sl], args) for sl in step_lengths]
 
 
@@ -36,6 +48,31 @@ def build_dp_schedule(
     global_batch_size: int,
     rollout_indices: list[int],
 ) -> tuple[list[list[int]], list[list[list[int]]], list[int], list[int]]:
+    # [FUNCTION DOC] Inputs: args (options: use_dynamic_batch_size, max_tokens_per_gpu,
+    # micro_batch_size, balance_data, optional allow_partial_train_step and balance_by_flops), the
+    # backend's parallel config (dp_size, cp_size, vpp_size where none counts as 1, and the
+    # microbatch group size), per-sample total lengths, the global batch size in rollouts, and a
+    # rollout id for every sample position. Outputs a 4-tuple: per-rank flat lists of sample
+    # positions in consumption order; per-rank lists of micro-batches, each a list of indices into
+    # that rank's flat list; per-step micro-batch count per rank; per-step rollout count.
+    # Steps: (1) the micro-batch count of a step must be a multiple of dp size times the micro
+    # batch group size (the latter only when vpp size > 1). (2) Dynamic mode needs a token budget
+    # of max tokens per GPU times cp size (assertion if unset). (3) Group sample positions by
+    # rollout id, in first-seen order. (4) Number of full steps = rollouts // global batch size
+    # (assertion if zero); an extra smaller final step with the leftover rollouts is added only if
+    # allow-partial, dynamic mode, and the leftover has at least dp-size samples (else logged and
+    # dropped); leftover rollouts otherwise are dropped. (5) Per step, take its rollouts' samples
+    # (assert at least dp-size samples) and pack: dynamic with FLOPs balancing uses ceil(total
+    # tokens / budget) balanced partitions of FLOPs (one micro-batch per sample if that count is
+    # at least the sample count), dynamic otherwise uses first-fit-decreasing under the budget;
+    # then the count is grown to the next multiple of the alignment (at least the alignment) by
+    # splitting micro-batches, asserting it is reachable. Static mode asserts micro batch size is
+    # set, cuts consecutive chunks of that size and raises an assertion error if the chunk count is
+    # not a multiple of the alignment. (6) Each rank gets count/dp-size micro-batches: with
+    # balance-data or FLOPs balancing, equal-size balanced partitions over micro-batch weights
+    # (FLOPs sums or token sums); else strided round-robin. (7) Append the samples of each
+    # assigned micro-batch to the rank's partition and record its local index range.
+    # Reads balance_data directly (error if absent) but the other optional flags with defaults.
     """Compute per-rank ``(partitions, micro_batch_indices, num_microbatches, num_rollouts)``;
     ``global_batch_size`` counts rollouts, not training samples."""
     dp_size = train_parallel_config["dp_size"]

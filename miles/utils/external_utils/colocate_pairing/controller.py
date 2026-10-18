@@ -1,3 +1,9 @@
+# [MODULE DOC] Core logic of the colocate pairing controller. At construction every inference pod
+# coordinate (pool, cell, pod index) of every configured pool is mapped to the trainer pod it must
+# share a node with and the base GPU id on that node. Reconciliation works per trainer pod: once
+# the trainer pod has a node, all its gated inference pods are patched (pinned to that node, base
+# GPU id annotated, scheduling gate removed). Pods are grouped under the key of their trainer pod;
+# unrelated pods get a unique key that makes their reconcile a no-op.
 from __future__ import annotations
 
 import asyncio
@@ -23,14 +29,25 @@ _UNRELATED_KEY_PREFIX = "__unrelated__/"
 
 
 class InferencePlacement(NamedTuple):
+    # [CLASS DOC] Where an inference pod must go: the coordinate of its trainer pod, and the GPU
+    # index on that node at which its GPUs start.
     trainer_coord: PodCoordinate
     base_gpu_id: int
 
 
 class PairingController:
+    # [CLASS DOC] Holds the config, the Kubernetes core API client, precomputed placement tables
+    # and (set after construction) the reconcile loop used to look up pods. Precomputed:
+    # for each trainer pod coordinate, the list of (inference coordinate, base GPU id) it hosts;
+    # and for every inference and trainer coordinate, the key of the trainer pod.
     _loop: ReconcileLoop
 
     def __init__(self, *, config: PairingConfig, core_v1: client.CoreV1Api) -> None:
+        # [FUNCTION DOC] Keyword-only. Computes a placement for every (pool, cell, pod) of every
+        # inference pool, groups inference pods by the trainer coordinate they land on, and builds
+        # a mapping from every inference and every hosting trainer coordinate to the trainer's
+        # key. Trainer pods hosting no inference pod are not in the mapping. Placement assertion
+        # errors propagate.
         self._config = config
         self._core_v1 = core_v1
         placement_of_inference = {
@@ -57,9 +74,18 @@ class PairingController:
         } | {trainer: trainer.key for trainer in self._inferences_of_trainer}
 
     def set_loop(self, loop: ReconcileLoop) -> None:
+        # [FUNCTION DOC] Stores the reconcile loop (needed before any reconcile call, because
+        # the loop is created after the controller whose methods it is built from).
         self._loop = loop
 
     async def reconcile(self, pair_key: str) -> None:
+        # [FUNCTION DOC] Reconciles one trainer-pod group. Takes the pods the loop has under the
+        # key and indexes those that have a parseable coordinate. Finds the trainer pod (the
+        # coordinate whose key equals the pair key); returns if absent. Collects inference pods
+        # expected on this trainer that exist and still carry the gate; returns if none. If the
+        # trainer pod has no node yet, logs and returns (retry on a later event or resync).
+        # Otherwise releases all collected pods concurrently; failures are logged per pod with the
+        # stack trace and not raised (the next reconcile retries).
         pods_by_coord = {
             coord: pod for pod in self._loop.get_by_parent(pair_key) if (coord := coordinate_of(pod)) is not None
         }
@@ -106,6 +132,10 @@ class PairingController:
                 )
 
     async def _release(self, inference_pod: Pod, *, node_name: str, base_gpu_id: int, trainer_key: str) -> None:
+        # [FUNCTION DOC] HELPER: Logs the intended placement, then patches the pod in the
+        # configured namespace with the release patch built from the node name, base GPU id, the
+        # pod's current gate names and its annotations (see the pod helpers). API errors
+        # propagate to the caller.
         logger.info(
             "Releasing %s onto gpu %s of %s, where %s runs",
             inference_pod.metadata.name,
@@ -125,6 +155,10 @@ class PairingController:
         )
 
     def key_of(self, pod: Pod) -> str:
+        # [FUNCTION DOC] The grouping key for a pod: the key of its trainer pod when the pod's
+        # coordinate is known to the placement tables; otherwise a unique per-pod key with the
+        # prefix "__unrelated__/" plus the pod name, so unrelated pods are reconciled alone (and
+        # reconcile ignores them).
         if (coord := coordinate_of(pod)) is not None and (key := self._trainer_key_of_coord.get(coord)) is not None:
             return key
         return f"{_UNRELATED_KEY_PREFIX}{pod.metadata.name}"
@@ -133,6 +167,12 @@ class PairingController:
 def _place_inference_pod(
     *, inference_cell_index: int, inference_pod_index: int, layout: PairingLayout, trainer_pool_id: str
 ) -> InferencePlacement:
+    # [FUNCTION DOC] HELPER: Keyword-only. Asserts the cell and pod indices are inside the
+    # layout. The pod's absolute trainer-GPU index = GPU offset + (cell index times pods per cell
+    # plus pod index) times GPUs per inference pod. The trainer node index = absolute GPU divided
+    # (floor) by GPUs per node; that node index is split into (trainer cell, pod in trainer cell)
+    # with the trainer cell's pod count. Returns the trainer coordinate in the trainer pool and the
+    # base GPU id = absolute GPU modulo GPUs per node.
     assert 0 <= inference_cell_index < layout.num_inference_cells, f"{inference_cell_index=} outside {layout}"
     assert 0 <= inference_pod_index < layout.num_pods_per_inference_cell, f"{inference_pod_index=} outside {layout}"
 
