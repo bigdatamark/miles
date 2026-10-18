@@ -1378,6 +1378,8 @@ class TestDeployComponent:
             _validate_deploy_component(args)
 
     def test_refuses_an_address_that_is_not_a_host_and_port(self):
+        # [FUNCTION DOC] A primary with trainer controller address "actor=10.0.0.1" (no port) raises an
+        # assertion error matching "host:port".
         """An unparseable address is found by the launch that installs the release, not by the one that dials it."""
         with pytest.raises(AssertionError, match="host:port"):
             _validate_deploy_component(
@@ -1393,6 +1395,9 @@ class TestDeployComponent:
             )
 
     def test_rejects_an_instance_of_a_component_a_run_has_one_of(self):
+        # [FUNCTION DOC] A primary with instance id "west" raises an assertion error mentioning
+        # "--deploy-instance-id". (Near duplicate of an earlier test using a slightly different
+        # parse helper.)
         """Two primaries would be two orchestration scripts driving one run against each other."""
         with pytest.raises(AssertionError, match="--deploy-instance-id"):
             _validate_deploy_component(
@@ -1400,16 +1405,22 @@ class TestDeployComponent:
             )
 
     def test_rejects_an_instance_of_the_selector_for_all_components(self):
+        # [FUNCTION DOC] An instance id with the default "all" component raises an assertion error
+        # mentioning "--deploy-instance-id".
         """`all` is not a component, so there is no instance of it to deploy."""
         with pytest.raises(AssertionError, match="--deploy-instance-id"):
             _validate_deploy_component(_parse_deploy_args(["--deploy-instance-id", "west"]))
 
     def test_rejects_an_engine_group_name_that_cannot_name_a_release(self):
+        # [FUNCTION DOC] Inference deployment with instance id "DC 1" (uppercase and a space) raises
+        # an assertion error mentioning "--deploy-instance-id".
         """It names the release and the pool ids of its engines, and helm and kubernetes both refuse that name."""
         with pytest.raises(AssertionError, match="--deploy-instance-id"):
             _validate_deploy_component(_parse_deploy_args([*_INFERENCE_ARGS, "--deploy-instance-id", "DC 1"]))
 
     def test_rejects_an_engine_group_name_too_long_to_sit_inside_a_pool_id(self):
+        # [FUNCTION DOC] An instance id one character longer than the maximum length raises an
+        # assertion error mentioning "characters".
         """Every engine pool id of this deployment carries it, and kubernetes bounds those names."""
         with pytest.raises(AssertionError, match="characters"):
             _validate_deploy_component(
@@ -1419,16 +1430,21 @@ class TestDeployComponent:
             )
 
     def test_takes_an_engine_group_name_that_can(self):
+        # [FUNCTION DOC] Inference deployment with instance id "dc-1" passes validation.
         """The lowercase dashed form is what the chart and the pool ids it namespaces both accept."""
         _validate_deploy_component(_parse_deploy_args([*_INFERENCE_ARGS, "--deploy-instance-id", "dc-1"]))
 
     def test_a_named_trainer_deployment_is_validated_as_a_trainer_deployment(self):
+        # [FUNCTION DOC] Trainer component with instance id "actor" and shared store passes
+        # validation.
         """The instance names the release; nothing about the rules of a trainer deployment changes with it."""
         _validate_deploy_component(
             self._parse(["--deploy-component", "trainer", "--deploy-instance-id", "actor", *_SHARED_STORE_ARGS])
         )
 
     def test_rejects_a_trainer_deployment_whose_arguments_describe_several_trainers(self):
+        # [FUNCTION DOC] A trainer component whose encoded Megatron config declares two trainers ("a"
+        # and "b") raises an assertion error matching "describe 2".
         """It carries one trainer, and arguments naming more mean it was handed the whole run's config."""
         with pytest.raises(AssertionError, match="describe 2"):
             _validate_deploy_component(
@@ -1444,6 +1460,8 @@ class TestDeployComponent:
             )
 
     def test_rejects_a_trainer_deployment_that_grows_itself_a_critic(self):
+        # [FUNCTION DOC] A trainer component with the use-critic attribute set raises an assertion
+        # error matching "describe 2".
         """--use-critic appends a second trainer, and this release carries exactly the one its config declares."""
         with pytest.raises(AssertionError, match="describe 2"):
             _validate_deploy_component(
@@ -1451,6 +1469,8 @@ class TestDeployComponent:
             )
 
     def test_rejects_a_trainer_deployment_whose_config_declares_the_critic(self, tmp_path):
+        # [FUNCTION DOC] A Megatron config file written to the temp dir with one trainer of role
+        # "critic" makes the trainer component raise an assertion error matching "declares a critic".
         """A run synthesizes its critic from --use-critic, so no deployment can be handed one to carry."""
         with pytest.raises(AssertionError, match="declares a critic"):
             _validate_deploy_component(
@@ -1466,6 +1486,8 @@ class TestDeployComponent:
             )
 
     def test_rejects_an_instance_that_is_not_the_trainer_its_config_declares(self):
+        # [FUNCTION DOC] A trainer instance id "actro" (typo of the declared "actor") raises an
+        # assertion error whose message mentions "actro".
         """The run reaches a trainer by the id its config declares, so a release named otherwise is unreachable."""
         with pytest.raises(AssertionError, match="actro"):
             _validate_deploy_component(
@@ -1473,6 +1495,8 @@ class TestDeployComponent:
             )
 
     def test_refuses_a_ray_trainer_deployment_that_debugs_the_rollout_alone(self):
+        # [FUNCTION DOC] Ray backend trainer component with the debug-rollout-only flag raises an
+        # assertion error mentioning "--debug-rollout-only".
         """It sizes the placement group for an inference side this deployment does not deploy."""
         with pytest.raises(AssertionError, match="--debug-rollout-only"):
             _validate_deploy_component(
@@ -1482,37 +1506,48 @@ class TestDeployComponent:
             )
 
     def test_a_ray_trainer_deployment_that_trains_normally_still_validates(self):
+        # [FUNCTION DOC] Ray backend trainer component without that flag passes validation.
         """The refusal is about that one flag, and the split trainer itself is unchanged."""
         _validate_deploy_component(self._parse([*_RAY_RPC_ARGS, "--deploy-component", "trainer", *_SHARED_STORE_ARGS]))
 
     def test_a_kubernetes_trainer_deployment_is_not_refused_the_flag(self):
+        # [FUNCTION DOC] Kubernetes trainer component with the debug-rollout-only flag passes
+        # validation.
         """The empty layout is a ray placement group, which this backend builds none of."""
         _validate_deploy_component(
             self._parse(["--deploy-component", "trainer", "--debug-rollout-only", *_SHARED_STORE_ARGS])
         )
 
     def test_an_unsplit_ray_run_may_still_debug_the_rollout_alone(self):
+        # [FUNCTION DOC] An unsplit ray run with the debug-rollout-only flag passes validation.
         """It deploys the inference side itself, so the layout it sizes has the bundles it asks for."""
         _validate_deploy_component(self._parse([*_RAY_RPC_ARGS, "--debug-rollout-only"]))
 
 
 class TestInitExpectedNumCells:
+    # [CLASS DOC] Tests of the init-expected-num-cells option: allowed only on a primary deployment,
+    # which waits for that many engine cells to register; must be positive.
     def test_a_run_told_nothing_names_no_number_and_is_left_to_the_default(self):
+        # [FUNCTION DOC] A primary without the option parses it as none.
         """A split run reaches its first rollout on one engine, so the flag is optional for the simplest split."""
         assert _parse_deploy_args([*_PRIMARY_ARGS, *_SHARED_STORE_ARGS]).init_expected_num_cells is None
 
     def test_a_run_deploying_its_own_engines_is_refused_the_flag(self):
+        # [FUNCTION DOC] The inference component with the option set to 2 raises an assertion error
+        # mentioning "--init-expected-num-cells".
         """It launches every cell it waits for, so a number here would contradict what it deploys."""
         with pytest.raises(AssertionError, match="--init-expected-num-cells"):
             _validate_deploy_component(_parse_deploy_args([*_INFERENCE_ARGS, "--init-expected-num-cells", "2"]))
 
     def test_a_run_waits_for_as_many_registered_cells_as_it_was_told_to(self):
+        # [FUNCTION DOC] A primary given the option 4 parses it as the integer 4.
         """Nothing here can derive the number: the engines are deployed by launches this one never sees."""
         args = _parse_deploy_args([*_PRIMARY_ARGS, *_SHARED_STORE_ARGS, "--init-expected-num-cells", "4"])
 
         assert args.init_expected_num_cells == 4
 
     def test_a_run_waiting_for_no_cell_at_all_is_refused(self):
+        # [FUNCTION DOC] A primary with the option 0 raises an assertion error mentioning the option.
         """It would start the first rollout against an empty fleet and fail on every request it routes."""
         with pytest.raises(AssertionError, match="--init-expected-num-cells"):
             _validate_deploy_component(
@@ -1520,6 +1555,8 @@ class TestInitExpectedNumCells:
             )
 
     def test_a_split_trainer_deployment_is_refused_the_flag(self):
+        # [FUNCTION DOC] The trainer component with the option 2 raises an assertion error mentioning
+        # the option.
         """It instantiates no inference controller, so the number it was given is dropped on the floor."""
         with pytest.raises(AssertionError, match="--init-expected-num-cells"):
             _validate_deploy_component(
@@ -1529,11 +1566,15 @@ class TestInitExpectedNumCells:
             )
 
     def test_an_unsplit_run_is_refused_the_flag(self):
+        # [FUNCTION DOC] An unsplit run with the option 2 raises an assertion error mentioning the
+        # option.
         """It deploys every engine it waits for, so the fleet it starts on is not something to be told."""
         with pytest.raises(AssertionError, match="--init-expected-num-cells"):
             _validate_deploy_component(_parse_deploy_args(["--init-expected-num-cells", "2"]))
 
     def test_the_refusal_names_the_deployment_that_does_take_the_flag(self):
+        # [FUNCTION DOC] The refusal for a trainer given the option has a message containing
+        # "primary", pointing to the deployment that accepts it.
         """Whoever launched the wrong half has to be told which half to move the flag to."""
         with pytest.raises(AssertionError, match="primary"):
             _validate_deploy_component(
@@ -1543,6 +1584,7 @@ class TestInitExpectedNumCells:
             )
 
     def test_the_primary_deployment_still_takes_the_flag(self):
+        # [FUNCTION DOC] A primary with the option 4 passes validation.
         """It is the one that waits for registrations, and nothing else can derive how many to wait for."""
         _validate_deploy_component(
             _parse_deploy_args([*_PRIMARY_ARGS, *_SHARED_STORE_ARGS, "--init-expected-num-cells", "4"])
@@ -1550,11 +1592,16 @@ class TestInitExpectedNumCells:
 
 
 class TestEngineRegistrationArguments:
+    # [CLASS DOC] Tests of the inference (engine) deployment arguments: instance id and the
+    # controller address it registers into (host:port, bracketed IPv6 allowed).
     def test_a_fully_told_engine_deployment_validates(self):
+        # [FUNCTION DOC] The standard inference arguments pass validation.
         """The controller address is all it needs; it redeems no object store reference of the run."""
         _validate_deploy_component(_parse_deploy_args([*_INFERENCE_ARGS]))
 
     def test_an_engine_deployment_has_to_be_given_an_instance_id(self):
+        # [FUNCTION DOC] Inference component without an instance id raises an assertion error
+        # mentioning "--deploy-instance-id".
         """It names the engine pools this deployment reports, and two unnamed ones would report the same pools."""
         with pytest.raises(AssertionError, match="--deploy-instance-id"):
             _validate_deploy_component(
@@ -1562,6 +1609,8 @@ class TestEngineRegistrationArguments:
             )
 
     def test_an_engine_deployment_has_to_be_told_which_controller_to_register_into(self):
+        # [FUNCTION DOC] Inference component without a controller address raises an assertion error
+        # mentioning "--inference-controller-addr".
         """It holds no controller, so an unnamed one leaves its engines announcing themselves to nobody."""
         with pytest.raises(AssertionError, match="--inference-controller-addr"):
             _validate_deploy_component(
@@ -1569,35 +1618,45 @@ class TestEngineRegistrationArguments:
             )
 
     def _parse_with_controller_addr(self, addr):
+        # [FUNCTION DOC] HELPER: Parses an inference deployment with instance id "dc1" and the given
+        # controller address.
         return _parse_deploy_args(
             ["--deploy-component", "inference", "--deploy-instance-id", "dc1", "--inference-controller-addr", addr]
         )
 
     def test_refuses_a_controller_address_that_names_no_port(self):
+        # [FUNCTION DOC] Address "controller" raises an assertion error matching "host:port".
         """The reporter parses it inside the pods, so an unparseable one costs a whole installed release."""
         with pytest.raises(AssertionError, match="host:port"):
             _validate_deploy_component(self._parse_with_controller_addr("controller"))
 
     def test_refuses_a_controller_address_that_names_no_host(self):
+        # [FUNCTION DOC] Address ":8000" raises an assertion error matching "no host".
         """A port on its own is dialable from nowhere, and the engines would register into nothing."""
         with pytest.raises(AssertionError, match="no host"):
             _validate_deploy_component(self._parse_with_controller_addr(":8000"))
 
     def test_refuses_a_bare_ipv6_controller_address(self):
+        # [FUNCTION DOC] Address "fd00::1:8000" (unbracketed IPv6) raises an assertion error matching
+        # "ipv6".
         """Its own colons cannot be told from the port separator, which the reporter finds out too late."""
         with pytest.raises(AssertionError, match="ipv6"):
             _validate_deploy_component(self._parse_with_controller_addr("fd00::1:8000"))
 
     def test_takes_a_bracketed_ipv6_controller_address(self):
+        # [FUNCTION DOC] Address "[fd00::1]:8000" passes validation.
         """That is the spelling the reporter reads, and an engine deployment may well be given one."""
         _validate_deploy_component(self._parse_with_controller_addr("[fd00::1]:8000"))
 
     def test_takes_an_ordinary_host_and_port(self):
+        # [FUNCTION DOC] Address "controller:8000" passes validation.
         """The check has to leave the addresses that already work exactly as they were."""
         _validate_deploy_component(self._parse_with_controller_addr("controller:8000"))
 
     @pytest.mark.parametrize("component", ["all", "primary", "trainer"])
     def test_only_an_engine_deployment_is_told_where_the_controller_is(self, component):
+        # [FUNCTION DOC] Parametrized over "all", "primary", "trainer": giving a controller address
+        # raises an assertion error mentioning "--inference-controller-addr".
         """Every other component holds that controller in its own process, so an address contradicts it."""
         with pytest.raises(AssertionError, match="--inference-controller-addr"):
             _validate_deploy_component(
@@ -1614,7 +1673,11 @@ class TestEngineRegistrationArguments:
 
 
 class TestAPrimaryTakesItsEnginesFromRegistrations:
+    # [CLASS DOC] Tests that a primary deployment rejects static engine addresses and a custom
+    # engine provider, since it takes engines from registrations.
     def test_a_primary_told_where_the_engines_already_are_is_refused(self):
+        # [FUNCTION DOC] A primary with static engine addresses raises an assertion error mentioning
+        # "--rollout-external-engine-addrs".
         """The addresses are dropped for a primary, leaving it waiting an hour for registrations nobody sends."""
         with pytest.raises(AssertionError, match="--rollout-external-engine-addrs"):
             _validate_deploy_component(
@@ -1624,6 +1687,8 @@ class TestAPrimaryTakesItsEnginesFromRegistrations:
             )
 
     def test_a_primary_given_an_engine_provider_of_its_own_is_refused(self):
+        # [FUNCTION DOC] A primary with a custom engine provider path raises an assertion error
+        # mentioning "--custom-inference-engine-provider-path".
         """A primary reads its engines out of the registration hub, so the provider would never be asked."""
         with pytest.raises(AssertionError, match="--custom-inference-engine-provider-path"):
             _validate_deploy_component(
@@ -1633,6 +1698,8 @@ class TestAPrimaryTakesItsEnginesFromRegistrations:
             )
 
     def test_a_run_deploying_its_own_engines_still_takes_both(self):
+        # [FUNCTION DOC] An unsplit run with static engine addresses and the shared store passes
+        # validation.
         """An unsplit run runs the provider it is given, and this check must not narrow that."""
         _validate_deploy_component(
             _parse_deploy_args(["--rollout-external-engine-addrs", "10.0.0.9:8000", *_SHARED_STORE_ARGS])
@@ -1640,12 +1707,18 @@ class TestAPrimaryTakesItsEnginesFromRegistrations:
 
 
 class TestRunUuidOfASplitRun:
+    # [CLASS DOC] Tests of run uuid resolution: split launches must be given one; unsplit runs
+    # generate their own.
     def _parse(self, extra):
+        # [FUNCTION DOC] HELPER: Parses the extra arguments, the required arguments and "--num-rollout
+        # 1" with the extra-args provider.
         parser = argparse.ArgumentParser()
         get_miles_extra_args_provider()(parser)
         return parser.parse_args([*extra, *REQUIRED_ARGS, "--num-rollout", "1"])
 
     def test_a_ray_split_launch_has_to_be_told_the_run_uuid(self):
+        # [FUNCTION DOC] Ray RPC trainer component without a run uuid: resolution raises an assertion
+        # error mentioning "--run-uuid".
         """Each launch would otherwise invent its own, and the handshake would refuse the other deployment."""
         args = self._parse([*_RAY_RPC_ARGS, "--deploy-component", "trainer"])
 
@@ -1653,18 +1726,22 @@ class TestRunUuidOfASplitRun:
             _resolve_run_uuid(args)
 
     def test_a_ray_split_launch_that_was_told_one_keeps_it(self):
+        # [FUNCTION DOC] With run uuid "0123456789abcdef" given, resolution returns it verbatim.
         """The two launches are joined by nothing else, so the value has to survive verbatim."""
         args = self._parse([*_RAY_RPC_ARGS, "--deploy-component", "trainer", "--run-uuid", "0123456789abcdef"])
 
         assert _resolve_run_uuid(args) == "0123456789abcdef"
 
     def test_an_unsplit_run_still_invents_its_own(self):
+        # [FUNCTION DOC] An unsplit run resolves to a generated uuid of the standard length.
         """One launch is the whole run, so nothing else has to agree with it."""
         args = self._parse([])
 
         assert len(_resolve_run_uuid(args)) == RUN_UUID_LENGTH
 
     def test_a_kubernetes_split_launch_has_to_be_told_it_too(self):
+        # [FUNCTION DOC] Kubernetes trainer component without a run uuid raises an assertion error
+        # mentioning "--run-uuid".
         """Its launcher is given the uuid and stamps it on every part, so no backend mints one of its own."""
         args = self._parse(["--cluster-backend", "kubernetes", "--deploy-component", "trainer"])
 
@@ -1673,41 +1750,54 @@ class TestRunUuidOfASplitRun:
 
 
 class TestEvalSglangOverrides:
+    # [CLASS DOC] Tests of the eval-prefixed SGLang options and collect_eval_sglang_overrides, which
+    # returns a mapping of server-argument names to values for only the eval options that were set.
     """Unset means "inherit --sglang-*", so an unset flag must leave no attribute at all."""
 
     def _parse(self, argv):
+        # [FUNCTION DOC] HELPER: Parses argv with a parser carrying only the SGLang arguments.
         return add_sglang_arguments(argparse.ArgumentParser()).parse_args(argv)
 
     def test_unset_flags_produce_no_overrides(self):
+        # [FUNCTION DOC] With only a base memory fraction given, the overrides mapping is empty and
+        # the eval attribute does not exist on the namespace.
         args = self._parse(["--sglang-mem-fraction-static", "0.7"])
 
         assert collect_eval_sglang_overrides(args) == {}
         assert not hasattr(args, "eval_sglang_mem_fraction_static")
 
     def test_set_flag_becomes_an_override_without_touching_the_base_family(self):
+        # [FUNCTION DOC] Base fraction 0.7 and eval fraction 0.9: overrides are the single entry
+        # mem_fraction_static = 0.9 and the base attribute stays 0.7.
         args = self._parse(["--sglang-mem-fraction-static", "0.7", "--eval-sglang-mem-fraction-static", "0.9"])
 
         assert collect_eval_sglang_overrides(args) == {"mem_fraction_static": 0.9}
         assert args.sglang_mem_fraction_static == 0.7
 
     def test_boolean_can_be_turned_back_off(self):
+        # [FUNCTION DOC] Base DP attention on with the eval "no-" flag: base stays true and the
+        # overrides map enable_dp_attention to false.
         args = self._parse(["--sglang-enable-dp-attention", "--no-eval-sglang-enable-dp-attention"])
 
         assert args.sglang_enable_dp_attention is True
         assert collect_eval_sglang_overrides(args) == {"enable_dp_attention": False}
 
     def test_parallel_sizes_keep_server_args_destinations(self):
+        # [FUNCTION DOC] Eval data-parallel 2 and expert-parallel 4 become overrides dp_size 2 and
+        # ep_size 4.
         args = self._parse(["--eval-sglang-data-parallel-size", "2", "--eval-sglang-expert-parallel-size", "4"])
 
         assert collect_eval_sglang_overrides(args) == {"dp_size": 2, "ep_size": 4}
 
     def test_tp_size_is_not_exposed(self):
+        # [FUNCTION DOC] The eval tensor-parallel option does not exist: the parser exits.
         """A second TP knob could move tp_size off the bundles --eval-num-gpus-per-engine placed."""
         with pytest.raises(SystemExit):
             self._parse(["--eval-sglang-tp-size", "2"])
 
 
 def test_custom_megatron_post_save_hook_path_is_parsed():
+    # [FUNCTION DOC] The post-save hook path option parses to the given dotted path.
     parser = argparse.ArgumentParser()
     get_miles_extra_args_provider()(parser)
 
@@ -1717,6 +1807,8 @@ def test_custom_megatron_post_save_hook_path_is_parsed():
 
 
 def test_custom_megatron_post_save_hook_path_requires_save():
+    # [FUNCTION DOC] A hook path without a save directory makes validation raise an assertion error
+    # saying '--save' is required when the hook path is set.
     parser = argparse.ArgumentParser()
     get_miles_extra_args_provider()(parser)
     args = parser.parse_args(
@@ -1731,6 +1823,8 @@ def test_custom_megatron_post_save_hook_path_requires_save():
 
 
 def test_dynamic_global_batch_size_requires_dynamic_batch_size():
+    # [FUNCTION DOC] Dynamic global batch size without dynamic batch size raises an assertion error
+    # matching "requires --use-dynamic-batch-size".
     parser = argparse.ArgumentParser()
     get_miles_extra_args_provider()(parser)
     args = parser.parse_args(["--use-dynamic-global-batch-size", "--num-rollout", "1"] + REQUIRED_ARGS)
@@ -1740,6 +1834,8 @@ def test_dynamic_global_batch_size_requires_dynamic_batch_size():
 
 
 def test_shared_actor_critic_ppo_rejects_indep_dp():
+    # [FUNCTION DOC] PPO advantage estimator with independent data parallelism (after setting the
+    # Megatron parallel sizes) raises an assertion error matching "does not support --indep-dp".
     """Multi-cell PPO used to pass validation and fail only at the first training step's external-data assert."""
     parser = argparse.ArgumentParser()
     get_miles_extra_args_provider()(parser)
@@ -1751,6 +1847,8 @@ def test_shared_actor_critic_ppo_rejects_indep_dp():
 
 
 def test_rollout_fault_tolerance_rejects_a_dedicated_eval_fleet():
+    # [FUNCTION DOC] Fault tolerance on the rollout component together with 8 dedicated eval GPUs
+    # raises an assertion error matching "dedicated eval fleet".
     """The eval fleet pins engine addresses once, so a healed eval cell would be skipped silently."""
     parser = argparse.ArgumentParser()
     get_miles_extra_args_provider()(parser)
@@ -1764,7 +1862,12 @@ def test_rollout_fault_tolerance_rejects_a_dedicated_eval_fleet():
 
 
 class TestFaultToleranceResolutionOrder:
+    # [CLASS DOC] Tests that fault tolerance derived settings follow the final values after the
+    # custom config file overrides the command line.
     def _validate(self, tmp_path: Path, extra: list[str], yaml_body: str) -> argparse.Namespace:
+        # [FUNCTION DOC] HELPER: Writes the YAML body to custom.yaml in the temp dir, parses the extra
+        # arguments plus the config path, rollout count and required arguments, sets the Megatron
+        # parallel sizes, runs full validation and returns the namespace.
         config_path = tmp_path / "custom.yaml"
         config_path.write_text(yaml_body)
         parser = argparse.ArgumentParser()
@@ -1777,18 +1880,25 @@ class TestFaultToleranceResolutionOrder:
         return args
 
     def test_the_config_file_can_turn_fault_tolerance_off(self, tmp_path):
+        # [FUNCTION DOC] Flag on but file off: components are empty, the mini controller is off and the
+        # API server port is 0.
         """Resolving ft_components before the file override left implicit healing on for a run that asked for none."""
         args = self._validate(tmp_path, ["--use-fault-tolerance"], "use_fault_tolerance: false\n")
 
         assert (args.ft_components, args.mini_ft_controller_enable, args.api_server_port) == ([], False, 0)
 
     def test_the_config_file_can_turn_fault_tolerance_on(self, tmp_path):
+        # [FUNCTION DOC] File on, flag absent: components are ["rollout"] and the mini controller is
+        # on.
         """A file-only opt-in must reach the same defaults the flag would have produced."""
         args = self._validate(tmp_path, [], "use_fault_tolerance: true\n")
 
         assert (args.ft_components, args.mini_ft_controller_enable) == (["rollout"], True)
 
     def test_the_config_file_can_select_the_train_component(self, tmp_path):
+        # [FUNCTION DOC] File selects the train component: components are ["train"], independent DP,
+        # witness and local non-persistent checkpointing are enabled, and the world size becomes 2
+        # (per-cell world).
         """Picking the component list after the derivations left a train-side run without the state it needs."""
         args = self._validate(tmp_path, ["--use-fault-tolerance"], "ft_components: [train]\n")
 
@@ -1797,6 +1907,8 @@ class TestFaultToleranceResolutionOrder:
         assert args.world_size == 2
 
     def test_the_config_file_can_cancel_the_train_component(self, tmp_path):
+        # [FUNCTION DOC] Flags select train but the file disables fault tolerance: components empty,
+        # independent DP and witness off, world size back to 8.
         """A file that switches fault tolerance off must also undo the per-cell world the train component implies."""
         args = self._validate(
             tmp_path, ["--use-fault-tolerance", "--ft-components", "train"], "use_fault_tolerance: false\n"
@@ -1806,6 +1918,8 @@ class TestFaultToleranceResolutionOrder:
         assert args.world_size == 8
 
     def test_the_config_file_keeps_an_explicit_api_server_port(self, tmp_path):
+        # [FUNCTION DOC] File enables fault tolerance with API server port 0: components ["rollout"],
+        # port 0 and the mini controller off.
         """The implicit healing defaults must follow the port the file asks for, not the one the flag implied."""
         args = self._validate(tmp_path, [], "use_fault_tolerance: true\napi_server_port: 0\n")
 
@@ -1813,7 +1927,12 @@ class TestFaultToleranceResolutionOrder:
 
 
 class TestCustomConfigAppliedBeforeDerivedArgs:
+    # [CLASS DOC] Tests that settings from the custom config file are applied before derived
+    # arguments are computed and checked during validation.
     def _parse(self, tmp_path: Path, extra: list[str], yaml_body: str) -> argparse.Namespace:
+        # [FUNCTION DOC] HELPER: Writes the YAML body to custom.yaml in the temp dir and parses the
+        # extra arguments plus the config path, rollout count and required arguments; returns the
+        # namespace (no validation).
         config_path = tmp_path / "custom.yaml"
         config_path.write_text(yaml_body)
         parser = argparse.ArgumentParser()
@@ -1823,11 +1942,15 @@ class TestCustomConfigAppliedBeforeDerivedArgs:
         )
 
     def test_score_centering_config_is_validated_at_startup(self, tmp_path: Path) -> None:
+        # [FUNCTION DOC] A file setting loss type score_centering with 0 top logprobs makes validation
+        # raise a value error mentioning "--rollout-top-logprobs-num".
         args = self._parse(tmp_path, [], "loss_type: score_centering\nrollout_top_logprobs_num: 0\n")
         with pytest.raises(ValueError, match="--rollout-top-logprobs-num"):
             miles_validate_args(args)
 
     def test_filtered_score_centering_enables_replay_at_startup(self, tmp_path: Path) -> None:
+        # [FUNCTION DOC] Top-p 0.9, top-k 64, 128 top logprobs and loss type score_centering from the
+        # file: validation enables sampling-support replay and the logprobs mode "support".
         args = self._parse(
             tmp_path,
             [
@@ -1846,6 +1969,10 @@ class TestCustomConfigAppliedBeforeDerivedArgs:
 
     @pytest.mark.parametrize("filtered", [False, True])
     def test_sampling_logprobs_mode_uses_final_sampling_config(self, tmp_path: Path, filtered: bool) -> None:
+        # [FUNCTION DOC] Command line has top-k 32 and 64 logprobs; the file overrides top-p/top-k to
+        # filtered (0.9/32) or unfiltered (1.0/-1) and sets the logprobs mode to the opposite value.
+        # After validation the mode is "support" when filtered, else "selected" (derived from the
+        # final sampling config, ignoring the file's mode).
         args = self._parse(
             tmp_path,
             ["--rollout-top-k", "32", "--rollout-top-logprobs-num", "64"],
@@ -1857,6 +1984,8 @@ class TestCustomConfigAppliedBeforeDerivedArgs:
         assert args.rollout_sampling_logprobs_mode == ("support" if filtered else "selected")
 
     def test_a_dashboard_switched_on_by_the_config_file_is_still_checked(self, tmp_path):
+        # [FUNCTION DOC] File enables the dashboard with no dump directory: validation raises an
+        # assertion error matching "--dump-details is required".
         """Checking the dashboard before the file override let a file-only opt-in start without a dump directory."""
         args = self._parse(tmp_path, [], "use_miles_dashboard: true\n")
 
@@ -1864,6 +1993,8 @@ class TestCustomConfigAppliedBeforeDerivedArgs:
             miles_validate_args(args)
 
     def test_a_dashboard_switched_off_by_the_config_file_drops_its_requirement(self, tmp_path):
+        # [FUNCTION DOC] Flag enables the dashboard but file disables it: validation passes with no
+        # dump directory and the dashboard flag is false.
         """A run whose file turns the dashboard off must not be rejected for telemetry it will never write."""
         args = self._parse(tmp_path, ["--use-miles-dashboard"], "use_miles_dashboard: false\n")
         miles_validate_args(args)
@@ -1871,6 +2002,9 @@ class TestCustomConfigAppliedBeforeDerivedArgs:
         assert args.use_miles_dashboard is False
 
     def test_eval_prompt_data_from_the_config_file_is_expanded_into_datasets(self, tmp_path):
+        # [FUNCTION DOC] File sets eval prompt data to a one-item list with a path; after validation
+        # the eval datasets hold one entry named "aime" (from the file stem) with that path, and the
+        # eval prompt data becomes the flat name/path pair.
         """Building the dataset list before the file override left the file's paths as an unparsed raw list."""
         args = self._parse(tmp_path, [], "eval_prompt_data: [/data/aime.jsonl]\n")
         miles_validate_args(args)
@@ -1880,6 +2014,9 @@ class TestCustomConfigAppliedBeforeDerivedArgs:
 
 
 def test_stream_optimizer_state_to_disk_rejects_fault_tolerant_training():
+    # [FUNCTION DOC] Streaming optimizer state to disk together with fault tolerance on the train
+    # component (adam, distributed optimizer, no offloading, Megatron sizes set) raises an assertion
+    # error matching "does not support --indep-dp".
     """Deriving indep_dp after the disk-stream asserts would have let an unsupported pair through."""
     parser = argparse.ArgumentParser()
     get_miles_extra_args_provider()(parser)
@@ -1916,6 +2053,9 @@ def test_stream_optimizer_state_to_disk_rejects_fault_tolerant_training():
     ],
 )
 def test_stream_optimizer_state_to_disk_rejects_reading_grads_outside_the_step(megatron_args, match):
+    # [FUNCTION DOC] Parametrized over fp16, a loss scale, zero-count logging and MTP training:
+    # starting from a valid adam/distributed-optimizer namespace and applying one such setting,
+    # validation raises an assertion error with the paired message.
     """The streamed params have fp32 gradients only inside the optimizer step."""
     parser = argparse.ArgumentParser()
     get_miles_extra_args_provider()(parser)
@@ -1931,7 +2071,10 @@ def test_stream_optimizer_state_to_disk_rejects_reading_grads_outside_the_step(m
 
 
 class TestCriticSaveDerivation:
+    # [CLASS DOC] Tests of how the critic save directory is derived from the save directory.
     def _validate(self, extra):
+        # [FUNCTION DOC] HELPER: Parses extra arguments, a rollout count and required arguments, runs
+        # full validation and returns the namespace.
         parser = argparse.ArgumentParser()
         get_miles_extra_args_provider()(parser)
         args = parser.parse_args(extra + ["--num-rollout", "1"] + REQUIRED_ARGS)
@@ -1939,26 +2082,34 @@ class TestCriticSaveDerivation:
         return args
 
     def test_derives_sibling_dir_from_save(self):
+        # [FUNCTION DOC] With PPO and save "/ckpts/run1", the critic save is "/ckpts/run1_critic".
         args = self._validate(["--advantage-estimator", "ppo", "--save", "/ckpts/run1"])
         assert args.critic_save == "/ckpts/run1_critic"
 
     def test_trailing_slash_is_stripped(self):
+        # [FUNCTION DOC] Save "/ckpts/run1/" (trailing slash) still gives "/ckpts/run1_critic".
         args = self._validate(["--advantage-estimator", "ppo", "--save", "/ckpts/run1/"])
         assert args.critic_save == "/ckpts/run1_critic"
 
     def test_explicit_critic_save_is_respected(self):
+        # [FUNCTION DOC] An explicit critic save path is kept unchanged.
         args = self._validate(
             ["--advantage-estimator", "ppo", "--save", "/ckpts/run1", "--critic-save", "/elsewhere/critic"]
         )
         assert args.critic_save == "/elsewhere/critic"
 
     def test_stays_none_without_save(self):
+        # [FUNCTION DOC] Without a save directory the critic save remains none.
         args = self._validate(["--advantage-estimator", "ppo"])
         assert args.critic_save is None
 
 
 class TestCheckpointLoadFallbackWiring:
+    # [CLASS DOC] Tests of the fallback from a missing load directory to the reference load
+    # directory, and its effect on the critic load.
     def _validate(self, extra):
+        # [FUNCTION DOC] HELPER: Parses extra arguments, a rollout count and required arguments, runs
+        # full validation and returns the namespace.
         parser = argparse.ArgumentParser()
         get_miles_extra_args_provider()(parser)
         args = parser.parse_args(extra + ["--num-rollout", "1"] + REQUIRED_ARGS)
@@ -1966,6 +2117,8 @@ class TestCheckpointLoadFallbackWiring:
         return args
 
     def test_a_fresh_ppo_run_starts_the_actor_and_its_critic_from_the_reference_weights(self, tmp_path):
+        # [FUNCTION DOC] PPO with a nonexistent load directory and an existing reference directory:
+        # both the load and the critic load become the reference directory.
         """The fallback has to run before critic_load is derived, or the critic resumes from a dir nobody wrote."""
         ref_load = tmp_path / "ref"
         ref_load.mkdir()
@@ -1978,6 +2131,8 @@ class TestCheckpointLoadFallbackWiring:
         assert args.critic_load == str(ref_load)
 
     def test_an_existing_checkpoint_is_left_alone(self, tmp_path):
+        # [FUNCTION DOC] Creates a load directory holding a latest-iteration tracker file with "10"
+        # (see the following lines for the assertions).
         """A real resume must keep --load, which is also what the critic inherits."""
         load = tmp_path / "save"
         load.mkdir()
@@ -1990,7 +2145,10 @@ class TestCheckpointLoadFallbackWiring:
 
 
 class TestSessionServerV2Validation:
+    # [CLASS DOC] Tests that session server version 2 rejects options that need a single-sample
+    # return.
     def _parse(self, extra):
+        # [FUNCTION DOC] HELPER: Parses extra arguments, a rollout count and required arguments.
         parser = argparse.ArgumentParser()
         get_miles_extra_args_provider()(parser)
         return parser.parse_args(extra + ["--num-rollout", "1"] + REQUIRED_ARGS)
@@ -2006,6 +2164,9 @@ class TestSessionServerV2Validation:
         ],
     )
     def test_rejects_unsupported_list_consumers(self, extra, flag):
+        # [FUNCTION DOC] Parametrized over group reward model, and prefill logprob recompute under
+        # true on-policy mode: with session server v2, validation raises a value error whose message
+        # is exactly "--use-session-server v2 does not support <flag>; v2 returns list[Sample]".
         args = self._parse(["--use-session-server", "v2", *extra])
 
         with pytest.raises(ValueError) as exc_info:
@@ -2015,35 +2176,43 @@ class TestSessionServerV2Validation:
 
 
 class TestSessionServerScalingArguments:
+    # [CLASS DOC] Tests of the session server port and worker count options (parsing only).
     def _parse(self, extra):
+        # [FUNCTION DOC] HELPER: Parses extra arguments, a rollout count and required arguments.
         parser = argparse.ArgumentParser()
         get_miles_extra_args_provider()(parser)
         return parser.parse_args(extra + ["--num-rollout", "1"] + REQUIRED_ARGS)
 
     def test_defaults_to_32_instances_and_an_auto_port(self):
+        # [FUNCTION DOC] Defaults: port none (automatic) and 32 workers.
         args = self._parse([])
 
         assert args.session_server_port is None
         assert args.session_server_workers == 32
 
     def test_parses_starting_port_and_instance_count(self):
+        # [FUNCTION DOC] Port 30000 and 4 workers parse as integers.
         args = self._parse(["--session-server-port", "30000", "--session-server-workers", "4"])
 
         assert args.session_server_port == 30000
         assert args.session_server_workers == 4
 
     def test_rejects_the_removed_end_port_form(self):
+        # [FUNCTION DOC] Giving two port values (start and end) makes the parser exit.
         with pytest.raises(SystemExit):
             self._parse(["--session-server-port", "30000", "30004"])
 
 
 class TestSessionMessageMatcherArgument:
+    # [CLASS DOC] Tests of the session message matcher selector option (parsing only).
     def _parse(self, extra):
+        # [FUNCTION DOC] HELPER: Parses extra arguments, a rollout count and required arguments.
         parser = argparse.ArgumentParser()
         get_miles_extra_args_provider()(parser)
         return parser.parse_args(extra + ["--num-rollout", "1"] + REQUIRED_ARGS)
 
     def test_defaults_to_strict(self):
+        # [FUNCTION DOC] The default selector is "strict".
         assert self._parse([]).session_message_matcher == "strict"
 
     @pytest.mark.parametrize(
@@ -2056,19 +2225,26 @@ class TestSessionMessageMatcherArgument:
         ],
     )
     def test_preserves_selector_without_importing(self, selector):
+        # [FUNCTION DOC] Parametrized over three builtin names and a dotted path of a module that does
+        # not exist: the value is stored verbatim (no import attempt at parse time).
         args = self._parse(["--session-message-matcher", selector])
 
         assert args.session_message_matcher == selector
 
 
 class TestSessionServerPauseGenerationMode:
+    # [CLASS DOC] Tests of validation interactions between the session server, the pause generation
+    # mode, partial rollout and rollout routing replay (R3).
     def _parse(self, extra):
+        # [FUNCTION DOC] HELPER: Parses extra arguments, a rollout count and required arguments.
         parser = argparse.ArgumentParser()
         get_miles_extra_args_provider()(parser)
         return parser.parse_args(extra + ["--num-rollout", "1"] + REQUIRED_ARGS)
 
     @pytest.mark.parametrize("colocate", [False, True])
     def test_session_server_accepts_abort(self, colocate):
+        # [FUNCTION DOC] Session server with abort pause mode, with or without colocation, validates
+        # without error.
         extra = ["--use-session-server", "--pause-generation-mode", "abort"]
         if colocate:
             extra.append("--colocate")
@@ -2077,10 +2253,13 @@ class TestSessionServerPauseGenerationMode:
         miles_validate_args(args)
 
     def test_abort_without_session_server_passes(self):
+        # [FUNCTION DOC] Abort pause mode alone validates without error.
         miles_validate_args(self._parse(["--pause-generation-mode", "abort"]))
 
     @pytest.mark.parametrize("mode", ["retract", "in_place"])
     def test_session_server_accepts_non_abort_modes(self, mode):
+        # [FUNCTION DOC] Parametrized over "retract" and "in_place": the session server with that mode
+        # validates without error.
         miles_validate_args(self._parse(["--use-session-server", "--pause-generation-mode", mode]))
 
     @pytest.mark.parametrize(
@@ -2088,6 +2267,8 @@ class TestSessionServerPauseGenerationMode:
         [["--use-session-server"], ["--use-session-server", "v1"], ["--use-session-server", "v2"]],
     )
     def test_session_server_rejects_partial_rollout(self, session_server_args):
+        # [FUNCTION DOC] Parametrized over the session server flag with no value, "v1" and "v2": adding
+        # partial rollout raises an assertion error matching "does not support --partial-rollout".
         args = self._parse([*session_server_args, "--partial-rollout"])
 
         with pytest.raises(AssertionError, match="does not support --partial-rollout"):
@@ -2119,6 +2300,9 @@ class TestSessionServerPauseGenerationMode:
         ],
     )
     def test_retract_r3_warning(self, caplog, extra, expect_warning):
+        # [FUNCTION DOC] Parametrized over argument sets: validation logs a warning containing "R3
+        # payloads can become very large" only when the session server, routing replay and retract
+        # mode are all on (not with colocation + abort, in_place mode, or either feature missing).
         args = self._parse(extra)
 
         with caplog.at_level(logging.WARNING, logger="miles.utils.arguments"):
@@ -2129,12 +2313,18 @@ class TestSessionServerPauseGenerationMode:
 
 
 class TestSnapshotEvalValidation:
+    # [CLASS DOC] Tests of validation for snapshot evaluation (dedicated eval GPUs reading HF
+    # snapshots) and train-only mode.
     def _parse(self, extra):
+        # [FUNCTION DOC] HELPER: Parses extra arguments, a rollout count and required arguments.
         parser = argparse.ArgumentParser()
         get_miles_extra_args_provider()(parser)
         return parser.parse_args(extra + ["--num-rollout", "1"] + REQUIRED_ARGS)
 
     def _snapshot_eval_args(self, tmp_path, *extra):
+        # [FUNCTION DOC] HELPER: Writes a one-line eval prompt file in the temp dir and parses snapshot
+        # eval arguments: 1 eval GPU, eval interval 5, eval HF dir "<tmp>/snapshots", eval prompt data
+        # named "dummy" pointing at the file, plus any extra arguments.
         prompts = tmp_path / "eval.jsonl"
         prompts.write_text("{}\n")
         return self._parse(
@@ -2153,17 +2343,23 @@ class TestSnapshotEvalValidation:
         )
 
     def test_snapshot_eval_rejects_load_debug_rollout_data(self, tmp_path):
+        # [FUNCTION DOC] Snapshot eval together with loading debug rollout data raises an assertion
+        # error mentioning "load-debug-rollout-data".
         """The replay path loads no rollout functions, so there is nothing to run the eval with."""
         args = self._snapshot_eval_args(tmp_path, "--load-debug-rollout-data", "/tmp/rollout_{rollout_id}.pt")
         with pytest.raises(AssertionError, match="load-debug-rollout-data"):
             miles_validate_args(args)
 
     def test_train_only_snapshot_eval_needs_its_own_eval_function(self, tmp_path):
+        # [FUNCTION DOC] Snapshot eval in train-only debug mode without an eval function raises an
+        # assertion error mentioning "eval-function-path".
         args = self._snapshot_eval_args(tmp_path, "--debug-train-only")
         with pytest.raises(AssertionError, match="eval-function-path"):
             miles_validate_args(args)
 
     def test_train_only_leaves_no_rollout_gpus_even_under_colocate(self):
+        # [FUNCTION DOC] Train-only debug mode with colocation: after validation the rollout GPU count
+        # is 0 and the starts-inference-engines flag is false.
         """The colocate normalization puts the actor's GPU count on rollout_num_gpus, which
         would claim rollout engines for a job that starts none."""
         args = self._parse(["--debug-train-only", "--colocate"])
@@ -2175,12 +2371,16 @@ class TestSnapshotEvalValidation:
 
 
 class TestTitoFixedTemplateConfiguration:
+    # [CLASS DOC] Tests of the TITO model option: named model families require the session server
+    # and resolve a registered chat template path and fixed chat-template kwargs.
     def _parse(self, extra):
+        # [FUNCTION DOC] HELPER: Parses extra arguments, a rollout count and required arguments.
         parser = argparse.ArgumentParser()
         get_miles_extra_args_provider()(parser)
         return parser.parse_args(extra + ["--num-rollout", "1"] + REQUIRED_ARGS)
 
     def test_removed_role_flag_is_rejected(self):
+        # [FUNCTION DOC] The removed "--tito-allowed-append-roles" option makes the parser exit.
         with pytest.raises(SystemExit):
             self._parse(["--tito-allowed-append-roles", "tool"])
 
@@ -2193,6 +2393,9 @@ class TestTitoFixedTemplateConfiguration:
         ],
     )
     def test_warns_only_for_default_model_session(self, caplog, extra, expect_warning):
+        # [FUNCTION DOC] Parametrized: the warning starting "--tito-model=default uses a best-effort
+        # four-role append surface." is logged exactly once for the session server with the default
+        # model and not at all for no session server or a named model.
         args = self._parse(extra)
 
         with caplog.at_level(logging.WARNING, logger="miles.utils.arguments"):
@@ -2206,11 +2409,15 @@ class TestTitoFixedTemplateConfiguration:
         assert len(target_records) == int(expect_warning)
 
     def test_named_family_requires_session_server(self):
+        # [FUNCTION DOC] A named family without the session server raises a value error matching
+        # "--tito-model=qwen3 requires --use-session-server".
         args = self._parse(["--tito-model", "qwen3"])
         with pytest.raises(ValueError, match="--tito-model=qwen3 requires --use-session-server"):
             miles_validate_args(args)
 
     def test_named_family_resolves_registered_template_and_kwargs(self):
+        # [FUNCTION DOC] Family qwen3 resolves the chat template path ending in "/qwen3_fixed.jinja"
+        # and chat-template kwargs {clear_thinking: false}.
         args = self._parse(["--use-session-server", "--tito-model", "qwen3"])
         miles_validate_args(args)
         assert args.chat_template_path.endswith("/qwen3_fixed.jinja")
@@ -2221,6 +2428,8 @@ class TestTitoFixedTemplateConfiguration:
         [("qwen35", "qwen3.5_fixed.jinja"), ("qwen36", "qwen3.6_fixed.jinja")],
     )
     def test_qwen35_and_qwen36_resolve_family_template(self, family, template):
+        # [FUNCTION DOC] Parametrized over qwen35 and qwen36: the template path ends in the family's
+        # fixed jinja file and the kwargs are {preserve_thinking: true}.
         args = self._parse(["--use-session-server", "--tito-model", family])
         miles_validate_args(args)
         assert args.chat_template_path.endswith(f"/{template}")
@@ -2229,6 +2438,9 @@ class TestTitoFixedTemplateConfiguration:
     @pytest.mark.parametrize("family", ["qwen38small", "qwen4exp"])
     @pytest.mark.parametrize("effort", [None, "low", "medium", "xhigh"])
     def test_qwen38_families_resolve_default_template(self, family, effort):
+        # [FUNCTION DOC] Parametrized over families qwen38small and qwen4exp and reasoning efforts
+        # (none, low, medium, xhigh): the template path ends in the shared qwen3.8 fixed jinja file
+        # and the kwargs are {preserve_thinking: true} plus the reasoning effort when one was given.
         extra = ["--use-session-server", "--tito-model", family]
         if effort is not None:
             extra += ["--apply-chat-template-kwargs", json.dumps({"reasoning_effort": effort})]
@@ -2241,6 +2453,8 @@ class TestTitoFixedTemplateConfiguration:
         assert args.apply_chat_template_kwargs == expected
 
     def test_glm53_uses_native_template(self):
+        # [FUNCTION DOC] Family glm53 leaves the chat template path none (native template) and sets
+        # kwargs {clear_thinking: false, enable_thinking: true}.
         args = self._parse(["--use-session-server", "--tito-model", "glm53"])
         miles_validate_args(args)
         assert args.chat_template_path is None
@@ -2250,6 +2464,7 @@ class TestTitoFixedTemplateConfiguration:
         }
 
     def test_glm53_fixed_thinking_overrides_launch_value(self):
+        # [FUNCTION DOC] A launch value enable_thinking false is overridden by the family's fixed true.
         args = self._parse(
             [
                 "--use-session-server",
@@ -2263,6 +2478,8 @@ class TestTitoFixedTemplateConfiguration:
         assert args.apply_chat_template_kwargs == {"clear_thinking": False, "enable_thinking": True}
 
     def test_named_family_rejects_custom_template(self):
+        # [FUNCTION DOC] A named family with a custom chat template path raises a value error
+        # matching "cannot override the template registered".
         args = self._parse(
             [
                 "--use-session-server",
@@ -2276,6 +2493,7 @@ class TestTitoFixedTemplateConfiguration:
             miles_validate_args(args)
 
     def test_named_family_fixed_kwargs_override_launch_values(self):
+        # [FUNCTION DOC] Launch kwargs clear_thinking true are replaced by the family's fixed false.
         args = self._parse(
             [
                 "--use-session-server",
@@ -2289,6 +2507,8 @@ class TestTitoFixedTemplateConfiguration:
         assert args.apply_chat_template_kwargs == {"clear_thinking": False}
 
     def test_named_family_accepts_same_registered_and_additional_kwargs(self):
+        # [FUNCTION DOC] Launch kwargs repeating the fixed value (clear_thinking false) plus an extra
+        # enable_thinking true are merged into {clear_thinking: false, enable_thinking: true}.
         args = self._parse(
             [
                 "--use-session-server",
@@ -2306,6 +2526,8 @@ class TestTitoFixedTemplateConfiguration:
 
 
 def test_bridge_mode_accepts_critic(tmp_path):
+    # [FUNCTION DOC] PPO with Megatron-to-HF mode "bridge" and an HF checkpoint dir validates and
+    # enables the critic.
     parser = argparse.ArgumentParser()
     get_miles_extra_args_provider()(parser)
     args = parser.parse_args(
@@ -2327,6 +2549,7 @@ def test_bridge_mode_accepts_critic(tmp_path):
 
 
 def test_critic_is_accepted_on_the_only_trainer(tmp_path):
+    # [FUNCTION DOC] PPO with an HF checkpoint dir validates and the critic flag is true.
     """Shared actor/critic PPO used to be rejected on the cell based trainer, which is now the only one."""
     parser = argparse.ArgumentParser()
     get_miles_extra_args_provider()(parser)
@@ -2340,6 +2563,8 @@ def test_critic_is_accepted_on_the_only_trainer(tmp_path):
 
 
 def test_critic_rejects_reward_level_kl(tmp_path):
+    # [FUNCTION DOC] PPO with a KL coefficient 0.05 and a reference load raises an assertion error
+    # matching "does not support reward-level KL".
     parser = argparse.ArgumentParser()
     get_miles_extra_args_provider()(parser)
     args = parser.parse_args(
@@ -2363,8 +2588,14 @@ def test_critic_rejects_reward_level_kl(tmp_path):
 
 
 class TestMultiLoRAValidation:
+    # [CLASS DOC] Tests of multi-LoRA argument validation: target module resolution against HF
+    # weight names (without initializing the Bridge), exclusions, and constraints on tokenizer
+    # workers, optimizer and parallelism.
     @pytest.fixture(autouse=True)
     def _bridge_selector(self, monkeypatch):
+        # [FUNCTION DOC] HELPER: Autouse fixture patching three LoRA helpers: the HF weight mapping
+        # factory returns an empty parameter-name set, the HF config loader returns a qwen3-typed
+        # config, and the Bridge-based target normalizer returns its targets unchanged.
         monkeypatch.setattr(
             "miles.utils.lora.arguments.HfWeightMapping.from_config",
             lambda config: SimpleNamespace(parameter_names=frozenset()),
@@ -2379,6 +2610,9 @@ class TestMultiLoRAValidation:
         )
 
     def _parse(self, extra):
+        # [FUNCTION DOC] HELPER: Parses two multi-LoRA adapters, rank 8, target modules "linear_qkv" and
+        # a rollout count, followed by the extra arguments and the required arguments (later target
+        # module options override the default).
         parser = argparse.ArgumentParser()
         get_miles_extra_args_provider()(parser)
         return parser.parse_args(
@@ -2397,12 +2631,16 @@ class TestMultiLoRAValidation:
         )
 
     def test_hf_selection_does_not_resolve_through_bridge(self, monkeypatch):
+        # [FUNCTION DOC] With a mapping holding one q_proj weight name and a Bridge normalizer that
+        # fails the test if called, target "q_proj" validates: the HF LoRA targets are ["q_proj"] and
+        # the target modules string is unchanged.
         monkeypatch.setattr(
             "miles.utils.lora.arguments.HfWeightMapping.from_config",
             lambda config: SimpleNamespace(parameter_names=frozenset({"model.layers.0.self_attn.q_proj.weight"})),
         )
 
         def unexpected_bridge(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Fails the test if called.
             pytest.fail("HF selection must not initialize Bridge")
 
         monkeypatch.setattr(
@@ -2417,6 +2655,13 @@ class TestMultiLoRAValidation:
     @pytest.mark.parametrize("exclusion", ["model.layers.*.self_attn.o_proj", "model.layers.0.self_attn.o_proj"])
     @pytest.mark.parametrize("targets", ["o_proj,down_proj", "attn,mlp", "all-linear"])
     def test_scoped_exclusion_resolves_without_bridge(self, monkeypatch, exclusion, targets):
+        # [FUNCTION DOC] Parametrized over exclusion patterns (all layers or layer 0 only for o_proj)
+        # and target specs. Builds a mapping of two layers with seven linear modules each and a Bridge
+        # normalizer that fails if called. For targets "o_proj,down_proj" with that exclusion,
+        # validation raises an assertion error matching "overlap --exclude-modules". Otherwise
+        # validation keeps the target and exclusion strings, and the HF LoRA targets equal all module
+        # names (without the weight suffix) not matching the exclusion pattern (case-sensitive glob),
+        # with adapter targets equal to the HF targets.
         hf_mapping = HfWeightMapping(
             frozenset(
                 f"model.layers.{layer}.{module}.weight"
@@ -2435,6 +2680,7 @@ class TestMultiLoRAValidation:
         monkeypatch.setattr("miles.utils.lora.arguments.HfWeightMapping.from_config", lambda config: hf_mapping)
 
         def unexpected_bridge(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Fails the test if called.
             pytest.fail("HF exclusions must not initialize Bridge")
 
         monkeypatch.setattr(
@@ -2459,6 +2705,8 @@ class TestMultiLoRAValidation:
         assert args.lora_adapter_targets == args.hf_lora_targets
 
     def test_rejects_multiple_tokenizer_workers(self):
+        # [FUNCTION DOC] Two SGLang tokenizer workers raise an assertion error matching
+        # "sglang-tokenizer-worker-num 1".
         # Each sglang tokenizer worker holds its own LoRA registry, so per-step
         # upserts fail non-deterministically; fail at launch, not first push.
         args = self._parse(["--sglang-tokenizer-worker-num", "2"])
@@ -2467,6 +2715,7 @@ class TestMultiLoRAValidation:
             miles_validate_args(args)
 
     def test_accepts_default_single_tokenizer_worker(self):
+        # [FUNCTION DOC] Default arguments validate and the multi-LoRA flag is true.
         args = self._parse([])
 
         miles_validate_args(args)
@@ -2474,6 +2723,8 @@ class TestMultiLoRAValidation:
         assert args.multi_lora is True
 
     def test_rejects_non_adam_optimizer(self):
+        # [FUNCTION DOC] Optimizer "muon" raises an assertion error matching "does not support Muon";
+        # optimizer "sgd" raises one matching "requires --optimizer adam".
         # Per-slot optimizer isolation (state init, retirement cleanup, step
         # clocks) only implements Adam semantics. Muon has its own dedicated
         # rejection; anything else non-Adam trips the generic guard.
@@ -2488,6 +2739,7 @@ class TestMultiLoRAValidation:
             miles_validate_args(args)
 
     def test_is_accepted_on_the_only_trainer(self):
+        # [FUNCTION DOC] Default multi-LoRA arguments validate without error.
         """Multi-LoRA used to be rejected on the cell based trainer, which is now the only one."""
         args = self._parse([])
 
@@ -2495,6 +2747,7 @@ class TestMultiLoRAValidation:
 
     @pytest.mark.parametrize("cp_size", [2, 4])
     def test_accepts_context_parallelism(self, cp_size):
+        # [FUNCTION DOC] Parametrized over context-parallel sizes 2 and 4: validation succeeds.
         # The Tinker losses shard their per-datum inputs with the native CP helpers.
         args = self._parse([])
         args.context_parallel_size = cp_size
@@ -2502,6 +2755,8 @@ class TestMultiLoRAValidation:
         miles_validate_args(args)
 
     def test_rejects_allgather_cp(self):
+        # [FUNCTION DOC] Context parallel 2 with the allgather-CP layout raises an assertion error
+        # mentioning "--allgather-cp".
         # get_batch cannot route adapter slots under the allgather CP layout; fail at launch.
         args = self._parse([])
         args.context_parallel_size = 2
@@ -2510,6 +2765,8 @@ class TestMultiLoRAValidation:
             miles_validate_args(args)
 
     def test_rejects_pipeline_parallelism(self):
+        # [FUNCTION DOC] Pipeline-parallel size 2 raises an assertion error matching
+        # "pipeline-model-parallel-size 1".
         # Adapter routing is not recompute-safe under a pipelined schedule.
         args = self._parse([])
         args.pipeline_model_parallel_size = 2
@@ -2517,6 +2774,7 @@ class TestMultiLoRAValidation:
             miles_validate_args(args)
 
     def test_rejects_bshd_qkv_format(self):
+        # [FUNCTION DOC] QKV format "bshd" raises an assertion error matching "qkv-format thd".
         # bshd interleaves samples in the sequence-major flattening the spans assume.
         args = self._parse([])
         args.qkv_format = "bshd"
@@ -2524,6 +2782,8 @@ class TestMultiLoRAValidation:
             miles_validate_args(args)
 
     def test_rejects_shared_outer_expert_loras(self):
+        # [FUNCTION DOC] Setting the experts-shared-outer-LoRAs flag raises an assertion error
+        # mentioning "experts-shared-outer-loras".
         # Per-expert layout only; the flag would switch sglang to a layout training never produces.
         args = self._parse([])
         args.experts_shared_outer_loras = True
@@ -2531,6 +2791,8 @@ class TestMultiLoRAValidation:
             miles_validate_args(args)
 
     def test_accepts_expert_leaf_targets_without_expert_tp_flag(self):
+        # [FUNCTION DOC] Targets gate_proj, up_proj, down_proj with the expert tensor-parallel size
+        # left none validate, and multi-LoRA stays enabled.
         # --expert-tensor-parallel-size stays None until Megatron's own validate_args;
         # comparing the raw value here rejected every run that omitted the flag.
         args = self._parse(["--target-modules", "gate_proj,up_proj,down_proj"])
@@ -2542,7 +2804,10 @@ class TestMultiLoRAValidation:
 
 
 class TestResolveFtComponents:
+    # [CLASS DOC] Tests of the fault tolerance component resolver on hand-built namespaces.
     def test_disabled_with_no_components_returns_empty_without_warning(self, caplog) -> None:
+        # [FUNCTION DOC] Fault tolerance off and no components: returns an empty list and logs no
+        # "--ft-components is ignored" warning.
         """use_fault_tolerance off and no ft_components yields an empty list and no warning."""
         args = SimpleNamespace(use_fault_tolerance=False, ft_components=None)
         with caplog.at_level(logging.WARNING, logger="miles.utils.arguments"):
@@ -2552,6 +2817,8 @@ class TestResolveFtComponents:
         assert not any("--ft-components is ignored" in record.message for record in caplog.records)
 
     def test_disabled_with_components_returns_empty_and_warns(self, caplog) -> None:
+        # [FUNCTION DOC] Fault tolerance off but components ["train"]: returns an empty list and logs
+        # a warning that components are ignored without fault tolerance.
         """use_fault_tolerance off but ft_components set returns empty list and logs an ignore warning."""
         args = SimpleNamespace(use_fault_tolerance=False, ft_components=["train"])
         with caplog.at_level(logging.WARNING, logger="miles.utils.arguments"):
@@ -2563,6 +2830,7 @@ class TestResolveFtComponents:
         )
 
     def test_enabled_with_no_components_returns_default(self) -> None:
+        # [FUNCTION DOC] Fault tolerance on and no components: returns ["rollout"].
         """use_fault_tolerance on with no ft_components falls back to the default ['rollout']."""
         args = SimpleNamespace(use_fault_tolerance=True, ft_components=None)
         result = _resolve_ft_components(args)
@@ -2570,6 +2838,8 @@ class TestResolveFtComponents:
         assert result == ["rollout"]
 
     def test_enabled_with_components_returns_distinct_copy(self) -> None:
+        # [FUNCTION DOC] Fault tolerance on with components ["train", "rollout"]: returns an equal
+        # list that is not the same object as the input.
         """use_fault_tolerance on with ft_components returns an equal but distinct list copy."""
         components = ["train", "rollout"]
         args = SimpleNamespace(use_fault_tolerance=True, ft_components=components)
@@ -2580,6 +2850,7 @@ class TestResolveFtComponents:
 
 
 class TestDebugUnifiedGradFusedLogprobArgument:
+    # [CLASS DOC] Test of the debug unified-grad fused-logprob switch.
     @pytest.mark.parametrize(
         ("extra_args", "expected"),
         [([], False), (["--debug-unified-grad-fused-logprob"], True)],
@@ -2587,6 +2858,8 @@ class TestDebugUnifiedGradFusedLogprobArgument:
     def test_the_debug_grad_switch_defaults_off_and_can_be_enabled(
         self, extra_args: list[str], expected: bool
     ) -> None:
+        # [FUNCTION DOC] Parametrized over no extra arguments (false) and the switch (true): the
+        # parsed attribute equals the expected boolean.
         """The fused-logprob debug path is opt-in and the command-line switch enables it."""
         parser = argparse.ArgumentParser()
         get_miles_extra_args_provider()(parser)
@@ -2631,6 +2904,11 @@ class TestDebugUnifiedGradFusedLogprobArgument:
     ],
 )
 def test_sglang_parallel_sizes_use_short_namespace_fields(parallel_args, expected):
+    # [FUNCTION DOC] Parametrized over no arguments (all sizes 1), long option spellings and short
+    # option spellings (tp 2, dp 3, pp 4, ep 5 with DP attention). Asserts the namespace uses short
+    # field names (tp, dp, pp, ep sizes) and has no long-named attributes. Then sets 8 GPUs per
+    # engine plus a few other attributes and validates: tensor-parallel size becomes 8 and the other
+    # three sizes keep the expected values.
     parser = argparse.ArgumentParser()
     add_sglang_arguments(parser)
     args = parser.parse_args(parallel_args)
@@ -2654,6 +2932,8 @@ def test_sglang_parallel_sizes_use_short_namespace_fields(parallel_args, expecte
 
 
 def test_sglang_parallel_size_aliases_keep_last_value():
+    # [FUNCTION DOC] Giving the long data-parallel option (2) then the short one (3) leaves the DP
+    # size at 3 (last wins).
     parser = argparse.ArgumentParser()
     add_sglang_arguments(parser)
 
@@ -2663,6 +2943,8 @@ def test_sglang_parallel_size_aliases_keep_last_value():
 
 
 def _make_async_ppo_args(**overrides) -> SimpleNamespace:
+    # [FUNCTION DOC] HELPER: Builds a namespace for the async off-policy correction check: critic on,
+    # rollout logprobs, TIS and keep-old-actor all off; keyword overrides replace defaults.
     defaults = dict(
         use_critic=True,
         use_rollout_logprobs=False,
@@ -2674,20 +2956,31 @@ def _make_async_ppo_args(**overrides) -> SimpleNamespace:
 
 
 class TestValidateAsyncOffPolicyCorrection:
+    # [CLASS DOC] Tests of the async off-policy correction validator for critic-based PPO.
     def test_ppo_without_correction_is_rejected(self):
+        # [FUNCTION DOC] Critic on with no correction option raises an assertion error matching
+        # "behavior-policy correction".
         with pytest.raises(AssertionError, match="behavior-policy correction"):
             validate_async_off_policy_correction(_make_async_ppo_args())
 
     @pytest.mark.parametrize("flag", ["use_rollout_logprobs", "use_tis", "keep_old_actor"])
     def test_ppo_with_any_correction_passes(self, flag):
+        # [FUNCTION DOC] Parametrized over rollout logprobs, TIS and keep-old-actor: enabling any one
+        # passes.
         validate_async_off_policy_correction(_make_async_ppo_args(**{flag: True}))
 
     def test_non_ppo_estimators_are_unaffected(self):
+        # [FUNCTION DOC] Without the critic, no correction is required and the check passes.
         validate_async_off_policy_correction(_make_async_ppo_args(use_critic=False))
 
 
 class TestValidateRematerializeParamFromMasterWeight:
+    # [CLASS DOC] Tests of the validator for rematerializing parameters from the master weight.
     def _make_args(self, **overrides) -> SimpleNamespace:
+        # [FUNCTION DOC] HELPER: Builds a namespace of a valid configuration for the feature (Megatron
+        # backend, no LoRA, colocated with CPU train offload, distributed optimizer, no KL, no
+        # precision-aware or CPU-offloaded optimizer, no param gather overlap, advantages computed
+        # and more); the remaining lines of the body apply keyword overrides.
         args = SimpleNamespace(
             rematerialize_param_from_master_weight=True,
             train_backend="megatron",
@@ -2718,36 +3011,48 @@ class TestValidateRematerializeParamFromMasterWeight:
         return args
 
     def test_valid_config_forces_no_param_buffer_cpu_backup(self):
+        # [FUNCTION DOC] A valid configuration passes and sets the disable-param-buffers-CPU-backup
+        # flag to true.
         args = self._make_args()
         _validate_rematerialize_param_from_master_weight(args)
         assert args.disable_param_buffers_cpu_backup is True
 
     def test_accepts_precision_aware_with_cpu_offload(self):
+        # [FUNCTION DOC] Precision-aware optimizer together with CPU optimizer offload passes and also
+        # disables the param buffer CPU backup.
         args = self._make_args(use_precision_aware_optimizer=True, optimizer_cpu_offload=True)
         _validate_rematerialize_param_from_master_weight(args)
         assert args.disable_param_buffers_cpu_backup is True
 
     def test_ci_test_auto_enables_the_check(self):
+        # [FUNCTION DOC] With the CI test flag on, validation turns the check flag on.
         args = self._make_args(ci_test=True)
         _validate_rematerialize_param_from_master_weight(args)
         assert args.check_rematerialize_param_from_master_weight is True
 
     def test_check_stays_off_outside_ci(self):
+        # [FUNCTION DOC] Without the CI test flag the check flag stays false.
         args = self._make_args()
         _validate_rematerialize_param_from_master_weight(args)
         assert args.check_rematerialize_param_from_master_weight is False
 
     def test_accepts_ref_and_teacher_tags(self):
+        # [FUNCTION DOC] KL loss, a reference KL coefficient, or a teacher load path each pass
+        # validation.
         for overrides in ({"use_kl_loss": True}, {"kl_coef": 0.1}, {"opd_teacher_load": "/path/to/teacher"}):
             _validate_rematerialize_param_from_master_weight(self._make_args(**overrides))
 
     def test_debug_train_only_silently_disables(self):
+        # [FUNCTION DOC] In train-only debug mode (not colocated) validation turns the feature off and
+        # leaves the param buffer backup flag false instead of raising.
         args = self._make_args(debug_train_only=True, colocate=False)
         _validate_rematerialize_param_from_master_weight(args)
         assert args.rematerialize_param_from_master_weight is False
         assert args.disable_param_buffers_cpu_backup is False
 
     def test_noop_when_disabled(self):
+        # [FUNCTION DOC] With the feature disabled, even a non-colocated config passes and the backup
+        # flag stays false.
         args = self._make_args(rematerialize_param_from_master_weight=False, colocate=False)
         _validate_rematerialize_param_from_master_weight(args)
         assert args.disable_param_buffers_cpu_backup is False
@@ -2772,10 +3077,16 @@ class TestValidateRematerializeParamFromMasterWeight:
         ],
     )
     def test_rejects_unsupported_config(self, overrides):
+        # [FUNCTION DOC] Parametrized over fourteen unsupported settings (FSDP, LoRA, disabled
+        # optimizer, independent DP, not colocated, no train offload, non-CPU offload target, no
+        # distributed optimizer, keep-old-actor, precision-aware optimizer, param gather overlap, no
+        # advantages computation, critic-only steps): each raises an assertion error.
         with pytest.raises(AssertionError):
             _validate_rematerialize_param_from_master_weight(self._make_args(**overrides))
 
     def test_backend_is_checked_before_megatron_only_args(self):
+        # [FUNCTION DOC] A minimal namespace on the FSDP backend (lacking Megatron-only fields) raises
+        # an assertion error mentioning "Megatron" (backend is checked before the other fields).
         # An fsdp Namespace has none of the megatron args the later asserts read.
         args = SimpleNamespace(
             rematerialize_param_from_master_weight=True,
@@ -2794,6 +3105,8 @@ class TestValidateRematerializeParamFromMasterWeight:
     ],
 )
 def test_skip_actor_forward_only_flag_is_parsed(extra_args, expected):
+    # [FUNCTION DOC] Parametrized: the skip-actor-forward-only flag is false by default and true when
+    # given.
     parser = argparse.ArgumentParser()
     get_miles_extra_args_provider()(parser)
 
@@ -2803,6 +3116,9 @@ def test_skip_actor_forward_only_flag_is_parsed(extra_args, expected):
 
 
 def test_skip_actor_forward_only_is_gated_during_miles_validation():
+    # [FUNCTION DOC] With the skip flag, global batch size 32 and rollout batch 64 (per the required
+    # arguments), plus dropout and MoE settings that are acceptable, full validation raises an
+    # assertion error mentioning "--skip-actor-forward-only" (the batch layout is not single-step).
     parser = argparse.ArgumentParser()
     get_miles_extra_args_provider()(parser)
     args = parser.parse_args(
@@ -2823,6 +3139,9 @@ def test_skip_actor_forward_only_is_gated_during_miles_validation():
 
 
 def _make_skip_actor_forward_only_args(**overrides) -> SimpleNamespace:
+    # [FUNCTION DOC] HELPER: Builds a namespace of a valid single-step skip-actor-forward-only
+    # configuration (Megatron backend, policy loss, 64 global batch with 8 prompts of 8 samples,
+    # zero dropouts, no hooks, no dumping, no replay, no KL/OPD/old actor) with keyword overrides.
     defaults = dict(
         compute_advantages_and_returns=True,
         custom_megatron_before_log_prob_hook_path=None,
@@ -2868,19 +3187,26 @@ def _make_skip_actor_forward_only_args(**overrides) -> SimpleNamespace:
 
 
 class TestValidateSkipActorForwardOnly:
+    # [CLASS DOC] Tests of the validator for the skip-actor-forward-only mode: a set of compatible
+    # configurations that pass and many incompatible ones that raise.
     def test_valid_single_step_configuration_passes(self):
+        # [FUNCTION DOC] The default valid namespace passes.
         validate_skip_actor_forward_only(_make_skip_actor_forward_only_args())
 
     def test_zero_moe_input_jitter_passes(self):
+        # [FUNCTION DOC] An MoE input jitter epsilon of 0.0 passes (only nonzero is rejected).
         validate_skip_actor_forward_only(_make_skip_actor_forward_only_args(moe_input_jitter_eps=0.0))
 
     def test_tis_configuration_passes(self):
+        # [FUNCTION DOC] Truncated importance sampling on passes.
         validate_skip_actor_forward_only(_make_skip_actor_forward_only_args(use_tis=True))
 
     def test_rollout_logprobs_configuration_passes(self):
+        # [FUNCTION DOC] Using rollout logprobs passes.
         validate_skip_actor_forward_only(_make_skip_actor_forward_only_args(use_rollout_logprobs=True))
 
     def test_rollout_logprobs_with_mismatch_metrics_passes(self):
+        # [FUNCTION DOC] Rollout logprobs together with mismatch metrics passes.
         validate_skip_actor_forward_only(
             _make_skip_actor_forward_only_args(
                 get_mismatch_metrics=True,
@@ -2902,6 +3228,8 @@ class TestValidateSkipActorForwardOnly:
         ],
     )
     def test_dumper_configuration_passes(self, overrides):
+        # [FUNCTION DOC] Parametrized over five dumper/dump-details settings (dumper on, dumper
+        # forward-only options, dump details with or without a train data save path): all pass.
         validate_skip_actor_forward_only(_make_skip_actor_forward_only_args(**overrides))
 
     @pytest.mark.parametrize(
@@ -2936,6 +3264,12 @@ class TestValidateSkipActorForwardOnly:
         ],
     )
     def test_incompatible_configuration_is_rejected(self, overrides):
+        # [FUNCTION DOC] Parametrized over 26 incompatible settings (non-Megatron backend, custom loss,
+        # no advantage computation, old actor, KL, OPD, any dropout, MoE jitter or forced/biased
+        # routing or sinkhorn balancing, rollout entropy, true on-policy, correct-sample logging,
+        # custom hooks or model provider, patcher config, train data saving, routing/indexer replay
+        # without the rollout variants, multiple steps per rollout, a smaller global batch): each
+        # raises an assertion error mentioning "--skip-actor-forward-only".
         with pytest.raises(AssertionError, match="--skip-actor-forward-only"):
             validate_skip_actor_forward_only(_make_skip_actor_forward_only_args(**overrides))
 
@@ -2947,6 +3281,8 @@ class TestValidateSkipActorForwardOnly:
         ],
     )
     def test_rollout_replay_is_compatible(self, base_flag, rollout_flag):
+        # [FUNCTION DOC] Parametrized over routing and indexer replay: the base replay flag together
+        # with its rollout variant passes.
         validate_skip_actor_forward_only(
             _make_skip_actor_forward_only_args(
                 **{
@@ -2957,6 +3293,8 @@ class TestValidateSkipActorForwardOnly:
         )
 
     def test_dynamic_global_batch_size_defers_step_count_to_runtime(self):
+        # [FUNCTION DOC] A smaller global batch (32) passes when the dynamic global batch size is on,
+        # since the step count is decided at runtime.
         validate_skip_actor_forward_only(
             _make_skip_actor_forward_only_args(
                 global_batch_size=32,
@@ -2966,12 +3304,16 @@ class TestValidateSkipActorForwardOnly:
 
 
 class TestRunUuidResolution:
+    # [CLASS DOC] Tests of run uuid handling in full validation: generation, uniqueness, pinning and
+    # validation of explicit and config-file values.
     def _parse(self, extra: list[str]):
+        # [FUNCTION DOC] HELPER: Parses "--num-rollout 1", the extra arguments and the required ones.
         parser = argparse.ArgumentParser()
         get_miles_extra_args_provider()(parser)
         return parser.parse_args(["--num-rollout", "1"] + extra + REQUIRED_ARGS)
 
     def test_unset_run_uuid_is_generated(self):
+        # [FUNCTION DOC] Without a run uuid, validation generates one that passes the uuid validator.
         """Every launch gets an identifier, so nothing has to cope with it being absent."""
         args = self._parse([])
         miles_validate_args(args)
@@ -2979,6 +3321,7 @@ class TestRunUuidResolution:
         assert validate_run_uuid(args.run_uuid)
 
     def test_two_launches_do_not_share_a_run_uuid(self):
+        # [FUNCTION DOC] Two separately validated namespaces get different generated uuids.
         """A colliding identifier would attribute one run's artifacts to another."""
         first, second = self._parse([]), self._parse([])
         miles_validate_args(first)
@@ -2987,6 +3330,8 @@ class TestRunUuidResolution:
         assert first.run_uuid != second.run_uuid
 
     def test_an_explicit_run_uuid_is_kept(self):
+        # [FUNCTION DOC] A valid hexadecimal uuid of the standard length given on the command line is
+        # kept verbatim.
         """Reproducing a run means being able to pin its identifier."""
         pinned = ("ab12cd34ef5678ab" * 4)[:RUN_UUID_LENGTH]
         args = self._parse(["--run-uuid", pinned])
@@ -2995,6 +3340,8 @@ class TestRunUuidResolution:
         assert args.run_uuid == pinned
 
     def test_a_run_uuid_from_the_custom_config_file_is_validated_too(self, tmp_path):
+        # [FUNCTION DOC] A config file setting run uuid "my-experiment" makes validation raise a value
+        # error matching "invalid run uuid".
         """The config file overwrites args after the flags are parsed, so it must not skip the check."""
         config = tmp_path / "override.yaml"
         config.write_text("run_uuid: my-experiment\n")
@@ -3004,6 +3351,8 @@ class TestRunUuidResolution:
             miles_validate_args(args)
 
     def test_a_run_uuid_blanked_by_the_custom_config_file_is_regenerated(self, tmp_path):
+        # [FUNCTION DOC] A config file setting run uuid to null results in a freshly generated valid
+        # uuid after validation.
         """A null in the config file must not leave the identifier unset for the whole run."""
         config = tmp_path / "override.yaml"
         config.write_text("run_uuid: null\n")
@@ -3013,6 +3362,8 @@ class TestRunUuidResolution:
         assert validate_run_uuid(args.run_uuid)
 
     def test_a_malformed_explicit_run_uuid_fails_at_launch(self):
+        # [FUNCTION DOC] A malformed command-line uuid "my-experiment" raises a value error matching
+        # "invalid run uuid".
         """Rejecting it here beats corrupting every string that embeds it hours into a run."""
         args = self._parse(["--run-uuid", "my-experiment"])
 
@@ -3021,12 +3372,16 @@ class TestRunUuidResolution:
 
 
 class TestRolloutHealthCheckArguments:
+    # [CLASS DOC] Tests of rollout health check option defaults and their mapping into the shared
+    # health checker config.
     def _parse(self, extra: list[str]):
+        # [FUNCTION DOC] HELPER: Parses the extra arguments followed by the required ones.
         parser = argparse.ArgumentParser()
         get_miles_extra_args_provider()(parser)
         return parser.parse_args(extra + REQUIRED_ARGS)
 
     def test_the_rollout_defaults_survive_the_move_onto_the_shared_config(self):
+        # [FUNCTION DOC] Defaults: interval 30.0, timeout 30.0, first wait 0.0, failure threshold 1.
         """The shared config carries the trainer's defaults, which are not the rollout ones."""
         args = self._parse([])
 
@@ -3036,10 +3391,13 @@ class TestRolloutHealthCheckArguments:
         assert args.rollout_health_check_failure_threshold == 1
 
     def test_the_first_wait_grace_period_is_still_tunable(self):
+        # [FUNCTION DOC] First wait option "600" parses to 600.0.
         """A first launch compiling deepgemm kernels needs a grace period, or it is killed while warming up."""
         assert self._parse(["--rollout-health-check-first-wait", "600"]).rollout_health_check_first_wait == 600.0
 
     def test_the_resolved_rollout_config_matches_the_parsed_arguments(self):
+        # [FUNCTION DOC] Building the health checker config from parsed args with the rollout prefix
+        # and first wait 600 gives interval 30.0, timeout 30.0 and first wait 600.0.
         """The config is what the checker actually runs on, so it must not diverge from the flags."""
         config = SimpleHealthCheckerConfig.from_args(
             self._parse(["--rollout-health-check-first-wait", "600"]), prefix="rollout_health_check"
@@ -3048,10 +3406,14 @@ class TestRolloutHealthCheckArguments:
         assert (config.interval, config.timeout, config.first_wait) == (30.0, 30.0, 600.0)
 
     def test_a_rollout_cell_is_reported_unhealthy_on_the_very_first_failed_probe(self):
+        # [FUNCTION DOC] The default rollout failure threshold is 1. (Duplicates an assertion in the
+        # defaults test above.)
         """At a 30s interval the shared three-failure debounce would hide a dead engine for 90s."""
         assert self._parse([]).rollout_health_check_failure_threshold == 1
 
     def test_a_tuned_rollout_debounce_reaches_the_shared_config(self):
+        # [FUNCTION DOC] A failure threshold option 7 is carried into the config built with the
+        # rollout prefix.
         """The failure threshold is what debounces transient blips, so the flag must reach the checker's config."""
         config = SimpleHealthCheckerConfig.from_args(
             self._parse(["--rollout-health-check-failure-threshold", "7"]), prefix="rollout_health_check"
@@ -3060,13 +3422,17 @@ class TestRolloutHealthCheckArguments:
         assert config.failure_threshold == 7
 
     def test_the_trainer_heartbeat_keeps_its_own_debounce(self):
+        # [FUNCTION DOC] The trainer heartbeat checker failure threshold defaults to 3.
         """The rollout default must not be pushed down into the shared config: a trainer heartbeat
         shares an RPC channel with the train step, so one slow reply is a blip, not a dead cell."""
         assert self._parse([]).trainer_heartbeat_checker_failure_threshold == 3
 
 
 class TestMiniFtControllerArguments:
+    # [CLASS DOC] Tests of the mini fault tolerance controller (healing loop) enable option.
     def _validate(self, extra: list[str]):
+        # [FUNCTION DOC] HELPER: Parses extra arguments, a rollout count and required arguments, runs
+        # full validation and returns the namespace.
         parser = argparse.ArgumentParser()
         get_miles_extra_args_provider()(parser)
         args = parser.parse_args(extra + ["--num-rollout", "1"] + REQUIRED_ARGS)
@@ -3074,16 +3440,20 @@ class TestMiniFtControllerArguments:
         return args
 
     def test_fault_tolerance_alone_turns_the_healing_loop_on(self):
+        # [FUNCTION DOC] Fault tolerance alone leaves the controller enabled.
         """Asking for fault tolerance heals on its own, so the loop must come up without a second flag."""
         assert self._validate(["--use-fault-tolerance"]).mini_ft_controller_enable is True
 
     def test_the_negative_flag_turns_the_healing_loop_back_off(self):
+        # [FUNCTION DOC] Fault tolerance plus the "no" flag disables the controller.
         """A run that drives healing from outside needs a way to keep the health reporting without the loop."""
         args = self._validate(["--use-fault-tolerance", "--no-mini-ft-controller-enable"])
 
         assert args.mini_ft_controller_enable is False
 
     def test_asking_for_the_loop_without_a_port_is_rejected_at_launch(self):
+        # [FUNCTION DOC] Controller enabled with API server port 0 raises a value error matching
+        # "requires --api-server-port to be set".
         """The loop drives cells over the api server port, so a disabled port would fail every poll instead."""
         parser = argparse.ArgumentParser()
         get_miles_extra_args_provider()(parser)
@@ -3096,12 +3466,16 @@ class TestMiniFtControllerArguments:
 
 
 class TestSessionServerArguments:
+    # [CLASS DOC] Tests of session server worker count and base port parsing. (Overlaps with
+    # TestSessionServerScalingArguments, which uses a slightly different parse helper.)
     def _parse(self, extra: list[str]):
+        # [FUNCTION DOC] HELPER: Parses the extra arguments followed by the required ones.
         parser = argparse.ArgumentParser()
         get_miles_extra_args_provider()(parser)
         return parser.parse_args(extra + REQUIRED_ARGS)
 
     def test_the_instance_count_and_base_port_come_from_the_flags(self):
+        # [FUNCTION DOC] Workers 3 and port 41000 parse to those integers.
         """A network policy whitelists a known range, so the base port is one scalar the instances offset from."""
         args = self._parse(["--session-server-workers", "3", "--session-server-port", "41000"])
 
@@ -3109,6 +3483,7 @@ class TestSessionServerArguments:
         assert args.session_server_port == 41000
 
     def test_an_unset_base_port_leaves_the_default_instances_dynamically_placed(self):
+        # [FUNCTION DOC] Without options, workers default to 32 and the port to none.
         """Without the flag the port stays unset so the placement allocates one, and the instance count is the default."""
         args = self._parse([])
 
@@ -3117,13 +3492,21 @@ class TestSessionServerArguments:
 
 
 class TestSecretArgumentsAreClassified:
+    # [CLASS DOC] Tests that every argument whose name looks like a credential is either in the
+    # redaction list of the environment report or explicitly declared harmless in this module.
     def _declared_names(self) -> set[str]:
+        # [FUNCTION DOC] HELPER: Returns the set of destination names of all actions registered by the
+        # extra-args provider (read from parser actions because eval SGLang flags default to
+        # suppressed and would not appear after parsing).
         parser = argparse.ArgumentParser()
         get_miles_extra_args_provider()(parser)
         # The eval sglang flags default to SUPPRESS, so parsing alone would not materialise them.
         return {action.dest for action in parser._actions}
 
     def test_every_secret_looking_miles_flag_is_either_redacted_or_declared_harmless(self):
+        # [FUNCTION DOC] Takes declared names that match the secret-name pattern and do not start with
+        # an SGLang prefix; after removing the redacted names, the remainder must equal the declared
+        # harmless set exactly (so stale entries in the harmless set also fail).
         """The env report hashes args by an explicit list, so a new credential flag would leak until listed."""
         suspicious = {
             name
@@ -3137,6 +3520,9 @@ class TestSecretArgumentsAreClassified:
         )
 
     def test_every_credential_inherited_from_sglang_and_the_router_is_redacted(self):
+        # [FUNCTION DOC] Names matching the inherited credential pattern (SGLang/router api keys and
+        # passwords, optionally eval-prefixed) include the SGLang, eval SGLang and router api keys, and
+        # are all in the redaction list.
         """sglang and the router contribute api keys and key passwords that land in the args dump verbatim."""
         credentials = {name for name in self._declared_names() if _INHERITED_CREDENTIAL_PATTERN.search(name)}
 
@@ -3145,6 +3531,7 @@ class TestSecretArgumentsAreClassified:
 
 
 def test_a_run_without_a_policy_id_still_carries_the_attribute():
+    # [FUNCTION DOC] Parsing without a trainer model id gives an attribute equal to none.
     """megatron declares no --trainer-model-id, so every log point relies on miles defaulting the attribute."""
     parser = argparse.ArgumentParser()
     get_miles_extra_args_provider()(parser)
@@ -3155,6 +3542,8 @@ def test_a_run_without_a_policy_id_still_carries_the_attribute():
 
 
 def test_the_megatron_config_flag_defaults_to_none(tmp_path):
+    # [FUNCTION DOC] The Megatron config option is none by default and equals the given path string
+    # when provided.
     """Without the flag a run is single policy, and the flag takes a path the whole run can read."""
     parser = argparse.ArgumentParser()
     get_miles_extra_args_provider()(parser)
@@ -3166,8 +3555,13 @@ def test_the_megatron_config_flag_defaults_to_none(tmp_path):
 
 
 class TestMilesValidateArgsCheckpointResolution:
+    # [CLASS DOC] Tests of the checkpoint load fallback in full validation: applied for a single
+    # policy run, deferred for runs with a Megatron config file declaring trainers.
     @staticmethod
     def _parse(extra, tmp_path):
+        # [FUNCTION DOC] HELPER: Parses the HF checkpoint and reference load as the temp dir, a
+        # rollout count, the extra arguments and required arguments; before parsing, sets the
+        # finetune default to false (mimicking Megatron, which owns that option).
         parser = argparse.ArgumentParser()
         get_miles_extra_args_provider()(parser)
         # megatron owns --finetune and the fallback only ever turns it on, so the run that
@@ -3180,6 +3574,8 @@ class TestMilesValidateArgsCheckpointResolution:
         )
 
     def test_a_single_policy_run_still_resolves_its_checkpoint_fallback(self, tmp_path):
+        # [FUNCTION DOC] Without a Megatron config, validation sets load to the reference directory,
+        # finetune to true and start rollout id to 0.
         """The fallback is what lets a fresh run start from --ref-load, and it must survive the multi policy fork."""
         args = self._parse([], tmp_path)
 
@@ -3188,6 +3584,8 @@ class TestMilesValidateArgsCheckpointResolution:
         assert (args.load, args.finetune, args.start_rollout_id) == (str(tmp_path), True, 0)
 
     def test_a_multi_policy_run_leaves_the_global_load_and_save_untouched(self, tmp_path):
+        # [FUNCTION DOC] With a Megatron config of two trainers, load stays none, finetune false and
+        # start rollout id none.
         """Each trainer resolves its own fallback later; settling it globally would point every policy at one dir."""
         args = self._parse(["--megatron-config", encode_megatron_config("a", "b")], tmp_path)
 
@@ -3196,6 +3594,8 @@ class TestMilesValidateArgsCheckpointResolution:
         assert (args.load, args.finetune, args.start_rollout_id) == (None, False, None)
 
     def test_a_single_trainer_config_also_defers_the_fallback_to_the_overlay(self, tmp_path):
+        # [FUNCTION DOC] Even with a Megatron config of a single trainer, the global fallback is
+        # deferred: load none, finetune false, start rollout id none.
         """That trainer may override --ref-load, and a fallback settled before the overlay would ignore it."""
         args = self._parse(["--megatron-config", encode_megatron_config("a")], tmp_path)
 
@@ -3205,21 +3605,29 @@ class TestMilesValidateArgsCheckpointResolution:
 
 
 class TestWeightTransferModeSelection:
+    # [CLASS DOC] Tests of the update-weight transfer mode option (broadcast or broadcast_packed) and
+    # its validation, including values coming from the custom config file.
     def _parse(self, extra=()):
+        # [FUNCTION DOC] HELPER: Parses "--num-rollout 1", the extra arguments and required arguments.
         parser = argparse.ArgumentParser()
         get_miles_extra_args_provider()(parser)
         return parser.parse_args(["--num-rollout", "1", *extra, *REQUIRED_ARGS])
 
     def test_broadcast_is_the_default_and_packed_is_an_explicit_choice(self):
+        # [FUNCTION DOC] The default mode is "broadcast"; the explicit option selects
+        # "broadcast_packed".
         assert self._parse().update_weight_transfer_mode == "broadcast"
         args = self._parse(["--update-weight-transfer-mode", "broadcast_packed"])
         assert args.update_weight_transfer_mode == "broadcast_packed"
 
     def test_unknown_mode_is_rejected(self):
+        # [FUNCTION DOC] The mode "typo" makes the parser exit.
         with pytest.raises(SystemExit):
             self._parse(["--update-weight-transfer-mode", "typo"])
 
     def test_packed_mode_from_yaml_overrides_cli_and_remains_observable(self, tmp_path):
+        # [FUNCTION DOC] A config file setting "broadcast_packed" overrides the command line's
+        # "broadcast"; with Megatron parallel sizes set, validation keeps "broadcast_packed".
         config = tmp_path / "custom.yaml"
         config.write_text("update_weight_transfer_mode: broadcast_packed\n")
         args = self._parse(["--custom-config-path", str(config), "--update-weight-transfer-mode", "broadcast"])
@@ -3240,6 +3648,9 @@ class TestWeightTransferModeSelection:
         ],
     )
     def test_yaml_cannot_bypass_mode_validation(self, tmp_path, body, extra, error):
+        # [FUNCTION DOC] Parametrized: a config file with an unknown mode, or the packed mode combined
+        # with colocation or the FSDP backend, makes validation raise a value error with the paired
+        # message ("Unknown --update-weight-transfer-mode" or "requires Megatron non-colocated").
         config = tmp_path / "custom.yaml"
         config.write_text(body)
         args = self._parse(["--custom-config-path", str(config), *extra])
