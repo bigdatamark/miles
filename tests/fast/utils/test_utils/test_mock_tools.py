@@ -1,3 +1,7 @@
+# [MODULE DOC] Tests for the mock tool helpers: executing the canned tools, the chat template
+# rendering of a sample tool-using prompt for the Qwen3 0.6B tokenizer (downloaded/loaded at test
+# time), and a guard that sglang's function call parser (qwen25 format) parses tool call blocks
+# in model output the way the mock server expects.
 import asyncio
 
 import pytest
@@ -10,16 +14,23 @@ from miles.utils.test_utils.mock_tools import SAMPLE_TOOLS, TwoTurnStub, execute
 
 
 class TestExecuteToolCall:
+    # [CLASS DOC] Tests of the canned tool executor (async, run in a fresh event loop).
     def test_execute_get_year(self):
+        # [FUNCTION DOC] The get-year tool returns a JSON string with year 2026.
         result = asyncio.run(execute_tool_call("get_year", {}))
         assert result == '{"year": 2026}'
 
     def test_execute_get_temperature(self):
+        # [FUNCTION DOC] The get-temperature tool for Mars returns a JSON string with minus 60.
         result = asyncio.run(execute_tool_call("get_temperature", {"location": "Mars"}))
         assert result == '{"temperature": -60}'
 
 
 class TestApplyChatTemplateWithTools:
+    # [CLASS DOC] Pins the exact prompt text rendered by the tokenizer chat template for one user
+    # message, without tools and with the sample tools (a tools section in the system turn listing
+    # each tool as a JSON line, instructions for tool call tags, then the user turn and an open
+    # assistant turn). Class constants hold the two expected strings.
     EXPECTED_PROMPT_WITHOUT_TOOLS = (
         "<|im_start|>user\n" "What's the weather in Paris?<|im_end|>\n" "<|im_start|>assistant\n"
     )
@@ -50,6 +61,9 @@ class TestApplyChatTemplateWithTools:
         ],
     )
     def test_apply_chat_template(self, tools, expected):
+        # [FUNCTION DOC] Parametrized over no tools and the sample tools. Loads the Qwen3 0.6B
+        # tokenizer (trusting remote code, imported lazily), renders the weather question as text
+        # with a generation prompt, and asserts it equals the pinned expected prompt.
         from miles.utils.processing_utils import load_tokenizer
 
         tokenizer = load_tokenizer("Qwen/Qwen3-0.6B", trust_remote_code=True)
@@ -106,6 +120,10 @@ class TestSGLangFunctionCallParser:
         ],
     )
     def test_parse_non_stream(self, model_output, expected):
+        # [FUNCTION DOC] Parametrized over a single tool call, two tool calls, no tool call, and
+        # the multi-turn stub's first response. Validates the sample tools into sglang tool
+        # models, builds the qwen25 parser, and asserts the non-streaming parse returns the
+        # leading normal text and the list of tool call items (index, name, argument string).
         tools = TypeAdapter(list[Tool]).validate_python(SAMPLE_TOOLS)
         parser = FunctionCallParser(tools=tools, tool_call_parser="qwen25")
         assert parser.parse_non_stream(model_output) == expected

@@ -1,3 +1,10 @@
+# [MODULE DOC] Tests for the OpenAI-style session verification agent used by end-to-end tests:
+# schedule selection of driver actions per allowed append role set (assistant input always last,
+# rollback kept, system reminder excluded for some families), per-family fixed template roles,
+# running the agent against a fake HTTP client and fake chat function (assistant input injection,
+# rollback regeneration), retrying length-truncated completions with a distinct seed, and the
+# generate wrapper that journals verification metrics (hard mismatches, coverage failures, errors)
+# to a file named by an environment variable.
 import asyncio
 import json
 from copy import deepcopy
@@ -21,6 +28,8 @@ from miles.utils.types import Sample
 
 
 def test_all_role_schedule_places_assistant_input_last():
+    # [FUNCTION DOC] With all valid append roles and 2 cycles, the schedule ends with the single
+    # assistant input action and contains a rollback before it.
     schedule = select_schedule(VALID_APPEND_ROLES, cycles=2)
 
     assert schedule[-1] is DriverAction.ASSISTANT_INPUT
@@ -29,6 +38,8 @@ def test_all_role_schedule_places_assistant_input_last():
 
 
 def test_model_config_uses_family_fixed_template_capability():
+    # [FUNCTION DOC] For a qwen3 model config, the fixed template append roles of its tito model
+    # equal the full valid append role set.
     cfg = ModelConfig(
         model_name="model",
         reasoning_parser="reasoning",
@@ -40,19 +51,32 @@ def test_model_config_uses_family_fixed_template_capability():
 
 
 def test_assistant_input_appends_two_text_messages_then_user(monkeypatch):
+    # [FUNCTION DOC] Patches the HTTP client, the chat function (records a deep copy of each
+    # message list and returns a generated assistant text) and the schedule (only the assistant
+    # input action). Runs the agent for qwen3. Asserts the second request's roles are system,
+    # user, assistant, assistant, assistant, user; the two injected assistant contents equal the
+    # module's assistant input texts; the last message is the follow-up user text; and the result
+    # has driver events initial then append-assistant, 2 assistant inputs and 1 user message.
     calls = []
 
     class FakeAsyncClient:
+        # [CLASS DOC] HELPER: Fake async context manager client that only stores its timeout.
         def __init__(self, *, timeout):
+            # [FUNCTION DOC] HELPER: Stores the timeout.
             self.timeout = timeout
 
         async def __aenter__(self):
+            # [FUNCTION DOC] HELPER: Returns the client.
             return self
 
         async def __aexit__(self, exc_type, exc, tb):
+            # [FUNCTION DOC] HELPER: Does not suppress exceptions.
             return None
 
     async def fake_chat(client, base_url, messages, request_kwargs, *, label):
+        # [FUNCTION DOC] HELPER: Records a deep copy of the messages and returns a chat response
+        # whose single choice is an assistant message with text generated response N (N being the
+        # call count) and no tool calls.
         calls.append(deepcopy(messages))
         return {
             "choices": [
@@ -99,6 +123,9 @@ def test_assistant_input_appends_two_text_messages_then_user(monkeypatch):
 
 
 def test_chat_complete_retries_length_with_distinct_seed(monkeypatch):
+    # [FUNCTION DOC] The fake chat first answers with a length-truncated choice, then a stopped
+    # one. Asserts the completion helper returns the stopped response and that the two attempts
+    # used seeds 7 and 1,000,007 (seed plus one million on retry).
     attempts = []
     responses = iter(
         [
@@ -108,6 +135,8 @@ def test_chat_complete_retries_length_with_distinct_seed(monkeypatch):
     )
 
     async def fake_chat(client, base_url, messages, request_kwargs, *, label):
+        # [FUNCTION DOC] HELPER: Records the request keyword arguments and returns the next
+        # scripted response.
         attempts.append(request_kwargs)
         return next(responses)
 
@@ -128,6 +157,8 @@ def test_chat_complete_retries_length_with_distinct_seed(monkeypatch):
 
 
 def test_minimax_schedule_excludes_system_and_keeps_assistant_rollback():
+    # [FUNCTION DOC] The minimax m27 family allows roles tool, user, assistant; its 1-cycle
+    # schedule has no system reminder, ends with assistant input and contains a rollback.
     roles = fixed_template_append_roles("minimax_m27")
     schedule = select_schedule(roles, cycles=1)
 
@@ -138,6 +169,7 @@ def test_minimax_schedule_excludes_system_and_keeps_assistant_rollback():
 
 
 def test_qwen35_schedule_excludes_system_and_keeps_assistant_rollback():
+    # [FUNCTION DOC] Same expectations as the minimax test, for the qwen35 family.
     roles = fixed_template_append_roles("qwen35")
     schedule = select_schedule(roles, cycles=1)
 
@@ -148,19 +180,30 @@ def test_qwen35_schedule_excludes_system_and_keeps_assistant_rollback():
 
 
 def test_assistant_input_generated_response_is_rolled_back_and_regenerated(monkeypatch):
+    # [FUNCTION DOC] Same fakes as the assistant input test, with a schedule of assistant input
+    # then rollback. Asserts the injected request ends with the follow-up user text; the rollback
+    # request equals the injected request exactly (the generated response was popped, injected
+    # assistants stay) and contains no generated response 2; and the result has driver events
+    # initial, append-assistant, rollback with counts 2 assistant inputs, 1 user, 1 rollback.
     calls = []
 
     class FakeAsyncClient:
+        # [CLASS DOC] HELPER: Fake async context manager client that only stores its timeout.
         def __init__(self, *, timeout):
+            # [FUNCTION DOC] HELPER: Stores the timeout.
             self.timeout = timeout
 
         async def __aenter__(self):
+            # [FUNCTION DOC] HELPER: Returns the client.
             return self
 
         async def __aexit__(self, exc_type, exc, tb):
+            # [FUNCTION DOC] HELPER: Does not suppress exceptions.
             return None
 
     async def fake_chat(client, base_url, messages, request_kwargs, *, label):
+        # [FUNCTION DOC] HELPER: Records a deep copy of the messages and returns an assistant
+        # response with text generated response N and no tool calls.
         calls.append(deepcopy(messages))
         return {
             "choices": [
@@ -206,6 +249,9 @@ def test_assistant_input_generated_response_is_rolled_back_and_regenerated(monke
 
 
 def _qwen3_verified_sample(mismatches):
+    # [FUNCTION DOC] HELPER: Builds a sample whose metadata holds a full qwen3 driver event list
+    # (initial, append tool, user, system, assistant, rollback) and the given session mismatch
+    # list.
     return Sample(
         metadata={
             "driver_events": [
@@ -222,12 +268,20 @@ def _qwen3_verified_sample(mismatches):
 
 
 def test_generate_records_hard_mismatch_without_dropping_sample(monkeypatch, tmp_path):
+    # [FUNCTION DOC] Points the metrics path at a temporary file and wraps the module's low-level
+    # write to record payloads. The base generate returns a sample with two mismatches (a special
+    # token count one and an assistant text one). Asserts generate returns that sample and writes
+    # one metrics line with hard mismatch count 1, types list of the special token count, the
+    # example entry, the assistant mismatch flag true, and that the single raw write equals that
+    # JSON plus a newline, encoded.
     metrics_path = tmp_path / "metrics.jsonl"
     monkeypatch.setenv("MILES_SESSION_VERIFY_METRICS_PATH", str(metrics_path))
     writes = []
     real_write = session_verify_agent.os.write
 
     def tracked_write(fd, payload):
+        # [FUNCTION DOC] HELPER: Records the payload and delegates to the real write; returns its
+        # result.
         writes.append(payload)
         return real_write(fd, payload)
 
@@ -249,6 +303,7 @@ def test_generate_records_hard_mismatch_without_dropping_sample(monkeypatch, tmp
     )
 
     async def fake_base_generate(input):
+        # [FUNCTION DOC] HELPER: Returns an output holding the prepared sample.
         return GenerateFnOutput(samples=[returned_sample])
 
     monkeypatch.setattr(session_verify_agent, "_base_generate", fake_base_generate)
@@ -277,6 +332,8 @@ def test_generate_records_hard_mismatch_without_dropping_sample(monkeypatch, tmp
 
 
 def test_hard_mismatch_still_raises_without_metrics_sidecar(monkeypatch):
+    # [FUNCTION DOC] With the metrics path variable unset, verifying a sample with a non
+    # assistant text mismatch raises an assertion error saying forbidden mismatches.
     monkeypatch.delenv("MILES_SESSION_VERIFY_METRICS_PATH", raising=False)
     sample = _qwen3_verified_sample([{"type": "non_assistant_text"}])
 
@@ -289,10 +346,14 @@ def test_hard_mismatch_still_raises_without_metrics_sidecar(monkeypatch):
 
 
 def test_run_agent_journals_assertion_before_retry(monkeypatch, tmp_path):
+    # [FUNCTION DOC] The fixed-template-roles lookup is patched to raise an assertion error with
+    # message journal me. Asserts the agent re-raises it and that exactly one record was written
+    # to the metrics file with a verification error naming the run agent stage and that message.
     metrics_path = tmp_path / "metrics.jsonl"
     monkeypatch.setenv("MILES_SESSION_VERIFY_METRICS_PATH", str(metrics_path))
 
     def reject_template(_tito_model):
+        # [FUNCTION DOC] HELPER: Always raises an assertion error with message journal me.
         raise AssertionError("journal me")
 
     monkeypatch.setattr(session_verify_agent, "fixed_template_append_roles", reject_template)
@@ -313,12 +374,17 @@ def test_run_agent_journals_assertion_before_retry(monkeypatch, tmp_path):
 
 
 def test_generate_journals_coverage_failure_after_hard_mismatch(monkeypatch, tmp_path):
+    # [FUNCTION DOC] The returned sample has a special token count mismatch and lacks the
+    # rollback driver event. Asserts generate raises an assertion error about missing required
+    # driver events, and the metrics file has two records: the sample record with hard mismatch
+    # count 1, then an error record naming the generate stage.
     metrics_path = tmp_path / "metrics.jsonl"
     monkeypatch.setenv("MILES_SESSION_VERIFY_METRICS_PATH", str(metrics_path))
     sample = _qwen3_verified_sample([{"type": "special_token_count", "detail": "count differs"}])
     sample.metadata["driver_events"].remove("rollback")
 
     async def fake_base_generate(input):
+        # [FUNCTION DOC] HELPER: Returns an output holding the prepared sample.
         return GenerateFnOutput(samples=[sample])
 
     monkeypatch.setattr(session_verify_agent, "_base_generate", fake_base_generate)
