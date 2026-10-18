@@ -1,3 +1,17 @@
+# [MODULE DOC] Manual multi-gpu benchmark for the head-sharded linear-attention layer (gated delta
+# net or kimi delta attention) of the Megatron backend. Launched with torchrun using
+# tensor-parallel size times context-parallel size processes; command line gives the tensor
+# parallel size, the context parallel size and optionally sequence lengths (default 4096 to 131072
+# doubling). For each model in the MODELS table (hidden size, head layout, layer kind) and each
+# sequence length, rank 0 prints one line with wall-clock milliseconds and peak gpu memory (GiB) of
+# forward plus backward for the head-sharded layer. With context parallel size 1 it also times the
+# replicated reference layer it replaced and prints speed and memory ratios and the relative
+# errors of output and input gradient versus the replicated layer. With context parallel size
+# above 1 it compares the context-parallel layer (contiguous shards) with the same layer run
+# without context parallelism and prints relative errors per output and input gradient. Reference
+# layers and helpers are imported from the fast-gpu test directory, which is added to the import
+# path. Out-of-memory cases print "OOM". Requires RANK and LOCAL_RANK environment variables set by
+# the launcher; initialises and tears down the distributed groups.
 """Speed, memory and precision of the head-sharded linear-attention layer at the attention configs of the
 latest models, across sequence lengths and one TP x CP layout (world size = TP * CP).
 
@@ -39,6 +53,9 @@ MODELS = {
 
 
 def wall_ms(fn, iters):
+    # [FUNCTION DOC] HELPER: Warm-up call, gpu synchronise, reset the peak memory statistics, then
+    # time iters calls with the wall clock and synchronise. Returns a pair: average milliseconds
+    # per call and the peak allocated gpu memory in GiB since the reset.
     fn()
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
@@ -50,15 +67,23 @@ def wall_ms(fn, iters):
 
 
 def zigzag_shard(full, cp_rank, cp_size):
+    # [FUNCTION DOC] HELPER: Splits the tensor along its first (sequence) dimension into twice
+    # cp_size equal chunks and returns the contiguous concatenation of chunk cp_rank and chunk
+    # (2 * cp_size - 1 - cp_rank) (the zigzag layout used by context parallel training).
     chunks = full.chunk(2 * cp_size, dim=0)
     return torch.cat([chunks[cp_rank], chunks[2 * cp_size - 1 - cp_rank]]).contiguous()
 
 
 def contiguous_shard(full, cp_rank, cp_size):
+    # [FUNCTION DOC] HELPER: Returns the cp_rank-th of cp_size equal contiguous chunks of the first
+    # dimension, as a contiguous tensor.
     return full.chunk(cp_size, dim=0)[cp_rank].contiguous()
 
 
 def tp_gather(x, tp_group):
+    # [FUNCTION DOC] HELPER: Gathers the sequence-parallel shards of x across the tensor-parallel
+    # group along the first dimension (without tensor-parallel output gradient handling) when the
+    # group has more than one member; otherwise returns x unchanged.
     return (
         gather_from_sequence_parallel_region(x, tensor_parallel_output_grad=False, group=tp_group)
         if tp_group.size() > 1
@@ -67,10 +92,25 @@ def tp_gather(x, tp_group):
 
 
 def sp_shard(x, tp_group):
+    # [FUNCTION DOC] HELPER: Returns this rank's contiguous sequence-parallel slice of x along the
+    # first dimension (chunk number equal to the tensor-parallel rank out of the group size).
     return x.chunk(tp_group.size(), dim=0)[tp_group.rank()].contiguous()
 
 
 def run(name, seq_len, tp, cp, log):
+    # [FUNCTION DOC] HELPER: Benchmarks one (model, sequence length) case. Builds a transformer
+    # config (one layer, bfloat16, sequence parallel when the tensor-parallel size exceeds 1), a
+    # seeded replicated reference layer of the model's kind, random full input and output gradient
+    # of shape (sequence, 1, hidden) on the gpu, and a cumulative sequence length tensor for a
+    # single packed sequence. Builds the head-sharded layer, feeds it the zigzag context shard
+    # further split for sequence parallelism, and measures it. For context parallel size 1 also
+    # measures the replicated path and compares output and input gradient. Otherwise runs the
+    # contiguous-shard layer and a no-context-parallel reference built from the same layer's
+    # attention core, and compares the overlapping window of output and input gradient after
+    # gathering over tensor parallelism. Collects the output into one text row and passes it to
+    # the log callable (printing only on rank 0). On gpu out-of-memory appends "OOM" to the row.
+    # Empties the gpu cache at the end. The timed layer uses the zigzag context layout while the
+    # context-parallel comparison layer uses contiguous shards.
     hidden, heads, kind = MODELS[name]
     tp_group = parallel_state.get_tensor_model_parallel_group()
     cp_group = parallel_state.get_context_parallel_group()
@@ -106,6 +146,12 @@ def run(name, seq_len, tp, cp, log):
         if cp == 1:
 
             def replicated(x=x):
+                # [FUNCTION DOC] HELPER: Forward of the replicated reference layer for the given
+                # sequence-parallel shard (default: the benchmark input): gathers the full
+                # sequence across tensor parallelism when its size exceeds 1, runs the reference
+                # layer on the transposed (batch-first) input with the cumulative lengths,
+                # transposes back, and scatters the output back to sequence-parallel shards when
+                # the tensor-parallel size exceeds 1. Returns the output.
                 whole = (
                     gather_from_sequence_parallel_region(x, tensor_parallel_output_grad=False, group=tp_group)
                     if tp > 1
@@ -154,6 +200,13 @@ def run(name, seq_len, tp, cp, log):
 
 
 def main():
+    # [FUNCTION DOC] Entry point. Reads tensor-parallel size, context-parallel size and optional
+    # sequence lengths from the command line (no validation; missing arguments raise an index
+    # error), reads RANK and LOCAL_RANK from the environment, selects the gpu, initialises the
+    # nccl process group (30 minute timeout), the Megatron model-parallel groups and the model
+    # parallel gpu random seed 1234. Defines a log function that prints (flushing) on rank 0 and
+    # ignores output elsewhere, runs every model at every sequence length, then synchronises and
+    # destroys the parallel state and process group.
     tp, cp = int(sys.argv[1]), int(sys.argv[2])
     seq_lens = [int(s) for s in sys.argv[3:]] or [4096, 8192, 16384, 32768, 65536, 131072]
     rank = int(os.environ["RANK"])

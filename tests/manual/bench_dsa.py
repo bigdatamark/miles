@@ -1,3 +1,15 @@
+# [MODULE DOC] Manual single-gpu benchmark for the DSA sparse attention kernels. For each model
+# attention configuration in the MODELS table (total heads, key dimension, value dimension, top-k,
+# whether an attention sink is used, key/value-to-query length ratio, tensor-parallel sizes), each
+# tensor-parallel size (heads are divided by it) and each sequence length (command line integers,
+# default 4096 to 131072 doubling), it builds random bfloat16 queries and key/values on the gpu with
+# random causal top-k index sets, then for each backend (the tuned default, the tilelang forward,
+# and flash_mla when that forward is available) times forward alone and forward plus backward in
+# milliseconds (iteration count between 2 and 10, shrinking with length) and prints one line per
+# case. It also prints the relative difference between the tilelang and flash_mla results (output,
+# query gradient, key/value gradient) and, for sequence lengths up to 8192, the relative error of
+# every backend against an fp32 dense reference loaded from the fast-gpu test directory by file
+# path. A case that runs out of gpu memory prints "OOM" and continues. Seeds are fixed per case.
 """DSA sparse attention fwd / fwd+bwd speed and precision at the attention configs of the latest models,
 per TP-local head count and sequence length. One GPU.
 
@@ -34,6 +46,9 @@ MODELS = {
 
 
 def cuda_ms(fn, iters):
+    # [FUNCTION DOC] HELPER: Times a no-argument callable with gpu events. Runs it once as warm-up,
+    # synchronises the gpu, then records iters back-to-back calls between two timing events and
+    # synchronises again. Returns the average elapsed milliseconds per call.
     fn()
     torch.cuda.synchronize()
     start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
@@ -46,6 +61,14 @@ def cuda_ms(fn, iters):
 
 
 def causal_indices(seq_len, seq_len_kv, topk):
+    # [FUNCTION DOC] HELPER: Builds random causal top-k selection indices on the gpu. Query rows are
+    # processed in chunks of 4096: each row gets random scores over all key/value positions;
+    # positions at or beyond the row's causal limit (row position plus one, scaled by the
+    # key/value-to-query length ratio, integer division) are masked to minus one; the top-k scores
+    # are taken, and selections whose score is negative (masked positions, when fewer than topk
+    # are allowed) are replaced by the index minus one. Returns an int32 tensor of shape
+    # (1, seq_len, 1, topk). Allocates a chunk-by-seq_len_kv float tensor per chunk, so memory
+    # grows with the key/value length; requires seq_len_kv at least topk.
     rows = []
     for chunk in torch.arange(seq_len, device="cuda").split(4096):
         scores = torch.rand(len(chunk), seq_len_kv, device="cuda")
@@ -57,6 +80,15 @@ def causal_indices(seq_len, seq_len_kv, topk):
 
 
 def main():
+    # [FUNCTION DOC] Entry point: runs the benchmark described in the module documentation and
+    # prints one result line per (model, tensor-parallel size, sequence length) to standard
+    # output, flushing each line. Sequence lengths come from the command line arguments. Per
+    # case: seeds the generator with 0, creates random queries (batch 1), a single shared
+    # key/value head, causal indices, and an optional random sink per head; for every backend,
+    # clones the inputs with gradients, times the forward without gradients and then
+    # forward-plus-backward of the summed output, re-runs once to capture the output and the
+    # query, key/value gradients. Catches gpu out-of-memory per case. Clears the gpu cache after
+    # each case.
     seq_lens = [int(s) for s in sys.argv[1:]] or [4096, 8192, 16384, 32768, 65536, 131072]
     backends = ["default", "tilelang"] + (["flash_mla"] if flash_mla_sparse_fwd is not None else [])
     for name, (total_heads, d_qk, d_v, topk, sink, kv_ratio, tps) in MODELS.items():
@@ -79,6 +111,10 @@ def main():
                         sg = attn_sink.clone().requires_grad_() if sink else None
 
                         def fwd(qg=qg, kvg=kvg, sg=sg, b=backend, idx=idx, scale=scale, d_v=d_v):
+                            # [FUNCTION DOC] HELPER: Runs sparse attention for the backend (all
+                            # inputs bound as defaults at definition time). The default backend
+                            # passes no config; otherwise a config selecting that forward backend.
+                            # Returns the attention output.
                             config = None if b == "default" else SparseAttentionConfig(forward_backend=b)
                             return sparse_attention(qg, kvg, idx, scale, d_v=d_v, attn_sink=sg, config=config)
 

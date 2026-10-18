@@ -1080,13 +1080,20 @@ class TestConcurrentPhases:
 
 
 class TestAddressPublication:
+    # [CLASS DOC] Tests that a worker's address map and its cell's aliveness are published only
+    # when every port of the worker (and every worker of the cell) has been assigned.
     async def test_reading_the_addrs_of_a_worker_mid_allocation_is_refused(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Pauses allocation of a single worker, starts init as a task, and while it
+        # is paused asserts the address lookup raises an assertion error (ports not given yet). After
+        # releasing and finishing init asserts the lookup includes the primary port.
         """A half-filled map reads like a worker that simply has no such endpoint, so it must not be observable."""
         original_alloc_ports = _CommandActorManager.alloc_ports
         entered = asyncio.Event()
         release = asyncio.Event()
 
         async def gated_alloc(self) -> None:
+            # [FUNCTION DOC] HELPER: Sets the entered event, waits (5 seconds) for release, then runs
+            # the original allocation.
             entered.set()
             await asyncio.wait_for(release.wait(), timeout=5)
             await original_alloc_ports(self)
@@ -1108,6 +1115,10 @@ class TestAddressPublication:
         assert "primary" in manager.get_worker_addrs("engine-00000-00000")
 
     async def test_a_read_between_two_ports_of_one_worker_is_refused(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] A router with one dynamic and two fixed ports; wraps the static-port check
+        # so each time it runs it tries to read the worker's own addresses and records either the
+        # result or the error text. Asserts two observations, both the "not given its ports yet"
+        # error, and that afterwards the worker lists all three ports.
         """A worker caught between two of its ports refuses the read rather than answering with the ports so far."""
         spec = _make_spec(
             "router",
@@ -1121,6 +1132,8 @@ class TestAddressPublication:
         observed: list[object] = []
 
         async def probing_assert_free(self, *, port: int, port_name: str, node_ip: str) -> None:
+            # [FUNCTION DOC] HELPER: Records the outcome of reading this worker's addresses through
+            # the manager (the map or the assertion message), then runs the original check.
             try:
                 observed.append(self.manager.get_worker_addrs(self.name))
             except AssertionError as error:
@@ -1136,12 +1149,17 @@ class TestAddressPublication:
         assert sorted(manager.get_worker_addrs("router-00000-00000")) == ["debug", "primary", "prometheus"]
 
     async def test_a_worker_that_declares_no_ports_publishes_an_empty_map(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] A spec with no ports; its worker's address lookup returns an empty mapping.
         """Owning no endpoint is a finished answer, so an empty map must read as published, not as unallocated."""
         manager = await _launch([_make_spec("controller", port_infos=[])])
 
         assert manager.get_worker_addrs("controller-00000-00000") == {}
 
     async def test_a_settled_worker_stays_readable_while_a_peer_allocates(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Launches a router and an engine with a fixed port, stops the engine cell,
+        # then restarts it with the static-port check wrapped to read the router's primary port
+        # during the engine's allocation. Asserts that one read succeeded with the router's
+        # original port and the engine came back on its fixed port 7001.
         """Only the worker still being given its ports is unreadable; one that already has all of its own answers."""
         specs = [
             _make_spec("router"),
@@ -1155,6 +1173,8 @@ class TestAddressPublication:
         observed: list[int] = []
 
         async def probing_assert_free(self, *, port: int, port_name: str, node_ip: str) -> None:
+            # [FUNCTION DOC] HELPER: Appends the router worker's primary port as read through the
+            # manager, then runs the original check.
             observed.append(self.manager.get_worker_addrs("router-00000-00000")["primary"].port)
             await original_assert_free(self, port=port, port_name=port_name, node_ip=node_ip)
 
@@ -1166,12 +1186,17 @@ class TestAddressPublication:
         assert manager.get_worker_addrs("engine-00000-00000")["primary"].port == 7001
 
     async def test_a_cell_is_published_only_once_every_worker_is_addressed(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] A 2-worker cell where worker 0 allocates immediately and worker 1 waits for
+        # release. While waiting, asserts the cell is not alive and the address listing's entry for
+        # worker 1 is empty; after release and completion asserts the cell is alive.
         """One unaddressed rank makes the whole cell unusable, so the cell must not be observed as alive yet."""
         original_alloc_ports = _CommandActorManager.alloc_ports
         first_done = asyncio.Event()
         release = asyncio.Event()
 
         async def gated_alloc(self) -> None:
+            # [FUNCTION DOC] HELPER: Worker 0 runs the original allocation and sets first_done; any
+            # other worker waits (5 seconds) for release before allocating.
             if self.worker_in_cell_index == 0:
                 await original_alloc_ports(self)
                 first_done.set()
@@ -1203,6 +1228,9 @@ class TestAddressPublication:
     async def test_a_worker_still_being_addressed_is_described_with_an_empty_addr_map(
         self, fake_ray_cluster: FakeRayCluster
     ):
+        # [FUNCTION DOC] Gate blocks worker 1 of a 2-worker cell. While blocked, the worker infos
+        # list both workers in order, worker 0 with its primary address and worker 1 with an empty
+        # address map. After release, worker 1's infos include the primary port.
         """A missing addr map, unlike an empty one, cannot be described at all and loses the cell's description."""
         gate = _AllocPortsGate(should_block=lambda actor: actor.worker_in_cell_index == 1)
 
@@ -1233,6 +1261,8 @@ class TestAddressPublication:
     async def test_a_cell_still_being_addressed_stays_listed_with_all_of_its_workers(
         self, fake_ray_cluster: FakeRayCluster
     ):
+        # [FUNCTION DOC] Gate blocks worker 1; while blocked the cell info is not alive but still
+        # lists both worker names; after release the cell is alive.
         """A cell being addressed is only unpublished, never hidden, so an observer can still track it."""
         gate = _AllocPortsGate(should_block=lambda actor: actor.worker_in_cell_index == 1)
 
@@ -1262,6 +1292,8 @@ class TestAddressPublication:
     async def test_a_fully_addressed_cell_is_published_while_a_sibling_still_waits_for_ports(
         self, fake_ray_cluster: FakeRayCluster
     ):
+        # [FUNCTION DOC] Gate blocks every worker of cell 1 in a 2-cell spec; once cell 0's workers
+        # are allocated, cell 0 is reported alive and cell 1 not. After release both are alive.
         """Addressing is judged per cell, so one slow cell must not withhold the cells that are ready to serve."""
         gate = _AllocPortsGate(should_block=lambda actor: actor.parent.cell_index == 1)
 
@@ -1291,6 +1323,9 @@ class TestAddressPublication:
     async def test_a_resumed_cell_is_unpublished_again_until_its_new_ports_are_handed_out(
         self, fake_ray_cluster: FakeRayCluster
     ):
+        # [FUNCTION DOC] Stops a 2-worker cell, then restarts it as a task with the gate blocking
+        # worker 1. While blocked the cell is not alive and worker 1's listing is empty; after
+        # release and completion the cell is alive again.
         """A resumed cell hands out fresh ports, so having been addressed once must not vouch for it again."""
         manager = await _launch([_make_spec("engine", num_workers_per_cell=2)])
         await manager.stop_cells(["engine-00000"])
@@ -1311,7 +1346,11 @@ class TestAddressPublication:
 
 
 class TestGpuPlacement:
+    # [CLASS DOC] Tests of how gpu slots from a placement group become gpu ids, local gpu ids and
+    # actor scheduling options.
     async def test_gpu_slots_expand_over_cells_and_workers(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] 2 cells of 2 workers, 2 slots per worker, group offset 2, 10 slots; asserts
+        # the workers' gpu ids are [2,3], [4,5], [6,7], [8,9] in cell-major order.
         """Each worker occupies its own contiguous slot span after its group's base offset."""
         recorder = _LaunchRecorder()
         spec = _make_spec(
@@ -1333,6 +1372,8 @@ class TestGpuPlacement:
         ] == [[2, 3], [4, 5], [6, 7], [8, 9]]
 
     async def test_gpu_ids_come_from_the_reordered_slot_mapping(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] The group's first gpu id is 4; a 2-worker cell with 2 slots each gets gpu
+        # ids [4,5] and [6,7].
         """A worker's gpu ids start at the node-local id its slot maps to, not at the slot index."""
         recorder = _LaunchRecorder()
         spec = _make_spec(
@@ -1351,6 +1392,9 @@ class TestGpuPlacement:
     async def test_local_gpu_ids_are_resolved_by_the_worker_itself_before_its_command_is_built(
         self, fake_ray_cluster: FakeRayCluster
     ):
+        # [FUNCTION DOC] Asserts each worker was asked (to-local-gpu-ids call) with its global ids
+        # [4,5] and [6,7], both launch contexts then carry local ids [0,1], and the last such call
+        # precedes the first command run in the event log.
         """The manager has no visibility mask of its own, so only the worker can turn its ids into local ones."""
         recorder = _LaunchRecorder()
         spec = _make_spec(
@@ -1369,6 +1413,8 @@ class TestGpuPlacement:
         assert fake_ray_cluster.last_event_index("_to_local_gpu_ids") < fake_ray_cluster.first_event_index("run")
 
     async def test_each_worker_is_asked_about_its_own_gpu_ids(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Asserts the to-local-gpu-ids calls map worker handle index 0 to [4,5] and
+        # index 1 to [6,7].
         """Probing one worker on behalf of the whole cell would describe every engine with that worker's mask."""
         spec = _make_spec(
             "engine",
@@ -1385,6 +1431,8 @@ class TestGpuPlacement:
     async def test_a_worker_that_owns_no_gpu_is_launched_with_an_empty_local_gpu_id_list(
         self, fake_ray_cluster: FakeRayCluster
     ):
+        # [FUNCTION DOC] A gpu-less router is still asked once with an empty id list, and its
+        # launch context has empty local gpu ids.
         """A gpu-less worker is probed like any other, and its command still has to receive a list."""
         recorder = _LaunchRecorder()
         spec = _make_spec("router", launch_command=recorder.command)
@@ -1394,6 +1442,9 @@ class TestGpuPlacement:
         assert recorder.context_of(cell_index=0, worker_in_cell_index=0).local_gpu_ids == []
 
     async def test_a_pg_worker_is_scheduled_on_the_bundle_its_slot_maps_to(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] 2 workers, 1 slot each, group offset 3; asserts their placement strategies
+        # use bundle indices at positions 3 and 4 of the reordered list, the fake group, and a gpu
+        # request of 0.2 each.
         """The actor is placed on the reordered bundle of its slot, not on the raw slot index."""
         pgs = _make_pgs(num_slots=8)
         spec = _make_spec(
@@ -1415,6 +1466,8 @@ class TestGpuPlacement:
         assert all(handle.options["num_gpus"] == 0.2 for handle in fake_ray_cluster.handles)
 
     async def test_a_worker_without_a_pg_asks_for_no_placement(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] A router without a group has no scheduling strategy, requests 0 gpus and
+        # gets empty gpu ids.
         """Specs that do not own gpus are scheduled anywhere and get no gpu ids."""
         recorder = _LaunchRecorder()
         await _launch([_make_spec("router", launch_command=recorder.command)])
@@ -1425,13 +1478,17 @@ class TestGpuPlacement:
 
 
 class TestPgActorResources:
+    # [CLASS DOC] Tests of gpu resources of placement-group actors.
     async def test_the_gpu_request_comes_from_the_spec(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] A spec with gpu fraction 0.2 yields an actor option of 0.2 gpus.
         """A spec that declares a gpu fraction gets exactly that, so co-located engines still fit."""
         await _launch([_make_spec("engine", num_gpus_per_worker=0.2)])
 
         assert fake_ray_cluster.handles[0].options["num_gpus"] == 0.2
 
     async def test_pg_workers_capture_their_child_tasks_in_the_group(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Asserts the placement strategy of a group worker has capture-child-tasks
+        # set to true.
         """Child tasks must stay inside the placement group, or they escape the reserved gpus."""
         spec = _make_spec(
             "engine",
@@ -1445,7 +1502,10 @@ class TestPgActorResources:
 
 
 class TestPgFailureModes:
+    # [CLASS DOC] Tests of misconfigured placement groups.
     async def test_a_spec_pointing_at_an_unknown_placement_group_fails(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] A spec naming a group that is not in the mapping makes init raise a key
+        # error, and no command is run.
         """Mistyping the placement group name must fail instead of silently ignoring placement."""
         spec = _make_spec("engine", num_gpus_per_worker=0.2, num_gpu_slots_per_worker=1, pg_name="typo")
 
@@ -1456,7 +1516,11 @@ class TestPgFailureModes:
 
 
 class TestCellLifecycle:
+    # [CLASS DOC] Tests of cell-level launch behavior, reaching into the manager's internal pool
+    # and cell objects.
     async def test_a_cell_launches_its_workers_only_once(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Calling the actor-launch method again on a populated cell raises an
+        # assertion error and creates no new actor (still 2 handles).
         """Launching an already-populated cell again would orphan the first generation of actors."""
         manager = await _launch([_make_spec("engine", num_workers_per_cell=2)])
         cell = manager._pools["engine"].cells[0]
@@ -1467,6 +1531,7 @@ class TestCellLifecycle:
         assert len(fake_ray_cluster.handles) == 2
 
     async def test_the_stages_of_a_cell_fan_out_to_every_worker(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] A 3-worker cell sees 3 node-address lookups, 3 command runs and 3 actors.
         """Each stage covers all workers of the cell, so no rank is left half-configured."""
         manager = await _launch([_make_spec("engine", num_workers_per_cell=3)])
 
@@ -1476,7 +1541,10 @@ class TestCellLifecycle:
 
 
 class TestCellStop:
+    # [CLASS DOC] Tests of stopping cells and shutting the manager down.
     async def test_shutting_down_the_manager_stops_every_cell_it_owns(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Manager shutdown with 3 workers in total kills all 3 and reports no cell
+        # alive.
         """A finished run releases its own workers without selecting unrelated host processes by name."""
         manager = await _launch([_make_spec("engine", num_cells=2), _make_spec("router")])
 
@@ -1486,6 +1554,8 @@ class TestCellStop:
         assert not any(info.alive for info in manager.get_cell_infos(pool_ids=["engine", "router"]).values())
 
     async def test_stopping_a_cell_shuts_down_and_kills_every_worker(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Stopping a 2-worker cell issues 2 shutdown calls and 2 kills, every handle
+        # ends up killed, and the cell's actor list becomes none.
         """A stopped cell releases all of its workers, not just the first one."""
         manager = await _launch([_make_spec("engine", num_workers_per_cell=2)])
         cell = manager._pools["engine"].cells[0]
@@ -1498,6 +1568,7 @@ class TestCellStop:
         assert cell.actors is None
 
     async def test_stopping_one_cell_leaves_the_others_running(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Stopping cell 0 of 2 kills only its actor; cell 1 keeps its actors.
         """Stopping a cell must not touch the workers of its siblings."""
         manager = await _launch([_make_spec("engine", num_cells=2)])
 
@@ -1507,6 +1578,8 @@ class TestCellStop:
         assert manager._pools["engine"].cells[1].actors is not None
 
     async def test_a_worker_that_cannot_shut_down_gracefully_is_still_killed(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] The worker's shutdown call raises a runtime error; stop still kills it
+        # once and clears the cell's actors.
         """A hung or broken worker is exactly the one that must be force-killed."""
         manager = await _launch([_make_spec("engine")])
         cell = manager._pools["engine"].cells[0]
@@ -1518,6 +1591,8 @@ class TestCellStop:
         assert cell.actors is None
 
     async def test_a_failing_kill_does_not_abort_the_teardown_of_other_workers(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] The fake kill raises a runtime error; stop of a 2-worker cell still attempts
+        # both kills and clears the cell's actors without raising.
         """One worker ray cannot kill must not stop the cell from tearing the rest down."""
         manager = await _launch([_make_spec("engine", num_workers_per_cell=2)])
         cell = manager._pools["engine"].cells[0]
@@ -1530,7 +1605,9 @@ class TestCellStop:
 
 
 class TestStopDetails:
+    # [CLASS DOC] Finer points of stop: ordering, timeouts and concurrency.
     async def test_each_worker_is_asked_to_shut_down_before_it_is_killed(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] The last two recorded events of a stop are shutdown then kill.
         """Graceful shutdown first gives the subprocess a chance to exit cleanly."""
         manager = await _launch([_make_spec("engine")])
 
@@ -1539,6 +1616,8 @@ class TestStopDetails:
         assert fake_ray_cluster.events[-2:] == ["shutdown", EVENT_KILL]
 
     async def test_graceful_shutdown_is_bounded_by_a_timeout(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] The shutdown call hangs for an hour; with the module's shutdown timeout
+        # patched to 0.01 seconds, stop completes and the worker is killed once.
         """A hung worker must not block teardown forever."""
         manager = await _launch([_make_spec("engine")])
         fake_ray_cluster.handles[0].hanging_methods["shutdown"] = 3600
@@ -1549,12 +1628,17 @@ class TestStopDetails:
         assert fake_ray_cluster.events.count(EVENT_KILL) == 1
 
     async def test_shutdown_leaves_the_managers_event_loop_free(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Shutdown takes 0.05 seconds; a concurrent polling task keeps reading cell
+        # infos and yielding. After stop completes the poller is cancelled and the test asserts it
+        # ran more than 20 polls during the stop.
         """A slow shutdown must not block the manager loop, which still has to answer cell polls meanwhile."""
         manager = await _launch([_make_spec("engine")])
         fake_ray_cluster.handles[0].hanging_methods["shutdown"] = 0.05
         polls: int = 0
 
         async def poll_cells() -> None:
+            # [FUNCTION DOC] HELPER: Loops forever; asserts the cell is listed, increments the poll
+            # counter of the enclosing test and yields to the event loop. Ends only by cancellation.
             nonlocal polls
             while True:
                 assert "engine-00000" in manager.get_cell_infos(pool_ids=["engine"])
@@ -1571,6 +1655,9 @@ class TestStopDetails:
         assert polls_during_stop > 20
 
     async def test_a_hung_shutdown_does_not_delay_killing_peer_workers(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Worker 0's shutdown hangs; with shutdown timeout 0.5 seconds, after 0.05
+        # seconds worker 1 is already killed while stop is still running; stop then finishes within
+        # 5 seconds with 2 kills in total.
         """One rank ignoring shutdown must not keep its peers holding gpus for the whole grace period."""
         manager = await _launch([_make_spec("engine", num_workers_per_cell=2)])
         fake_ray_cluster.handles[0].hanging_methods["shutdown"] = 3600
@@ -1585,6 +1672,8 @@ class TestStopDetails:
         assert fake_ray_cluster.events.count(EVENT_KILL) == 2
 
     async def test_all_workers_are_killed_even_when_one_shutdown_hangs(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Worker 1 of 3 fails its shutdown with a timeout error; all 3 are killed.
+        # KNOWN ISSUE: the name says "hangs" but the setup makes the call fail immediately.
         """One broken worker must not save its peers from teardown."""
         manager = await _launch([_make_spec("engine", num_workers_per_cell=3)])
         fake_ray_cluster.handles[1].failing_methods["shutdown"] = TimeoutError("hung")
@@ -1596,9 +1685,13 @@ class TestStopDetails:
 
 
 class TestGetWorkerInfos:
+    # [CLASS DOC] Tests of the worker description listing for one cell.
     async def test_a_worker_still_being_given_its_ports_is_described_as_holding_none(
         self, fake_ray_cluster: FakeRayCluster
     ):
+        # [FUNCTION DOC] Resets worker 1's address map to none; asserts the infos still list both
+        # workers in order, worker 1 described with an empty map, and the full address listing
+        # shows an empty entry for it.
         """A description is taken of whatever exists at the time, and a cell mid-start is part of that;
         it has to render as a worker holding no endpoints rather than fail the whole description."""
         manager = await _launch([_make_spec("engine", num_workers_per_cell=2)])
@@ -1611,6 +1704,10 @@ class TestGetWorkerInfos:
         assert manager.get_addrs()["engine"][1] == {}
 
     async def test_describes_every_worker_of_only_the_requested_cell(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] 2 cells of 2 workers with 2 gpu slots each; for cell 1 asserts names in
+        # rank order, generation 1 for both, gpu ids [4,5] and [6,7], self addresses equal to the
+        # last two entries of the address listing, and actor handles (looked up with the expected
+        # generation) equal to the last two fake handles.
         """A consumer asking about one cell gets that cell's workers, in rank order, fully described."""
         spec = _make_spec(
             "engine",
@@ -1633,6 +1730,7 @@ class TestGetWorkerInfos:
         ] == fake_ray_cluster.handles[2:]
 
     async def test_a_stopped_cell_reports_no_workers_instead_of_raising(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] After stopping the cell, the worker infos are an empty list.
         """A cell stopped between snapshot and round-trip must report an empty worker list, not crash."""
         manager = await _launch([_make_spec("engine")])
         await manager.stop_cells(["engine-00000"])
@@ -1643,9 +1741,13 @@ class TestGetWorkerInfos:
 
 
 class TestGetActorHandle:
+    # [CLASS DOC] Tests of generation checking when resolving an actor handle.
     async def test_a_cell_restarted_after_its_info_was_read_refuses_the_new_generation_handle(
         self, fake_ray_cluster: FakeRayCluster
     ):
+        # [FUNCTION DOC] Reads a worker's info (generation 1), stops and restarts its cell, then
+        # asks for the handle with the old generation; expects an assertion error saying the worker
+        # is now generation 2, not the 1 it was described as.
         """A stale worker description must not resolve to the replacement generation's actor."""
         manager = await _launch([_make_spec("engine")])
         cell_id = next(iter(manager.get_cell_infos(pool_ids=["engine"])))
@@ -1659,7 +1761,9 @@ class TestGetActorHandle:
 
 
 class TestGetWorkerInfosErrors:
+    # [CLASS DOC] Tests of invalid arguments to the worker description listing.
     async def test_an_unknown_pool_is_reported_instead_of_guessed(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] A cell id from a pool never launched raises an assertion error.
         """Asking about a spec the manager never launched must fail loudly."""
         manager = await _launch([_make_spec("engine")])
 
@@ -1667,6 +1771,7 @@ class TestGetWorkerInfosErrors:
             manager.get_worker_infos("router-00000")
 
     async def test_a_cell_index_beyond_the_group_is_reported(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Cell index 2 of a 2-cell pool raises an assertion error.
         """Asking about a cell that does not exist must fail rather than return another cell."""
         manager = await _launch([_make_spec("engine", num_cells=2)])
 
@@ -1675,7 +1780,10 @@ class TestGetWorkerInfosErrors:
 
 
 class TestGetCellInfos:
+    # [CLASS DOC] Tests of the cell description listing, a mapping from cell id to info.
     async def test_only_the_asked_for_specs_are_reported(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Asking for the engine pool among engine and router returns only the two
+        # engine cell ids.
         """The controller owns engines only; reconciling a router would try to serve from it."""
         manager = await _launch([_make_spec("engine", num_cells=2), _make_spec("router")])
 
@@ -1684,12 +1792,14 @@ class TestGetCellInfos:
         assert sorted(infos) == ["engine-00000", "engine-00001"]
 
     async def test_every_info_carries_the_spec_it_came_from(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] The info's pool id equals the spec name.
         """The spec name is what makes a cell's role explicit instead of sniffed from its meta."""
         manager = await _launch([_make_spec("engine")])
 
         assert manager.get_cell_infos(pool_ids=["engine"])["engine-00000"].pool_id == "engine"
 
     async def test_an_unknown_pool_is_reported_instead_of_silently_empty(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Asking for a pool list including an unknown name raises an assertion error.
         """A renamed spec would otherwise make every consumer see zero cells and blame something else."""
         manager = await _launch([_make_spec("engine")])
 
@@ -1697,18 +1807,22 @@ class TestGetCellInfos:
             manager.get_cell_infos(pool_ids=["engine", "router"])
 
     async def test_asking_for_nothing_reports_nothing(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] An empty pool list returns an empty mapping.
         """A run with no engines of its own must not fall back to seeing everyone else's."""
         manager = await _launch([_make_spec("engine")])
 
         assert manager.get_cell_infos(pool_ids=[]) == {}
 
     async def test_every_info_says_whether_its_cell_still_has_a_process(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] A freshly launched cell's info is marked alive.
         """A suspended cell must stay listed, or nothing could ever ask for it to be resumed."""
         manager = await _launch([_make_spec("engine")])
 
         assert manager.get_cell_infos(pool_ids=["engine"])["engine-00000"].alive
 
     async def test_each_cell_meta_is_computed_from_its_own_cell_index(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] A spec copy with a meta callable returning twice the cell index; 3 cells
+        # report meta values 0, 2, 4 in cell order.
         """Meta carries per-cell placement facts, so a shared index would mislabel every cell but one."""
         spec = _make_spec("engine", num_cells=3).model_copy(
             update={"meta": lambda ctx: {"gpu_offset": ctx.cell_index * 2}}
@@ -1725,7 +1839,11 @@ class TestGetCellInfos:
 
 
 class TestStartAndStopCells:
+    # [CLASS DOC] Tests of the public stop and start operations by cell id, including idempotence,
+    # errors and rollback of failed starts.
     async def test_stopping_by_id_releases_only_the_named_cell(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Stopping cell 0 of 2 leaves it not alive, cell 1 alive, and only the first
+        # actor killed.
         """Suspending one engine must leave its siblings serving."""
         manager = await _launch([_make_spec("engine", num_cells=2)])
 
@@ -1737,6 +1855,7 @@ class TestStartAndStopCells:
         assert [handle.killed for handle in fake_ray_cluster.handles] == [True, False]
 
     async def test_a_stopped_cell_comes_back_on_start(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Stop then start cell 0; all cells report alive.
         """Resume is a fresh launch of the same cell, so the cell reappears to the reconciler."""
         manager = await _launch([_make_spec("engine", num_cells=2)])
         await manager.stop_cells(["engine-00000"])
@@ -1746,6 +1865,7 @@ class TestStartAndStopCells:
         assert all(info.alive for info in manager.get_cell_infos(pool_ids=["engine"]).values())
 
     async def test_a_restarted_cell_reports_a_new_workers_hash(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] The workers hash after stop plus start differs from the hash before.
         """The hash is what tells the trainer to rebuild its connection to the new process."""
         manager = await _launch([_make_spec("engine")])
         before = manager.get_cell_infos(pool_ids=["engine"])["engine-00000"].workers_hash
@@ -1756,6 +1876,7 @@ class TestStartAndStopCells:
         assert manager.get_cell_infos(pool_ids=["engine"])["engine-00000"].workers_hash != before
 
     async def test_a_restarted_cell_runs_its_command_again(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] After stop and start, the command was run twice in total.
         """Resume must relaunch the subprocess, not merely re-register the old actors."""
         manager = await _launch([_make_spec("engine")])
 
@@ -1765,6 +1886,7 @@ class TestStartAndStopCells:
         assert len(fake_ray_cluster.calls_of("run")) == 2
 
     async def test_starting_a_running_cell_leaves_it_alone(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Starting a running cell creates no new handles.
         """Relaunching a live cell would orphan its current actors, so a repeated resume is a no-op."""
         manager = await _launch([_make_spec("engine")])
         handles_before = list(fake_ray_cluster.handles)
@@ -1774,6 +1896,7 @@ class TestStartAndStopCells:
         assert fake_ray_cluster.handles == handles_before
 
     async def test_stopping_an_already_stopped_cell_is_a_noop(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Stopping twice produces a single kill event.
         """Heal loops retry, so a redundant suspend must not blow up on missing actors."""
         manager = await _launch([_make_spec("engine")])
         await manager.stop_cells(["engine-00000"])
@@ -1783,6 +1906,8 @@ class TestStartAndStopCells:
         assert fake_ray_cluster.events.count(EVENT_KILL) == 1
 
     async def test_starting_an_already_running_cell_is_a_noop(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Starting a running cell adds no creation event and the cell stays alive.
+        # KNOWN ISSUE: near-duplicate of test_starting_a_running_cell_leaves_it_alone above.
         """A repeated resume must not relaunch a live cell, nor fail the request that asked for it."""
         manager = await _launch([_make_spec("engine")])
         created_before = fake_ray_cluster.events.count(EVENT_CREATE)
@@ -1793,6 +1918,8 @@ class TestStartAndStopCells:
         assert manager.get_cell_infos(pool_ids=["engine"])["engine-00000"].alive
 
     async def test_a_cell_whose_actor_is_already_dead_still_stops(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] The worker's shutdown call fails as if the actor died; stopping the cell
+        # still succeeds and the cell is not alive.
         """Suspend is step one of healing a crashed cell, so a dead actor is the normal case."""
         manager = await _launch([_make_spec("engine")])
         fake_ray_cluster.handles[0].failing_methods["shutdown"] = RuntimeError("actor died")
@@ -1802,6 +1929,7 @@ class TestStartAndStopCells:
         assert not manager.get_cell_infos(pool_ids=["engine"])["engine-00000"].alive
 
     async def test_several_cells_are_stopped_together(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] One stop call naming cells 0 and 2 of 3 leaves both not alive.
         """A multi-cell suspend is one request, not a caller-side loop."""
         manager = await _launch([_make_spec("engine", num_cells=3)])
 
@@ -1812,6 +1940,8 @@ class TestStartAndStopCells:
     async def test_a_cell_is_not_reported_alive_until_every_worker_has_its_ports(
         self, fake_ray_cluster: FakeRayCluster
     ):
+        # [FUNCTION DOC] A 2-worker cell is alive; after clearing worker 1's address map to none it
+        # is reported not alive.
         """An observer builds cells out of this report, so a worker it could not address must not appear in one."""
         manager = await _launch([_make_spec("engine", num_workers_per_cell=2)])
         actors = manager._pools["engine"].cells[0].actors
@@ -1825,6 +1955,8 @@ class TestStartAndStopCells:
     async def test_a_half_started_cell_is_withheld_without_withholding_its_healthy_siblings(
         self, fake_ray_cluster: FakeRayCluster
     ):
+        # [FUNCTION DOC] Cell 1's worker 0 loses its address map; only cell 0 is reported alive, and
+        # each worker info of cell 0 holds a primary address.
         """An observer must still reconcile the rest of the round, which one unaddressable worker used to abort."""
         manager = await _launch([_make_spec("engine", num_cells=2, num_workers_per_cell=2)])
         manager._pools["engine"].cells[1].actors[0].self_addrs = None
@@ -1838,6 +1970,7 @@ class TestStartAndStopCells:
             assert "primary" in info.self_addrs, f"{info.name} is reported alive but describes no ports"
 
     async def test_an_unknown_cell_id_fails_loudly(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Stopping a nonexistent cell id raises an assertion error.
         """A typo'd cell id must not silently suspend nothing."""
         manager = await _launch([_make_spec("engine")])
 
@@ -1845,6 +1978,7 @@ class TestStartAndStopCells:
             await manager.stop_cells(["engine-00007"])
 
     async def test_starting_an_unknown_cell_id_fails_loudly(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Starting a nonexistent cell id raises an assertion error.
         """A typo'd cell id must not silently start nothing while the caller believes it resumed."""
         manager = await _launch([_make_spec("engine")])
 
@@ -1854,6 +1988,9 @@ class TestStartAndStopCells:
     async def test_a_cell_that_fails_while_allocating_ports_is_rolled_back_and_can_be_retried(
         self, fake_ray_cluster: FakeRayCluster
     ):
+        # [FUNCTION DOC] After stopping the cell, makes the node-address lookup fail; a start raises
+        # that error, leaves the cell not alive and kills the newly created actor. Removing the
+        # failure and starting again brings the cell alive, with 2 command runs in total.
         """A resume dying mid-setup must leave the cell stopped, else every later resume is skipped as a no-op."""
         manager = await _launch([_make_spec("engine")])
         await manager.stop_cells(["engine-00000"])
@@ -1872,10 +2009,15 @@ class TestStartAndStopCells:
         assert len(fake_ray_cluster.calls_of("run")) == 2
 
     async def test_a_cell_that_fails_its_post_setup_is_rolled_back(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] The launch command renders normally at init, then is flipped to raise a
+        # runtime error before a restart; the start raises it, the cell is not alive and the newest
+        # actor is killed.
         """Failing after the actors exist must still release them, or the cell stays alive but never serves."""
         command_fails = False
 
         def launch_command(ctx: LaunchCommandContext) -> str:
+            # [FUNCTION DOC] HELPER: Raises a runtime error when the enclosing flag is set,
+            # otherwise returns a fixed sleep command.
             if command_fails:
                 raise RuntimeError("cannot render command")
             return "sleep 600"
@@ -1891,6 +2033,8 @@ class TestStartAndStopCells:
         assert fake_ray_cluster.handles[-1].killed
 
     async def test_a_failed_start_leaves_the_running_cells_alone(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Cell 0 stopped and its restart made to fail; afterwards cell 0 is not
+        # alive and cell 1 is still alive.
         """Rollback must be scoped to the cell that failed, not to the siblings that are already serving."""
         manager = await _launch([_make_spec("engine", num_cells=2)])
         await manager.stop_cells(["engine-00000"])
@@ -1904,6 +2048,8 @@ class TestStartAndStopCells:
         assert infos["engine-00001"].alive
 
     async def test_a_restarted_cell_allocates_ports_and_addrs_again(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] After stop and start the worker has an address and two node-address lookups
+        # happened in total.
         """The new process needs its own addresses; a stale addr book would point at the dead one."""
         manager = await _launch([_make_spec("engine")])
 
@@ -1914,6 +2060,8 @@ class TestStartAndStopCells:
         assert len(fake_ray_cluster.calls_of("_get_node_ip")) == 2
 
     async def test_start_runs_every_phase_before_the_next_one(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Clears the call log after a stop, restarts a 2-worker cell and asserts the
+        # first command run comes after the last node-address lookup.
         """A worker must be addressable before any worker of the cell is handed its command."""
         manager = await _launch([_make_spec("engine", num_workers_per_cell=2)])
         await manager.stop_cells(["engine-00000"])
@@ -1925,6 +2073,8 @@ class TestStartAndStopCells:
         assert methods.index("run") > max(i for i, m in enumerate(methods) if m == "_get_node_ip")
 
     async def test_a_suspended_sibling_does_not_break_the_addr_book(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] After stopping cell 0 of 2, the address listing's lists have lengths [1]
+        # (one pool, one live cell).
         """Launch commands are rendered from every spec's addrs, so a suspended cell must drop out of it."""
         manager = await _launch([_make_spec("engine", num_cells=2)])
 
@@ -1933,6 +2083,8 @@ class TestStartAndStopCells:
         assert [len(addrs) for addrs in manager.get_addrs().values()] == [1]
 
     async def test_a_cell_restarts_while_a_sibling_stays_suspended(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Of 3 cells, stops 0 and 1, restarts 1; cell 0 stays not alive, cells 1 and
+        # 2 are alive.
         """Healing one cell must not depend on every other cell being up."""
         manager = await _launch([_make_spec("engine", num_cells=3)])
         await manager.stop_cells(["engine-00000", "engine-00001"])
@@ -1944,6 +2096,7 @@ class TestStartAndStopCells:
         assert infos["engine-00001"].alive and infos["engine-00002"].alive
 
     async def test_worker_addrs_ignore_suspended_cells(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] With cell 0 stopped, the address lookup for a cell 1 worker still works.
         """Resolving a live worker must not walk into a suspended cell's missing actors."""
         manager = await _launch([_make_spec("engine", num_cells=2)])
 
@@ -1953,12 +2106,17 @@ class TestStartAndStopCells:
 
 
 class TestStartCellsRollback:
+    # [CLASS DOC] Tests that a start request is transactional: on failure the cells it touched are
+    # rolled back and killed, and a later start works.
     async def test_a_resume_that_fails_midway_leaves_the_cell_suspended(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Port allocation is patched to fail during a restart; the start raises and
+        # the cell is reported not alive.
         """A half-started cell that still looked alive would never be retried by the heal loop."""
         manager = await _launch([_make_spec("engine")])
         await manager.stop_cells(["engine-00000"])
 
         async def failing_alloc(self) -> None:
+            # [FUNCTION DOC] HELPER: Replacement allocation that always raises a runtime error.
             raise RuntimeError("no ports")
 
         with pytest.raises(RuntimeError, match="no ports"):
@@ -1969,11 +2127,14 @@ class TestStartCellsRollback:
         assert not manager.get_cell_infos(pool_ids=["engine"])["engine-00000"].alive
 
     async def test_a_resume_that_fails_midway_kills_the_actors_it_created(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Post-setup is patched to fail during a restart; the start raises and both
+        # handles (original and new) are killed.
         """Leaked actors keep holding their GPUs, so the next resume would find no capacity."""
         manager = await _launch([_make_spec("engine")])
         await manager.stop_cells(["engine-00000"])
 
         async def failing_post_setup(self) -> None:
+            # [FUNCTION DOC] HELPER: Replacement post-setup that always raises a runtime error.
             raise RuntimeError("cannot render")
 
         with pytest.raises(RuntimeError, match="cannot render"):
@@ -1984,11 +2145,14 @@ class TestStartCellsRollback:
         assert [handle.killed for handle in fake_ray_cluster.handles] == [True, True]
 
     async def test_the_resume_after_a_failed_one_starts_the_cell_for_real(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] After one failed restart (patch removed), a second start succeeds: the cell
+        # is alive and the command has run twice overall.
         """The whole point of rolling back is that the very next resume attempt is not skipped."""
         manager = await _launch([_make_spec("engine")])
         await manager.stop_cells(["engine-00000"])
 
         async def failing_alloc(self) -> None:
+            # [FUNCTION DOC] HELPER: Replacement allocation that always raises a runtime error.
             raise RuntimeError("no ports")
 
         with pytest.raises(RuntimeError, match="no ports"):
@@ -2002,6 +2166,9 @@ class TestStartCellsRollback:
         assert len(fake_ray_cluster.calls_of("run")) == 2
 
     async def test_a_failed_start_leaves_no_late_sibling_actor_alive(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] During init of 2 cells, launching cell 0's actor raises "no capacity" while
+        # cell 1 launches 50 ms after that. After init fails and 0.1 seconds pass, asserts every
+        # created actor was killed and no cell is alive.
         """A sibling still launching when the request failed must not survive the rollback holding its gpus."""
         from miles.utils.workers.ray_worker_manager import _CommandActorManager
 
@@ -2009,6 +2176,8 @@ class TestStartCellsRollback:
         first_failed = asyncio.Event()
 
         async def staggered_launch(self) -> None:
+            # [FUNCTION DOC] HELPER: Cell 0 signals first_failed and raises a runtime error; other
+            # cells wait for that signal, sleep 50 ms, then run the original launch.
             if self.parent.cell_index == 0:
                 first_failed.set()
                 raise RuntimeError("no capacity")
@@ -2029,10 +2198,13 @@ class TestStartCellsRollback:
         assert not any(info.alive for info in manager.get_cell_infos(pool_ids=["engine"]).values())
 
     async def test_a_failed_start_rolls_back_the_siblings_of_the_failing_cell(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Post-setup is patched to fail during init of 2 cells; init raises and no
+        # cell is alive afterwards.
         """One request is one transaction, so no cell of it may survive half configured."""
         spec = _make_spec("engine", num_cells=2)
 
         async def failing_post_setup(self) -> None:
+            # [FUNCTION DOC] HELPER: Replacement post-setup that always raises a runtime error.
             raise RuntimeError("cannot render")
 
         manager = RayWorkerManager()
@@ -2045,7 +2217,9 @@ class TestStartCellsRollback:
 
 
 class TestSuspendedCellInfos:
+    # [CLASS DOC] Tests of how a stopped cell appears in descriptions.
     async def test_a_suspended_cell_is_still_described(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] After stopping cell 0 of 2, both cells are listed; 0 not alive, 1 alive.
         """The api server must still list a suspended cell, or it could never be resumed."""
         manager = await _launch([_make_spec("engine", num_cells=2)])
         await manager.stop_cells(["engine-00000"])
@@ -2057,6 +2231,8 @@ class TestSuspendedCellInfos:
         assert infos["engine-00001"].alive
 
     async def test_the_meta_of_a_suspended_cell_is_still_known(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] A spec with a constant meta callable; after stop the cell info still has
+        # that meta.
         """Meta comes from the spec, so suspending a cell must not make it unidentifiable."""
         spec = _make_spec("engine").model_copy(update={"meta": lambda ctx: {"model_id": "default"}})
         manager = await _launch([spec])
@@ -2065,6 +2241,7 @@ class TestSuspendedCellInfos:
         assert manager.get_cell_infos(pool_ids=["engine"])["engine-00000"].meta == {"model_id": "default"}
 
     async def test_a_suspended_cell_reports_no_workers(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] A stopped cell's info has an empty worker-name list.
         """Its actors are gone, so anything reading worker names off it must get an empty list."""
         manager = await _launch([_make_spec("engine")])
         await manager.stop_cells(["engine-00000"])
@@ -2073,7 +2250,10 @@ class TestSuspendedCellInfos:
 
 
 class TestInjectFault:
+    # [CLASS DOC] Tests of the fire-and-forget fault injection into one worker of a cell.
     async def test_the_fault_reaches_the_selected_worker(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Injecting a sigkill into worker 1 of a 2-worker cell sends one inject call
+        # with the mode as the only argument, to the second handle.
         """A multi-node engine is crashed by crashing one of its node ranks."""
         manager = await _launch([_make_spec("engine", num_workers_per_cell=2)])
 
@@ -2084,6 +2264,8 @@ class TestInjectFault:
         assert calls[0].handle is fake_ray_cluster.handles[1]
 
     async def test_injection_does_not_wait_for_the_worker_to_answer(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] The worker's inject call is set to fail; the manager call still returns
+        # without raising (only absence of an error is checked).
         """The worker is about to die, so waiting for its reply would hang the caller."""
         manager = await _launch([_make_spec("engine")])
         fake_ray_cluster.handles[0].failing_methods["inject_fault"] = RuntimeError("actor died")
@@ -2091,6 +2273,8 @@ class TestInjectFault:
         manager.inject_fault("engine-00000", mode="sigkill", worker_in_cell_index=0)
 
     async def test_injecting_into_a_suspended_cell_is_rejected(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] After stopping the cell, injection raises a runtime error mentioning "not
+        # alive".
         """A suspended cell has no worker to crash."""
         manager = await _launch([_make_spec("engine")])
         await manager.stop_cells(["engine-00000"])
@@ -2099,6 +2283,8 @@ class TestInjectFault:
             manager.inject_fault("engine-00000", mode="sigkill", worker_in_cell_index=0)
 
     async def test_a_worker_index_beyond_the_cell_is_rejected(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Worker index 1 in a one-worker cell raises an index error mentioning "out
+        # of range".
         """Injecting into a neighbouring cell by accident would corrupt the test's premise."""
         manager = await _launch([_make_spec("engine", num_cells=2, num_workers_per_cell=1)])
 
@@ -2106,6 +2292,7 @@ class TestInjectFault:
             manager.inject_fault("engine-00000", mode="sigkill", worker_in_cell_index=1)
 
     async def test_a_negative_worker_index_is_rejected(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] Worker index minus one raises an index error mentioning "out of range".
         """Negative indexing would silently select the last worker instead of failing."""
         manager = await _launch([_make_spec("engine", num_workers_per_cell=2)])
 
@@ -2113,6 +2300,7 @@ class TestInjectFault:
             manager.inject_fault("engine-00000", mode="sigkill", worker_in_cell_index=-1)
 
     async def test_an_unknown_cell_is_rejected(self, fake_ray_cluster: FakeRayCluster):
+        # [FUNCTION DOC] An unknown cell id raises an assertion error.
         """A typo must not silently inject nothing."""
         manager = await _launch([_make_spec("engine")])
 
