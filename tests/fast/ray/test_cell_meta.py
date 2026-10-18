@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Tests that the per-cell metadata a spec declares survives the whole path to the consumer: spec,
+# rendered helm values, pod annotations (fake pods), the kubernetes worker provider's observation
+# of those pods, and the cell info metadata. Consumers (the inference controller and the trainer
+# group) index metadata keys by literal names; the tests find those names by static analysis of
+# the consumer source files and require that every one is present in the observed metadata.
+# A fake pod listing api replaces the cluster, and the trainer environment is made gpu-less.
 from __future__ import annotations
 
 import ast
@@ -44,24 +51,38 @@ LAYOUT = LaunchPlan(
 
 
 class FakePodApi:
+    # [CLASS DOC] HELPER: Fake kubernetes pod api serving a fixed list of pods. The watch stream
+    # never delivers an event.
     def __init__(self, pods: list[Any]) -> None:
+        # [FUNCTION DOC] HELPER: Stores the pods to serve.
         self.pods = pods
 
     async def list_pods(self, *, namespace: str, label_selector: str) -> PodListPage:
+        # [FUNCTION DOC] HELPER: Returns a page holding a copy of the stored pods with resource
+        # version "1". The namespace and selector arguments are ignored (no filtering).
         return PodListPage(pods=list(self.pods), resource_version="1")
 
     async def stream_pods(self, *, namespace, label_selector, resource_version, timeout_seconds):
+        # [FUNCTION DOC] HELPER: Fake watch stream; sleeps for an hour and then yields once with no
+        # event, so effectively no event is ever delivered. All arguments are ignored.
         await asyncio.sleep(3600)
         yield None
 
 
 @pytest.fixture(autouse=True)
 def _fake_pod_api(monkeypatch: pytest.MonkeyPatch) -> None:
+    # [FUNCTION DOC] HELPER: Autouse fixture. Resets the shared fake pod api holder and makes the
+    # kubernetes provider obtain its pod api from that holder, so tests never talk to a cluster.
     fake_pod_api.reset()
     monkeypatch.setattr(core_provider, "_kubernetes_pod_api", fake_pod_api.installed)
 
 
 def engine_spec(*, num_cells: int = 2, gpu_offset: int = 0) -> CommandWorkerSpec:
+    # [FUNCTION DOC] HELPER: Builds a hand-written inference engine command spec: the given number
+    # of cells (default 2) of one worker each, taking a whole 8-gpu node as slots, in the rollout
+    # placement group at the given slot offset. The per-cell metadata (model id qwen3-4b, decode
+    # worker type, 8 gpus per engine, no api key, no offload, weight updates on) includes a gpu
+    # offset equal to the spec offset plus the cell index times the gpus of one cell.
     scheduling = SchedulingSpec(
         num_cells=num_cells,
         num_workers_per_cell=1,
@@ -91,6 +112,10 @@ def engine_spec(*, num_cells: int = 2, gpu_offset: int = 0) -> CommandWorkerSpec
 
 
 def trainer_args(*, num_cells: int) -> SimpleNamespace:
+    # [FUNCTION DOC] HELPER: Builds a minimal trainer argument object: actor only, one node of 8
+    # gpus per cell (node count equals the requested cell count), independent dp when more than
+    # one cell, tensor parallel size 8 and no other parallelism, megatron backend, no offload, no
+    # fault tolerance.
     return SimpleNamespace(
         use_critic=False,
         actor_num_nodes=num_cells,
@@ -112,12 +137,23 @@ def trainer_args(*, num_cells: int) -> SimpleNamespace:
 
 
 def specs_of(*, engine_cells: int, trainer_cells: int) -> list[Any]:
+    # [FUNCTION DOC] HELPER: Returns the hand-written engine spec followed by the real trainer
+    # specs for the requested numbers of cells.
     return [engine_spec(num_cells=engine_cells), *specs_trainer(trainer_args(num_cells=trainer_cells))]
 
 
 def observed_meta(
     *, pool_id: str, cell_id_suffix: int, engine_cells: int = 2, trainer_cells: int = 1
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Runs the full metadata path for one cell and returns the metadata the
+    # provider reports. Steps: build the specs, render them to helm values, find the values entry
+    # for the pool (matched by pool id or name) in the inference or trainer sections, create fake
+    # pods for the cell (one per entry size, default 1) whose annotations carry the entry's
+    # metadata under the meta annotation prefix, install a fake pod api serving them, create the
+    # helm backend capability and a dynamic worker provider over the pool, start watching cells
+    # (ignoring callbacks), read the cell info for the requested cell index, stop the watch and
+    # return a copy of the info metadata. Raises an assertion error if no cell info exists, and a
+    # stop iteration error if the pool has no values entry. Side effect: installs the fake pod api.
     specs = specs_of(engine_cells=engine_cells, trainer_cells=trainer_cells)
     values = build_values(specs, LAYOUT).as_values()
     entry = next(
@@ -142,6 +178,8 @@ def observed_meta(
     provider = factory.dynamic_worker_provider(pool_ids=[pool_id])
 
     async def scenario() -> dict[str, Any]:
+        # [FUNCTION DOC] HELPER: Starts the cell watch, reads the cell info for the requested cell,
+        # asserts it exists, returns a copy of its metadata, and always stops the watch afterwards.
         stop = await provider.watch_cells(_ignore_cell)
         try:
             info = provider.cell_info(compute_cell_id(pool_id=pool_id, cell_index=cell_id_suffix))
@@ -154,6 +192,9 @@ def observed_meta(
 
 
 def indexed_meta_keys(source: Path, *, attribute: str) -> set[str]:
+    # [FUNCTION DOC] HELPER: Parses the given python source file and returns the set of string
+    # literal keys used in subscript expressions on an attribute with the given name (for example
+    # keys read from a meta attribute). Only subscripts whose key is a literal string count.
     tree = ast.parse(source.read_text())
     return {
         node.slice.value
@@ -167,24 +208,32 @@ def indexed_meta_keys(source: Path, *, attribute: str) -> set[str]:
 
 
 async def _ignore_cell(cell_id: str, info: Any) -> None:
+    # [FUNCTION DOC] HELPER: Cell reconcile callback that does nothing.
     return None
 
 
 @pytest.fixture(autouse=True)
 def trainer_env_without_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    # [FUNCTION DOC] HELPER: Autouse fixture. Replaces the fp8 scaling default probe with one
+    # returning "0" (no gpu needed) and sets the namespace and release environment variables the
+    # helm provider reads. Undone at test end.
     monkeypatch.setattr(specs_train, "default_fp8_block_scaling_fp32_scales", lambda: "0")
     monkeypatch.setenv(env.NAMESPACE_ENV_VAR, NAMESPACE)
     monkeypatch.setenv(env.RELEASE_ENV_VAR, _RELEASE)
 
 
 class TestWhatAnEngineCellReports:
+    # [CLASS DOC] Tests the metadata reported for engine cells after the full round trip.
     def test_carries_every_fact_the_inference_controller_indexes(self):
+        # [FUNCTION DOC] Every literal meta key that the inference controller source indexes is
+        # present in the observed metadata of engine cell 0.
         """The first reconcile builds ServerCellMetadata out of these keys, so a missing one is a KeyError."""
         meta = observed_meta(pool_id=ENGINE_POOL_ID, cell_id_suffix=0)
 
         assert indexed_meta_keys(INFERENCE_CONTROLLER, attribute="meta") <= set(meta)
 
     def test_gives_each_cell_its_own_gpu_offset(self):
+        # [FUNCTION DOC] Engine cells 0 and 1 report gpu offsets 0 and 8 (the gpus of one node).
         """Two cells of one pool_id share a values entry, and a shared offset would update one engine twice."""
         first = observed_meta(pool_id=ENGINE_POOL_ID, cell_id_suffix=0)
         second = observed_meta(pool_id=ENGINE_POOL_ID, cell_id_suffix=1)
@@ -192,6 +241,8 @@ class TestWhatAnEngineCellReports:
         assert (first["gpu_offset"], second["gpu_offset"]) == (0, GPUS_PER_NODE)
 
     def test_keeps_the_types_the_consumers_expect(self):
+        # [FUNCTION DOC] For engine cell 1, the gpu offset is an integer, the offload flag is a
+        # boolean and the model id is qwen3-4b, i.e. the annotation round trip restores types.
         """ServerCellMetadata declares ints and bools, and a stringly typed offset would index the wrong gpus."""
         meta = observed_meta(pool_id=ENGINE_POOL_ID, cell_id_suffix=1)
 
@@ -200,6 +251,8 @@ class TestWhatAnEngineCellReports:
         assert meta["model_id"] == "qwen3-4b"
 
     def test_still_reports_the_gpus_the_values_file_annotated(self):
+        # [FUNCTION DOC] The gpu ids metadata of engine cell 0 is the comma joined list of gpu ids
+        # 0 to 7, as annotated in the rendered values.
         """gpu_ids is what the pod itself was given, so it travels on the pod rather than being recomputed."""
         meta = observed_meta(pool_id=ENGINE_POOL_ID, cell_id_suffix=0)
 
@@ -207,13 +260,18 @@ class TestWhatAnEngineCellReports:
 
 
 class TestWhatATrainerCellReports:
+    # [CLASS DOC] Tests the metadata reported for trainer cells after the full round trip.
     def test_carries_every_fact_the_trainer_group_indexes(self):
+        # [FUNCTION DOC] Every literal meta key that the trainer group source indexes is present in
+        # the observed metadata of trainer cell 0.
         """The group turns an observation into a TrainerCell and reads its index straight out of the meta."""
         meta = observed_meta(pool_id=TRAINER_POOL_ID, cell_id_suffix=0)
 
         assert indexed_meta_keys(TRAIN_GROUP, attribute="meta") <= set(meta)
 
     def test_carries_the_same_facts_for_every_cell_of_the_pool(self):
+        # [FUNCTION DOC] With two trainer cells, cells 0 and 1 report cell indices 0 and 1, and all
+        # other metadata entries are identical between the two cells.
         """Cells of one indep-dp pool_id share every fact but the index that tells them apart."""
         first = observed_meta(pool_id=TRAINER_POOL_ID, cell_id_suffix=0, trainer_cells=2)
         second = observed_meta(pool_id=TRAINER_POOL_ID, cell_id_suffix=1, trainer_cells=2)
@@ -224,5 +282,6 @@ class TestWhatATrainerCellReports:
         }
 
     def test_reports_the_role_the_spec_was_built_for(self):
+        # [FUNCTION DOC] The actor pool's cell 0 metadata has role actor.
         """A critic pool_id observes the same way, and the role is how a consumer tells the two apart."""
         assert observed_meta(pool_id=TRAINER_POOL_ID, cell_id_suffix=0)["role"] == "actor"

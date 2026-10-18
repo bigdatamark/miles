@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Subprocess based import tests. Each test starts a fresh interpreter (so the module table is
+# empty), with the repository root prepended to the python path, and imports modules there. They
+# guard against circular imports between the inference specs and the router manager, and against
+# the inference specs eagerly loading gpu-only dumper dependencies.
 from __future__ import annotations
 
 import os
@@ -24,6 +29,11 @@ CYCLE_PRONE_MODULES: tuple[str, str] = (
     ids=["specs_first", "router_manager_first"],
 )
 def test_cycle_prone_modules_import_in_either_order(module_names: tuple[str, str]) -> None:
+    # [FUNCTION DOC] Parametrized with the two cycle-prone modules in both orders. Builds a small
+    # program importing the modules one after another, runs it in a fresh interpreter with a
+    # five minute timeout, the repository root as working directory and python path, captures
+    # output, and asserts a zero exit code; on failure the message includes the standard error text.
+    # Side effect: spawns a subprocess; raises a timeout error if the import hangs.
     """A fresh interpreter can import the spec and router-manager modules in either order."""
     program: str = "\n".join(f"import {module_name}" for module_name in module_names)
     env: dict[str, str] = dict(os.environ)
@@ -42,6 +52,11 @@ def test_cycle_prone_modules_import_in_either_order(module_names: tuple[str, str
 
 
 def test_inference_specs_import_without_loading_gpu_dumper_dependencies() -> None:
+    # [FUNCTION DOC] In a fresh interpreter, imports the inference specs module and then asserts
+    # that neither the miles dumper utilities module nor the sglang debug dumper module is in the
+    # module table. The subprocess must exit with zero (five minute timeout, repository root as
+    # working directory and python path); otherwise the test fails with the standard error text.
+    # Side effect: spawns a subprocess.
     """A CPU-only controller can import inference specs without loading GPU dumper dependencies."""
     program = "\n".join(
         [
