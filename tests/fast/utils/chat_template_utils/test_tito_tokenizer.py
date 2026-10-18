@@ -1009,6 +1009,8 @@ class TestInklingFixedTemplate:
 
 
 class TestDeepSeekV32IncrementalAppend:
+    # [CLASS DOC] Tests that for the DeepSeek V3.2 family the synthetic-prefix incremental render
+    # equals the suffix of the real-history render, for both tool and user appends.
     """V3.2 rides the default synthetic-prefix suffix diff; with the family's
     pinned ``drop_thinking=False`` the vendored encoder renders every turn
     position-independently, so the synthetic-prefix incremental must equal the

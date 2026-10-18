@@ -237,6 +237,9 @@ class TestQwen3_5BridgeALogOverride:
 
 
 class TestALogLoadPathEndToEnd:
+    # [CLASS DOC] End-to-end test group replaying the dtype-relevant steps of the bridge weight
+    # loading path on a toy model; guards against the old conversion helper casting the float32
+    # value down to the bfloat16 parameter dtype.
     """Replays the dtype-relevant subset of ``Bridge.load_weights`` on a toy
     model, as documented in ``tools/debug_a_log_old_flow.py``. No distributed
     or real safetensor IO — only the two cast points we care about.

@@ -117,6 +117,8 @@ _CONFIGS: dict[str, ModelConfig] = {
 
 @dataclass
 class TokenizerEnv:
+    # [CLASS DOC] HELPER: Dataclass bundling a tokenizer, its model config and a sequence comparator,
+    # with small encode and token-id lookup helpers for tests.
     """Bundle of tokenizer + comparator + helpers for concise test code."""
 
     tokenizer: AutoTokenizer

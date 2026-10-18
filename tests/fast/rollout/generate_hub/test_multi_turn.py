@@ -620,6 +620,8 @@ class TestRespectMaxContextLen:
 
 
 class TestThreeTurn:
+    # [CLASS DOC] Tests of a three-turn tool-call conversation, complementing the two-turn tests since
+    # sample merging may behave differently with more turns.
     """Need to test 3-turn case besides 2-turn, because e.g. merge_samples may behave differently."""
 
     def test_three_turns_with_sequential_tool_calls(self, variant, generation_env):

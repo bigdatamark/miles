@@ -1085,6 +1085,8 @@ class TestComputeSessionMismatch:
 
         @dataclass
         class FakeMismatch:
+            # [CLASS DOC] HELPER: Fake mismatch record holding a token position; only provides a
+            # to-dict conversion.
             position: int
 
             def to_dict(self):

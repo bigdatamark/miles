@@ -51,10 +51,14 @@ def own_args_resolutions(monkeypatch) -> list[tuple[str, object]]:
     recorded: list[tuple[str, object]] = []
 
     async def _record_router(args, **kwargs):
+        # [FUNCTION DOC] HELPER: Records a router-address resolution call with its args and returns an
+        # empty mapping.
         recorded.append(("resolve_router_addrs", args))
         return {}
 
     async def _record_session(args, **kwargs):
+        # [FUNCTION DOC] HELPER: Records a session-server readiness wait with its args and returns an
+        # empty mapping.
         recorded.append(("wait_session_server_ready", args))
         return {}
 

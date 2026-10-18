@@ -102,6 +102,9 @@ def test_broadcast_roundtrip_preserves_mixed_dtype_bytes_and_scalar_shape(monkey
     group = object()
 
     def send(tensor, src, *, group, async_op):
+        # [FUNCTION DOC] HELPER: Fake replacement for the distributed broadcast. Asserts source rank 0,
+        # asynchronous mode and a contiguous tensor; records a clone of the tensor in the sent list and
+        # returns a handle whose wait method records the element count in the waits list.
         assert src == 0 and async_op
         assert tensor.is_contiguous()
         sent.append(tensor.clone())
