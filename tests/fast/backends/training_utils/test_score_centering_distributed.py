@@ -1,3 +1,10 @@
+# [MODULE DOC] Four-process tests of tensor parallel 2 by context parallel 2 parity for the score
+# centering loss: the selected log-prob/entropy helper with a vocabulary sharded across the tensor
+# parallel pair, and the full loss function across layouts (packed, padded, and the allgather
+# variants of each), importance modes (none, tis, mis) and sampling-support replay on/off with a KL
+# loss on/off, each compared against a dense single-device reference (loss and local gradient).
+# Runs on CPU with Gloo by default (spawned in a normal test), and with NCCL on four GPUs only when
+# an opt-in environment variable is set and at least four devices exist.
 """TP=2, CP=2 parity on CPU/Gloo and opt-in four-GPU NCCL."""
 
 import os
@@ -28,6 +35,14 @@ from miles.utils.sampling_mask import RolloutSamplingMask
 
 
 def _layout(parts: list[torch.Tensor], args: Namespace, cp_rank: int) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Converts full per-sample tensors (rows by width) into the local tensor
+    # one context-parallel rank holds in the configured layout. Allgather layout, padded format:
+    # each sample is zero-padded along rows to 12, split in two contiguous halves, the rank's half
+    # taken, samples stacked. Allgather, packed format: samples concatenated, padded with one zero
+    # row when the total row count is odd (none when even), split into two halves, the rank's half
+    # given a leading batch axis. Otherwise (zigzag): each
+    # sample sliced for this rank with the context-parallel slicer using padded max length 12, then
+    # stacked (padded format) or concatenated with a leading batch axis (packed). Returns it.
     if args.allgather_cp:
         if args.qkv_format == "bshd":
             return torch.stack([F.pad(part, (0, 0, 0, 12 - part.size(0))).chunk(2)[cp_rank] for part in parts])
@@ -39,6 +54,14 @@ def _layout(parts: list[torch.Tensor], args: Namespace, cp_rank: int) -> torch.T
 
 
 def _check_selected(tp: GroupInfo, dtype: torch.dtype, device: torch.device) -> None:
+    # [FUNCTION DOC] HELPER: Checks the selected log-prob and entropy helper under tensor
+    # parallelism. A seeded full logits tensor (4 rows by 8, given dtype and device, requiring
+    # grad) is split by columns into 2 shards of 4; this rank's shard is the local input. Ids are 4
+    # by 4 with -1 padding; vocabulary size 7, temperature 0.7, chunk size 2, entropy on. Compares
+    # entropy and selected log-probs (tolerance 1e-6) with a dense reference over the full logits
+    # (sliced to the vocabulary); then backpropagates identical weighted objectives (random weights
+    # minus 0.2 times entropy) through both and compares the local gradient with the matching column
+    # slice of the reference gradient (tolerance 0.01 for bf16, else 1e-6).
     full = (
         torch.randn(4, 8, generator=torch.Generator().manual_seed(31)).to(device=device, dtype=dtype).requires_grad_()
     )
@@ -73,6 +96,26 @@ def _check_loss(
     replay: bool = False,
     use_kl: bool = True,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Checks the full score centering loss function for one configuration.
+    # Inputs: tensor and context parallel group infos, a layout name (thd, bshd, allgather,
+    # bshd_allgather), the importance mode, device, a replay flag (sampling-support replay: the
+    # head becomes the sampling support and train log-probs are renormalized over it) and a KL
+    # flag. Builds args (score centering, temperature 0.7, chunk 2, vocab 7, tis clip 2, mis band
+    # 0.5 to 5, entropy coefficient 0.03, KL k2 with coefficient 0.1). Three samples with total
+    # lengths 5, 9, 3 and responses 2, 3, 0 (one has an empty response), random logits (width 8, 7
+    # real vocabulary entries), tokens, partial masks, advantages, and rollout distributions whose
+    # top-3 form the head (in replay mode the sampled token is the head's top entry, heads are
+    # renormalized, and one head slot is invalidated with -1 / 0). Reference path: dense per-sample
+    # log-softmax at the response positions, optional support renormalization, the dense loss via the
+    # score centering helper minus entropy coefficient times entropy (head-restricted in replay),
+    # masked mean per sample, summed; backward gives reference gradients. Under test: this rank's
+    # local logits (layout slice, this tensor shard of columns), a batch with lengths, tokens, masks,
+    # rollout top-k ids and log-probs (replay uses lengths and sampling-mask ids/offsets instead),
+    # context-parallel-sliced rollout log-probs and advantages, and reference log-probs equal to the
+    # actor's own (so the KL loss must be exactly zero when enabled). Calls the loss function; asserts
+    # KL metric zero, local gradient equals the layout/shard slice of the reference gradient (atol
+    # 2e-6, rtol 2e-5), the loss summed over the context-parallel group equals the reference loss, and
+    # all metrics are finite.
     args = Namespace(
         loss_type="score_centering",
         qkv_format="bshd" if layout in ("bshd", "bshd_allgather") else "thd",
@@ -207,6 +250,13 @@ def _check_loss(
 
 
 def _worker(rank: int, rendezvous: str, backend: str) -> None:
+    # [FUNCTION DOC] HELPER: Per-rank body spawned for 4 ranks. Single-threaded; picks the CUDA
+    # device of the rank for NCCL else CPU; initializes the process group (120 second timeout) from
+    # the rendezvous URL. Builds tensor parallel groups {0,1},{2,3} and context parallel groups
+    # {0,2},{1,3} (tensor rank = rank mod 2, context rank = rank div 2), installs a global parallel
+    # state with those and trivial other axes. Runs the selected-log-prob check for fp32 and bf16,
+    # then for each of four layouts and three modes runs the loss check plain, and with replay on
+    # both with and without KL. Always destroys the process group.
     torch.set_num_threads(1)
     device = torch.device("cuda", rank) if backend == "nccl" else torch.device("cpu")
     if device.type == "cuda":
@@ -232,6 +282,8 @@ def _worker(rank: int, rendezvous: str, backend: str) -> None:
 
 
 def test_tensor_and_context_parallel_gradients(tmp_path: Path) -> None:
+    # [FUNCTION DOC] Test: spawns 4 processes running the worker with Gloo on CPU and a file-URI
+    # rendezvous in the temp directory; failures in any process propagate.
     mp.spawn(_worker, args=((tmp_path / "rendezvous").as_uri(), "gloo"), nprocs=4, join=True)
 
 
@@ -240,4 +292,6 @@ def test_tensor_and_context_parallel_gradients(tmp_path: Path) -> None:
     reason="opt-in four-GPU NCCL parity",
 )
 def test_tensor_and_context_parallel_cuda_gradients(tmp_path: Path) -> None:
+    # [FUNCTION DOC] Test (skipped unless the opt-in environment variable equals 1 and at least 4
+    # GPUs exist): same as the CPU test but with the NCCL backend.
     mp.spawn(_worker, args=((tmp_path / "rendezvous").as_uri(), "nccl"), nprocs=4, join=True)

@@ -1,3 +1,10 @@
+# [MODULE DOC] Two-process CPU (Gloo) tests that the allgather context-parallel loss path with
+# cp=2 matches the plain cp=1 path. For each case (a response split across both halves, a rank
+# whose contiguous half has no response logits, a rank whose zigzag share has no response tokens)
+# and each model dtype (fp32, bf16, fp16), the same logits run once as cp=1 and once as cp=2 where
+# each rank holds one contiguous half of the sequence axis. Per-token log-probs must match exactly;
+# the summed loss (all-reduced across ranks) must match within 1e-6. Totals must divide by twice
+# the cp size for the zigzag layout.
 """CP=2 consistency tests for the allgather-CP loss path.
 
 Each case runs the same data through cp=1 (plain path) and cp=2
@@ -36,6 +43,10 @@ CASES = [
 
 
 def _set_parallel_state(rank: int, world_size: int, tp_group) -> None:
+    # [FUNCTION DOC] HELPER: Installs a global parallel state in which all axes are trivial (rank 0,
+    # size 1) except context parallel (given rank and world size, using the world process group
+    # only when world size exceeds 1; also used for the intra-dp-with-cp axis) and tensor parallel
+    # (rank 0, size 1, the supplied group). Marks the last pipeline stage.
     trivial = GroupInfo(rank=0, size=1, group=None)
     cp = GroupInfo(rank=rank, size=world_size, group=dist.group.WORLD if world_size > 1 else None)
     set_parallel_state(
@@ -54,6 +65,15 @@ def _set_parallel_state(rank: int, world_size: int, tp_group) -> None:
 
 
 def _run_case(rank: int, world_size: int, port: int, *, prompt_lens: list[int], response_lens: list[int]) -> None:
+    # [FUNCTION DOC] HELPER: Per-rank worker. Initializes Gloo, creates a single-rank group per rank
+    # (group creation is collective, so every rank builds all of them) for the tensor-parallel
+    # axis, builds sft-loss args (not true-on-policy, chunk size 4, temperature 0.7) and seed-42
+    # inputs. For each model dtype: (1) cp=1 pass: allgather off, trivial parallel state, compute
+    # log-probs and the loss on the full logits cast to the dtype; (2) cp=2 pass: allgather on,
+    # state with this rank, local logits are this rank's contiguous slice of the sequence axis,
+    # compute log-probs and loss. Asserts per-token log-probs, after gathering across context
+    # parallel ranks, equal the cp=1 ones exactly; and the loss summed over ranks via all-reduce is
+    # close to the cp=1 loss (relative and absolute tolerance 1e-6).
     init_gloo(rank, world_size, port=port)
     # The fused CE needs a real group per rank; new_group is collective, so build all of them.
     tp_group = [dist.new_group([r]) for r in range(world_size)][rank]
@@ -109,4 +129,7 @@ def _run_case(rank: int, world_size: int, port: int, *, prompt_lens: list[int], 
 
 @pytest.mark.parametrize(("name", "prompt_lens", "response_lens"), CASES, ids=[c[0] for c in CASES])
 def test_allgather_cp2_matches_cp1(name: str, prompt_lens: list[int], response_lens: list[int]) -> None:
+    # [FUNCTION DOC] Test (parametrized over the three cases): launches the per-rank worker in a
+    # multi-process runner with the case's prompt and response lengths. The name only labels the
+    # case. Failures in any rank propagate through the runner.
     run_multiprocess(partial(_run_case, prompt_lens=prompt_lens, response_lens=response_lens))

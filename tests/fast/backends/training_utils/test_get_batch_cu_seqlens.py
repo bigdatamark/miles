@@ -1,3 +1,6 @@
+# [MODULE DOC] CPU test that the batch builder's host-side copy of cumulative sequence lengths
+# equals the device tensor, for every context-parallel rank at cp sizes 1, 2, 4 and with the
+# allgather-cp option off and on. CUDA is stubbed so tensors stay on CPU.
 """`get_batch`'s host copy of `cu_seqlens` must describe the same packed stream as the device tensor."""
 
 from types import SimpleNamespace
@@ -14,6 +17,13 @@ from miles.backends.training_utils.data import rollout as data_utils
 def test_the_host_cu_seqlens_match_the_device_tensor(
     monkeypatch: pytest.MonkeyPatch, allgather_cp: bool, cp_size: int
 ):
+    # [FUNCTION DOC] Test (parametrized over allgather option and cp size): four sequences of
+    # lengths 13, 11, 5, 1 with response lengths half of that (integer division) and all-ones masks.
+    # The cuda device query is patched to return the CPU device and tensor cuda-move to the identity.
+    # For each cp rank, patches the parallel state in both the rollout and context-parallel
+    # modules (tensor parallel size 1), builds one batch over the whole rollout (micro batch size
+    # 4, pad multiplier 7, packed format) and asserts the host cumulative sequence lengths tuple
+    # equals the device tensor's values.
     """The DSv4 row balancer plans from the host copy to avoid a device sync, so a drift would misroute rows."""
     lengths = [13, 11, 5, 1]
     rollout = {

@@ -1,3 +1,5 @@
+# [MODULE DOC] CPU test for the CI KL checker of the training metrics: an out-of-tolerance PPO KL
+# value must be detected whether metric keys are plain or prefixed by a trainer model id namespace.
 from argparse import Namespace
 
 import pytest
@@ -6,7 +8,11 @@ from miles.backends.training_utils.metrics.checks import check_kl
 
 
 class TestCheckKl:
+    # [CLASS DOC] Tests for the KL checker.
     def test_namespaced_policy_metrics_still_trigger_the_kl_checker(self) -> None:
+        # [FUNCTION DOC] Test: with a log dictionary of ppo_kl 0.1 and clip fraction 0.2, the checker
+        # raises an assertion error both for plain keys (model id unset) and for keys prefixed with
+        # the trainer model id "alpha" (model id set), each at step 0 / accumulated step 1.
         """A policy namespace must not hide an out-of-tolerance PPO KL value."""
         args = Namespace(
             multi_latent_attention=False,

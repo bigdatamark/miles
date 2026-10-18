@@ -1,3 +1,12 @@
+# [MODULE DOC] CPU tests for the engine lock of the distributed-broadcast weight update protocol.
+# Construction: a single pipeline stage builds no lock (a null context); every pipelined source
+# (pp size above 1) gets a shared world ticket lock under a fixed key prefix and participates;
+# non-source ranks (nonzero tensor-parallel or data-parallel rank) still join the collective lock
+# construction without participating; reconnecting to engines never rebuilds the lock. Sending a
+# bucket under a real store-based ticket lock (in-memory hash store): the finished update hands the
+# lock to the next source and empties the bucket; the broadcast is issued while the lock is held; an
+# engine failure or a broadcast failure keeps the ticket and the bucket and blocks later sends on
+# that rank with an assertion error.
 from argparse import Namespace
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -19,6 +28,9 @@ _SERVING_KEY = f"{_PREFIX}/serving"
 def _build_protocol(
     *, pp_size: int, pp_rank: int = 0, tp_rank: int = 0, intra_dp_cp_rank: int = 0
 ) -> tuple[UpdateWeightFromDistributed, MagicMock]:
+    # [FUNCTION DOC] HELPER: Builds the protocol under a fake parallel state (pipeline size and rank,
+    # tensor-parallel rank, data-parallel-with-cp rank as given) with the state getter and the world
+    # ticket lock factory patched during construction. Returns (protocol, the mock lock factory).
     parallel_state = SimpleNamespace(
         pp=SimpleNamespace(size=pp_size, rank=pp_rank),
         tp=SimpleNamespace(rank=tp_rank),
@@ -33,7 +45,10 @@ def _build_protocol(
 
 
 class TestEngineLockConstruction:
+    # [CLASS DOC] Tests for how the protocol builds its engine lock.
     def test_a_single_stage_world_builds_no_lock_at_all(self) -> None:
+        # [FUNCTION DOC] Test: pipeline size 1 never calls the lock factory and the stored lock is a
+        # null context.
         """One PP stage means one source, so there is nothing to exclude and no store to host."""
         protocol, create_lock = _build_protocol(pp_size=1)
 
@@ -42,6 +57,8 @@ class TestEngineLockConstruction:
 
     @pytest.mark.parametrize(("pp_size", "pp_rank"), [(2, 0), (2, 1), (3, 0), (3, 1), (3, 2)])
     def test_every_pipelined_source_contends_on_the_shared_lock(self, pp_size: int, pp_rank: int) -> None:
+        # [FUNCTION DOC] Test (pipeline size 2 or 3, every rank): the factory is called once with the
+        # fixed prefix and participation true, and the stored lock is the factory's result.
         """Every PP stage broadcasts its own slice, so every stage must queue, not just the first."""
         protocol, create_lock = _build_protocol(pp_size=pp_size, pp_rank=pp_rank)
 
@@ -52,12 +69,17 @@ class TestEngineLockConstruction:
     def test_a_rank_that_never_broadcasts_joins_the_collective_without_contending(
         self, tp_rank: int, intra_dp_cp_rank: int
     ) -> None:
+        # [FUNCTION DOC] Test (tensor-parallel rank 1, or data-parallel rank 1): with pipeline size 3
+        # the factory is still called once, with participation false.
         """Non-source ranks must still call in, since building the lock is collective."""
         _, create_lock = _build_protocol(pp_size=3, tp_rank=tp_rank, intra_dp_cp_rank=intra_dp_cp_rank)
 
         create_lock.assert_called_once_with(prefix=_PREFIX, participates=False)
 
     def test_reconnecting_to_the_engines_does_not_rebuild_the_lock(self) -> None:
+        # [FUNCTION DOC] Test: after constructing with pipeline size 3, connecting to one mock engine
+        # (no gpu counts or offsets, selector "all", patched replica, disconnect and connect helpers)
+        # leaves the factory called only once and the stored lock the same object.
         """Reconnects are not collective, so entering one there would hang the ranks that skip it."""
         protocol, create_lock = _build_protocol(pp_size=3)
         lock_after_init = protocol._engine_lock
@@ -82,8 +104,13 @@ class TestEngineLockConstruction:
 
 
 class TestSendBucketUnderTheEngineLock:
+    # [CLASS DOC] Tests for the protocol's send-bucket method, called unbound on a fake self object
+    # that carries a real store-based ticket lock (1 ms polling) over an in-memory store.
     @staticmethod
     def _make_self(store: HashStore) -> SimpleNamespace:
+        # [FUNCTION DOC] HELPER: Builds the fake protocol object: empty args, a ticket lock on the
+        # store with the fixed prefix, group name "miles-pp_0", a mock update group, one mock
+        # engine, and selector "all".
         return SimpleNamespace(
             args=Namespace(),
             _engine_lock=StoreTicketLock(store=store, prefix=_PREFIX, poll_interval=0.001),
@@ -101,6 +128,10 @@ class TestSendBucketUnderTheEngineLock:
         broadcast_side_effect=None,
         engine_failure: Exception | None = None,
     ) -> tuple[MagicMock, MagicMock]:
+        # [FUNCTION DOC] HELPER: Runs the unbound send-bucket method on the fake self and bucket with
+        # the broadcast function (side effect optional, returns an empty futures list) and the
+        # future-waiting helper (raises the optional engine failure, else returns an empty list)
+        # patched. Returns (broadcast mock, wait mock). Exceptions propagate.
         with (
             patch(f"{_BROADCAST_MODULE}.update_weights_from_distributed") as broadcast,
             patch(f"{_BROADCAST_MODULE}.async_utils.wait_futures") as wait_futures,
@@ -113,6 +144,10 @@ class TestSendBucketUnderTheEngineLock:
         return broadcast, wait_futures
 
     def test_a_finished_update_hands_the_lock_to_the_next_source(self) -> None:
+        # [FUNCTION DOC] Test: a normal send: the broadcast function is called once with group name,
+        # update group, engines, the bucket, selector "all" and transfer mode "broadcast"; the wait
+        # helper is called with the broadcast's returned futures; the bucket list is emptied; and
+        # the store's serving counter is 1 (the next ticket was called).
         """The common path: broadcast, drop the bucket, then call the next ticket."""
         store = HashStore()
         fake_self = self._make_self(store)
@@ -133,6 +168,10 @@ class TestSendBucketUnderTheEngineLock:
         assert store.add(_SERVING_KEY, 0) == 1
 
     def test_the_broadcast_is_issued_while_the_lock_is_held(self) -> None:
+        # [FUNCTION DOC] Test: the store starts with one ticket taken and serving at 1; the broadcast
+        # fake records the (next, serving) counters when called: exactly [(2, 1)] (the next-ticket
+        # counter has advanced to 2 for this source while the serving counter is still 1), and
+        # afterwards the serving counter is 2.
         """A broadcast outside the critical section would be exactly the interleaving this prevents."""
         store = HashStore()
         store.add(_NEXT_KEY, 1)
@@ -141,6 +180,8 @@ class TestSendBucketUnderTheEngineLock:
         observed: list[tuple[int, int]] = []
 
         def record(*args, **kwargs) -> None:
+            # [FUNCTION DOC] HELPER: Broadcast side effect; appends the current values of the next
+            # and serving counters (read via an add of zero) to the observed list.
             observed.append((store.add(_NEXT_KEY, 0), store.add(_SERVING_KEY, 0)))
 
         self._run(fake_self, [("w", torch.zeros(2))], broadcast_side_effect=record)
@@ -149,6 +190,9 @@ class TestSendBucketUnderTheEngineLock:
         assert store.add(_SERVING_KEY, 0) == 2
 
     def test_an_engine_failure_keeps_the_lock_and_the_bucket(self) -> None:
+        # [FUNCTION DOC] Test: waiting for futures raises a runtime error "engine died"; the send
+        # raises it, the serving counter stays 0 (lock not handed on) and the bucket still has its
+        # one entry.
         """Failing closed where it actually fails: awaiting the futures reports the dead engine."""
         store = HashStore()
         fake_self = self._make_self(store)
@@ -161,6 +205,9 @@ class TestSendBucketUnderTheEngineLock:
         assert len(bucket) == 1
 
     def test_a_broadcast_failure_keeps_the_lock_and_the_bucket(self) -> None:
+        # [FUNCTION DOC] Test: the broadcast itself raises a runtime error "broadcast failed"; the
+        # send raises it, the serving counter stays 0, the bucket is kept, and a second send on the
+        # same object raises an assertion error (the retained ticket blocks reuse).
         """A source that fails before returning futures must retain its ticket and bucket."""
         store = HashStore()
         fake_self = self._make_self(store)
@@ -175,6 +222,8 @@ class TestSendBucketUnderTheEngineLock:
             self._run(fake_self, bucket)
 
     def test_a_source_that_failed_once_refuses_to_broadcast_again(self) -> None:
+        # [FUNCTION DOC] Test: after a send fails with an engine error, a second send on the same
+        # object raises an assertion error.
         """The retained ticket must block this rank too, not just the ranks behind it."""
         store = HashStore()
         fake_self = self._make_self(store)

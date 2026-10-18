@@ -1,3 +1,7 @@
+# [MODULE DOC] CPU tests for data logging in true-on-policy mode: the rollout log-prob dtype follows
+# training precision (bf16 or fp16) only in true-on-policy mode, else fp32; the CI log-prob checker
+# passes when trainer and rollout log-probs match in values and dtype; and sampling-mask transport
+# fields (ids, offsets) are excluded from the metrics sent to the gather.
 from argparse import Namespace
 from types import SimpleNamespace
 
@@ -9,6 +13,8 @@ from miles.backends.training_utils.metrics import log_utils
 
 
 def test_true_on_policy_rollout_logprob_dtype_follows_training_precision():
+    # [FUNCTION DOC] Test: the rollout log-prob dtype is bf16 for true-on-policy with bf16, fp16 for
+    # true-on-policy with fp16, and fp32 when not true-on-policy (even with bf16).
     assert (
         data_utils._rollout_logprob_dtype(Namespace(true_on_policy_mode=True, bf16=True, fp16=False)) is torch.bfloat16
     )
@@ -21,6 +27,12 @@ def test_true_on_policy_rollout_logprob_dtype_follows_training_precision():
 
 
 def test_true_on_policy_log_checker_passes_when_values_and_dtype_match(monkeypatch):
+    # [FUNCTION DOC] Test: with a fake single-rank, last-stage parallel state patched into the log
+    # utilities and context-parallel module, and the gather function replaced by one that captures
+    # the log dictionary, logging rollout data (one sample, bf16 log-probs equal to bf16 rollout
+    # log-probs [-13.25, -13.5]) under CI-test args with the log-prob checker enabled and
+    # true-on-policy mode does not raise, and the captured logged log-probs equal the logged
+    # rollout log-probs.
     captured = {}
     parallel_state = SimpleNamespace(
         tp=SimpleNamespace(rank=0),
@@ -64,6 +76,9 @@ def test_true_on_policy_log_checker_passes_when_values_and_dtype_match(monkeypat
 
 
 def test_sampling_mask_csr_payload_is_not_averaged_as_a_metric(monkeypatch):
+    # [FUNCTION DOC] Test: rollout data containing sampling-mask ids and offsets (compressed sparse
+    # row payload) logged under non-CI args: the dictionary captured by the patched gather contains
+    # neither key.
     captured = {}
     parallel_state = SimpleNamespace(
         tp=SimpleNamespace(rank=0),

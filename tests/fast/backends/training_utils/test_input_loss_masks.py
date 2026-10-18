@@ -1,3 +1,8 @@
+# [MODULE DOC] CPU test that the batch builder's input-aligned loss masks follow each token through
+# packing and context-parallel slicing: for packed and padded layouts, allgather option off/on and
+# cp sizes 1, 2, 4, the mask at every kept token position equals an independent oracle keyed by token
+# id. Samples cover different lengths, multiple supervised spans, an empty response, a fully masked
+# response and a prompt-free sample. CUDA is stubbed to stay on CPU.
 """Mask alignment must be established before packing and context-parallel slicing."""
 
 import pytest
@@ -9,6 +14,9 @@ from miles.backends.training_utils.parallel import GroupInfo, ParallelState
 
 
 def _parallel_state(cp_size: int, cp_rank: int) -> ParallelState:
+    # [FUNCTION DOC] HELPER: Builds a real parallel state with trivial groups except: context
+    # parallel (given rank and size, also used for intra-dp-with-cp) and tensor parallel (rank 0,
+    # size 2). No process groups attached. Does not install it globally.
     group = GroupInfo(rank=0, size=1, group=None)
     cp_group = GroupInfo(rank=cp_rank, size=cp_size, group=None)
     return ParallelState(
@@ -32,6 +40,15 @@ def test_mask_alignment_survives_packing_and_cp(
     allgather_cp: bool,
     cp_size: int,
 ) -> None:
+    # [FUNCTION DOC] Test (parametrized over layout, allgather option, cp size): six samples with
+    # lengths 13, 11, 5, 9, 7, 1 (token ids unique per sample), int masks of response lengths 9, 7,
+    # 0, 6, 7, 1 and a padded max length of 24. Builds an oracle mapping each token id to its input
+    # position weight (zeros for prompt positions, mask values for response positions; pad token 0
+    # maps to 0). For each cp rank with the state patched in both modules, builds a batch (micro
+    # batch of all samples, pad multiplier 7) and asserts: no full-loss-masks key is present; the
+    # input loss mask, flattened, equals the oracle applied to the flattened tokens and has the
+    # same shape as tokens; across ranks the non-pad tokens seen are exactly all input tokens and the
+    # total mask sum equals the oracle's total; the original mask tensors are not mutated.
     # Different lengths, multiple assistant spans, an empty response, a masked
     # response, and a prompt-free sample. Token IDs uniquely identify positions.
     # Masks use the production dtype from get_rollout_data (torch.int).

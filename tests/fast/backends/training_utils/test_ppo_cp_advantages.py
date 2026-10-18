@@ -1,3 +1,11 @@
+# [MODULE DOC] Two-process CPU (Gloo) tests that PPO advantage and return computation under
+# context parallelism of 2 matches the single-rank baseline: terminal reward is added to the tail of
+# the global response (even when the tail or rank 0 shard is empty), masked generalized advantage
+# estimation with trainable-token gaps matches the baseline for two gamma/lambda settings (and the
+# gamma 0 case matches hand-computed values), padded (bshd) layouts use the padded layout metadata
+# for slicing and gathering, and with the actor forward-only pass skipped the synthesized zero KL
+# gives identical grpo advantages and returns. Each worker initializes Gloo and always destroys the
+# process group. Each test launches workers through the multi-process runner.
 from argparse import Namespace
 
 import torch
@@ -11,6 +19,9 @@ from miles.backends.training_utils.parallel import GroupInfo, ParallelState, set
 
 
 def _parallel_state(rank: int = 0, world_size: int = 1) -> ParallelState:
+    # [FUNCTION DOC] HELPER: Builds a parallel state with trivial groups except context parallel and
+    # intra-dp-with-cp which use the given rank and world size (default rank 0, size 1); the world
+    # process group is attached only when world size exceeds 1. Not installed globally.
     trivial_group = GroupInfo(rank=0, size=1, group=None)
     cp_group = dist.group.WORLD if world_size > 1 else None
     return ParallelState(
@@ -26,6 +37,13 @@ def _parallel_state(rank: int = 0, world_size: int = 1) -> ParallelState:
 
 
 def _run_ppo_case(rank: int, total_length: int, response_length: int, expected_local_sizes: list[int]) -> None:
+    # [FUNCTION DOC] HELPER: Per-rank body for the terminal-reward cases. Args: ppo, KL coefficient
+    # 0.1, gamma 0, lambda 0, packed layout. KL is 1..response_length, values are zeros, reward 10.
+    # Installs a two-rank state, slices KL and values to this rank (asserting the local KL size
+    # equals the expected size for the rank), computes advantages and returns on the local shard,
+    # gathers them across context-parallel ranks, then installs a one-rank state and computes the
+    # baseline on full tensors. Asserts gathered advantages and returns equal -0.1 times KL with 10
+    # added at the last element, and equal the baseline.
     args = Namespace(advantage_estimator="ppo", kl_coef=0.1, gamma=0.0, lambd=0.0, qkv_format="thd")
     full_kl = torch.arange(1, response_length + 1, dtype=torch.float32)
     full_values = torch.zeros(response_length)
@@ -71,6 +89,14 @@ def _run_ppo_case(rank: int, total_length: int, response_length: int, expected_l
 
 
 def _run_ppo_masked_case(rank: int) -> None:
+    # [FUNCTION DOC] HELPER: Per-rank body for the masked case: total length 7, response length 6,
+    # loss mask [1,1,0,0,1,0], values [0.5,-0.3,0.7,0.1,-0.2,0.4], KL 1..6, reward 10. For (gamma,
+    # lambda) in (0,0) and (0.9,0.8): computes advantages/returns on this rank's shard under a
+    # two-rank state, gathers, and compares with a one-rank baseline on full tensors (both close);
+    # asserts masked positions have exactly zero advantage and return. For gamma = lambda = 0,
+    # additionally asserts hand-computed advantages: trainable positions 0, 1, 4 equal
+    # -0.1 * KL - value, with the terminal reward 10 added at position 4 (the last trainable
+    # token), zeros elsewhere.
     total_length, response_length = 7, 6
     loss_mask = torch.tensor([1.0, 1.0, 0.0, 0.0, 1.0, 0.0])
 
@@ -124,6 +150,8 @@ def _run_ppo_masked_case(rank: int) -> None:
 
 
 def _worker_tail_on_rank_one(rank: int, world_size: int, port: int) -> None:
+    # [FUNCTION DOC] HELPER: Worker; init Gloo, run the terminal-reward case with total 7, response
+    # 6 (rank 0 holds 2 response entries, rank 1 holds 4, so the tail is on rank 1), destroy group.
     init_gloo(rank, world_size, port=port)
     try:
         _run_ppo_case(rank, total_length=7, response_length=6, expected_local_sizes=[2, 4])
@@ -132,6 +160,8 @@ def _worker_tail_on_rank_one(rank: int, world_size: int, port: int) -> None:
 
 
 def _worker_empty_rank_zero(rank: int, world_size: int, port: int) -> None:
+    # [FUNCTION DOC] HELPER: Worker; init Gloo, run the terminal-reward case with total 7, response
+    # 2 (rank 0 holds 0 response entries, rank 1 holds 2), destroy group.
     init_gloo(rank, world_size, port=port)
     try:
         _run_ppo_case(rank, total_length=7, response_length=2, expected_local_sizes=[0, 2])
@@ -140,6 +170,14 @@ def _worker_empty_rank_zero(rank: int, world_size: int, port: int) -> None:
 
 
 def _worker_bshd_layout_metadata(rank: int, world_size: int, port: int) -> None:
+    # [FUNCTION DOC] HELPER: Worker for the padded-layout case. Init Gloo; ppo args with padded
+    # layout, KL coefficient 0.1, gamma/lambda 0. Two samples: total lengths 8 and 11, response
+    # lengths 5 and 6, padded max length 12 each, rewards 10 and 20, log-probs 1..n, zero reference
+    # log-probs and values. Slices log-probs per sample with padded-layout metadata (asserts local
+    # sizes [1,1] for rank 0 and [4,5] for rank 1), runs the advantage-and-returns routine on
+    # rollout data, gathers advantages and returns per sample with the same metadata, then runs the
+    # routine on full tensors under a one-rank state and asserts each gathered advantage and return
+    # is close to the baseline. Destroys the process group at the end.
     init_gloo(rank, world_size, port=port)
     try:
         args = Namespace(
@@ -227,6 +265,7 @@ def _worker_bshd_layout_metadata(rank: int, world_size: int, port: int) -> None:
 
 
 def _worker_masked_case(rank: int, world_size: int, port: int) -> None:
+    # [FUNCTION DOC] HELPER: Worker; init Gloo, run the masked case for this rank, destroy group.
     init_gloo(rank, world_size, port=port)
     try:
         _run_ppo_masked_case(rank)
@@ -235,22 +274,33 @@ def _worker_masked_case(rank: int, world_size: int, port: int) -> None:
 
 
 def test_ppo_terminal_reward_is_added_to_global_response_tail() -> None:
+    # [FUNCTION DOC] Test: runs the tail-on-rank-one worker across processes.
     run_multiprocess(_worker_tail_on_rank_one)
 
 
 def test_ppo_terminal_reward_handles_empty_rank_zero_shard() -> None:
+    # [FUNCTION DOC] Test: runs the empty-rank-zero worker across processes.
     run_multiprocess(_worker_empty_rank_zero)
 
 
 def test_ppo_bshd_cp_uses_padded_layout_metadata() -> None:
+    # [FUNCTION DOC] Test: runs the padded-layout worker across processes.
     run_multiprocess(_worker_bshd_layout_metadata)
 
 
 def test_ppo_masked_gae_matches_single_rank_baseline() -> None:
+    # [FUNCTION DOC] Test: runs the masked-case worker across processes.
     run_multiprocess(_worker_masked_case)
 
 
 def _worker_reused_zero_kl(rank: int, world_size: int, port: int) -> None:
+    # [FUNCTION DOC] HELPER: Worker for the skipped-forward case. Init Gloo; grpo args with the
+    # skip-actor-forward-only flag on, KL coefficient 0, gamma 1, lambda 0.95. Rollout data has one
+    # sample (total 7, response 6, reward 3.0, all-ones mask) and no log-probs. Under a two-rank
+    # state, computes advantages and returns (the routine synthesizes zero KL), gathers them across
+    # context-parallel ranks. Then under a one-rank state, builds baseline data with zero log-probs,
+    # no stored advantages/returns, skip flag off, recomputes, and asserts gathered results are
+    # close to the baseline. Destroys the process group at the end.
     init_gloo(rank, world_size, port=port)
     try:
         args = Namespace(
@@ -295,4 +345,5 @@ def _worker_reused_zero_kl(rank: int, world_size: int, port: int) -> None:
 
 
 def test_reused_zero_kl_matches_single_rank_baseline_with_context_parallelism() -> None:
+    # [FUNCTION DOC] Test: runs the skipped-forward zero-KL worker across processes.
     run_multiprocess(_worker_reused_zero_kl)

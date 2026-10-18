@@ -1,3 +1,10 @@
+# [MODULE DOC] Multi-process CPU (Gloo) tests that the tinker (multi-LoRA) loss path gives the same
+# results under context parallelism (cp=2 and cp=4, zigzag layout where each rank holds chunks rank
+# and 2*cp-1-rank of every sequence) as under cp=1. Compared: per-datum target log-probs (exact),
+# the loss summed across ranks, logits gradients on each rank's shard, and the per-datum outputs
+# (sample index, loss, log-probs). Covers every registered tinker loss function, ragged datum
+# shapes (including one that leaves rank 0 without response logits), a single one-token response
+# leaving a rank with no response tokens, and direct vs recomputed loss evaluation.
 """CP>1 consistency tests for the Tinker (multi-LoRA) loss path.
 
 Each case runs the same client batch through cp=1 and cp>1 (zigzag layout:
@@ -34,6 +41,10 @@ EMPTY_RANK_SHAPES = [(9, 1)]
 
 
 def _set_parallel_state(rank: int, world_size: int, tp_group) -> None:
+    # [FUNCTION DOC] HELPER: Installs a global parallel state with all axes trivial (rank 0, size 1)
+    # except context parallel (given rank and world size; the world process group only when world
+    # size exceeds 1) and tensor parallel (rank 0, size 1, the supplied group). Unlike the sft
+    # variant, the intra-dp-with-cp axis stays trivial. Marks the last pipeline stage.
     trivial = GroupInfo(rank=0, size=1, group=None)
     cp = GroupInfo(rank=rank, size=world_size, group=dist.group.WORLD if world_size > 1 else None)
     set_parallel_state(
@@ -52,10 +63,18 @@ def _set_parallel_state(rank: int, world_size: int, tp_group) -> None:
 
 
 def _make_datums(shapes: list[tuple[int, int]]) -> list[dict]:
+    # [FUNCTION DOC] HELPER: Generates one datum dictionary per (total length, response length)
+    # pair using a generator seeded 7. Loss mask is ones except zeros at response position 2 for
+    # datum 0 and position 0 for datum 1 (skipped if beyond the response). Fields: token ids
+    # (random below vocab 64), target tokens (list of random ids), advantages (normal list), loss
+    # weights (absolute normal plus 0.5, list), rollout log-probs (normal times 2 minus 3), the
+    # loss mask, and logits (total length by vocab, normal).
     g = torch.Generator()
     g.manual_seed(7)
 
     def randn(*shape):
+        # [FUNCTION DOC] HELPER: Draws a float32 standard normal tensor of the given shape from the
+        # seeded generator.
         return torch.randn(*shape, generator=g, dtype=torch.float32)
 
     datums = []
@@ -78,6 +97,10 @@ def _make_datums(shapes: list[tuple[int, int]]) -> list[dict]:
 
 
 def _batch(datums: list[dict], rollout_log_probs: list, loss_fn: str) -> dict:
+    # [FUNCTION DOC] HELPER: Builds the client batch dictionary from datums: the loss function
+    # name, token ids, targets, total lengths (token counts), response lengths (target counts),
+    # advantages, loss weights, the supplied rollout log-probs (full or already context-parallel
+    # sliced), loss masks, sample indices 0..n-1, and dynamic global batch size equal to the count.
     return {
         "loss_fn": loss_fn,
         "unconcat_tokens": [d["unconcat_tokens"] for d in datums],
@@ -102,6 +125,18 @@ def _run_case(
     shapes: list[tuple[int, int]],
     recompute: bool = False,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Per-rank worker. Initializes Gloo, creates one single-rank group per
+    # rank for tensor parallel, builds args (multi-LoRA, dynamic global batch size equal to the
+    # datum count, chunk size 64, optional recompute of the loss). Reference pass (cp=1): full
+    # packed logits requiring grad, loss through the dispatcher, per-datum target log-probs,
+    # backward, logits gradient. Context-parallel pass: sets the state for this rank, takes each
+    # datum's zigzag shard of logits (concatenated, requiring grad) and pre-slices rollout log-probs
+    # per datum like the real data path does, runs the same loss, log-probs and backward. Asserts:
+    # client vectors (advantages, loss weights, loss masks) in the batch keep full response length
+    # (slicing is never in place); (a) gathered per-token log-probs equal the reference exactly;
+    # (b) the loss all-reduced over ranks matches the reference within 1e-6; (c) the local logits
+    # gradient equals this rank's zigzag shard of the reference gradient within 1e-6; (d) per-datum
+    # outputs have identical sample indices, matching losses (1e-6) and exactly equal log-probs.
     init_gloo(rank, world_size, port=port)
     tp_group = [dist.new_group([r]) for r in range(world_size)][rank]
 
@@ -189,10 +224,14 @@ def _run_case(
 @pytest.mark.parametrize("shapes", [DATUM_SHAPES, EMPTY_RANK_SHAPES], ids=["ragged", "empty_rank"])
 @pytest.mark.parametrize("loss_fn", sorted(tinker_losses.TINKER_LOSS_FUNCTIONS))
 def test_tinker_cp2_matches_cp1(loss_fn: str, shapes: list[tuple[int, int]]) -> None:
+    # [FUNCTION DOC] Test (parametrized over every registered tinker loss and over ragged vs
+    # empty-rank shapes): runs the worker on two processes.
     run_multiprocess(partial(_run_case, loss_fn=loss_fn, shapes=shapes))
 
 
 @pytest.mark.parametrize("recompute", [False, True], ids=["direct", "recompute"])
 @pytest.mark.parametrize("loss_fn", ["importance_sampling", "cross_entropy"])
 def test_tinker_cp4_matches_cp1(loss_fn: str, recompute: bool) -> None:
+    # [FUNCTION DOC] Test (parametrized over importance sampling / cross entropy and direct /
+    # recomputed loss): runs the worker on four processes with the ragged datum shapes.
     run_multiprocess(partial(_run_case, loss_fn=loss_fn, shapes=DATUM_SHAPES, recompute=recompute), world_size=4)

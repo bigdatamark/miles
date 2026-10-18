@@ -1,3 +1,8 @@
+# [MODULE DOC] CPU tests for the FSDP train actor's step logic with mocked collaborators:
+# a rollout-only debug step trains nothing but returns a normal outcome, and the log-prob pass
+# requests and passes the rollout sampling-support mask only for the actor (not the reference) pass
+# and only when sampling-support replay is on. Actors are built without their constructors and
+# module-level helpers in the base actor module are monkeypatched.
 from argparse import Namespace
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
@@ -14,10 +19,16 @@ from miles.backends.training_utils.types import TrainStepOutcome, TrainStepOutpu
 
 @contextmanager
 def _noop_timer(_name: str) -> Iterator[None]:
+    # [FUNCTION DOC] HELPER: Context manager replacing the timing context; ignores the name and
+    # yields once with no effect.
     yield
 
 
 def test_fsdp_train_debug_rollout_only_returns_a_normal_output(monkeypatch):
+    # [FUNCTION DOC] Test: an actor with offload off and the rollout-only debug flag on, with mock
+    # heartbeat, train core and wake up, and patched rollout fetch (returning an empty-token
+    # dictionary and a null context) and no-op timers. Calling train for step 3 returns a train
+    # output with normal outcome and never calls the train core.
     """A debug-rollout-only FSDP step trains nothing yet answers the driver with a NORMAL output."""
     actor = object.__new__(actor_module.FSDPTrainRayActor)
     actor.args = Namespace(offload_train=False, debug_rollout_only=True)
@@ -47,6 +58,14 @@ def test_fsdp_train_debug_rollout_only_returns_a_normal_output(monkeypatch):
 def test_only_the_actor_pass_scores_replay_rollout_sampling_support(
     monkeypatch, store_prefix, use_sampling_support_replay, expected
 ):
+    # [FUNCTION DOC] Test (parametrized: actor prefix with replay on expects true; reference prefix
+    # with replay on expects false; actor prefix with replay off expects false): builds an actor
+    # with a fake profiler and a fake runner whose forward-only step applies the compute callback
+    # to zero logits per batch. Patches batch fetch (recording requested keys and returning one
+    # sequence of length 1), rollout sampling mask getter, the log-prob/entropy function (capturing
+    # keyword arguments) and result aggregation. After calling the log-prob method, asserts the
+    # captured sampling mask argument is the supplied mask object exactly when expected, and the
+    # sampling-mask ids key was requested exactly when expected.
     actor = object.__new__(actor_module.FSDPTrainRayActor)
     actor.args = Namespace(
         use_sampling_support_replay=use_sampling_support_replay,
@@ -62,6 +81,8 @@ def test_only_the_actor_pass_scores_replay_rollout_sampling_support(
     requested_keys = []
 
     def get_batch(_iterator, keys, *_args, **_kwargs):
+        # [FUNCTION DOC] HELPER: Fake batch getter; records the requested keys and returns a
+        # one-sequence batch (tokens, total/response length 1, no max sequence lengths).
         requested_keys.append(list(keys))
         return {
             "unconcat_tokens": [torch.tensor([0])],
@@ -71,6 +92,8 @@ def test_only_the_actor_pass_scores_replay_rollout_sampling_support(
         }
 
     def get_log_probs_and_entropy(**kwargs):
+        # [FUNCTION DOC] HELPER: Fake log-prob function; stores all keyword arguments in the
+        # captured dictionary and returns a result with zero log-probs of length 1.
         captured.update(kwargs)
         return {"log_probs": [torch.zeros(1)]}
 

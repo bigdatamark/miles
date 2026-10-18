@@ -1,3 +1,10 @@
+# [MODULE DOC] CPU tests for the tinker loss path's per-datum outputs and objectives with the
+# target log-prob routine and sum-of-sample-mean helper replaced by trivial fakes: outputs are
+# independent per loss pass and detached (also when the loss is recomputed during backward and
+# must not append duplicate outputs); a zero loss mask removes a datum from every objective with no
+# gradient; and for each objective (importance sampling, ppo with default/override clipping, cispo
+# with default/override clipping, dro with default/override beta) the loss, logits gradient and
+# per-datum outputs match hand-computed values, with masked tokens contributing nothing.
 """Per-datum outputs belong to their loss pass, including when backward recomputes the loss."""
 
 from argparse import Namespace
@@ -13,6 +20,12 @@ from .loss_test_utils import make_parallel_state
 
 @pytest.mark.parametrize("recompute", [False, True], ids=["direct", "recomputed"])
 def test_loss_passes_return_independent_detached_outputs(monkeypatch, recompute):
+    # [FUNCTION DOC] Test (parametrized: direct vs recomputed loss): runs the dispatcher twice with
+    # cross-entropy batches (sample indices 7 then 11; weights 2 and 3; log-probs -0.5 and -0.25
+    # used as logits, patched through the target log-prob routine). Each pass: backward gives
+    # gradients -2 and -3, logging keys are just the loss, logged value list is [1.0, 1.75]. After
+    # both passes: per-pass outputs carry their own sample index, each has exactly one entry (the
+    # recompute does not append another), loss 1.75, log-probs [-0.5, -0.25], both detached.
     make_parallel_state()
     monkeypatch.setattr(loss_module, "get_sum_of_sample_mean", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(tinker_losses, "_target_logprobs", lambda _args, _batch, logits: [logits])
@@ -54,6 +67,10 @@ def test_loss_passes_return_independent_detached_outputs(monkeypatch, recompute)
 
 @pytest.mark.parametrize("loss_fn", sorted(tinker_losses.TINKER_LOSS_FUNCTIONS))
 def test_a_zero_loss_mask_removes_the_datum_from_every_objective(monkeypatch, loss_fn):
+    # [FUNCTION DOC] Test (parametrized over every registered tinker loss): one datum with an
+    # all-zero loss mask (a data-parallel padding datum), rollout log-probs different from the
+    # scores so that the DRO divergence term would be nonzero. Calling the loss function directly
+    # gives exactly zero loss and exactly zero total absolute gradient.
     make_parallel_state()
     logprobs = torch.tensor([-0.5, -0.25], requires_grad=True)
     monkeypatch.setattr(tinker_losses, "_target_logprobs", lambda _args, _batch, logits: [logits])
@@ -98,6 +115,17 @@ def test_a_zero_loss_mask_removes_the_datum_from_every_objective(monkeypatch, lo
     ids=["is", "ppo-default", "ppo-override", "cispo-default", "cispo-override", "dro-default", "dro-override"],
 )
 def test_nonzero_objectives_and_gradients(monkeypatch, recompute, loss_fn, config, token_losses, gradients):
+    # [FUNCTION DOC] Test (parametrized over direct/recomputed and seven objective settings): two
+    # datums (3 and 5 response tokens, last two tokens of the second masked) with float64 scores
+    # all -1 and sampling log-probs chosen so the importance ratios are 0.5, 0.5, 1, 1, 5, 5, 0.5,
+    # 5 (advantages of both signs cross each clipping boundary). Runs the dispatcher with sample
+    # indices 7 and 11 and a dynamic global batch size 4, then backward. Expected per-token losses
+    # and gradients are given by the parameters; for dro they are computed from the advantages and
+    # beta (0.05 default, 0.5 override) as advantage plus beta/2 times the squared log-ratio, with
+    # gradient minus advantage plus beta times log-ratio. Asserts the total loss equals the sum of
+    # the expected per-datum sums, the score gradient equals expected gradients padded with zeros
+    # for the two masked tokens, per-datum outputs have sample indices 7 and 11, per-datum losses
+    # and log-probs match, and none of the outputs require grad.
     make_parallel_state()
     monkeypatch.setattr(loss_module, "get_sum_of_sample_mean", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(tinker_losses, "_target_logprobs", lambda _args, _batch, logits: [logits[:3], logits[3:]])

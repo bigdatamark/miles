@@ -1,3 +1,13 @@
+# [MODULE DOC] CPU tests for reusing training log-probs in the policy loss when the actor
+# forward-only pass is skipped: the loss, gradient and metrics with reuse must be bit-identical to
+# an explicit detached baseline (grpo, gspo and grpo with importance sampling; the gspo case also
+# checks per-sample gathers); with rollout log-probs used as the old policy the metrics still
+# reflect a nonzero old/new gap; train-rollout metrics use trainer scores independent of the loss
+# baseline; missing old-policy log-probs are rejected with specific errors; advantage computation
+# synthesizes zero-KL reference scores only on the last pipeline stage and detaches fixed scores;
+# the dispatcher passes only the args to the loss function (also not applying the skip to the value
+# loss); and mismatch-metric correction functions receive detached actor log-probs. A module-scoped
+# fixture ensures a one-rank Gloo process group.
 from __future__ import annotations
 
 from unittest.mock import Mock
@@ -19,6 +29,9 @@ from .loss_test_utils import deep_clone, make_args, make_batch, make_inputs, mak
 
 @pytest.fixture(scope="module")
 def process_group(tmp_path_factory):
+    # [FUNCTION DOC] HELPER: Module-scoped fixture; if a process group already exists, does nothing;
+    # otherwise initializes a one-rank Gloo group with a file rendezvous in a temp dir and destroys
+    # it afterwards (also on failure).
     if dist.is_initialized():
         yield
         return
@@ -32,6 +45,9 @@ def process_group(tmp_path_factory):
 
 
 def _run_policy_loss(args, batch, inputs, *, skip_actor_forward_only):
+    # [FUNCTION DOC] HELPER: Sets the skip-actor-forward-only flag on args (mutation), clones the
+    # policy logits with gradient enabled, builds the sum-of-sample-mean reducer from the batch,
+    # runs the policy loss, backpropagates. Returns (detached loss, metrics, clone of logits grad).
     args.skip_actor_forward_only = skip_actor_forward_only
     logits = deep_clone(inputs["policy_logits"])
     logits.requires_grad_(True)
@@ -67,6 +83,13 @@ def test_reused_training_log_probs_match_an_explicit_detached_baseline(
     use_tis,
     monkeypatch,
 ):
+    # [FUNCTION DOC] Test (parametrized over grpo, gspo, grpo with importance sampling): computes the
+    # policy loss with the batch's old-policy log-probs removed and the skip flag on (log-probs are
+    # reused from the training forward), and again with explicit detached log-probs computed
+    # separately and the skip flag off. Asserts the losses and logits gradients are exactly equal,
+    # the gradient is nonzero, metrics have the same keys and exactly equal values, and ppo_kl and
+    # clip fraction are zero. For gspo, the per-sample gather function is spied and must be called
+    # once per sample in the reuse pass.
     parallel_state = make_parallel_state()
     parallel_state.tp = GroupInfo(rank=0, size=1, group=dist.group.WORLD)
     args = make_args(
@@ -131,6 +154,10 @@ def test_reused_training_log_probs_match_an_explicit_detached_baseline(
 
 
 def test_skip_actor_forward_only_preserves_rollout_log_probs_as_old_policy(process_group):
+    # [FUNCTION DOC] Test: with rollout log-probs used as the old policy and set to the trainer's
+    # log-probs plus 0.25, the loss with the skip flag on and off is exactly equal in loss, gradient
+    # and all metrics, while ppo_kl, train-rollout log-prob absolute difference and train-rollout
+    # KL are all positive (the old-policy gap is preserved, not zeroed).
     parallel_state = make_parallel_state()
     parallel_state.tp = GroupInfo(rank=0, size=1, group=dist.group.WORLD)
     args = make_args(
@@ -178,6 +205,9 @@ def test_skip_actor_forward_only_preserves_rollout_log_probs_as_old_policy(proce
 
 @pytest.mark.parametrize("use_rollout_logprobs", [False, True])
 def test_train_rollout_metrics_use_trainer_scores_independent_of_loss_baseline(process_group, use_rollout_logprobs):
+    # [FUNCTION DOC] Test (parametrized over the rollout-log-probs-as-baseline flag): batch with
+    # trainer log-probs and rollout log-probs equal to them plus 0.25. The reported train-rollout
+    # absolute difference is approximately 0.25 and train-rollout KL is positive in both settings.
     make_parallel_state()
     args = make_args(
         entropy_coef=0.0,
@@ -216,6 +246,12 @@ def test_policy_loss_rejects_missing_old_policy_log_probs(
     use_rollout_logprobs,
     remove_old,
 ):
+    # [FUNCTION DOC] Test (parametrized: normal estimator without skip, and skip with rollout
+    # baseline; in both the old-policy entry is removed): the policy loss raises a value error
+    # mentioning old-policy log-probs when the baseline is trainer log-probs, and an assertion
+    # error saying rollout log-probs must be provided when the rollout baseline is used.
+    # KNOWN ISSUE: the remove flag is true in every parametrization, so the no-removal branch is
+    # never exercised.
     make_parallel_state()
     args = make_args(
         entropy_coef=0.0,
@@ -250,6 +286,11 @@ def test_policy_loss_rejects_missing_old_policy_log_probs(
 
 @pytest.mark.parametrize("is_pp_last_stage", [False, True])
 def test_skip_actor_forward_only_synthesizes_zero_kl_only_on_the_last_pipeline_stage(is_pp_last_stage):
+    # [FUNCTION DOC] Test (parametrized over last-stage or not): with the skip flag on and KL
+    # coefficient 0, rollout data lacking log-probs, reference log-probs and values. On a non-last
+    # stage no advantages or returns are produced. On the last stage, advantages and returns equal
+    # exactly those from a baseline run with the skip flag off on rollout data that still has
+    # log-probs and reference log-probs (only values removed).
     parallel_state = make_parallel_state()
     parallel_state.is_pp_last_stage = is_pp_last_stage
     args = make_args(kl_coef=0.0, skip_actor_forward_only=True, true_on_policy_mode=False)
@@ -275,6 +316,9 @@ def test_skip_actor_forward_only_synthesizes_zero_kl_only_on_the_last_pipeline_s
 
 
 def test_skip_actor_forward_only_detaches_fixed_scores_without_precomputed_log_probs():
+    # [FUNCTION DOC] Test: last stage, skip flag on, rollout data without log-probs or values and
+    # with reference and teacher log-probs computed from leaf tensors requiring grad. After the
+    # advantage computation both entries have no gradient history and do not require grad.
     parallel_state = make_parallel_state()
     parallel_state.is_pp_last_stage = True
     args = make_args(kl_coef=0.0, skip_actor_forward_only=True, true_on_policy_mode=False)
@@ -296,6 +340,9 @@ def test_skip_actor_forward_only_detaches_fixed_scores_without_precomputed_log_p
 
 @pytest.mark.parametrize("skip_actor_forward_only", [False, True])
 def test_loss_dispatcher_uses_args_without_extra_policy_kwargs(monkeypatch, skip_actor_forward_only):
+    # [FUNCTION DOC] Test (parametrized over the skip flag): the loss-function getter is replaced
+    # to return a mock policy loss. After calling the dispatcher, the mock was called with the args
+    # object as the first positional argument and no keyword arguments.
     make_parallel_state()
     args = make_args(
         observe_training_entropy=False,
@@ -320,6 +367,9 @@ def test_loss_dispatcher_uses_args_without_extra_policy_kwargs(monkeypatch, skip
 
 
 def test_loss_dispatcher_does_not_apply_actor_skip_to_value_loss(monkeypatch):
+    # [FUNCTION DOC] Test: with the value loss type and the skip flag on, the dispatcher calls the
+    # (mocked) value loss with the args object as first positional argument and no keyword
+    # arguments.
     make_parallel_state()
     args = make_args(loss_type="value_loss", skip_actor_forward_only=True)
     inputs = make_inputs(seed=23, batch_size=1, prompt_lens=[3], response_lens=[2], vocab_size=8, args=args)
@@ -336,6 +386,12 @@ def test_loss_dispatcher_does_not_apply_actor_skip_to_value_loss(monkeypatch):
 
 @pytest.mark.parametrize("skip_actor_forward_only", [False, True])
 def test_mismatch_metrics_keep_actor_log_probs_as_training_source(process_group, monkeypatch, skip_actor_forward_only):
+    # [FUNCTION DOC] Test (parametrized over the skip flag): with a custom correction function path
+    # and mismatch metrics on, the function loader is replaced by a fake correction function. The
+    # fake asserts the train log-probs it receives exist, do not require grad, and equal the
+    # expected ones (the batch's own when not skipping; freshly computed from the logits when
+    # skipping and the batch's were removed). It returns the pg loss and loss masks unchanged with
+    # empty metrics. The test just runs the policy loss under each setting.
     parallel_state = make_parallel_state()
     parallel_state.tp = GroupInfo(rank=0, size=1, group=dist.group.WORLD)
     args = make_args(
@@ -362,6 +418,9 @@ def test_mismatch_metrics_keep_actor_log_probs_as_training_source(process_group,
         expected_train_log_probs = batch["log_probs"]
 
     def fake_tis_function(**kwargs):
+        # [FUNCTION DOC] HELPER: Fake correction function; asserts the train log-probs keyword is
+        # present, none require grad and each equals the expected train log-probs exactly. Returns
+        # the pg loss, loss masks and an empty metrics dictionary.
         assert kwargs["train_log_probs"] is not None
         assert all(not log_prob.requires_grad for log_prob in kwargs["train_log_probs"])
         for actual, expected in zip(kwargs["train_log_probs"], expected_train_log_probs, strict=True):

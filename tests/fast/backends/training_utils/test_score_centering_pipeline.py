@@ -1,3 +1,11 @@
+# [MODULE DOC] CPU end-to-end style tests of score centering candidate transport through the real
+# rollout and training consumers: a two-turn multi-turn sample is merged, trimmed, encoded and
+# decoded over the wire, converted to train data, split across data-parallel ranks, and its loss and
+# gradient compared with a hand-built dense reference (modes none/tis/mis, CI checks on/off; padded
+# vocabulary and observation tokens get zero gradient, NaN observation rows are ignored, train-rollout
+# KL metric checked); and shared advantage computation with loss scaling (per-token or per-sample,
+# recomputed or not) combined with entropy and unbiased KL regularization. Uses shared fixtures for
+# args, a fake tokenizer and turn samples.
 """Exercise candidate transport through the real rollout and training consumers."""
 
 from copy import deepcopy
@@ -21,6 +29,8 @@ from miles.utils.types import Sample
 
 @pytest.fixture
 def single_rank(monkeypatch: pytest.MonkeyPatch) -> None:
+    # [FUNCTION DOC] HELPER: Fixture; replaces the global parallel state in the parallel module
+    # (restored at teardown) with a state whose eight axes are all one trivial single-rank group.
     singleton = GroupInfo(rank=0, size=1, group=None)
     monkeypatch.setattr(
         parallel,
@@ -34,6 +44,18 @@ def single_rank(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.parametrize("mode", ["none", "tis", "mis"])
 @pytest.mark.parametrize("ci_test", [False, True])
 def test_multiturn_wire_dp_split_and_training_gradient(single_rank: None, mode: str, ci_test: bool) -> None:
+    # [FUNCTION DOC] Test (modes none/tis/mis; CI off/on): merges two turn samples (loss mask
+    # [1,1,0,1,1], observation row has no candidates: ids -1 and log-probs negative infinity),
+    # strips the last output token, round-trips through the wire codec (restored candidate ids
+    # [[2,3,-1],[2,3,-1],[-1,-1,-1],[4,5,-1]] and equal log-probs). The restored sample gets reward
+    # 1.0 / index 0; a deep copy gets index 1 / reward -0.7. Converts both to train data and splits
+    # for 2 data-parallel ranks (takes shard 1); candidate ids survive. The batch is completed
+    # (lengths, tokens, masks, rollout log-probs; advantages -0.7) and the observation row's rollout
+    # log-prob and advantage are set to NaN to prove no leakage. The configured loss function's
+    # gradient w.r.t. random logits (width 10, vocabulary 8, temperature 0.7) is compared (2e-6)
+    # with a dense reference loss reduced with the same reducer. Also: loss and all metrics finite;
+    # zero gradient at the observation position and in the padded vocabulary columns; the
+    # train-rollout KL metric equals an independent clamped k3 over trainable tokens and has no grad.
     first = _turn([0, 1], [2, 3], [0.5, 0.25])
     second = _turn([0, 1, 2, 3, 6], [4, 5], [0.55, 0.2])
     merged = merge_samples([first, second], _Tokenizer())
@@ -97,6 +119,16 @@ def test_multiturn_wire_dp_split_and_training_gradient(single_rank: None, mode: 
 def test_shared_advantages_loss_scaling_and_regularization(
     single_rank: None, per_token: bool, recompute: bool
 ) -> None:
+    # [FUNCTION DOC] Test (per-token loss off/on; loss recomputation off/on): args with rollout
+    # log-probs as baseline, no KL coefficient on rewards, entropy coefficient 0.03, unbiased k2 KL
+    # loss with coefficient 0.1, global batch size 1. One turn sample is converted; the batch gets
+    # lengths, tokens, loss mask [1,0], rollout mask sum 1, rollout log-probs [log 0.5, NaN] and
+    # reference [-0.8, NaN]; shared advantage computation runs. The loss dispatcher is called with
+    # micro-batch count 2 and Megatron loss scaling. Reference: score centering loss with unit
+    # advantage on the support {2,3} at temperature 0.7, minus 0.03 times entropy, plus 0.1 times the
+    # unbiased k2 term; scaled by 1 for per-token loss, else by 2 (the micro-batch count). Asserts
+    # loss and gradient match (gradient tolerance 1e-6 / 1e-5), the normalizer is 1, and the log
+    # keys include entropy loss, KL loss and train-rollout KL.
     args = _args(
         use_rollout_logprobs=True,
         skip_actor_forward_only=False,

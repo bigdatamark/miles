@@ -1,3 +1,7 @@
+# [MODULE DOC] CPU tests for the Qwen3 dense true-on-policy patch in the FSDP backend: the final
+# norm replacement and its idempotence, contract gating of the instance patch hook, the final norm's
+# bf16 rounding order, which parameter names keep fp32 when syncing weights, preservation of fp32
+# values after an update, and that the reference model is created with fp32 master storage.
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -20,6 +24,11 @@ from miles.true_on_policy.contracts import QWEN3_DENSE_TRUE_ON_POLICY_V1
 
 
 def test_qwen3_patch_changes_only_final_norm_and_is_idempotent():
+    # [FUNCTION DOC] Test: on a tiny Qwen3 causal LM, the patch reports true the first time and
+    # false the second. The final norm object and its weight are the same objects but now an
+    # instance of the special final norm class; the per-layer input, post-attention and q norms keep
+    # the stock class; the final norm weight stays in the state dictionary; a model built afterwards
+    # has the stock final norm (the patch is per-instance, not global).
     config = _tiny_config()
     model = modeling_qwen3.Qwen3ForCausalLM(config)
     final_norm = model.model.norm
@@ -41,6 +50,8 @@ def test_qwen3_patch_changes_only_final_norm_and_is_idempotent():
 
 
 def _tiny_config():
+    # [FUNCTION DOC] HELPER: Returns a tiny Qwen3 config: vocab 32, hidden 16, intermediate 32, one
+    # layer, two attention heads, one key-value head, head dim 8.
     return Qwen3Config(
         vocab_size=32,
         hidden_size=16,
@@ -53,6 +64,10 @@ def _tiny_config():
 
 
 def test_qwen3_instance_patch_registry_is_contract_gated(monkeypatch):
+    # [FUNCTION DOC] Test: the registered qwen3 dense hook is replaced by a recording function.
+    # Applying instance patches with each of four non-qualifying combinations (mode off; no
+    # contract; moe model type; fp16) never calls it. With qwen3, mode on, formal contract and no
+    # fp16, the hook reports it applies and applying patches calls it exactly once with the model.
     from miles.backends.fsdp_utils.models import qwen3 as qwen3_model
 
     hook = {hook.name: hook for hook in _MODEL_INSTANCE_PATCH_HOOKS}["qwen3_dense_true_on_policy"]
@@ -94,6 +109,10 @@ def test_qwen3_instance_patch_registry_is_contract_gated(monkeypatch):
 
 
 def test_qwen3_final_norm_uses_contract_rounding_order():
+    # [FUNCTION DOC] Test: with a seeded random fp32 weight and input of shape 4 by 16, the final
+    # norm output is bf16 and bit-equal to bf16(weight) times bf16(normalized input), where
+    # normalization is fp32 root-mean-square scaling with the layer's epsilon; and differs from
+    # rounding after multiplying in fp32 (so the rounding order is what is pinned).
     norm = Qwen3FinalRMSNorm(16, eps=1e-6).to(torch.float32)
     torch.manual_seed(1)
     norm.weight.data.copy_(torch.randn_like(norm.weight))
@@ -120,6 +139,8 @@ def test_qwen3_final_norm_uses_contract_rounding_order():
     ],
 )
 def test_qwen3_formal_sync_preserves_fp32_contract_parameters(name):
+    # [FUNCTION DOC] Test (parametrized over embedding, layer input/post-attention norms, q and k
+    # norms): the sync dtype resolver returns fp32 even when the checkpoint dtype is bf16.
     assert resolve_qwen3_dense_sync_dtype(name, torch.bfloat16) is torch.float32
 
 
@@ -133,10 +154,17 @@ def test_qwen3_formal_sync_preserves_fp32_contract_parameters(name):
     ],
 )
 def test_qwen3_formal_sync_keeps_bf16_math_parameters_at_checkpoint_dtype(name):
+    # [FUNCTION DOC] Test (parametrized over q projection, mlp gate projection, final norm, lm
+    # head): the sync dtype resolver returns the checkpoint dtype (bf16) unchanged.
     assert resolve_qwen3_dense_sync_dtype(name, torch.bfloat16) is torch.bfloat16
 
 
 def test_qwen3_formal_sync_preserves_post_update_fp32_values():
+    # [FUNCTION DOC] Test: builds a bf16 tiny model, resolves the formal policy and casts to fp32
+    # master with its resolver. Adds a tiny increment (1e-6) in place to one fp32-synced parameter
+    # (layer input norm) and one bf16-synced parameter (final norm). Casting each to its recorded
+    # sync dtype: the fp32 one equals the updated parameter exactly; the bf16 one, converted back to
+    # fp32, differs from it (precision lost).
     model = modeling_qwen3.Qwen3ForCausalLM(_tiny_config()).to(torch.bfloat16)
     policy = resolve_precision_policy(
         model.config,
@@ -165,6 +193,13 @@ def test_qwen3_formal_sync_preserves_post_update_fp32_values():
 
 
 def test_qwen3_ref_model_uses_fp32_master_storage(monkeypatch):
+    # [FUNCTION DOC] Test: builds a train actor without running its constructor and fills in args,
+    # hf config, hub kernels, precision policy and stub hooks (init context, a model class whose
+    # loader returns a bf16 tiny model, a state-dict loader returning the model). Patches the
+    # directory check to true, the rank to 0, the parallel state to expose an fsdp mesh, and the
+    # fsdp2 wrapper to a recorder capturing parameter dtypes and sync dtypes. Creating the ref model
+    # asserts: all params seen by the wrapper are fp32; embedding sync dtype fp32, q projection sync
+    # dtype bf16; and the returned ref model's parameters are all fp32.
     from miles.backends.fsdp_utils import actor as actor_module
 
     config = _tiny_config()
@@ -190,6 +225,8 @@ def test_qwen3_ref_model_uses_fp32_master_storage(monkeypatch):
     captured = {}
 
     def capture_apply_fsdp2(model, **kwargs):
+        # [FUNCTION DOC] HELPER: Recorder replacing the fsdp2 wrapper; stores the set of parameter
+        # dtypes and the sync dtype mapping, and returns the model unchanged.
         captured["dtypes"] = {param.dtype for param in model.parameters()}
         captured["sync_dtypes"] = model._fsdp_sync_dtypes
         return model

@@ -1,3 +1,12 @@
+# [MODULE DOC] HELPER: Shared utilities for loss function snapshot tests. Provides a trivial
+# single-process parallel state, default argument sets for the loss code paths, deterministic
+# seeded input generation (per-sample tensors plus packed or padded logits), builders for the
+# rollout-data and batch dictionaries consumed by advantage and loss functions, deep cloning, a
+# recursive output comparison with an absolute tolerance on tensors, and snapshot save/load plus
+# lookup of a snapshot directory (shallow-cloning an external artifacts repository into a cache
+# under the home directory when no local snapshot files exist).
+# KNOWN ISSUE: the usage example in the docstring below mentions a function that runs all loss
+# functions, which is not defined in this module (it lives in the callers).
 """Utilities for loss function snapshot testing.
 
 Provides deterministic input generation, snapshot save/load, and recursive
@@ -41,7 +50,13 @@ ARTIFACTS_CACHE = Path.home() / ".cache" / "miles-test-artifacts"
 
 
 def make_parallel_state(is_pp_last_stage: bool = True) -> ParallelState:
+    # [FUNCTION DOC] HELPER: Builds a single-process parallel state where all axes are trivial
+    # (rank 0, size 1, no group) except: the tensor-parallel axis uses the world process group when
+    # distributed is initialized (needed by the fused vocab-parallel cross entropy), else none; and
+    # when is_pp_last_stage is false the pipeline axis has size 2 (rank 0). Records the last-stage
+    # flag, installs the state as the process-global parallel state (side effect), and returns it.
     def _trivial_group() -> GroupInfo:
+        # [FUNCTION DOC] HELPER: Returns a rank 0, size 1 group info with no process group.
         return GroupInfo(rank=0, size=1, group=None)
 
     # The fused vocab-parallel CE needs a real group object; use the 1-rank
@@ -115,15 +130,23 @@ _ARGS_DEFAULTS = dict(
 
 
 def make_args(**overrides) -> Namespace:
+    # [FUNCTION DOC] HELPER: Returns an argument namespace made from the module defaults updated
+    # with the keyword overrides (unknown keys are accepted and added).
+    # KNOWN ISSUE: a comment on the defaults says the global batch size is overridden by the input
+    # generator, but the generator never changes it; the default of 1 stays unless overridden here.
     d = {**_ARGS_DEFAULTS, **overrides}
     return Namespace(**d)
 
 
 def args_to_dict(args: Namespace) -> dict:
+    # [FUNCTION DOC] HELPER: Returns the namespace's attribute dictionary itself (not a copy, so
+    # later mutation of the namespace is visible through it).
     return vars(args)
 
 
 def args_from_dict(d: dict) -> Namespace:
+    # [FUNCTION DOC] HELPER: Rebuilds a namespace from a saved dictionary, with module defaults
+    # filling keys missing from the dictionary (so older snapshots lacking newer args still load).
     return Namespace(**{**_ARGS_DEFAULTS, **d})
 
 
@@ -140,6 +163,19 @@ def make_inputs(
     vocab_size: int,
     args: Namespace,
 ) -> dict:
+    # [FUNCTION DOC] HELPER: Builds a dictionary of deterministic inputs from a seeded CPU random
+    # generator. Requires (assertion) that prompt and response length lists both have batch_size
+    # entries. Total length per sample is prompt plus response. Per-sample tensors in draw order:
+    # token ids (uniform integers below vocab size, total length), policy log-probs, reference
+    # log-probs, rollout log-probs (each normal samples scaled by 2 minus 3, response length),
+    # loss masks (all ones), rewards (python floats drawn from the generator), values, advantages,
+    # returns (standard normal, response length), teacher log-probs (like log-probs but total
+    # length). Logits: when the args qkv format is padded (bshd), max sequence length is the
+    # largest total and logits shapes are batch by max length by vocab (policy) and by 1 (value),
+    # max_seq_lens lists that max per sample; otherwise (packed) shapes are 1 by sum of totals by
+    # vocab / 1 and max_seq_lens is none. Returns a dictionary with the seed, sizes, argument
+    # dictionary, total lengths, max sequence lengths and all tensors above. Ordering of draws
+    # matters for reproducing saved snapshots.
     """Generate deterministic test inputs from a seed."""
     assert len(prompt_lens) == len(response_lens) == batch_size
     total_lens = [p + r for p, r in zip(prompt_lens, response_lens, strict=True)]
@@ -148,9 +184,13 @@ def make_inputs(
     g.manual_seed(seed)
 
     def randn(shape):
+        # [FUNCTION DOC] HELPER: Draws a float32 standard normal tensor of the shape from the seeded
+        # generator.
         return torch.randn(shape, generator=g, dtype=torch.float32)
 
     def randint(low, high, shape):
+        # [FUNCTION DOC] HELPER: Draws an int64 tensor of the shape with values in [low, high) from
+        # the seeded generator.
         return torch.randint(low, high, shape, generator=g, dtype=torch.int64)
 
     # Per-sample tensors
@@ -209,6 +249,10 @@ def make_inputs(
 
 
 def make_rollout_data(inputs: dict) -> dict:
+    # [FUNCTION DOC] HELPER: Builds the rollout data dictionary for the advantage computation from
+    # generated inputs: deep copies of log-probs, reference log-probs, rollout log-probs, values,
+    # loss masks and teacher log-probs, plain list copies of rewards, response lengths and total
+    # lengths; adds max sequence lengths (copied) only when the inputs have them.
     """Build the rollout_data dict consumed by compute_advantages_and_returns."""
     d = dict(
         log_probs=deep_clone(inputs["log_probs"]),
@@ -227,6 +271,11 @@ def make_rollout_data(inputs: dict) -> dict:
 
 
 def make_batch(inputs: dict, loss_type: str) -> dict:
+    # [FUNCTION DOC] HELPER: Builds the batch dictionary for loss functions from generated inputs:
+    # deep copies of tokens, loss masks, log-probs, reference and rollout log-probs, advantages and
+    # returns; list copies of response and total lengths; max sequence lengths when present; and
+    # the values only when the loss type is the value loss. Rewards, teacher log-probs and logits
+    # are not included.
     """Build the RolloutBatch dict consumed by loss functions."""
     batch = dict(
         unconcat_tokens=deep_clone(inputs["unconcat_tokens"]),
@@ -252,6 +301,9 @@ def make_batch(inputs: dict, loss_type: str) -> dict:
 
 
 def deep_clone(obj):
+    # [FUNCTION DOC] HELPER: Recursively copies a structure: tensors are cloned, dictionaries are
+    # rebuilt with cloned values, lists and tuples are rebuilt (keeping their type) from cloned
+    # elements, anything else gets a shallow copy. Returns the new structure.
     """Recursively clone tensors so in-place ops don't corrupt shared state."""
     if isinstance(obj, torch.Tensor):
         return obj.clone()
@@ -271,6 +323,16 @@ TENSOR_ATOL = 2e-6
 
 
 def assert_outputs_equal(actual, expected, path: str = "root"):
+    # [FUNCTION DOC] HELPER: Recursively asserts that actual equals expected, using a path string in
+    # failure messages. Tensors: actual must be a tensor with identical shape and dtype, and the
+    # maximum absolute elementwise difference (zero when empty) must not exceed the tolerance
+    # (2e-6), else an assertion error reports max and mean difference. Dictionaries: must be
+    # dictionaries with identical key sets (extra and missing keys reported), compared per key.
+    # Lists and tuples: either kind accepted for either, same length, compared per index. Anything
+    # else: compared for equality. Raises assertion errors; returns nothing.
+    # KNOWN ISSUE: the docstring says "<= TENSOR_ATOL" but the code only fails when the maximum
+    # difference exceeds it, which is equivalent; non-finite values (NaN) would not fail the
+    # comparison because a NaN maximum compares false against the tolerance.
     """Recursively compare outputs. Tensors compared with `<= TENSOR_ATOL`."""
     if isinstance(expected, torch.Tensor):
         assert isinstance(actual, torch.Tensor), f"{path}: expected Tensor, got {type(actual)}"
@@ -306,6 +368,11 @@ def assert_outputs_equal(actual, expected, path: str = "root"):
 
 
 def ensure_snapshot_dir(snapshot_dir: Path) -> Path:
+    # [FUNCTION DOC] HELPER: Locates snapshot files. Returns the given directory if it exists and
+    # holds any snapshot (.pt) file; else returns the loss_snapshots folder of the cached clone if
+    # it holds any; else creates the cache directory, shallow-clones (depth 1) the artifacts repo
+    # into it with a subprocess (network access; raises a called-process error on failure), asserts
+    # the loss_snapshots folder exists, and returns it.
     """Return a directory containing .pt snapshots.
 
     If *snapshot_dir* already has .pt files, return it as-is.
@@ -328,11 +395,15 @@ def ensure_snapshot_dir(snapshot_dir: Path) -> Path:
 
 
 def save_snapshot(path: str | Path, inputs: dict, outputs: dict) -> None:
+    # [FUNCTION DOC] HELPER: Creates the parent directory if needed and serializes a dictionary with
+    # the inputs and outputs to the path with torch's saver. Returns nothing.
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"inputs": inputs, "outputs": outputs}, path)
 
 
 def load_snapshot(path: str | Path) -> tuple[dict, dict]:
+    # [FUNCTION DOC] HELPER: Loads a snapshot file with torch's loader (full unpickling, weights-only
+    # disabled, so only trusted files should be loaded) and returns the (inputs, outputs) pair.
     data = torch.load(path, weights_only=False)
     return data["inputs"], data["outputs"]

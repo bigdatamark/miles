@@ -1,3 +1,8 @@
+# [MODULE DOC] CPU-only unit tests for the FSDP precision policy: policy resolution from a model
+# config and args (parameter, reduce and autocast dtypes, fp32 master switch, sync dtype resolver),
+# the command-line default for keeping fp32 master weights, the Qwen3 dense formal true-on-policy
+# contract (fp32 params with bf16 autocast, rejection of fp16 and of disabled fp32 master), the
+# autocast forward context, and recording of per-parameter sync dtypes when casting to fp32 master.
 """Unit tests for the FSDP precision policy (CPU-only)."""
 
 import sys
@@ -18,6 +23,11 @@ from miles.true_on_policy.contracts import QWEN3_DENSE_TRUE_ON_POLICY_V1
 
 
 def test_resolve_precision_policy_uses_independent_fp32_master_switch_and_dtypes():
+    # [FUNCTION DOC] Test: for a dense qwen3 config with bf16 and fp32 master on, the policy keeps
+    # fp32 master, parameter dtype bf16 and reduce dtype fp32. For a different model type (glm4 moe
+    # lite) with fp16 and fp32 master off, master is off, parameter dtype fp16, reduce dtype fp32,
+    # and the policy equals the one resolved for the dense config under the same args (model type
+    # does not matter outside the formal contract).
     dense = SimpleNamespace(model_type="qwen3")
     bf16_args = SimpleNamespace(fp16=False, keep_fp32_master=True)
 
@@ -38,6 +48,8 @@ def test_resolve_precision_policy_uses_independent_fp32_master_switch_and_dtypes
 
 
 def test_fp32_master_cli_defaults_enabled_and_can_be_disabled(monkeypatch):
+    # [FUNCTION DOC] Test: parsing the FSDP command line with no flags enables fp32 master; passing
+    # the negated flag disables it (argv is patched for each parse).
     monkeypatch.setattr(sys, "argv", ["miles"])
     assert parse_fsdp_cli().keep_fp32_master
 
@@ -46,6 +58,9 @@ def test_fp32_master_cli_defaults_enabled_and_can_be_disabled(monkeypatch):
 
 
 def test_fsdp_args_expose_effective_compute_precision(monkeypatch):
+    # [FUNCTION DOC] Test: for no flags (bf16) and the fp16 flag, loads FSDP args with true-on-policy
+    # mode forced on and asserts bf16 equals not fp16, the resolved policy parameter dtype and the
+    # rollout log-prob dtype both equal the expected compute dtype (bf16 or fp16).
     for cli_args, expected_dtype in (([], torch.bfloat16), (["--fp16"], torch.float16)):
         monkeypatch.setattr(sys, "argv", ["miles", *cli_args])
         args = load_fsdp_args()
@@ -57,6 +72,9 @@ def test_fsdp_args_expose_effective_compute_precision(monkeypatch):
 
 
 def test_qwen3_formal_true_on_policy_resolves_fp32_params_with_bf16_autocast():
+    # [FUNCTION DOC] Test: with qwen3 dense, bf16, fp32 master, true-on-policy mode and the formal
+    # Qwen3 dense contract name, the policy has fp32 parameter and reduce dtypes, bf16 autocast
+    # dtype, fp32 master on, and a sync dtype resolver present.
     args = SimpleNamespace(
         fp16=False,
         keep_fp32_master=True,
@@ -82,6 +100,9 @@ def test_qwen3_formal_true_on_policy_resolves_fp32_params_with_bf16_autocast():
     ],
 )
 def test_qwen3_formal_precision_does_not_leak_to_other_modes(model_type, true_on_policy_mode, contract):
+    # [FUNCTION DOC] Test (parametrized over: qwen3 with the mode off, qwen3 with no contract,
+    # qwen3 moe with the contract): the formal contract is not engaged, so the policy has bf16
+    # parameter dtype, no autocast dtype, and no sync dtype resolver.
     policy = resolve_precision_policy(
         SimpleNamespace(model_type=model_type),
         SimpleNamespace(
@@ -98,6 +119,8 @@ def test_qwen3_formal_precision_does_not_leak_to_other_modes(model_type, true_on
 
 
 def test_qwen3_formal_true_on_policy_rejects_fp16():
+    # [FUNCTION DOC] Test: resolving the policy under the formal contract with fp16 raises a value
+    # error saying bf16 training is required.
     with pytest.raises(ValueError, match="requires bf16 training"):
         resolve_precision_policy(
             SimpleNamespace(model_type="qwen3"),
@@ -111,6 +134,8 @@ def test_qwen3_formal_true_on_policy_rejects_fp16():
 
 
 def test_qwen3_formal_true_on_policy_rejects_disabled_fp32_master():
+    # [FUNCTION DOC] Test: resolving the policy under the formal contract with fp32 master disabled
+    # raises a value error saying fp32 master weights are required.
     with pytest.raises(ValueError, match="requires fp32 master weights"):
         resolve_precision_policy(
             SimpleNamespace(model_type="qwen3"),
@@ -124,10 +149,15 @@ def test_qwen3_formal_true_on_policy_rejects_disabled_fp32_master():
 
 
 def test_precision_forward_context_uses_policy_autocast(monkeypatch):
+    # [FUNCTION DOC] Test: replaces torch's autocast with a recording context manager, resolves the
+    # formal Qwen3 policy, enters the precision forward context and asserts autocast was entered
+    # exactly once with device type cuda and dtype bf16.
     entered = []
 
     @contextmanager
     def fake_autocast(*, device_type, dtype):
+        # [FUNCTION DOC] HELPER: Recording stand-in for autocast; appends the device type and dtype
+        # to the list and yields without doing anything.
         entered.append((device_type, dtype))
         yield
 
@@ -149,6 +179,10 @@ def test_precision_forward_context_uses_policy_autocast(monkeypatch):
 
 
 def test_apply_fp32_master_records_sync_dtypes_before_cast():
+    # [FUNCTION DOC] Test: builds a bf16 linear layer plus an extra fp32 parameter, applies the fp32
+    # master cast with a resolver that returns fp32 for the weight and the checkpoint dtype
+    # otherwise. Asserts all parameters become fp32 and the recorded sync dtypes are fp32 for weight,
+    # bf16 for bias (dtype before the cast), and fp32 for the extra parameter.
     m = torch.nn.Linear(4, 4).to(torch.bfloat16)
     m.register_parameter("score_bias", torch.nn.Parameter(torch.zeros(4, dtype=torch.float32)))
 

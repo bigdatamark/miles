@@ -1,3 +1,9 @@
+# [MODULE DOC] CPU tests for Ulysses-style context parallel detection and slicing in the context
+# parallel helpers: the parallel state reports Ulysses mode only for cp size above 1 with the
+# all-to-all communication type (string or one-element list); token slicing, log-prob slicing and
+# local response mask lengths for cp size 4 rank 2 with all-to-all, and the regular (p2p) cp size 2
+# rank 1 zigzag response slice, are checked against fixed expected values for an 11-token sequence
+# with a 7-token response.
 import torch
 
 from miles.backends.training_utils.data import context_parallel
@@ -5,6 +11,9 @@ from miles.backends.training_utils.parallel import GroupInfo, ParallelState
 
 
 def _parallel_state(*, cp_size: int, cp_rank: int = 0, cp_comm_type: str | None = None) -> ParallelState:
+    # [FUNCTION DOC] HELPER: Builds a real parallel state with trivial groups except: intra-dp-with-cp
+    # (rank 0, size cp_size), cp (given rank and size), and the given context-parallel communication
+    # type (string, list, or none). No process groups attached.
     return ParallelState(
         intra_dp=GroupInfo(rank=0, size=1, group=None),
         intra_dp_cp=GroupInfo(rank=0, size=cp_size, group=None),
@@ -19,6 +28,8 @@ def _parallel_state(*, cp_size: int, cp_rank: int = 0, cp_comm_type: str | None 
 
 
 def test_parallel_state_detects_ulysses_cp():
+    # [FUNCTION DOC] Test: Ulysses mode is true for cp 4 with all-to-all given as a string or a
+    # one-element list; false for cp 1 with all-to-all, and for cp 4 with p2p.
     assert _parallel_state(cp_size=4, cp_comm_type="a2a").is_ulysses_cp
     assert _parallel_state(cp_size=4, cp_comm_type=["a2a"]).is_ulysses_cp
     assert not _parallel_state(cp_size=1, cp_comm_type="a2a").is_ulysses_cp
@@ -26,6 +37,8 @@ def test_parallel_state_detects_ulysses_cp():
 
 
 def test_slice_with_cp_uses_sequence_shards_for_sglang_ulysses(monkeypatch):
+    # [FUNCTION DOC] Test: with cp 4 rank 2 and all-to-all patched in, slicing tokens 0..10 with pad
+    # value 0 returns [4, 5, 10, 0] (two chunks of two tokens, the second padded).
     monkeypatch.setattr(
         context_parallel, "get_parallel_state", lambda: _parallel_state(cp_size=4, cp_rank=2, cp_comm_type="a2a")
     )
@@ -38,6 +51,8 @@ def test_slice_with_cp_uses_sequence_shards_for_sglang_ulysses(monkeypatch):
 
 
 def test_slice_log_prob_with_cp_uses_sequence_shards_for_sglang_ulysses(monkeypatch):
+    # [FUNCTION DOC] Test: same state; slicing response log-probs 0..6 (total length 11, response
+    # length 7) returns [1.0, 2.0].
     monkeypatch.setattr(
         context_parallel, "get_parallel_state", lambda: _parallel_state(cp_size=4, cp_rank=2, cp_comm_type="a2a")
     )
@@ -51,6 +66,8 @@ def test_slice_log_prob_with_cp_uses_sequence_shards_for_sglang_ulysses(monkeypa
 
 
 def test_regular_cp_still_uses_zigzag_response_slice(monkeypatch):
+    # [FUNCTION DOC] Test: cp 2 rank 1 with p2p patched in; slicing log-probs 0..6 (total 11,
+    # response 7) returns [0,1,2,3,4,5] (the zigzag share of that rank).
     monkeypatch.setattr(
         context_parallel, "get_parallel_state", lambda: _parallel_state(cp_size=2, cp_rank=1, cp_comm_type="p2p")
     )
@@ -63,6 +80,8 @@ def test_regular_cp_still_uses_zigzag_response_slice(monkeypatch):
 
 
 def test_local_response_masks_use_sequence_shards_for_sglang_ulysses(monkeypatch):
+    # [FUNCTION DOC] Test: cp 4 rank 2 all-to-all; local response loss masks for one sample (total
+    # 11, response 7, ones) are a ones tensor of length 2.
     monkeypatch.setattr(
         context_parallel, "get_parallel_state", lambda: _parallel_state(cp_size=4, cp_rank=2, cp_comm_type="a2a")
     )

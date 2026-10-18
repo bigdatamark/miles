@@ -1,3 +1,10 @@
+# [MODULE DOC] CPU regression tests for the reference-KL part of the score centering loss: candidate
+# collection retains full-vocabulary KL scores alongside support-normalized selected scores (with
+# correct gradient); the regularization term for KL kinds k1, k2, k3 and low-variance, biased and
+# unbiased, matches formulas and gradients when full-vocabulary scores are supplied; extreme or
+# non-finite inputs give finite loss and gradients (zero gradient where the reference or rollout is
+# infinite or the value is extremely off); and identical full-vocabulary policies give exactly zero
+# KL and zero gradient under sampling-support replay.
 """Regression coverage for reference KL and finite score-centering gradients."""
 
 from argparse import Namespace
@@ -11,6 +18,13 @@ from miles.backends.training_utils.loss.hub.score_centering_loss import _regular
 
 
 def test_candidate_collection_retains_full_vocabulary_kl_scores(monkeypatch: pytest.MonkeyPatch) -> None:
+    # [FUNCTION DOC] Test: one logits row [0.2,-0.3,0.8,0.4,10] (width 5, vocabulary 4, so the last
+    # column is padding) with temperature 0.7, KL loss and support replay on. The parallel state is
+    # patched to one tensor/context rank and the response-chunk iterator to yield this row for token
+    # 2 at response index 0. The batch has candidate ids [2,3,-1]. Collecting candidate log-probs
+    # returns "kl_log_probs" equal to the full-vocabulary tempered log-softmax at token 2, and
+    # "selected" scores (first candidate) equal to the log-softmax over the support {2,3} only;
+    # the gradient of the KL scores equals the full-vocabulary one.
     logits = torch.tensor([[0.2, -0.3, 0.8, 0.4, 10.0]], requires_grad=True)
     args = Namespace(
         use_kl_loss=True,
@@ -47,6 +61,12 @@ def test_candidate_collection_retains_full_vocabulary_kl_scores(monkeypatch: pyt
 @pytest.mark.parametrize("kind", ["k1", "k2", "k3", "low_var_kl"])
 @pytest.mark.parametrize("unbiased", [False, True])
 def test_reference_kl_matches_full_vocabulary_gradient(kind: str, unbiased: bool) -> None:
+    # [FUNCTION DOC] Test (KL kind k1/k2/k3/low_var_kl; unbiased off/on): three logits, full log-prob
+    # of token 0 (over 3) and support log-prob (over the first 2), rollout -0.5, reference -1.3,
+    # coefficient 0.1. The regularization loss, given the full-vocabulary scores, equals 0.1 times
+    # the mean of the formula applied to difference = full - reference: k1 difference; k2 half its
+    # square; k3 and low-variance exp(-d) - 1 + d (low-variance clamped to [-10, 10]); if unbiased,
+    # multiplied by exp(support - rollout). The gradient w.r.t. logits equals that of the formula.
     logits = torch.tensor([0.2, -0.3, 0.8], requires_grad=True)
     full = logits.log_softmax(-1)[0:1]
     support = logits[:2].log_softmax(-1)[0:1]
@@ -76,6 +96,11 @@ def test_reference_kl_matches_full_vocabulary_gradient(kind: str, unbiased: bool
 @pytest.mark.parametrize("coefficient", [0.0, 0.1])
 @pytest.mark.parametrize("unbiased", [False, True])
 def test_extreme_reference_kl_has_finite_loss_and_gradients(coefficient: float, unbiased: bool) -> None:
+    # [FUNCTION DOC] Test (coefficient 0 or 0.1; unbiased off/on; k3 kind): four tokens with log-probs
+    # [-100,-1,-inf,-0.5], reference [0,-0.8,-inf,-inf], rollout [-200,-1.1,-inf,-inf], mask
+    # [T,T,F,T]. The loss and the logged KL metric are finite. With a nonzero coefficient, backward
+    # gives finite gradients, exactly zero for tokens 0, 2 and 3 (extreme, masked, or infinite
+    # reference) and nonzero for token 1; with coefficient 0 the loss is exactly zero.
     log_probs = torch.tensor([-100.0, -1.0, -torch.inf, -0.5], requires_grad=True)
     reference = torch.tensor([0.0, -0.8, -torch.inf, -torch.inf])
     rollout = torch.tensor([-200.0, -1.1, -torch.inf, -torch.inf])
@@ -101,6 +126,9 @@ def test_extreme_reference_kl_has_finite_loss_and_gradients(coefficient: float, 
 
 
 def test_identical_full_vocabulary_policies_have_zero_kl_under_replay() -> None:
+    # [FUNCTION DOC] Test: when the reference log-prob equals the detached full-vocabulary log-prob
+    # (while the support-normalized scores differ), the k2 KL metric is exactly zero and backward
+    # leaves an all-zero gradient on the logits.
     logits = torch.tensor([0.2, -0.3, 0.8], requires_grad=True)
     full = logits.log_softmax(-1)[0:1]
     support = logits[:2].log_softmax(-1)[0:1]

@@ -1,3 +1,10 @@
+# [MODULE DOC] Two-process CPU (Gloo) test that HubKernels.prepare reaches the same outcome on both
+# ranks. The pytest entry launches this same file as a subprocess in worker mode, which spawns two
+# ranks; each rank loops over scenarios (success, leader/follower fetch failure, missing function,
+# differing revision or build id, invalid / differing / empty mapping, differing strict flag),
+# injects the fault on one rank via the fake kernels package from the sibling single-process test,
+# and checks prepare either succeeds consistently or raises on both ranks with identical messages.
+# Run directly without arguments it invokes pytest on itself; with the worker flag it is a worker.
 """Two-rank Gloo regressions for `HubKernels.prepare`; no CUDA devices or Hub requests."""
 
 import os
@@ -25,6 +32,22 @@ _SCENARIOS = (
 
 
 def _worker(rank: int, rendezvous: str, strict: bool) -> None:
+    # [FUNCTION DOC] HELPER: Per-rank body spawned by the multiprocess launcher. Inputs: rank, a
+    # file path used for the file-based rendezvous, and the strict flag. Sets the local-rank
+    # environment variable, initializes a two-rank Gloo group (15 second timeout) plus the project's
+    # Gloo group, then for each scenario: builds args, installs fake kernels, wraps the fake fetch
+    # so that rank 0 fails for the fla repo in "leader_failure" and rank 1 in "follower_failure"
+    # (an OS error), and on rank 1 only deletes the chunk function ("missing_function"), changes
+    # the recorded revision ("different_revision") or build id ("different_build"), replaces mapping
+    # loading with one that raises ("invalid_mapping"), returns a reduced mapping
+    # ("different_mapping": conv slot only; "empty_mapping": empty), or flips strict
+    # ("different_strict"). Then calls prepare, capturing the message of a value or runtime error.
+    # Expected to fail: configuration scenarios always, other non-success scenarios only when
+    # strict; asserted per rank. When not failing, binds two fresh fake models (policy and
+    # reference path) expecting two layers bound, conv slot resolved, and the chunk slot resolved
+    # only in "success" (hub function bound in success, stand-in otherwise). Finally gathers errors
+    # across ranks and asserts they are equal; rank 0 prints a PASS line per scenario and strict
+    # value. Always destroys the process group. Side effects: environment, process group, monkeypatches.
     from tests.fast.backends.test_fsdp_hub_kernels import _all_hub_modules, _build_gdn_model, _make_args, _stub_kernels
 
     from miles.backends.fsdp_utils.plugins.hf_kernels import loader
@@ -48,6 +71,11 @@ def _worker(rank: int, rendezvous: str, strict: bool) -> None:
                 error = None
 
                 def get_kernel(repo_id, *, scenario=scenario, original_get=original_get, fake=fake, **kwargs):
+                    # [FUNCTION DOC] HELPER: Fault-injecting wrapper over the fake fetch for the
+                    # current scenario (bound through defaults so each loop pass keeps its own).
+                    # Raises an OS error for the fla repo on the failing rank; otherwise calls the
+                    # original, and on rank 1 for fla mutates the result or its recorded metadata
+                    # per scenario. Returns the module.
                     if repo_id == "kernels-community/fla":
                         if (scenario == "leader_failure" and rank == 0) or (
                             scenario == "follower_failure" and rank == 1
@@ -70,6 +98,8 @@ def _worker(rank: int, rendezvous: str, strict: bool) -> None:
                     if scenario == "invalid_mapping":
 
                         def invalid_mapping(args):
+                            # [FUNCTION DOC] HELPER: Replacement mapping loader that always raises a
+                            # value error, simulating an invalid slot declaration on one rank.
                             raise ValueError("simulated invalid slot declaration")
 
                         patch.setattr(loader, "load_mapping", invalid_mapping)
@@ -121,6 +151,11 @@ def _worker(rank: int, rendezvous: str, strict: bool) -> None:
 
 @pytest.mark.parametrize("strict", [False, True])
 def test_hub_preparation_agrees_across_ranks(tmp_path: Path, strict: bool) -> None:
+    # [FUNCTION DOC] Test (parametrized over strict): runs this file in a subprocess with the
+    # worker flag, a rendezvous path inside the temp directory and the strict flag as 0/1, with the
+    # repository root (three directories above this file) prepended to the python path and a 60
+    # second timeout. Asserts the subprocess exits with code zero (showing its output otherwise)
+    # and that its output contains the PASS line for every scenario at this strict value.
     env = os.environ.copy()
     root = str(Path(__file__).resolve().parents[3])
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [root, env.get("PYTHONPATH")]))

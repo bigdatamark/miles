@@ -1,3 +1,12 @@
+# [MODULE DOC] Snapshot regression tests for the loss stack. A list of configurations (estimator,
+# loss type, flags, batch size, prompt/response lengths; covering grpo, tis, gspo, reinforce++
+# baseline, value, sft, kl loss, chunked fused cross entropy, and padded bshd layouts) is run
+# through advantage computation, mismatch correction helpers, log-prob/entropy and value
+# extraction, each loss function with backward, and the loss dispatcher, and compared against saved
+# .pt snapshots (bitwise within the helper's small tolerance). Mode comes from command-line
+# switches: the snapshot switch regenerates snapshot files locally; otherwise (default, as in CI)
+# compare mode loads snapshots from the local directory or a cached clone of an external artifacts
+# repo (network). A module-scoped fixture ensures a one-rank Gloo group exists.
 """Snapshot-based regression tests for loss functions.
 
 Verifies that loss function outputs are bitwise identical to saved snapshots.
@@ -119,6 +128,9 @@ CONFIGS = [
 # The non-true-on-policy configs reach collectives (fused CE); give them a 1-rank group.
 @pytest.fixture(scope="module", autouse=True)
 def process_group(tmp_path_factory):
+    # [FUNCTION DOC] HELPER: Module-scoped autouse fixture. If a process group already exists, does
+    # nothing. Otherwise initializes a one-rank Gloo group with a file rendezvous in a temp dir and
+    # destroys it after the module's tests (even on failure).
     if dist.is_initialized():
         yield
         return
@@ -133,6 +145,10 @@ def process_group(tmp_path_factory):
 
 @pytest.fixture
 def mode(request):
+    # [FUNCTION DOC] HELPER: Fixture returning "snapshot" when the snapshot switch is given and
+    # "compare" otherwise. Asserts the snapshot and compare switches are not both set.
+    # KNOWN ISSUE: the compare switch has no effect beyond the mutual-exclusion assertion, since
+    # compare is already the default.
     snapshot = request.config.getoption("--snapshot", default=False)
     compare = request.config.getoption("--compare", default=False)
     assert not (snapshot and compare), "Cannot use --snapshot and --compare together"
@@ -148,6 +164,10 @@ def mode(request):
 
 
 def _get_sum_of_sample_mean(batch, args, parallel_state):
+    # [FUNCTION DOC] HELPER: Builds the sum-of-sample-mean reducer from the context-parallel module
+    # using the batch's total lengths, response lengths and loss masks, the per-token-loss flag and
+    # qkv format from args, and the batch's max sequence lengths if any. The parallel state
+    # argument is unused.
     from miles.backends.training_utils.data.context_parallel import get_sum_of_sample_mean
 
     return get_sum_of_sample_mean(
@@ -161,16 +181,26 @@ def _get_sum_of_sample_mean(batch, args, parallel_state):
 
 
 def run_compute_advantages_and_returns(args, parallel_state, inputs):
+    # [FUNCTION DOC] HELPER: Builds rollout data from inputs, runs the advantage computation (which
+    # mutates it), and returns a dictionary with the resulting advantages and returns lists. The
+    # parallel state argument is unused.
     rollout_data = make_rollout_data(inputs)
     compute_advantages_and_returns(args, rollout_data)
     return {"advantages": rollout_data["advantages"], "returns": rollout_data["returns"]}
 
 
 def run_mismatch_helpers(args, inputs):
+    # [FUNCTION DOC] HELPER: Draws a policy-gradient loss vector (total response length, normal
+    # samples from a generator seeded with seed plus one), then calls the vanilla importance
+    # sampling correction and the icepop correction each with a clone of it plus deep clones of
+    # log-probs, rollout log-probs and loss masks. Returns a dictionary keyed "vanilla_tis" and
+    # "icepop" with each function's output.
     total_response = sum(inputs["response_lens"])
     pg_loss = torch.randn(total_response, generator=torch.Generator().manual_seed(SEED + 1))
 
     def _call(fn):
+        # [FUNCTION DOC] HELPER: Calls the correction function with fresh clones of the shared
+        # inputs (so the functions cannot affect each other) and returns its result.
         return fn(
             args=args,
             pg_loss=pg_loss.clone(),
@@ -183,6 +213,9 @@ def run_mismatch_helpers(args, inputs):
 
 
 def run_get_log_probs_and_entropy(args, parallel_state, inputs):
+    # [FUNCTION DOC] HELPER: Calls log-prob/entropy extraction with entropy enabled on a clone of
+    # the policy logits, cloned tokens, copied length lists and the max sequence lengths (if any).
+    # Returns its result. The parallel state argument is unused.
     return get_log_probs_and_entropy(
         deep_clone(inputs["policy_logits"]),
         args=args,
@@ -195,6 +228,9 @@ def run_get_log_probs_and_entropy(args, parallel_state, inputs):
 
 
 def run_get_values(args, parallel_state, inputs):
+    # [FUNCTION DOC] HELPER: Calls value extraction on a clone of the value logits with cloned
+    # tokens, copied length lists and max sequence lengths. Returns its result. The parallel state
+    # argument is unused.
     return get_values(
         deep_clone(inputs["value_logits"]),
         args=args,
@@ -206,6 +242,11 @@ def run_get_values(args, parallel_state, inputs):
 
 
 def run_loss_fn(args, parallel_state, inputs):
+    # [FUNCTION DOC] HELPER: Runs the loss function chosen by the args loss type (policy, value or
+    # sft) directly: builds the batch, clones the policy logits (value logits for value loss) with
+    # gradient enabled, builds the sum-of-sample-mean reducer, calls the function, backpropagates
+    # the loss. Returns a dictionary with the detached loss, detached metrics and a clone of the
+    # logits gradient. Unknown loss types raise a key error.
     loss_type = args.loss_type
     batch = make_batch(inputs, loss_type)
     logits = deep_clone(inputs["policy_logits"] if loss_type != "value_loss" else inputs["value_logits"])
@@ -222,6 +263,10 @@ def run_loss_fn(args, parallel_state, inputs):
 
 
 def run_loss_function_dispatcher(args, parallel_state, inputs):
+    # [FUNCTION DOC] HELPER: Same setup as the direct loss runner but calls the dispatcher with
+    # microbatch count argument 1; backpropagates the loss. Returns a dictionary with the detached
+    # loss, the normalizer (detached if a tensor), the log dictionary's keys and detached values,
+    # and a clone of the logits gradient. The parallel state argument is unused.
     loss_type = args.loss_type
     batch = make_batch(inputs, loss_type)
     logits = deep_clone(inputs["policy_logits"] if loss_type != "value_loss" else inputs["value_logits"])
@@ -239,6 +284,9 @@ def run_loss_function_dispatcher(args, parallel_state, inputs):
 
 
 def run_all(args, parallel_state, inputs):
+    # [FUNCTION DOC] HELPER: Runs the six runners above in order (advantages and returns, mismatch
+    # helpers, log-probs and entropy, values, direct loss function, dispatcher) and returns a
+    # dictionary of their outputs keyed by short names. This is the unit saved and compared.
     outputs = {}
     outputs["compute_advantages_and_returns"] = run_compute_advantages_and_returns(args, parallel_state, inputs)
     outputs["mismatch_helpers"] = run_mismatch_helpers(args, inputs)
@@ -256,11 +304,18 @@ def run_all(args, parallel_state, inputs):
 
 @pytest.mark.parametrize("config", CONFIGS, ids=[c[0] for c in CONFIGS])
 class TestLossSnapshot:
+    # [CLASS DOC] Snapshot test class, parametrized over every configuration; each config yields a
+    # snapshot file named after the config.
 
     def _snapshot_path(self, config):
+        # [FUNCTION DOC] HELPER: Returns the local snapshot file path: the snapshot directory next
+        # to this test plus the config name with a .pt suffix.
         return SNAPSHOT_DIR / f"{config[0]}.pt"
 
     def _build(self, config):
+        # [FUNCTION DOC] HELPER: Unpacks a config, builds args (global batch size set to the batch
+        # size plus the overrides), installs the trivial parallel state, and generates seeded inputs
+        # (seed 42, vocab 128). Returns (args, parallel state, inputs).
         name, args_overrides, batch_size, prompt_lens, response_lens = config
         args = make_args(global_batch_size=batch_size, **args_overrides)
         parallel_state = make_parallel_state()
@@ -275,6 +330,11 @@ class TestLossSnapshot:
         return args, parallel_state, inputs
 
     def test_loss_snapshot(self, config, mode):
+        # [FUNCTION DOC] Test: in snapshot mode, runs everything on the generated inputs and saves
+        # inputs and outputs to the local snapshot file. In compare mode, finds the snapshot
+        # directory (local or cached clone, which may need network), asserts the file exists,
+        # loads it, rebuilds args from the saved argument dictionary, reruns everything on the
+        # saved inputs and asserts outputs equal the saved outputs within tolerance.
         args, parallel_state, inputs = self._build(config)
 
         if mode == "snapshot":
