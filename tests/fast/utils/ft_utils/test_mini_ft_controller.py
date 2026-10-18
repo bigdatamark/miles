@@ -1,3 +1,9 @@
+# [MODULE DOC] Tests for the mini fault tolerance controller: the healing poll suspends an
+# unhealthy cell without an explicit resume when cells auto resume, and the start function, with
+# the http client and thread classes replaced by fakes (a fake client serves one unhealthy cell
+# list then cancels on the second poll; the fake thread runs its target synchronously and
+# swallows the cancellation), sends the patch requests each cluster backend owns (ray: suspend
+# then resume; kubernetes: suspend only).
 from __future__ import annotations
 
 import argparse
@@ -13,7 +19,12 @@ from miles.utils.ft_utils.mini_ft_controller import CellHealthStatus, _CellSnaps
 
 
 class TestControllerHealing:
+    # [CLASS DOC] Test of the controller's poll and heal step.
     async def test_an_auto_resuming_cell_is_suspended_without_an_explicit_resume(self) -> None:
+        # [FUNCTION DOC] Asynchronous test. A controller with mocked callbacks, a cell list of one
+        # unhealthy cell, zero delays, auto resume enabled and a fixed clock runs one poll and
+        # heal. Asserts suspend was awaited exactly once with the cell name and resume was never
+        # awaited.
         """An auto-resuming cell completes healing without an explicit resume request."""
         get_cells = AsyncMock(return_value=[_CellSnapshot(name="cell-0", status=CellHealthStatus.UNHEALTHY)])
         suspend_cell = AsyncMock()
@@ -35,26 +46,37 @@ class TestControllerHealing:
 
 
 class _Response:
+    # [CLASS DOC] HELPER: Fake http response holding an optional json payload.
     def __init__(self, payload: dict[str, Any] | None = None) -> None:
+        # [FUNCTION DOC] HELPER: Stores the payload (may be none).
         self._payload = payload
 
     def json(self) -> dict[str, Any]:
+        # [FUNCTION DOC] HELPER: Returns the payload; asserts one was given.
         assert self._payload is not None
         return self._payload
 
     def raise_for_status(self) -> None:
+        # [FUNCTION DOC] HELPER: Never raises; always reports success.
         return None
 
 
 class _HttpClientFake:
+    # [CLASS DOC] HELPER: Fake asynchronous http client. The class attribute lists every created
+    # instance (tests reset it). Each instance records the suspend values it was patched with.
     instances: list[_HttpClientFake] = []
 
     def __init__(self, **_: Any) -> None:
+        # [FUNCTION DOC] HELPER: Ignores construction arguments, starts with no patches and a zero
+        # poll count, and registers itself in the class level instance list.
         self.patches: list[bool] = []
         self._poll_count = 0
         self.instances.append(self)
 
     async def get(self, _: str) -> _Response:
+        # [FUNCTION DOC] HELPER: Counts polls. The first poll returns a cell list with one running
+        # cell named cell-0 whose healthy condition is false and whose suspend flag is false; any
+        # later poll raises the asynchronous cancellation error to end the controller loop.
         self._poll_count += 1
         if self._poll_count > 1:
             raise asyncio.CancelledError
@@ -79,19 +101,26 @@ class _HttpClientFake:
         )
 
     async def patch(self, _: str, *, content: str, headers: dict[str, str]) -> _Response:
+        # [FUNCTION DOC] HELPER: Asserts the content type header is json, records the suspend value
+        # from the json body's spec, and returns an empty response.
         assert headers == {"Content-Type": "application/json"}
         self.patches.append(json.loads(content)["spec"]["suspend"])
         return _Response()
 
     async def aclose(self) -> None:
+        # [FUNCTION DOC] HELPER: Does nothing.
         return None
 
 
 class _ThreadFake:
+    # [CLASS DOC] HELPER: Fake thread that runs its target inline when started.
     def __init__(self, *, target: Any, daemon: bool) -> None:
+        # [FUNCTION DOC] HELPER: Remembers the target; the daemon flag is ignored.
         self._target = target
 
     def start(self) -> None:
+        # [FUNCTION DOC] HELPER: Runs the target synchronously and swallows the asynchronous
+        # cancellation error that the fake http client raises to end the loop.
         try:
             self._target()
         except asyncio.CancelledError:
@@ -99,6 +128,7 @@ class _ThreadFake:
 
 
 class TestMaybeStartMiniFtController:
+    # [CLASS DOC] Test of the controller start function.
     @pytest.mark.parametrize(
         ("cluster_backend", "expected_patches"),
         [("ray", [True, False]), ("kubernetes", [True])],
@@ -109,6 +139,11 @@ class TestMaybeStartMiniFtController:
         cluster_backend: str,
         expected_patches: list[bool],
     ) -> None:
+        # [FUNCTION DOC] Parametrized over ray (expects suspend true then resume false patches) and
+        # kubernetes (expects suspend true only). Resets the fake client's instance list, swaps in
+        # the fake http client and thread, and starts the controller with args enabling it on port
+        # 8080 with zero poll interval and resume delay. Asserts exactly one client was created and
+        # its recorded patch values equal the expected list.
         """Each cluster backend emits only the cell healing requests it owns."""
         _HttpClientFake.instances = []
         monkeypatch.setattr(mini_ft_controller.httpx, "AsyncClient", _HttpClientFake)

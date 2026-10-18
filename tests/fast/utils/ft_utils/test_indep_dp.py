@@ -1,3 +1,8 @@
+# [MODULE DOC] Tests for the independent data parallel TCP store creator: with the store class
+# mocked, it binds a non-blocking master store on the wildcard address with an OS chosen port and
+# advertises the node's routable address plus the actual port; with a real store, a client
+# connecting to the advertised address can read a key set on the master. Uses real sockets in the
+# second test and requires torch.
 from unittest.mock import MagicMock
 
 import pytest
@@ -12,9 +17,15 @@ FAKE_STORE_PORT = 4567
 
 
 class TestCreateTcpStore:
+    # [CLASS DOC] Tests of the TCP store creation function, which returns the store and its
+    # host-and-port address text.
     def test_create_tcp_store_binds_a_nonblocking_master_and_advertises_its_address(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # [FUNCTION DOC] The store class is mocked to report port 4567 and the current node ip is
+        # faked. Asserts the class was constructed once with host 0.0.0.0, port 0, master mode and
+        # no waiting for workers; the returned store is the mock instance; and the address is the
+        # fake ip, a colon and the port.
         """The store must use a wildcard ephemeral bind and publish its routable address."""
         store_class = MagicMock()
         store_class.return_value.port = FAKE_STORE_PORT
@@ -33,6 +44,8 @@ class TestCreateTcpStore:
         assert addr == f"{FAKE_NODE_IP}:{FAKE_STORE_PORT}"
 
     def test_create_tcp_store_returns_a_master_serving_clients_on_the_advertised_port(self) -> None:
+        # [FUNCTION DOC] Creates a real store, connects a non-master client to the advertised host
+        # and port, sets a key on the master, and asserts the client reads the value as bytes.
         """A remote worker dialing the advertised port must reach the master store without it waiting for workers."""
         store, addr = create_tcp_store()
 

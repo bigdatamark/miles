@@ -1,3 +1,11 @@
+# [MODULE DOC] Tests for the Hugging Face config loader: config overrides are applied as
+# attributes on the loaded config, trust remote code defaults to true and extra keyword args are
+# forwarded to the auto config loader (mocked), an unknown model type fails with a value error,
+# repeated loads are safe (alias registration is idempotent), registering an alias for a model
+# type that transformers natively supports fails unless the alias sets the override flag (then
+# registration is allowed to replace the existing entry), and a real deepseek v32 config loads as
+# a subclass of the deepseek v3 config. One test is skipped pending a fix for auto model alias
+# registration.
 """Unit tests for miles.utils.hf_utils.config."""
 
 import json
@@ -9,12 +17,18 @@ import pytest
 
 
 def _write_config_json(directory: str, config_dict: dict) -> None:
+    # [FUNCTION DOC] HELPER: Writes the mapping as json, utf-8 encoded, to a config.json file in
+    # the given directory (overwriting). Side effect: file write.
     with open(os.path.join(directory, "config.json"), "w", encoding="utf-8") as f:
         json.dump(config_dict, f)
 
 
 class TestLoadHfConfig:
+    # [CLASS DOC] Tests of the config loader (imports are done inside each test).
     def test_overrides_apply_to_returned_config(self, tmp_path):
+        # [FUNCTION DOC] With the auto config loader mocked to return a simple namespace, loading
+        # with overrides for the max position embeddings and the attention implementation returns
+        # that config with those attributes set, while untouched attributes stay.
         from miles.utils.hf_utils.config import load_hf_config
 
         fake_config = SimpleNamespace(max_position_embeddings=4096, hidden_size=128)
@@ -28,6 +42,8 @@ class TestLoadHfConfig:
         assert cfg._attn_implementation == "flash"
 
     def test_trust_remote_code_default_is_true(self, tmp_path):
+        # [FUNCTION DOC] Loading without extra args calls the mocked loader with trust remote code
+        # true.
         from miles.utils.hf_utils.config import load_hf_config
 
         with patch("transformers.AutoConfig.from_pretrained", return_value=SimpleNamespace()) as mock_from_pretrained:
@@ -36,6 +52,8 @@ class TestLoadHfConfig:
         assert kwargs["trust_remote_code"] is True
 
     def test_extra_kwargs_forwarded_to_autoconfig(self, tmp_path):
+        # [FUNCTION DOC] A revision and an explicit trust remote code of false are forwarded to the
+        # mocked loader as keyword arguments unchanged.
         from miles.utils.hf_utils.config import load_hf_config
 
         with patch("transformers.AutoConfig.from_pretrained", return_value=SimpleNamespace()) as mock_from_pretrained:
@@ -45,6 +63,8 @@ class TestLoadHfConfig:
         assert kwargs["trust_remote_code"] is False
 
     def test_unknown_model_type_raises(self, tmp_path):
+        # [FUNCTION DOC] A config.json with an unknown model type (real loader, not mocked) makes
+        # loading raise a value error.
         """Unrecognized model_type must fail loud, not be silently routed elsewhere."""
         from miles.utils.hf_utils.config import load_hf_config
 
@@ -53,6 +73,8 @@ class TestLoadHfConfig:
             load_hf_config(str(tmp_path))
 
     def test_repeated_calls_are_idempotent(self, tmp_path):
+        # [FUNCTION DOC] Loading twice with the mocked loader does not raise; there is no other
+        # assertion.
         """Alias registration on every call must not raise on the second pass."""
         from miles.utils.hf_utils.config import load_hf_config
 
@@ -61,6 +83,9 @@ class TestLoadHfConfig:
             load_hf_config(str(tmp_path))
 
     def test_native_support_raises_without_override(self, tmp_path):
+        # [FUNCTION DOC] An alias for a fake model type is installed as the only alias, with the
+        # registered set emptied and the native mapping naming that type. Loading raises a runtime
+        # error saying transformers natively supports it.
         """If transformers ships native support for an alias, registration must fail loud."""
         from miles.utils.hf_utils import config as hf_config_module
 
@@ -79,6 +104,9 @@ class TestLoadHfConfig:
             hf_config_module.load_hf_config(str(tmp_path))
 
     def test_native_support_overridden_when_flag_set(self, tmp_path):
+        # [FUNCTION DOC] Same setup with the alias flagged to override native support, and the
+        # register function and loader mocked. Loading succeeds and the register call receives the
+        # allow-existing flag as true.
         """override_hf_native=True must allow registration to win over native support."""
         from miles.utils.hf_utils import config as hf_config_module
 
@@ -102,9 +130,13 @@ class TestLoadHfConfig:
 
 
 class TestDeepseekV32Alias:
+    # [CLASS DOC] Integration tests using real transformers classes.
     """Integration: alias registration makes AutoConfig recognize deepseek_v32."""
 
     def test_deepseek_v32_loads_via_alias(self, tmp_path):
+        # [FUNCTION DOC] Skipped if the deepseek v3 config module is missing. Writes a config.json
+        # from the v3 defaults restamped as deepseek v32, loads it, and asserts the model type is
+        # deepseek v32 and the object is an instance of the v3 config class.
         """A config.json with model_type=deepseek_v32 should load as a DeepseekV3Config subclass."""
         pytest.importorskip("transformers.models.deepseek_v3.configuration_deepseek_v3")
         from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
@@ -123,6 +155,10 @@ class TestDeepseekV32Alias:
 
     @pytest.mark.skip(reason="FIXME: re-enable after deepseek_v32 AutoModel alias registration is fixed.")
     def test_deepseek_v32_resolves_via_auto_model_for_causal_lm(self, tmp_path):
+        # [FUNCTION DOC] Currently skipped unconditionally with a note to re-enable after the
+        # auto model alias registration is fixed. If run, it loads the restamped deepseek v32
+        # config and asserts the config's exact type is a key of the auto causal language model
+        # mapping.
         """The returned config must be resolvable by AutoModelForCausalLM.from_config.
 
         AutoConfig.register only updates CONFIG_MAPPING. AutoModelForCausalLM looks
