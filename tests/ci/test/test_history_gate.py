@@ -1,3 +1,16 @@
+# [MODULE DOC]
+# Offline tests for the metric-history regression gate (tests.ci.metric_history.gate:
+# parse_merged_record, evaluate_gate, GateStatus). Every test builds a fixture test file that
+# declares gates with register_ci_gate (a metric key, a step selector such as "last", "all" or a
+# list of steps, and a constraint with relative up/down bands and optional absolute floors), writes
+# a merged JSONL metric record, optionally seeds trusted baseline runs into an in-memory SQLite
+# store, then evaluates the gate and inspects per-metric results (status, current value, baseline
+# count and mean, reason, coordinate keys) and the overall trusted flag. Covers parsing and
+# non-finite decoding, cold start, historical pass/fail, per-step fan-out, separate coordinates per
+# declaration, near-zero floors, missing/empty/ill-formed series, asymmetric corridors, no specs,
+# no persistence, and files registered for both CUDA and ROCm. PROVENANCE is a sample pull request
+# run; LAST_KEY is the canonical key of the step selector "last". Registers itself as a CPU test in
+# suite stage-a-cpu.
 """Offline tests for the metric-history regression gate.
 
 These run fully offline against an in-memory :class:`SQLiteMetricHistoryStore`
@@ -30,6 +43,8 @@ PROVENANCE = RunProvenance(
 
 
 def _key(literal: object) -> str:
+    # [FUNCTION DOC] HELPER: Serialize a literal to compact JSON with sorted keys and no spaces
+    # (separators comma and colon), the canonical declaration key.
     """Canonical declaration key, matching register.py's `_canonical_key`."""
     return json.dumps(literal, sort_keys=True, separators=(",", ":"))
 
@@ -40,12 +55,18 @@ LAST_KEY = _key("last")
 
 @pytest.fixture
 def store():
+    # [FUNCTION DOC] HELPER: Fixture yielding a fresh in-memory SQLite metric history store, closed
+    # afterwards.
     s = SQLiteMetricHistoryStore(":memory:")
     yield s
     s.close()
 
 
 def _write_test_file(tmp_path: Path, gate_lines: str, *, name: str = "test_e2e_fixture.py") -> str:
+    # [FUNCTION DOC] HELPER: Write a fixture test file (default test_e2e_fixture.py) with the two
+    # imports, one CUDA registration (est_time 600, stage-c-8-gpu-h100, label megatron, hopper) and
+    # then the dedented, stripped gate lines; return its path. Built by concatenation so multi-line
+    # gate blocks keep correct indentation.
     # Concatenate instead of interpolating into an indented f-string: a
     # multi-line gate block would otherwise defeat the outer dedent.
     body = (
@@ -61,6 +82,8 @@ def _write_test_file(tmp_path: Path, gate_lines: str, *, name: str = "test_e2e_f
 
 
 def _write_record(tmp_path: Path, by_metric: dict[str, list], *, name: str = "merged.jsonl") -> str:
+    # [FUNCTION DOC] HELPER: Write a JSONL record (default name merged.jsonl) with one line per metric
+    # holding the metric name and its series; return the path.
     p = tmp_path / name
     with open(p, "w", encoding="utf-8") as f:
         for metric, series in by_metric.items():
@@ -71,6 +94,10 @@ def _write_record(tmp_path: Path, by_metric: dict[str, list], *, name: str = "me
 def _seed_baseline(
     store, test_filename, *, metric_key, steps_key, constraint_key, step, values, suite="stage-c-8-gpu-h100"
 ):
+    # [FUNCTION DOC] HELPER: Seed trusted baseline runs: for each value (in order, index i) write one
+    # run for the test under cuda and the suite (default stage-c-8-gpu-h100) with the sample
+    # provenance, created at "2026-06-0<i+1>T00:00:00+00:00" (so at most nine values), trusted, with
+    # a single metric sample for the given metric key, steps key, constraint key and step.
     identity = RunIdentity(
         test_path=test_filename,
         backend="cuda",
@@ -90,12 +117,15 @@ def _seed_baseline(
 
 
 def test_parse_merged_record(tmp_path):
+    # [FUNCTION DOC] Parsing a two-metric record returns a mapping from metric name to its series.
     path = _write_record(tmp_path, {"train/grad_norm": [[0, 0.5], [1, 1.0]], "rollout/raw_reward": [[0, 0.3]]})
     got = parse_merged_record(path)
     assert got == {"train/grad_norm": [[0, 0.5], [1, 1.0]], "rollout/raw_reward": [[0, 0.3]]}
 
 
 def test_parse_merged_record_decodes_non_finite_markers(tmp_path):
+    # [FUNCTION DOC] The string markers "NaN", "Infinity" and "-Infinity" in a series are decoded to
+    # real not-a-number, positive infinity and negative infinity floats; finite points are kept.
     path = _write_record(tmp_path, {"train/grad_norm": [[0, 0.5], [1, "NaN"], [2, "Infinity"], [3, "-Infinity"]]})
     series = parse_merged_record(path)["train/grad_norm"]
     assert series[0] == [0, 0.5]
@@ -105,6 +135,9 @@ def test_parse_merged_record_decodes_non_finite_markers(tmp_path):
 
 
 def test_non_finite_at_gated_coordinate_errors_and_untrusts(tmp_path, store):
+    # [FUNCTION DOC] A last-step gate on grad norm where the last point is a NaN marker yields an
+    # error status whose reason mentions non-finite (no silent fallback to the previous finite
+    # point), and the run is not trusted.
     test_file = _write_test_file(
         tmp_path,
         """
@@ -128,6 +161,9 @@ def test_non_finite_at_gated_coordinate_errors_and_untrusts(tmp_path, store):
 
 
 def test_cold_start_vacuously_trusted(tmp_path, store):
+    # [FUNCTION DOC] With no stored baselines, one result is produced with inactive status (not an
+    # error or failure), reason "historical: cold start (0 trusted baselines)", zero baseline count,
+    # the "last" steps key and step -1; the run is trusted because it has zero active checks.
     test_file = _write_test_file(
         tmp_path,
         """
@@ -155,6 +191,9 @@ def test_cold_start_vacuously_trusted(tmp_path, store):
 
 
 def test_historical_failure(tmp_path, store):
+    # [FUNCTION DOC] Seeds baselines 0.80, 0.82, 0.78 for the last step with a 20 percent band and
+    # evaluates a current 0.55. Asserts baseline count 3, baseline mean equal to the average, fail
+    # status (deviation 0.25 exceeds the 0.16 band) and an untrusted run.
     test_file = _write_test_file(
         tmp_path,
         """
@@ -184,6 +223,8 @@ def test_historical_failure(tmp_path, store):
 
 
 def test_historical_pass_within_tolerance(tmp_path, store):
+    # [FUNCTION DOC] Same baselines as the failure test with a current of 0.79: pass status and a
+    # trusted run.
     test_file = _write_test_file(
         tmp_path,
         """
@@ -209,6 +250,8 @@ def test_historical_pass_within_tolerance(tmp_path, store):
 
 
 def test_drift_beyond_historical_band_not_trusted(tmp_path, store):
+    # [FUNCTION DOC] Baselines of 1.0 three times with a 50 percent band and a current of 1.8
+    # (deviation 0.8) give fail status, baseline mean 1.0 and an untrusted run.
     test_file = _write_test_file(
         tmp_path,
         """
@@ -239,6 +282,9 @@ def test_drift_beyond_historical_band_not_trusted(tmp_path, store):
 
 
 def test_all_fans_out_one_result_per_step(tmp_path, store):
+    # [FUNCTION DOC] An all-steps gate over a two-point series yields two results with step, the
+    # recorded step and current value (0, 0.9) and (1, 1.1) in order; with no baselines the run is
+    # trusted.
     test_file = _write_test_file(
         tmp_path,
         """
@@ -258,6 +304,9 @@ def test_all_fans_out_one_result_per_step(tmp_path, store):
 
 
 def test_all_reads_per_step_baselines(tmp_path, store):
+    # [FUNCTION DOC] Seeds step 0 baselines of 0.1 and step 1 baselines of 0.9 (all-steps key, 90
+    # percent band) and evaluates 0.1 at step 0 and 0.9 at step 1. Asserts each step's baseline mean
+    # is its own (no cross-contamination), both pass, and the run is trusted.
     # Step 0's history and step 1's history must never cross-contaminate.
     test_file = _write_test_file(
         tmp_path,
@@ -297,6 +346,8 @@ def test_all_reads_per_step_baselines(tmp_path, store):
 
 
 def test_all_one_bad_step_untrusts_run(tmp_path, store):
+    # [FUNCTION DOC] Seeds baselines 1.0 at steps 0 and 1 with a 20 percent band; current 1.1 at
+    # step 0 passes and 1.5 at step 1 fails, so the run is untrusted.
     test_file = _write_test_file(
         tmp_path,
         """
@@ -333,6 +384,10 @@ def test_all_one_bad_step_untrusts_run(tmp_path, store):
 
 
 def test_all_and_explicit_steps_have_separate_coordinates(tmp_path, store):
+    # [FUNCTION DOC] Two gates on the same metric, one with all steps and one with the explicit step
+    # list [0], same constraint. Only the all-steps coordinate is seeded (two runs at step 0). Both
+    # results judge step 0, but the first has baseline count 2 and the second count 0 with inactive
+    # status, showing each declaration owns its series.
     # The coordinate is the declaration's literal content: a steps="all" gate and
     # a steps=[0] gate both judge step 0's value, but each owns its own series.
     gate_lines = """
@@ -362,6 +417,10 @@ def test_all_and_explicit_steps_have_separate_coordinates(tmp_path, store):
 
 
 def test_rule_is_part_of_coordinate(tmp_path, store):
+    # [FUNCTION DOC] Two last-step gates with 50 percent and 1 percent bands; only the loose rule is
+    # seeded (three baselines of 1.0). With current 1.2 the two results have different constraint
+    # keys; the loose one has count 3 and passes; the tight one has count 0 and is inactive (cold
+    # start rather than a shared read).
     # Two gates, same steps, different constraints: different constraint_key,
     # so each judges against its own baseline series.
     gate_lines = """
@@ -396,6 +455,10 @@ def test_rule_is_part_of_coordinate(tmp_path, store):
 
 
 def test_near_zero_not_flagged_on_relative_pct(tmp_path, store):
+    # [FUNCTION DOC] A gate on step 0 of ppo kl with 20 percent bands and absolute floors of 1e-6 in
+    # both directions, baselines around 1e-9, and a record where step 0 is 1e-7 (and step 1 is 5e-3,
+    # which is ignored). The selected current is 1e-7; the absolute deviation (~1e-7) is within the
+    # floor, so the status is pass despite the huge relative change, and the run is trusted.
     # ppo_kl rides at ~1e-9. With a positive abs_floor, a tiny absolute
     # deviation must NOT trip even though the *relative* change is huge.
     test_file = _write_test_file(
@@ -428,6 +491,8 @@ def test_near_zero_not_flagged_on_relative_pct(tmp_path, store):
 
 
 def test_near_zero_real_jump_is_flagged(tmp_path, store):
+    # [FUNCTION DOC] Same gate and baselines, with current 0.5 at step 0 (far beyond the floor): fail
+    # status and an untrusted run.
     # Sanity counterpart: a ppo_kl that jumps well past abs_floor IS flagged.
     test_file = _write_test_file(
         tmp_path,
@@ -456,6 +521,8 @@ def test_near_zero_real_jump_is_flagged(tmp_path, store):
 
 
 def test_missing_required_series_verdict_not_crash(tmp_path, store):
+    # [FUNCTION DOC] The record lacks the gated metric: the result has error status, no current value,
+    # a reason containing "missing", and the run is untrusted (no exception).
     test_file = _write_test_file(
         tmp_path,
         """
@@ -475,6 +542,7 @@ def test_missing_required_series_verdict_not_crash(tmp_path, store):
 
 
 def test_empty_required_series_verdict(tmp_path, store):
+    # [FUNCTION DOC] The gated metric has an empty series: error status and an untrusted run.
     test_file = _write_test_file(
         tmp_path,
         """
@@ -491,6 +559,8 @@ def test_empty_required_series_verdict(tmp_path, store):
 
 
 def test_all_null_step_is_error_verdict(tmp_path, store):
+    # [FUNCTION DOC] An all-steps gate over a series containing a point with a null step yields a
+    # single result for the spec with error status (no crash, no silent skip) and an untrusted run.
     # A steps="all" gate over a series with a step-less point yields one ERROR
     # verdict for the spec, not a crash and not a silent skip.
     test_file = _write_test_file(
@@ -512,6 +582,9 @@ def test_all_null_step_is_error_verdict(tmp_path, store):
 
 
 def test_asymmetric_corridor_tight_up_loose_down(tmp_path, store):
+    # [FUNCTION DOC] Baselines of 2.0 with an up band of 10 percent and a down band of 80 percent
+    # (corridor 0.4 to 2.2). Current 0.5 passes (within the loose lower band), 3.0 fails (above the
+    # tight upper band), and 0.1 fails (a suspiciously good collapse below the lower band).
     test_file = _write_test_file(
         tmp_path,
         """
@@ -554,6 +627,8 @@ def test_asymmetric_corridor_tight_up_loose_down(tmp_path, store):
 
 
 def test_reward_corridor_flags_drop_and_suspicious_jump(tmp_path, store):
+    # [FUNCTION DOC] Baselines of 0.60 with up band 50 percent and down band 10 percent (corridor
+    # 0.54 to 0.90). Current 0.85 passes, 0.50 (a drop) fails, 0.95 (a suspicious jump) fails.
     # raw_reward regressing means DROPPING (tight lower band); a jump far
     # above baseline smells of a broken env / reward hack (loose upper band).
     test_file = _write_test_file(
@@ -597,6 +672,8 @@ def test_reward_corridor_flags_drop_and_suspicious_jump(tmp_path, store):
 
 
 def test_no_gate_specs_is_vacuously_trusted(tmp_path, store):
+    # [FUNCTION DOC] A test file with a CUDA registration but no gate declarations evaluates to an
+    # empty metric list and a trusted result.
     body = textwrap.dedent(
         """
         from tests.ci.ci_register import register_cuda_ci
@@ -613,6 +690,8 @@ def test_no_gate_specs_is_vacuously_trusted(tmp_path, store):
 
 
 def test_gate_writes_no_rows(tmp_path, store):
+    # [FUNCTION DOC] After evaluating an all-steps gate, the store's runs table is still empty: the
+    # gate never persists.
     # The gate must never persist: after evaluation the store has no runs.
     test_file = _write_test_file(
         tmp_path,
@@ -632,6 +711,10 @@ def test_gate_writes_no_rows(tmp_path, store):
 
 
 def _write_dual_register_file(tmp_path: Path, gate_lines: str, *, name: str = "test_dual_fixture.py") -> str:
+    # [FUNCTION DOC] HELPER: Write a fixture file (default test_dual_fixture.py) with both a CUDA
+    # registration (est_time 360, stage-c-8-gpu-h100, label short, hopper) and a ROCm registration
+    # (est_time 360, stage-c-8-gpu-mi350, label short), followed by the dedented gate lines; return
+    # its path.
     """A real-shaped e2e file: BOTH register_cuda_ci and register_rocm_ci.
 
     Mirrors tests/e2e/short/test_qwen2.5_0.5B_gsm8k_short.py, which trips the
@@ -652,6 +735,9 @@ def _write_dual_register_file(tmp_path: Path, gate_lines: str, *, name: str = "t
 
 
 def test_dual_register_with_gate_uses_supplied_registry(tmp_path, store):
+    # [FUNCTION DOC] For a dual-registered file with a gate, evaluates with an explicitly supplied
+    # CUDA registry. Asserts no ambiguity error, one result with inactive status, and that the
+    # result's backend is cuda, its suite the supplied stage, and its test path the file.
     # A file with BOTH register_cuda_ci and register_rocm_ci would make the
     # single-registry reparse raise (ambiguous). With the harness passing the
     # CUDA registry explicitly, the gate uses that identity and does not raise.
@@ -682,6 +768,9 @@ def test_dual_register_with_gate_uses_supplied_registry(tmp_path, store):
 
 
 def test_dual_register_no_spec_registry_none_vacuously_trusted(tmp_path, store):
+    # [FUNCTION DOC] A dual-registered file without any gate, evaluated with no registry, gives an
+    # empty metric list, a trusted result and the file path, without raising on the ambiguous
+    # registrations.
     # A dual-registered file with NO register_ci_gate spec, evaluated with
     # registry=None, must be vacuously trusted -- it must NOT raise on the
     # ambiguous (two register_*_ci) file because no gate identity is needed.
@@ -704,6 +793,8 @@ def test_dual_register_no_spec_registry_none_vacuously_trusted(tmp_path, store):
 
 
 def test_single_register_gate_registry_none_still_reparses(tmp_path, store):
+    # [FUNCTION DOC] A single-registration file with a gate evaluated without a registry reparses its
+    # identity: one inactive result, backend cuda, suite stage-c-8-gpu-h100, trusted.
     # The isolated unit-test convenience path: a single-register file with a
     # gate spec and registry=None still reparses identity via _registry_for.
     test_file = _write_test_file(

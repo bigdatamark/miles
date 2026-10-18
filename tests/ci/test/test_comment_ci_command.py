@@ -1,3 +1,17 @@
+# [MODULE DOC]
+# Tests for the PR comment command handler (.github/workflows/scripts/comment_ci_command.py, loaded
+# by path as HANDLER) and its policy file (.github/workflows/policies/comment-command-access.json)
+# and workflow. The handler parses issue comments on pull requests into one of four exact commands
+# (add a run-ci/run-on/bypass label, clear CI labels, rerun failed CI, run one test file), checks
+# the actor against a versioned access policy (live repository permission, explicit user ids, or
+# the comment's author association depending on the command's group), re-reads the live pull
+# request, and then mutates labels, reruns workflow jobs or dispatches a file-run workflow through
+# a narrowly scoped GitHub API client. It also has a preflight mode that only writes fixed routing
+# outputs (capability and success reaction), and a file-run status mode that announces and reports
+# the dispatched file run in a pull request comment.
+# These tests use a FakeAPI recording every call, builders for events, pull requests, policies and
+# workflow runs, monkeypatched URL opening for the real client, and temporary policy / output files.
+# Registers itself as a CPU test in suite stage-a-cpu.
 import datetime
 import importlib.util
 import json
@@ -18,6 +32,9 @@ WORKFLOW_PATH = ROOT / ".github/workflows/comment-ci-command.yml"
 
 
 def load_module(name, path):
+    # [FUNCTION DOC] HELPER: Import a Python file by path under the given module name and execute its
+    # body; return the module. Unlike similar helpers it does not register the module in the module
+    # table.
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -48,6 +65,10 @@ ANNOUNCE_BODY = (
 
 
 def file_run_env(mode, **overrides):
+    # [FUNCTION DOC] HELPER: Build the environment mapping for the file-run status mode: the mode
+    # (announce or report), pull number "123", the sample test file and the sample run id. In report
+    # mode it also adds the existing comment id, suite stage-c-4-gpu-h200, resolve and CUDA results
+    # "success" and CPU result "skipped". Keyword overrides replace entries.
     environ = {
         "CI_COMMAND_FILE_RUN_STATUS": mode,
         "FILE_RUN_PULL_NUMBER": "123",
@@ -69,11 +90,23 @@ def file_run_env(mode, **overrides):
 
 
 def file_run_status(mode="report", **overrides):
+    # [FUNCTION DOC] HELPER: Parse the file-run environment for the mode with the handler's private
+    # inputs parser and return the second element of its result (the status object).
     return HANDLER._file_run_status_inputs(file_run_env(mode, **overrides))[1]
 
 
 class FakeAPI:
+    # [CLASS DOC] HELPER: In-memory stand-in for the handler's GitHub API client. Serves a fixed pull
+    # request, a fixed permission answer, per-workflow run lists, head pull request lists, a workflow
+    # run detail, and returns canned ids. Every call is appended to the combined calls list (tuples
+    # starting with the method name) and to a per-method list for easy assertions. Label mutations
+    # update the stored pull request's labels in place (removal) or return a derived list (add).
     def __init__(self, pull, *, permission="write", permission_actor_id=ACTOR_ID):
+        # [FUNCTION DOC] HELPER: Store the pull request and the permission answer (a mapping with the
+        # permission and a user with the given actor id; defaults write and the sample actor), and
+        # initialize all call lists empty. The workflow runs mapping has an empty list for every
+        # rerun workflow file, head pulls default to the pull itself, and the workflow run detail has
+        # the sample start time.
         self.pull = pull
         self.permission = {
             "permission": permission,
@@ -97,65 +130,87 @@ class FakeAPI:
         self.head_pulls = [pull]
 
     def get_pull(self, pull_number):
+        # [FUNCTION DOC] HELPER: Record the call and return the stored pull request.
         self.calls.append(("get_pull", pull_number))
         self.get_calls.append(pull_number)
         return self.pull
 
     def get_permission(self, actor_login):
+        # [FUNCTION DOC] HELPER: Record the call and return the stored permission mapping.
         self.calls.append(("get_permission", actor_login))
         self.permission_calls.append(actor_login)
         return self.permission
 
     def add_label(self, pull_number, label):
+        # [FUNCTION DOC] HELPER: Record the call and return the pull request's current labels plus a
+        # new label entry for the added one. The stored pull request is not modified.
         self.calls.append(("add_label", pull_number, label))
         self.add_calls.append((pull_number, label))
         return [*self.pull["labels"], {"name": label}]
 
     def remove_label(self, pull_number, label):
+        # [FUNCTION DOC] HELPER: Record the call, remove entries with that name from the stored pull
+        # request's labels (in place), and return the remaining labels.
         self.calls.append(("remove_label", pull_number, label))
         self.remove_calls.append((pull_number, label))
         self.pull["labels"] = [item for item in self.pull["labels"] if item["name"] != label]
         return self.pull["labels"]
 
     def list_workflow_runs(self, workflow_file, head_sha):
+        # [FUNCTION DOC] HELPER: Record the call and return the configured run list of that workflow
+        # file (raises a key error for an unknown file); the sha is recorded but not used to filter.
         self.calls.append(("list_workflow_runs", workflow_file, head_sha))
         self.list_run_calls.append((workflow_file, head_sha))
         return self.workflow_runs[workflow_file]
 
     def rerun_failed_jobs(self, run_id):
+        # [FUNCTION DOC] HELPER: Record a rerun request for the run id; returns nothing.
         self.calls.append(("rerun_failed_jobs", run_id))
         self.rerun_calls.append(run_id)
 
     def list_pulls_for_head(self, owner_login, head_ref):
+        # [FUNCTION DOC] HELPER: Record the call and return the configured head pull request list.
         self.calls.append(("list_pulls_for_head", owner_login, head_ref))
         self.list_pull_calls.append((owner_login, head_ref))
         return self.head_pulls
 
     def create_workflow_dispatch(self, workflow_file, ref, inputs):
+        # [FUNCTION DOC] HELPER: Record the dispatch (workflow file, ref, inputs) and return the
+        # sample workflow run html url.
         self.calls.append(("create_workflow_dispatch", workflow_file, ref, inputs))
         self.dispatch_calls.append((workflow_file, ref, inputs))
         return WORKFLOW_RUN_URL
 
     def add_comment_reaction(self, comment_id, content):
+        # [FUNCTION DOC] HELPER: Record the reaction request (comment id, reaction content).
         self.calls.append(("add_comment_reaction", comment_id, content))
         self.reaction_calls.append((comment_id, content))
 
     def create_issue_comment(self, pull_number, body):
+        # [FUNCTION DOC] HELPER: Record the new comment (pull number, body) and return the canned new
+        # comment id 4242.
         self.calls.append(("create_issue_comment", pull_number, body))
         self.comment_calls.append((pull_number, body))
         return NEW_COMMENT_ID
 
     def update_issue_comment(self, comment_id, body):
+        # [FUNCTION DOC] HELPER: Record the comment edit (comment id, body).
         self.calls.append(("update_issue_comment", comment_id, body))
         self.update_calls.append((comment_id, body))
 
     def get_workflow_run(self, run_id):
+        # [FUNCTION DOC] HELPER: Record the call and return the workflow run detail mapping (only a
+        # start time).
         self.calls.append(("get_workflow_run", run_id))
         self.run_calls.append(run_id)
         return self.workflow_run
 
 
 def event(*, body="/run-ci-short", actor_id=ACTOR_ID, author_association="NONE"):
+    # [FUNCTION DOC] HELPER: Build a GitHub issue-comment event payload for a created comment on pull
+    # request 123 of the expected repository, from a human user "actor" with the given id (default
+    # 1234), comment body (default "/run-ci-short") and author association (default NONE). Comment
+    # id is 5678; the sender equals the commenter.
     return {
         "action": "created",
         "repository": {"id": HANDLER.REPOSITORY_ID, "full_name": HANDLER.REPOSITORY},
@@ -178,6 +233,10 @@ def pull(
     state="open",
     labels=(),
 ):
+    # [FUNCTION DOC] HELPER: Build a live pull request mapping for number 123 with state (default
+    # open), base repo equal to the expected repository, head ref / sha defaults to the sample
+    # values, head repository id (default the base repository, otherwise a fork owned by
+    # "fork-owner"), and the given label names as label entries.
     head_owner = "radixark" if head_repository_id == HANDLER.REPOSITORY_ID else "fork-owner"
     return {
         "number": 123,
@@ -201,6 +260,12 @@ def policy(
     repo_permissions=("write", "admin"),
     author_associations=("OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR"),
 ):
+    # [FUNCTION DOC] HELPER: Build a loaded (already parsed) policy mapping. Groups: add-label access
+    # (repository permissions, user ids), repo-write access (repo permissions only) and prior
+    # contributor access (repo permissions, prior user ids, author associations); all sets are
+    # frozen sets. Commands: add-label (group add-label access, allowed label set), clear-labels
+    # (repo-write group), rerun-failed-ci and run-test-file (both prior contributor group).
+    # Defaults: write and admin permissions, no user ids, labels run-ci-short and bypass-fastfail.
     return {
         "groups": {
             "add_label_access": {
@@ -244,6 +309,10 @@ def workflow_run(
     pull_number=123,
     pull_requests=None,
 ):
+    # [FUNCTION DOC] HELPER: Build a workflow run mapping for the given workflow path: conclusion
+    # (default failure), pull_request event, head repository id, head branch, head sha, id, path, run
+    # number, status (default completed), and pull requests (default one entry with the pull number
+    # 123; an explicit empty list is kept).
     return {
         "conclusion": conclusion,
         "event": "pull_request",
@@ -291,24 +360,34 @@ def workflow_run(
     ],
 )
 def test_command_parser_rejects_non_exact_commands(body):
+    # [FUNCTION DOC] Parametrized over comment bodies that start a known command but are not exactly
+    # one command alone (extra words, multiple commands, leading prose, empty or unsafe label
+    # suffixes, a bare run-ci, bad test paths such as a non-e2e directory, helper file, absolute or
+    # parent paths, shell characters, two files). Parsing raises the comment command error whose
+    # message mentions the one exact /<label> form.
     with pytest.raises(HANDLER.CommentCommandError, match="one exact /<label>"):
         HANDLER.parse_command(body)
 
 
 @pytest.mark.parametrize("label", ["run-ci-a_B.c-d", "run-on-blackwell"])
 def test_command_parser_accepts_one_exact_command_with_outer_whitespace(label):
+    # [FUNCTION DOC] A label command (a run-ci label with underscore, dot and dash, or run-on-
+    # blackwell) surrounded by whitespace and newlines parses to an add-label request for that label.
     assert HANDLER.parse_command(f" \n/{label}\t") == HANDLER.AddLabel(label)
 
 
 def test_command_parser_accepts_exact_bypass_fastfail_command():
+    # [FUNCTION DOC] The bypass-fastfail comment parses to an add-label request.
     assert HANDLER.parse_command("/bypass-fastfail") == HANDLER.AddLabel("bypass-fastfail")
 
 
 def test_command_parser_accepts_exact_clear_command_with_outer_whitespace():
+    # [FUNCTION DOC] The clear-labels comment with outer whitespace parses to a clear-labels request.
     assert HANDLER.parse_command(" \n/clear-labels\t") == HANDLER.ClearLabels()
 
 
 def test_command_parser_accepts_exact_rerun_command_with_outer_whitespace():
+    # [FUNCTION DOC] The rerun-failed-ci comment with outer whitespace parses to a rerun request.
     assert HANDLER.parse_command(" \n/rerun-failed-ci\t") == HANDLER.RerunFailedCI()
 
 
@@ -326,15 +405,23 @@ def test_command_parser_accepts_exact_rerun_command_with_outer_whitespace():
     ],
 )
 def test_command_parser_accepts_run_file_command(body, test_file):
+    # [FUNCTION DOC] Parametrized over rerun-test comments for files under tests/e2e, tests/fast,
+    # tests/fast-gpu and tests/ci (including outer whitespace and multiple spaces between command and
+    # path); each parses to a run-test-file request carrying the path.
     assert HANDLER.parse_command(body) == HANDLER.RunTestFile(test_file)
 
 
 @pytest.mark.parametrize("body", ["", "ordinary review comment", "/Clear-labels", "/unknown-command"])
 def test_command_parser_ignores_unrelated_comments(body):
+    # [FUNCTION DOC] Empty text, ordinary prose, a wrongly capitalized command and an unknown slash
+    # command all parse to none (not a command).
     assert HANDLER.parse_command(body) is None
 
 
 def test_static_registry_owns_policy_capability_and_handler_routing():
+    # [FUNCTION DOC] Asserts the command registry has exactly the four request types and that each
+    # entry carries the expected policy key, capability (issues for label commands, actions for
+    # rerun and file run), handler function and success reaction ("none" except "+1" for file run).
     expected = {
         HANDLER.AddLabel: ("add_label", "issues", HANDLER._handle_add_label, "none"),
         HANDLER.ClearLabels: ("clear_labels", "issues", HANDLER._handle_clear_labels, "none"),
@@ -353,7 +440,10 @@ def test_static_registry_owns_policy_capability_and_handler_routing():
 
 
 def test_unknown_request_type_fails_closed():
+    # [FUNCTION DOC] Looking up the command spec of an instance of an unregistered class raises the
+    # comment command error saying it is not registered.
     class UnknownRequest:
+        # [CLASS DOC] HELPER: Empty request type that is not in the registry.
         pass
 
     with pytest.raises(HANDLER.CommentCommandError, match="not registered"):
@@ -361,6 +451,11 @@ def test_unknown_request_type_fails_closed():
 
 
 def raw_policy():
+    # [FUNCTION DOC] HELPER: Return a valid raw (JSON-shaped) policy of version 4: three groups
+    # (add-label access with write/admin and no users; repo-write access with write/admin; prior
+    # contributor access with write/admin, no users and the four prior-contributor author
+    # associations) and four commands (add-label with allowed labels run-ci-short and
+    # bypass-fastfail; clear-labels; rerun-failed-ci; run-test-file) bound to groups.
     return {
         "version": 4,
         "groups": {
@@ -466,6 +561,15 @@ def raw_policy():
     ],
 )
 def test_policy_parser_rejects_legacy_or_nonstandard_schema(tmp_path, text, message):
+    # [FUNCTION DOC] Parametrized over raw policy file texts: a duplicate JSON key, a non-standard
+    # number (NaN), and many legacy version-1 shaped documents (bad permissions, duplicates, bad user
+    # ids, unsafe or duplicate labels, extra legacy sections). Writes the text to a file and loads
+    # it. Duplicate-key and non-standard-number texts must raise the comment command error with that
+    # specific message; every other text must raise it with a message saying the policy has only the
+    # version, groups and commands fields.
+    # KNOWN ISSUE: several cases carry per-field messages (for example "repository_permissions must
+    # contain only write or admin") that are never matched, because the test only checks the generic
+    # "only version, groups" message for them.
     path = tmp_path / "policy.json"
     path.write_text(text)
     expected = message if "duplicate JSON" in message or "non-standard JSON" in message else "only version, groups"
@@ -502,6 +606,12 @@ def test_policy_parser_rejects_legacy_or_nonstandard_schema(tmp_path, text, mess
     ],
 )
 def test_policy_parser_rejects_invalid_group_command_or_resource(tmp_path, path_parts, value, message):
+    # [FUNCTION DOC] Parametrized over a path into the raw policy and a bad value: wrong version,
+    # bad or duplicate repository permissions, empty / non-string / unknown / duplicate author
+    # associations, unsafe or duplicate allowed labels, an unknown group reference, unexpected
+    # command or group fields (users on the repo-write group, author associations on groups that
+    # do not take them). Sets the value into a fresh valid raw policy, writes it as JSON and asserts
+    # loading raises the comment command error matching the expected message.
     raw = raw_policy()
     target = raw
     for part in path_parts[:-1]:
@@ -514,6 +624,8 @@ def test_policy_parser_rejects_invalid_group_command_or_resource(tmp_path, path_
 
 
 def test_policy_parser_loads_independent_users_for_both_customizable_tiers(tmp_path):
+    # [FUNCTION DOC] A raw policy with one user in add-label access (id 111) and a different user in
+    # prior contributor access (id 222) loads with each group's user id set holding only its own id.
     raw = raw_policy()
     raw["groups"]["add_label_access"]["users"] = [{"id": 111, "login": "alice"}]
     raw["groups"]["prior_contributor_access"]["users"] = [{"id": 222, "login": "bob"}]
@@ -534,6 +646,10 @@ def test_policy_parser_loads_independent_users_for_both_customizable_tiers(tmp_p
     ],
 )
 def test_user_login_is_display_only_for_authorization(tmp_path, group, body):
+    # [FUNCTION DOC] Parametrized over (group, command): the policy lists the actor's id with a stale
+    # login name. The fake API reports permission none and the author association is FIRST_TIMER.
+    # Preflight authorization succeeds on the id alone: it returns the pull number and actor id
+    # and makes no API call, showing the login is display-only.
     raw = raw_policy()
     raw["groups"][group]["users"] = [{"id": ACTOR_ID, "login": "stale-login"}]
     path = tmp_path / "policy.json"
@@ -552,6 +668,9 @@ def test_user_login_is_display_only_for_authorization(tmp_path, group, body):
 
 @pytest.mark.parametrize("section", ["groups", "commands"])
 def test_policy_parser_rejects_unknown_group_or_command(tmp_path, section):
+    # [FUNCTION DOC] Adds an unexpected empty entry to the groups or commands section of the raw
+    # policy; loading raises the comment command error ("groups must contain only ..." or "commands
+    # do not match ...").
     raw = raw_policy()
     raw[section]["unexpected"] = {}
     path = tmp_path / "policy.json"
@@ -562,6 +681,8 @@ def test_policy_parser_rejects_unknown_group_or_command(tmp_path, section):
 
 
 def test_repo_write_command_cannot_use_a_group_with_explicit_user_ids(tmp_path):
+    # [FUNCTION DOC] Binding clear-labels to the add-label group while that group lists a user makes
+    # loading raise the error "cannot grant access by user ID".
     raw = raw_policy()
     raw["groups"]["add_label_access"]["users"] = [{"id": ACTOR_ID, "login": "actor"}]
     raw["commands"]["clear_labels"]["group"] = "add_label_access"
@@ -572,6 +693,13 @@ def test_repo_write_command_cannot_use_a_group_with_explicit_user_ids(tmp_path):
 
 
 def test_checked_in_policy_exposes_exact_labels_and_access_groups():
+    # [FUNCTION DOC] Loads the checked-in policy file. Asserts the allowed labels are exactly one
+    # run-ci label per known domain label plus bypass-fastfail, run-ci-image, run-ci-blackwell-only,
+    # run-on-hopper and run-on-blackwell; the add-label group has write/admin permissions, a fixed
+    # set of nine user ids and no author associations; the repo-write group has write/admin only; the
+    # prior contributor group has write/admin, no user ids and the four associations OWNER, MEMBER,
+    # COLLABORATOR, CONTRIBUTOR; the clear command uses repo-write, rerun and file-run use prior
+    # contributor; and every allowed label matches the handler's label pattern.
     loaded = HANDLER.load_policy(POLICY_PATH)
     labels = loaded["commands"]["add_label"]["allowed_labels"]
     assert labels == {f"run-ci-{key}" for key in KNOWN_LABELS} | {
@@ -617,6 +745,9 @@ def test_checked_in_policy_exposes_exact_labels_and_access_groups():
 
 @pytest.mark.parametrize("permission", ["write", "admin"])
 def test_repository_writer_adds_one_exact_label(permission):
+    # [FUNCTION DOC] For write and admin actors, processing the default label comment returns the
+    # ALLOW_ADDED decision with actor id, label and pull number; the API calls are exactly: read the
+    # pull, look up the actor's permission, add the label (in that order).
     api = FakeAPI(pull(), permission=permission)
 
     result = HANDLER.process_event(event(), policy(), api)
@@ -638,6 +769,8 @@ def test_repository_writer_adds_one_exact_label(permission):
 
 
 def test_maintain_role_is_allowed_by_legacy_write_permission():
+    # [FUNCTION DOC] An actor whose legacy permission is write but whose role name is maintain is
+    # allowed to add the label.
     api = FakeAPI(pull(), permission="write")
     api.permission["role_name"] = "maintain"
 
@@ -648,6 +781,8 @@ def test_maintain_role_is_allowed_by_legacy_write_permission():
 
 
 def test_add_label_access_user_id_can_add_label_without_repository_write():
+    # [FUNCTION DOC] An actor with read permission but whose id is in the add-label group's user ids
+    # adds the label (ALLOW_ADDED) without any permission lookup.
     api = FakeAPI(pull(), permission="read")
 
     result = HANDLER.process_event(event(), policy(user_ids=(ACTOR_ID,)), api)
@@ -658,6 +793,8 @@ def test_add_label_access_user_id_can_add_label_without_repository_write():
 
 
 def test_add_label_access_user_id_can_add_bypass_fastfail():
+    # [FUNCTION DOC] An actor with no repository permission but listed by id can add the
+    # bypass-fastfail label; no permission lookup occurs.
     api = FakeAPI(pull(), permission="none")
 
     result = HANDLER.process_event(
@@ -672,6 +809,8 @@ def test_add_label_access_user_id_can_add_bypass_fastfail():
 
 
 def test_add_label_access_user_id_preflight_does_not_require_repository_permission():
+    # [FUNCTION DOC] Preflight authorization for a listed actor returns (pull number, actor id,
+    # add-label request, its registry spec) and makes no API calls.
     api = FakeAPI(pull(), permission="none")
 
     assert HANDLER.authorize_policy(event(), policy(user_ids=(ACTOR_ID,)), api) == (
@@ -691,6 +830,9 @@ def test_add_label_access_user_id_preflight_does_not_require_repository_permissi
     ],
 )
 def test_prior_contributor_access_user_id_preflight_does_not_require_repository_permission(body, request_type):
+    # [FUNCTION DOC] Parametrized over the file-run and rerun commands. An actor listed in the prior
+    # contributor group's user ids (author association FIRST_TIMER, permission none) passes preflight
+    # with the right request type and no API calls.
     api = FakeAPI(pull(), permission="none")
 
     result = HANDLER.authorize_policy(
@@ -706,6 +848,8 @@ def test_prior_contributor_access_user_id_preflight_does_not_require_repository_
 
 @pytest.mark.parametrize("body", ["/clear-labels", "/rerun-failed-ci"])
 def test_add_label_access_user_id_cannot_clear_or_rerun(body):
+    # [FUNCTION DOC] An actor listed only for add-label access (permission read) attempting clear or
+    # rerun gets the error "not authorized"; no label was added or removed and no rerun requested.
     api = FakeAPI(pull(labels=("run-ci-short",)), permission="read")
 
     with pytest.raises(HANDLER.CommentCommandError, match="not authorized"):
@@ -718,6 +862,8 @@ def test_add_label_access_user_id_cannot_clear_or_rerun(body):
 
 @pytest.mark.parametrize(("permission", "allowed"), [("write", False), ("admin", True)])
 def test_add_label_access_group_can_require_admin(permission, allowed):
+    # [FUNCTION DOC] With a policy that lets only admin add labels: an admin is allowed (ALLOW_ADDED),
+    # a write-permission actor raises "not authorized".
     api = FakeAPI(pull(), permission=permission)
 
     if allowed:
@@ -728,6 +874,8 @@ def test_add_label_access_group_can_require_admin(permission, allowed):
 
 
 def test_existing_label_is_an_authorized_no_op():
+    # [FUNCTION DOC] When the pull request already has the label, an authorized request returns
+    # ALLOW_ALREADY_PRESENT and adds nothing.
     api = FakeAPI(pull(labels=("run-ci-short", "documentation")))
 
     result = HANDLER.process_event(event(), policy(), api)
@@ -738,6 +886,10 @@ def test_existing_label_is_an_authorized_no_op():
 
 @pytest.mark.parametrize("permission", ["write", "admin"])
 def test_repository_writer_clears_only_ci_control_labels(permission):
+    # [FUNCTION DOC] A write or admin actor clears labels on a pull request carrying CI control labels
+    # (run-ci-*, run-ci, run-ci-all, run-on-*, nightly, bypass-fastfail) and unrelated labels
+    # (documentation, bug). The result is ALLOW_CLEARED listing the removed labels in sorted order;
+    # removals happen in that order; only the unrelated labels remain on the pull request.
     api = FakeAPI(
         pull(
             labels=(
@@ -779,6 +931,8 @@ def test_repository_writer_clears_only_ci_control_labels(permission):
 
 
 def test_clear_is_an_authorized_no_op_when_no_ci_control_label_exists():
+    # [FUNCTION DOC] With only unrelated labels present, clearing returns ALLOW_ALREADY_CLEAR with an
+    # empty label list and removes nothing.
     api = FakeAPI(pull(labels=("documentation", "bug")))
 
     result = HANDLER.process_event(event(body="/clear-labels"), policy(), api)
@@ -789,6 +943,8 @@ def test_clear_is_an_authorized_no_op_when_no_ci_control_label_exists():
 
 
 def test_unknown_request_does_not_call_github_api():
+    # [FUNCTION DOC] A label command not on the allowed list (run-ci-unknown) raises an error saying
+    # it is not exposed, before any API call.
     api = FakeAPI(pull())
     with pytest.raises(HANDLER.CommentCommandError, match="not exposed"):
         HANDLER.process_event(event(body="/run-ci-unknown"), policy(), api)
@@ -797,6 +953,8 @@ def test_unknown_request_does_not_call_github_api():
 
 @pytest.mark.parametrize("permission", ["read", "none", "unknown"])
 def test_caller_without_write_permission_cannot_mutate(permission):
+    # [FUNCTION DOC] Permissions read, none and an unknown value raise "not authorized"; the API was
+    # asked for the pull and the permission only, and nothing was added.
     api = FakeAPI(pull(), permission=permission)
     with pytest.raises(HANDLER.CommentCommandError, match="not authorized"):
         HANDLER.process_event(event(), policy(), api)
@@ -805,6 +963,8 @@ def test_caller_without_write_permission_cannot_mutate(permission):
 
 
 def test_preflight_checks_permission_without_reading_pull_request():
+    # [FUNCTION DOC] Preflight authorization returns (pull number, actor id, add-label request, its
+    # spec) and the only API call is the permission lookup (the pull is not read).
     api = FakeAPI(pull())
 
     assert HANDLER.authorize_policy(event(), policy(), api) == (
@@ -817,6 +977,8 @@ def test_preflight_checks_permission_without_reading_pull_request():
 
 
 def test_clear_preflight_uses_its_own_permission_policy_without_reading_pull_request():
+    # [FUNCTION DOC] With the repo-write group requiring admin and an admin actor, clear-labels
+    # preflight succeeds with the clear request and spec, using only the permission lookup.
     api = FakeAPI(pull(), permission="admin")
 
     assert HANDLER.authorize_policy(
@@ -833,6 +995,8 @@ def test_clear_preflight_uses_its_own_permission_policy_without_reading_pull_req
 
 
 def test_clear_requires_its_exact_live_permission_policy():
+    # [FUNCTION DOC] With the repo-write group requiring admin, a write-permission actor clearing
+    # labels gets "not authorized" and nothing is removed.
     api = FakeAPI(pull(labels=("run-ci-short",)), permission="write")
 
     with pytest.raises(HANDLER.CommentCommandError, match="not authorized"):
@@ -847,6 +1011,8 @@ def test_clear_requires_its_exact_live_permission_policy():
 
 @pytest.mark.parametrize("permission", ["write", "admin"])
 def test_repository_writer_can_add_a_label_to_a_fork_pr(permission):
+    # [FUNCTION DOC] For a pull request whose head is in a fork and an actor (id 2) with write or
+    # admin permission, adding a label returns ALLOW_ADDED.
     api = FakeAPI(pull(head_repository_id=999), permission=permission, permission_actor_id=2)
 
     result = HANDLER.process_event(event(actor_id=2), policy(), api)
@@ -856,6 +1022,8 @@ def test_repository_writer_can_add_a_label_to_a_fork_pr(permission):
 
 
 def test_add_label_access_user_id_can_add_a_label_to_a_fork_pr():
+    # [FUNCTION DOC] A listed actor (id 2, permission none) adds a label to a fork pull request with
+    # no permission lookup.
     api = FakeAPI(
         pull(head_repository_id=999),
         permission="none",
@@ -874,6 +1042,8 @@ def test_add_label_access_user_id_can_add_a_label_to_a_fork_pr():
 
 
 def test_repository_writer_can_clear_ci_labels_from_a_fork_pr():
+    # [FUNCTION DOC] A writer clears labels on a fork pull request: ALLOW_CLEARED, only the CI label
+    # removed, documentation label kept.
     api = FakeAPI(
         pull(head_repository_id=999, labels=("run-ci-short", "documentation")),
         permission_actor_id=2,
@@ -888,6 +1058,11 @@ def test_repository_writer_can_clear_ci_labels_from_a_fork_pr():
 
 @pytest.mark.parametrize("permission", ["write", "admin"])
 def test_repository_writer_reruns_latest_failed_pr_ci(permission):
+    # [FUNCTION DOC] For each rerun workflow, two failed runs exist (older run number 1, latest run
+    # number 2). A write or admin actor's rerun comment returns ALLOW_RERUN_REQUESTED with the head
+    # sha, pull number and the latest run ids. Each workflow is listed twice (before and re-checked
+    # right before posting), only the latest runs are rerun, and the permission is looked up once per
+    # rerun.
     api = FakeAPI(pull(), permission=permission)
     expected_ids = []
     for index, (workflow_file, workflow_path) in enumerate(HANDLER.RERUN_WORKFLOWS):
@@ -926,6 +1101,9 @@ def test_repository_writer_reruns_latest_failed_pr_ci(permission):
     ],
 )
 def test_newer_non_failure_run_does_not_revive_an_older_failure(status, conclusion):
+    # [FUNCTION DOC] Parametrized over newer run states (queued, in progress, success, skipped,
+    # cancelled, timed out) after an older failed run. The result is ALLOW_NO_FAILED_RUNS with no run
+    # ids and no rerun: only the latest run counts.
     api = FakeAPI(pull())
     workflow_file, workflow_path = HANDLER.RERUN_WORKFLOWS[0]
     api.workflow_runs[workflow_file] = [
@@ -947,6 +1125,8 @@ def test_newer_non_failure_run_does_not_revive_an_older_failure(status, conclusi
 
 
 def test_rerun_ignores_same_sha_run_not_associated_with_this_pr():
+    # [FUNCTION DOC] A failed run with the same sha whose pull request list names pull 456 is ignored:
+    # ALLOW_NO_FAILED_RUNS and no rerun.
     api = FakeAPI(pull())
     workflow_file, workflow_path = HANDLER.RERUN_WORKFLOWS[0]
     api.workflow_runs[workflow_file] = [workflow_run(workflow_path, pull_number=456)]
@@ -969,6 +1149,10 @@ def test_rerun_ignores_same_sha_run_not_associated_with_this_pr():
     ],
 )
 def test_rerun_fails_closed_on_mismatched_run_identity(change, message):
+    # [FUNCTION DOC] Parametrized over changes to a listed run: wrong workflow path, wrong event,
+    # wrong head sha, wrong head branch, wrong head repository, or a null pull request list. The
+    # rerun command raises the comment command error with the matching message (unexpected path,
+    # event or SHA, head ref, repository, or invalid pull requests) and requests no rerun.
     api = FakeAPI(pull())
     workflow_file, workflow_path = HANDLER.RERUN_WORKFLOWS[0]
     api.workflow_runs[workflow_file] = [{**workflow_run(workflow_path), **change}]
@@ -980,6 +1164,8 @@ def test_rerun_fails_closed_on_mismatched_run_identity(change, message):
 
 
 def test_rerun_requires_its_exact_live_permission_policy():
+    # [FUNCTION DOC] With the prior contributor group requiring admin, a write-permission actor's
+    # rerun gets "not authorized" and no rerun is requested.
     api = FakeAPI(pull(), permission="write")
     workflow_file, workflow_path = HANDLER.RERUN_WORKFLOWS[0]
     api.workflow_runs[workflow_file] = [workflow_run(workflow_path)]
@@ -995,6 +1181,8 @@ def test_rerun_requires_its_exact_live_permission_policy():
 
 
 def test_rerun_preflight_uses_its_own_policy_without_reading_pull_request():
+    # [FUNCTION DOC] An admin actor passes rerun preflight when the group requires admin; the result
+    # holds the rerun request and spec and only the permission lookup was made.
     api = FakeAPI(pull(), permission="admin")
 
     assert HANDLER.authorize_policy(
@@ -1011,6 +1199,9 @@ def test_rerun_preflight_uses_its_own_policy_without_reading_pull_request():
 
 
 def test_repository_writer_can_rerun_failed_ci_for_a_fork_pr():
+    # [FUNCTION DOC] For a fork pull request, run records have an empty pull request list and the
+    # fork's repository id. A writer's rerun requests run 10 and looks up the head pull by fork
+    # owner and branch twice (initial and re-check).
     api = FakeAPI(pull(head_repository_id=999), permission_actor_id=2)
     workflow_file, workflow_path = HANDLER.RERUN_WORKFLOWS[0]
     api.workflow_runs[workflow_file] = [workflow_run(workflow_path, head_repository_id=999, pull_requests=[])]
@@ -1024,6 +1215,8 @@ def test_repository_writer_can_rerun_failed_ci_for_a_fork_pr():
 
 @pytest.mark.parametrize("head_pulls", [[], [pull(head_repository_id=999)] * 2])
 def test_fork_rerun_requires_one_unique_head_pull(head_pulls):
+    # [FUNCTION DOC] Parametrized over a head pull lookup returning no pull or two identical pulls:
+    # the rerun raises an error saying exactly one pull request is required and requests no rerun.
     api = FakeAPI(pull(head_repository_id=999))
     api.head_pulls = head_pulls
     workflow_file, workflow_path = HANDLER.RERUN_WORKFLOWS[0]
@@ -1036,6 +1229,8 @@ def test_fork_rerun_requires_one_unique_head_pull(head_pulls):
 
 
 def test_fork_rerun_rejects_mismatched_unique_head_pull():
+    # [FUNCTION DOC] The unique head pull has a different head sha than the live pull: the rerun
+    # raises an error saying the identity does not match and requests no rerun.
     api = FakeAPI(pull(head_repository_id=999))
     api.head_pulls = [pull(head_repository_id=999, head_sha="b" * 40)]
 
@@ -1046,12 +1241,17 @@ def test_fork_rerun_rejects_mismatched_unique_head_pull():
 
 
 def test_rerun_stops_if_pr_head_changes_before_post():
+    # [FUNCTION DOC] The pull request read returns the original head first and a changed head sha on
+    # the second read (the re-check before posting). The rerun raises an error saying the head
+    # changed and requests no rerun.
     api = FakeAPI(pull())
     workflow_file, workflow_path = HANDLER.RERUN_WORKFLOWS[0]
     api.workflow_runs[workflow_file] = [workflow_run(workflow_path)]
     pulls = iter([pull(), pull(head_sha="b" * 40)])
 
     def get_pull(pull_number):
+        # [FUNCTION DOC] HELPER: Record the pull number and return the next pull from the prepared
+        # sequence (original, then changed head).
         api.get_calls.append(pull_number)
         return next(pulls)
 
@@ -1064,11 +1264,16 @@ def test_rerun_stops_if_pr_head_changes_before_post():
 
 
 def test_rerun_stops_if_latest_run_state_changes_before_post():
+    # [FUNCTION DOC] The first workflow's listing shows a failed run on the first call and a queued
+    # run on the second (re-check). The rerun raises an error saying the state changed and requests
+    # no rerun.
     api = FakeAPI(pull())
     workflow_file, workflow_path = HANDLER.RERUN_WORKFLOWS[0]
     calls = 0
 
     def list_workflow_runs(requested_workflow, head_sha):
+        # [FUNCTION DOC] HELPER: Assert the sha is the head sha. For other workflows return no runs;
+        # for the first workflow return a failed run on the first call and a queued run afterwards.
         nonlocal calls
         assert head_sha == HEAD_SHA
         if requested_workflow != workflow_file:
@@ -1087,11 +1292,16 @@ def test_rerun_stops_if_latest_run_state_changes_before_post():
 
 
 def test_rerun_stops_after_partial_failure_without_retry_or_rollback():
+    # [FUNCTION DOC] Two workflows have failed runs 10 and 20. The rerun of run 20 raises a timeout
+    # error. The command raises an error naming workflow run 20, and the rerun attempts are exactly
+    # [10, 20]: no retry, no rollback.
     api = FakeAPI(pull())
     for index, (workflow_file, workflow_path) in enumerate(HANDLER.RERUN_WORKFLOWS[:2]):
         api.workflow_runs[workflow_file] = [workflow_run(workflow_path, run_id=(index + 1) * 10)]
 
     def rerun_failed_jobs(run_id):
+        # [FUNCTION DOC] HELPER: Record the rerun; raise the comment command error "GitHub API request
+        # timed out" for run 20.
         api.rerun_calls.append(run_id)
         if run_id == 20:
             raise HANDLER.CommentCommandError("GitHub API request timed out")
@@ -1126,6 +1336,10 @@ def test_rerun_stops_after_partial_failure_without_retry_or_rollback():
     ],
 )
 def test_untrusted_event_identity_fails_before_api_access(bad_event, message):
+    # [FUNCTION DOC] Parametrized over events with a sender id differing from the commenter, a bot
+    # commenter, a commenter without a login, and a foreign repository. Processing raises the
+    # matching error (sender mismatch, human user required, login missing, event repository) before
+    # any API call.
     api = FakeAPI(pull())
     with pytest.raises(HANDLER.CommentCommandError, match=message):
         HANDLER.process_event(bad_event, policy(), api)
@@ -1143,6 +1357,9 @@ def test_untrusted_event_identity_fails_before_api_access(bad_event, message):
     ],
 )
 def test_invalid_permission_response_fails_before_mutation(permission_result, message):
+    # [FUNCTION DOC] Parametrized over malformed permission answers (a list, missing user, boolean
+    # user id, a different user id, none permission). Processing raises the matching error; only the
+    # pull read and the permission lookup were made; nothing was added.
     api = FakeAPI(pull())
     api.permission = permission_result
 
@@ -1163,6 +1380,9 @@ def test_invalid_permission_response_fails_before_mutation(permission_result, me
     ],
 )
 def test_unverifiable_live_pull_fails_before_mutation(bad_pull, message):
+    # [FUNCTION DOC] Parametrized over a closed pull request, a pull request with a missing head
+    # repository, a wrong base repository, and null labels. Processing raises the matching error
+    # after exactly one API call (the pull read).
     api = FakeAPI(bad_pull)
     with pytest.raises(HANDLER.CommentCommandError, match=message):
         HANDLER.process_event(event(), policy(), api)
@@ -1170,19 +1390,29 @@ def test_unverifiable_live_pull_fails_before_mutation(bad_pull, message):
 
 
 def test_github_api_uses_only_fixed_repository_and_additive_endpoint(monkeypatch):
+    # [FUNCTION DOC] Replaces URL opening with a recorder returning a label list body, then adds a
+    # label through the real client. Asserts the single request is a POST to the fixed repository's
+    # issues labels endpoint for pull 123, with a JSON body of one label, a bearer authorization
+    # header, and a 15 second timeout.
     requests = []
 
     class Response:
+        # [CLASS DOC] HELPER: Fake HTTP response, context manager, whose read returns a JSON list with
+        # one label entry.
         def __enter__(self):
+            # [FUNCTION DOC] HELPER: Return the response itself.
             return self
 
         def __exit__(self, *_args):
+            # [FUNCTION DOC] HELPER: Never suppress exceptions.
             return False
 
         def read(self):
+            # [FUNCTION DOC] HELPER: Return the fixed JSON body bytes.
             return b'[{"name":"run-ci-short"}]'
 
     def urlopen(request, *, timeout):
+        # [FUNCTION DOC] HELPER: Record (request, timeout) and return a response.
         requests.append((request, timeout))
         return Response()
 
@@ -1199,19 +1429,29 @@ def test_github_api_uses_only_fixed_repository_and_additive_endpoint(monkeypatch
 
 
 def test_remove_label_uses_encoded_name_in_a_fixed_repository_path(monkeypatch):
+    # [FUNCTION DOC] Removes a label whose name contains slash, space, question mark, hash and
+    # percent through the real client with a recording opener. Asserts the request is a DELETE to the
+    # fixed repository's labels path with the name fully percent-encoded, no body, and a 15 second
+    # timeout.
     requests = []
 
     class Response:
+        # [CLASS DOC] HELPER: Fake HTTP response, context manager, whose read returns an empty JSON
+        # list.
         def __enter__(self):
+            # [FUNCTION DOC] HELPER: Return the response itself.
             return self
 
         def __exit__(self, *_args):
+            # [FUNCTION DOC] HELPER: Never suppress exceptions.
             return False
 
         def read(self):
+            # [FUNCTION DOC] HELPER: Return the bytes of an empty JSON list.
             return b"[]"
 
     def urlopen(request, *, timeout):
+        # [FUNCTION DOC] HELPER: Record (request, timeout) and return a response.
         requests.append((request, timeout))
         return Response()
 
@@ -1228,22 +1468,34 @@ def test_remove_label_uses_encoded_name_in_a_fixed_repository_path(monkeypatch):
 
 
 def test_list_workflow_runs_uses_fixed_filters_and_complete_pagination(monkeypatch):
+    # [FUNCTION DOC] The fake opener serves page 1 with 100 runs and page 2 with one run, both
+    # reporting a total of 101. Listing runs of pr-test.yml for the sample sha must return all 101
+    # items in order using exactly two GET requests, each with a 15 second timeout, to the fixed
+    # repository's workflow runs path with query parameters event=pull_request, head_sha, page
+    # (1, 2) and per_page=100.
     requests = []
 
     class Response:
+        # [CLASS DOC] HELPER: Fake response holding a payload that is serialized to JSON on read.
         def __init__(self, payload):
+            # [FUNCTION DOC] HELPER: Store the payload.
             self.payload = payload
 
         def __enter__(self):
+            # [FUNCTION DOC] HELPER: Return the response itself.
             return self
 
         def __exit__(self, *_args):
+            # [FUNCTION DOC] HELPER: Never suppress exceptions.
             return False
 
         def read(self):
+            # [FUNCTION DOC] HELPER: Return the payload serialized to JSON bytes.
             return json.dumps(self.payload).encode()
 
     def urlopen(request, *, timeout):
+        # [FUNCTION DOC] HELPER: Record (request, timeout); parse the page query parameter and return
+        # a response with 100 runs for page 1 and one run (total 101) for any other page.
         requests.append((request, timeout))
         page = urllib.parse.parse_qs(urllib.parse.urlparse(request.full_url).query)["page"][0]
         if page == "1":
@@ -1284,17 +1536,26 @@ def test_list_workflow_runs_uses_fixed_filters_and_complete_pagination(monkeypat
     ],
 )
 def test_list_workflow_runs_fails_closed_on_invalid_pagination(monkeypatch, pages, message):
+    # [FUNCTION DOC] Parametrized over page sequences: a boolean total count, a total above the
+    # allowed maximum (1001), a total larger than the runs actually returned, and a total that changes
+    # between pages. Opening yields the pages in order. Listing raises the comment command error
+    # matching the message (invalid count, incomplete listing, count changed).
     class Response:
+        # [CLASS DOC] HELPER: Fake response holding a payload that is serialized to JSON on read.
         def __init__(self, payload):
+            # [FUNCTION DOC] HELPER: Store the payload.
             self.payload = payload
 
         def __enter__(self):
+            # [FUNCTION DOC] HELPER: Return the response itself.
             return self
 
         def __exit__(self, *_args):
+            # [FUNCTION DOC] HELPER: Never suppress exceptions.
             return False
 
         def read(self):
+            # [FUNCTION DOC] HELPER: Return the payload serialized to JSON bytes.
             return json.dumps(self.payload).encode()
 
     page_iterator = iter(pages)
@@ -1309,19 +1570,28 @@ def test_list_workflow_runs_fails_closed_on_invalid_pagination(monkeypatch, page
 
 
 def test_list_pulls_for_head_uses_encoded_all_state_query(monkeypatch):
+    # [FUNCTION DOC] Listing pulls for a fork owner and a branch name containing a space returns an
+    # empty list and sends one GET to the fixed repository's pulls path with query head
+    # "<owner>:<branch>", page 1, per_page 100 and state all, and a 15 second timeout.
     requests = []
 
     class Response:
+        # [CLASS DOC] HELPER: Fake HTTP response, context manager, whose read returns an empty JSON
+        # list.
         def __enter__(self):
+            # [FUNCTION DOC] HELPER: Return the response itself.
             return self
 
         def __exit__(self, *_args):
+            # [FUNCTION DOC] HELPER: Never suppress exceptions.
             return False
 
         def read(self):
+            # [FUNCTION DOC] HELPER: Return the bytes of an empty JSON list.
             return b"[]"
 
     def urlopen(request, *, timeout):
+        # [FUNCTION DOC] HELPER: Record (request, timeout) and return a response.
         requests.append((request, timeout))
         return Response()
 
@@ -1342,21 +1612,30 @@ def test_list_pulls_for_head_uses_encoded_all_state_query(monkeypatch):
 
 
 def test_rerun_failed_jobs_uses_exact_endpoint_and_accepts_empty_201(monkeypatch):
+    # [FUNCTION DOC] The recording opener answers with status 201 and an empty body. The real client's
+    # rerun of run 987 must accept it and have sent exactly one POST to the fixed repository's
+    # actions runs rerun-failed-jobs endpoint with no request body and a 15 second timeout.
     requests = []
 
     class Response:
+        # [CLASS DOC] HELPER: Fake HTTP response with status 201 and an empty body, as a context
+        # manager.
         status = 201
 
         def __enter__(self):
+            # [FUNCTION DOC] HELPER: Return the response itself.
             return self
 
         def __exit__(self, *_args):
+            # [FUNCTION DOC] HELPER: Never suppress exceptions.
             return False
 
         def read(self):
+            # [FUNCTION DOC] HELPER: Return empty bytes.
             return b""
 
     def urlopen(request, *, timeout):
+        # [FUNCTION DOC] HELPER: Record (request, timeout) and return a response.
         requests.append((request, timeout))
         return Response()
 
@@ -1375,22 +1654,32 @@ def test_rerun_failed_jobs_uses_exact_endpoint_and_accepts_empty_201(monkeypatch
     [(202, b"", "expected 201"), (201, b"{}", "unexpected response body")],
 )
 def test_rerun_failed_jobs_rejects_unconfirmed_response_without_retry(monkeypatch, status, body, message):
+    # [FUNCTION DOC] Parametrized over (202 with empty body -> error "expected 201") and (201 with a
+    # non-empty JSON body -> error "unexpected response body"). The rerun call raises the comment
+    # command error matching the message and the opener was called exactly once (no retry).
     attempts = 0
 
     class Response:
+        # [CLASS DOC] HELPER: Fake context-manager response returning the parametrized body; the
+        # status attribute is set on the instance afterwards.
         def __enter__(self):
+            # [FUNCTION DOC] HELPER: Return the response itself.
             return self
 
         def __exit__(self, *_args):
+            # [FUNCTION DOC] HELPER: Never suppress exceptions.
             return False
 
         def read(self):
+            # [FUNCTION DOC] HELPER: Return the parametrized body bytes.
             return body
 
     response = Response()
     response.status = status
 
     def urlopen(_request, *, timeout):
+        # [FUNCTION DOC] HELPER: Count the call, assert the 15 second timeout, and return the shared
+        # response.
         nonlocal attempts
         attempts += 1
         assert timeout == 15
@@ -1403,19 +1692,29 @@ def test_rerun_failed_jobs_rejects_unconfirmed_response_without_retry(monkeypatc
 
 
 def test_permission_lookup_encodes_the_login_in_a_fixed_repository_path(monkeypatch):
+    # [FUNCTION DOC] Looks up the permission of a login containing slashes and parent-directory
+    # segments through the real client with a recording opener. Asserts a single GET to the fixed
+    # repository's collaborators path with the login fully percent-encoded (slashes as %2F) followed
+    # by the permission suffix, and a 15 second timeout.
     requests = []
 
     class Response:
+        # [CLASS DOC] HELPER: Fake context-manager response returning a write permission for user
+        # 1234.
         def __enter__(self):
+            # [FUNCTION DOC] HELPER: Return the response itself.
             return self
 
         def __exit__(self, *_args):
+            # [FUNCTION DOC] HELPER: Never suppress exceptions.
             return False
 
         def read(self):
+            # [FUNCTION DOC] HELPER: Return the fixed permission JSON bytes.
             return b'{"permission":"write","user":{"id":1234}}'
 
     def urlopen(request, *, timeout):
+        # [FUNCTION DOC] HELPER: Record (request, timeout) and return a response.
         requests.append((request, timeout))
         return Response()
 
@@ -1439,9 +1738,13 @@ def test_permission_lookup_encodes_the_login_in_a_fixed_repository_path(monkeypa
     ],
 )
 def test_permission_api_failure_is_not_retried(monkeypatch, exception, message):
+    # [FUNCTION DOC] Parametrized over opener failures (HTTP 403, HTTP 404, a timeout). The
+    # permission lookup raises the comment command error whose message matches (status or "timed
+    # out") and the opener was called exactly once with a 15 second timeout.
     attempts = []
 
     def urlopen(_request, *, timeout):
+        # [FUNCTION DOC] HELPER: Record the timeout, then raise the parametrized exception.
         attempts.append(timeout)
         raise exception
 
@@ -1452,19 +1755,26 @@ def test_permission_api_failure_is_not_retried(monkeypatch, exception, message):
 
 
 def test_permission_api_invalid_json_is_not_retried(monkeypatch):
+    # [FUNCTION DOC] The opener returns a non-JSON body. The permission lookup raises the comment
+    # command error "invalid JSON" and the opener was called exactly once.
     attempts = 0
 
     class Response:
+        # [CLASS DOC] HELPER: Fake context-manager response returning non-JSON bytes.
         def __enter__(self):
+            # [FUNCTION DOC] HELPER: Return the response itself.
             return self
 
         def __exit__(self, *_args):
+            # [FUNCTION DOC] HELPER: Never suppress exceptions.
             return False
 
         def read(self):
+            # [FUNCTION DOC] HELPER: Return the bytes "not-json".
             return b"not-json"
 
     def urlopen(_request, *, timeout):
+        # [FUNCTION DOC] HELPER: Count the call, assert the 15 second timeout, return a response.
         nonlocal attempts
         attempts += 1
         assert timeout == 15
@@ -1485,9 +1795,13 @@ def test_permission_api_invalid_json_is_not_retried(monkeypatch):
     ],
 )
 def test_label_mutation_api_failure_is_not_retried(monkeypatch, operation, exception, message):
+    # [FUNCTION DOC] Parametrized over add or remove label and an opener failure (HTTP 403 or a
+    # timeout). The call raises the comment command error matching the message and the opener ran
+    # exactly once with a 15 second timeout.
     attempts = []
 
     def urlopen(_request, *, timeout):
+        # [FUNCTION DOC] HELPER: Record the timeout, then raise the parametrized exception.
         attempts.append(timeout)
         raise exception
 
@@ -1502,7 +1816,13 @@ def test_label_mutation_api_failure_is_not_retried(monkeypatch, operation, excep
 
 
 def test_http_error_names_the_request_and_accepted_permissions(monkeypatch):
+    # [FUNCTION DOC] The opener raises an HTTP 403 whose headers list accepted GitHub permissions.
+    # Adding a label raises the comment command error with exactly the message "GitHub API returned
+    # HTTP 403 for POST /repos/radixark/miles/issues/123/labels; accepted permissions:
+    # pull_requests=write", which does not contain the token.
     def urlopen(_request, *, timeout):
+        # [FUNCTION DOC] HELPER: Always raise an HTTP 403 error carrying the accepted-permissions
+        # header.
         raise urllib.error.HTTPError(
             "url", 403, "forbidden", {"X-Accepted-GitHub-Permissions": "pull_requests=write"}, None
         )
@@ -1519,7 +1839,11 @@ def test_http_error_names_the_request_and_accepted_permissions(monkeypatch):
 
 
 def test_http_error_without_accepted_permissions_still_names_the_request(monkeypatch):
+    # [FUNCTION DOC] The opener raises HTTP 404 with no permission header. The permission lookup
+    # raises an error whose message is exactly "GitHub API returned HTTP 404 for GET
+    # /repos/radixark/miles/collaborators/actor/permission".
     def urlopen(_request, *, timeout):
+        # [FUNCTION DOC] HELPER: Always raise an HTTP 404 error without headers.
         raise urllib.error.HTTPError("url", 404, "missing", {}, None)
 
     monkeypatch.setattr(HANDLER.urllib.request, "urlopen", urlopen)
@@ -1531,6 +1855,8 @@ def test_http_error_without_accepted_permissions_still_names_the_request(monkeyp
 
 
 def test_unconfirmed_mutation_response_fails_without_rollback():
+    # [FUNCTION DOC] The fake add-label returns an empty label list (the label is not confirmed).
+    # Processing raises the error "did not confirm".
     api = FakeAPI(pull())
     api.add_label = lambda _pull_number, _label: []
     with pytest.raises(HANDLER.CommentCommandError, match="did not confirm"):
@@ -1538,6 +1864,8 @@ def test_unconfirmed_mutation_response_fails_without_rollback():
 
 
 def test_unconfirmed_label_removal_fails_without_rollback():
+    # [FUNCTION DOC] The fake remove-label returns the unchanged labels (still containing the CI
+    # label). Clearing raises the error "did not confirm removal".
     api = FakeAPI(pull(labels=("run-ci-short", "documentation")))
     api.remove_label = lambda _pull_number, _label: [
         {"name": "run-ci-short"},
@@ -1549,9 +1877,15 @@ def test_unconfirmed_label_removal_fails_without_rollback():
 
 
 def test_clear_stops_after_partial_failure_without_retry_or_rollback():
+    # [FUNCTION DOC] Removal of run-ci-b raises a timeout error. Clearing raises an error "could not
+    # remove CI label run-ci-b"; removals were attempted for run-ci-a then run-ci-b only; the pull
+    # request keeps run-ci-b and documentation (run-ci-a stays removed, no rollback).
     api = FakeAPI(pull(labels=("run-ci-a", "run-ci-b", "documentation")))
 
     def remove_label(pull_number, label):
+        # [FUNCTION DOC] HELPER: Record the call; raise the comment command error "GitHub API request
+        # timed out" for run-ci-b; otherwise remove the label from the stored pull and return the
+        # remaining labels.
         api.calls.append(("remove_label", pull_number, label))
         api.remove_calls.append((pull_number, label))
         if label == "run-ci-b":
@@ -1569,6 +1903,8 @@ def test_clear_stops_after_partial_failure_without_retry_or_rollback():
 
 
 def test_clear_rejects_a_final_response_with_a_new_ci_control_label():
+    # [FUNCTION DOC] The fake remove-label returns a final label list containing a different CI
+    # control label (nightly). Clearing raises an error saying not all CI labels were removed.
     api = FakeAPI(pull(labels=("run-ci-short",)))
     api.remove_label = lambda _pull_number, _label: [{"name": "nightly"}]
 
@@ -1587,6 +1923,12 @@ def test_clear_rejects_a_final_response_with_a_new_ci_control_label():
     ],
 )
 def test_preflight_writes_only_fixed_routing(monkeypatch, tmp_path, body, capability, success_reaction):
+    # [FUNCTION DOC] Parametrized over command bodies with their expected capability (issues for
+    # label commands, actions for rerun and file run) and success reaction (none, or +1 for file
+    # run). Replaces event loading, policy loading and the API client constructor, sets the event
+    # path, policy path, token, preflight flag and output file environment variables, and runs the
+    # handler main. Asserts exit code 0, the output file is exactly "capability=<c>" and
+    # "success_reaction=<r>" lines, and the only API call was the permission lookup.
     api = FakeAPI(pull())
     output_path = tmp_path / "github-output"
     monkeypatch.setattr(HANDLER, "load_json", lambda _path: event(body=body))
@@ -1604,6 +1946,9 @@ def test_preflight_writes_only_fixed_routing(monkeypatch, tmp_path, body, capabi
 
 
 def test_preflight_rejects_an_unknown_registry_capability(monkeypatch, tmp_path):
+    # [FUNCTION DOC] Temporarily replaces the add-label registry entry with one whose capability is
+    # "unknown" and runs preflight for a label comment. Asserts main exits 1 and writes no output
+    # file.
     api = FakeAPI(pull())
     output_path = tmp_path / "github-output"
     spec = HANDLER.COMMAND_REGISTRY[HANDLER.AddLabel]
@@ -1622,6 +1967,9 @@ def test_preflight_rejects_an_unknown_registry_capability(monkeypatch, tmp_path)
 
 
 def test_preflight_rejects_an_unknown_registry_success_reaction(monkeypatch, tmp_path):
+    # [FUNCTION DOC] Temporarily replaces the run-test-file registry entry with one whose success
+    # reaction is "heart" and runs preflight for a file-run comment. Asserts main exits 1 and writes
+    # no output file.
     api = FakeAPI(pull())
     output_path = tmp_path / "github-output"
     spec = HANDLER.COMMAND_REGISTRY[HANDLER.RunTestFile]
@@ -1644,6 +1992,8 @@ def test_preflight_rejects_an_unknown_registry_success_reaction(monkeypatch, tmp
 
 
 def test_unrelated_comment_preflight_uses_no_policy_or_api(monkeypatch, tmp_path):
+    # [FUNCTION DOC] For an ordinary comment, preflight (with policy loading and API construction
+    # set to fail the test) exits 0 and writes "capability=none" and "success_reaction=none".
     output_path = tmp_path / "github-output"
     monkeypatch.setattr(HANDLER, "load_json", lambda _path: event(body="ordinary review comment"))
     monkeypatch.setattr(HANDLER, "load_policy", lambda _path: pytest.fail("policy must not be loaded"))
@@ -1658,6 +2008,10 @@ def test_unrelated_comment_preflight_uses_no_policy_or_api(monkeypatch, tmp_path
 
 @pytest.mark.parametrize("permission", ["write", "admin"])
 def test_repository_writer_dispatches_a_file_run(permission):
+    # [FUNCTION DOC] A write or admin actor's file-run comment dispatches exactly one workflow
+    # (run-ci-file.yml on ref main) with inputs pull number "123", head sha and the test file, and
+    # returns ALLOW_FILE_RUN_DISPATCHED with actor id, head sha, pull number, test file and the
+    # workflow run url.
     api = FakeAPI(pull(), permission=permission)
 
     result = HANDLER.process_event(event(body=RUN_FILE_BODY), policy(), api)
@@ -1680,6 +2034,9 @@ def test_repository_writer_dispatches_a_file_run(permission):
 
 
 def test_file_run_main_reports_the_dispatched_run_without_writing_an_output(monkeypatch, tmp_path, capsys):
+    # [FUNCTION DOC] Runs the handler main for a file-run comment with patched loaders and API.
+    # Asserts exit 0, the audit record printed to standard output contains the dispatched run url,
+    # and no GitHub output file was written (the dispatched run owns the status comment).
     api = FakeAPI(pull())
     output_path = tmp_path / "github-output"
     monkeypatch.setattr(HANDLER, "load_json", lambda _path: event(body=RUN_FILE_BODY))
@@ -1699,6 +2056,10 @@ def test_file_run_main_reports_the_dispatched_run_without_writing_an_output(monk
 
 @pytest.mark.parametrize("bridge_ref", ["#41", "bridge", "v0.7.0", "8cd3466d14d2337c8492827b3712482c2b3e4866"])
 def test_file_run_forwards_validated_pr_body_pins(bridge_ref):
+    # [FUNCTION DOC] Parametrized over the Megatron-Bridge pin value (a PR number, a branch, a tag,
+    # or a commit sha). The pull request body contains lines for image tag pr-42, Megatron pin #77,
+    # SGLang pin feature/pin-x and the bridge pin. The dispatched inputs contain the basic three plus
+    # ci_image_tag, ci_megatron_pr, ci_sglang_pr and ci_megatron_bridge_pr with those values.
     target = pull()
     target["body"] = (
         "Summary line\nci-image-tag: pr-42\nci-megatron-pr: #77\nci-sglang-pr: feature/pin-x\n"
@@ -1725,6 +2086,9 @@ def test_file_run_forwards_validated_pr_body_pins(bridge_ref):
     ["ci-image-tag: -bad", "ci-megatron-pr: $(reboot)", "ci-sglang-pr: bad;ref", "ci-megatron-bridge-pr: $(reboot)"],
 )
 def test_file_run_rejects_an_invalid_pr_body_pin(line):
+    # [FUNCTION DOC] Parametrized over a pull request body line with an unsafe value (a tag starting
+    # with a hyphen, command substitution, a semicolon). Processing raises an error "unsupported
+    # value" and dispatches nothing.
     target = pull()
     target["body"] = f"{line}\n"
     api = FakeAPI(target)
@@ -1736,6 +2100,8 @@ def test_file_run_rejects_an_invalid_pr_body_pin(line):
 
 @pytest.mark.parametrize("permission", ["read", "triage", "none"])
 def test_fork_file_run_without_contributor_tier_or_write_is_denied(permission):
+    # [FUNCTION DOC] For a fork pull request, an actor with read, triage or no permission and the
+    # default author association NONE gets "not authorized" and nothing is dispatched.
     api = FakeAPI(pull(head_repository_id=HANDLER.REPOSITORY_ID + 1), permission=permission)
 
     with pytest.raises(HANDLER.CommentCommandError, match="not authorized"):
@@ -1745,6 +2111,9 @@ def test_fork_file_run_without_contributor_tier_or_write_is_denied(permission):
 
 @pytest.mark.parametrize("permission", ["write", "admin"])
 def test_repository_writer_dispatches_a_fork_file_run(permission):
+    # [FUNCTION DOC] A write or admin actor dispatches a file run for a fork pull request: the head
+    # pull is looked up once by fork owner and branch, exactly one dispatch of run-ci-file.yml on
+    # main with the three basic inputs occurs, and the decision is ALLOW_FILE_RUN_DISPATCHED.
     api = FakeAPI(pull(head_repository_id=HANDLER.REPOSITORY_ID + 1), permission=permission)
 
     result = HANDLER.process_event(event(body=RUN_FILE_BODY), policy(), api)
@@ -1762,6 +2131,9 @@ def test_repository_writer_dispatches_a_fork_file_run(permission):
 
 @pytest.mark.parametrize("author_association", ["OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR"])
 def test_prior_contributor_dispatches_a_fork_file_run_without_a_permission_lookup(author_association):
+    # [FUNCTION DOC] Parametrized over author associations OWNER, MEMBER, COLLABORATOR, CONTRIBUTOR
+    # with permission none: the fork file run is dispatched without any permission lookup, after one
+    # head pull lookup.
     api = FakeAPI(pull(head_repository_id=HANDLER.REPOSITORY_ID + 1), permission="none")
 
     result = HANDLER.process_event(event(body=RUN_FILE_BODY, author_association=author_association), policy(), api)
@@ -1773,6 +2145,9 @@ def test_prior_contributor_dispatches_a_fork_file_run_without_a_permission_looku
 
 @pytest.mark.parametrize("author_association", ["FIRST_TIME_CONTRIBUTOR", "FIRST_TIMER", "NONE", "MANNEQUIN"])
 def test_first_time_contributor_cannot_dispatch_a_fork_file_run(author_association):
+    # [FUNCTION DOC] Parametrized over author associations FIRST_TIME_CONTRIBUTOR, FIRST_TIMER, NONE,
+    # MANNEQUIN with permission read: the fork file run gets "not authorized" and nothing is
+    # dispatched.
     api = FakeAPI(pull(head_repository_id=HANDLER.REPOSITORY_ID + 1), permission="read")
 
     with pytest.raises(HANDLER.CommentCommandError, match="not authorized"):
@@ -1781,6 +2156,8 @@ def test_first_time_contributor_cannot_dispatch_a_fork_file_run(author_associati
 
 
 def test_fork_file_run_requires_one_unique_head_pull():
+    # [FUNCTION DOC] When the head pull lookup returns nothing for a fork pull request, the file run
+    # raises an error saying exactly one pull request is required and dispatches nothing.
     api = FakeAPI(pull(head_repository_id=HANDLER.REPOSITORY_ID + 1))
     api.head_pulls = []
 
@@ -1791,6 +2168,8 @@ def test_fork_file_run_requires_one_unique_head_pull():
 
 @pytest.mark.parametrize("permission", ["read", "triage", "none"])
 def test_file_run_requires_live_write_permission(permission):
+    # [FUNCTION DOC] For a same-repository pull request, an actor with read, triage or none
+    # permission (association NONE) gets "not authorized" and nothing is dispatched.
     api = FakeAPI(pull(), permission=permission)
 
     with pytest.raises(HANDLER.CommentCommandError, match="not authorized"):
@@ -1799,6 +2178,8 @@ def test_file_run_requires_live_write_permission(permission):
 
 
 def test_add_label_access_user_id_cannot_dispatch_a_file_run():
+    # [FUNCTION DOC] An actor listed only in the add-label group (permission read) gets "not
+    # authorized" for a file run and nothing is dispatched.
     api = FakeAPI(pull(), permission="read")
 
     with pytest.raises(HANDLER.CommentCommandError, match="not authorized"):
@@ -1808,6 +2189,9 @@ def test_add_label_access_user_id_cannot_dispatch_a_file_run():
 
 @pytest.mark.parametrize("author_association", ["OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR"])
 def test_prior_contributor_dispatches_a_file_run_without_a_permission_lookup(author_association):
+    # [FUNCTION DOC] Parametrized over associations OWNER, MEMBER, COLLABORATOR, CONTRIBUTOR with
+    # permission none: a same-repository file run is dispatched with the three basic inputs and no
+    # permission lookup; the decision is ALLOW_FILE_RUN_DISPATCHED.
     api = FakeAPI(pull(), permission="none")
 
     result = HANDLER.process_event(
@@ -1829,6 +2213,8 @@ def test_prior_contributor_dispatches_a_file_run_without_a_permission_lookup(aut
 
 @pytest.mark.parametrize("author_association", ["FIRST_TIME_CONTRIBUTOR", "FIRST_TIMER", "NONE", "MANNEQUIN"])
 def test_first_time_contributor_cannot_dispatch_a_file_run(author_association):
+    # [FUNCTION DOC] Parametrized over associations FIRST_TIME_CONTRIBUTOR, FIRST_TIMER, NONE,
+    # MANNEQUIN with permission read: "not authorized" and nothing dispatched.
     api = FakeAPI(pull(), permission="read")
 
     with pytest.raises(HANDLER.CommentCommandError, match="not authorized"):
@@ -1841,6 +2227,8 @@ def test_first_time_contributor_cannot_dispatch_a_file_run(author_association):
 
 
 def test_prior_contributor_access_user_id_dispatches_a_file_run():
+    # [FUNCTION DOC] An actor with association FIRST_TIMER and permission none who is listed by id in
+    # the prior contributor group dispatches the file run without a permission lookup.
     api = FakeAPI(pull(), permission="none")
 
     result = HANDLER.process_event(
@@ -1862,6 +2250,9 @@ def test_prior_contributor_access_user_id_dispatches_a_file_run():
 
 @pytest.mark.parametrize("body", ["/run-ci-short", "/clear-labels"])
 def test_contributor_association_grants_no_label_command(body):
+    # [FUNCTION DOC] Parametrized over an add-label and a clear-labels comment from an actor with
+    # association CONTRIBUTOR and permission read: "not authorized", and no label added or removed,
+    # no rerun, no dispatch (the contributor tier covers only rerun and file-run).
     api = FakeAPI(pull(labels=("run-ci-short",)), permission="read")
 
     with pytest.raises(HANDLER.CommentCommandError, match="not authorized"):
@@ -1875,6 +2266,9 @@ def test_contributor_association_grants_no_label_command(body):
 
 @pytest.mark.parametrize("body", ["/run-ci-short", "/clear-labels"])
 def test_prior_contributor_access_user_id_grants_no_label_command(body):
+    # [FUNCTION DOC] Parametrized over add-label and clear-labels comments from an actor listed only
+    # in the prior contributor group (association FIRST_TIMER, permission none): "not authorized" and
+    # no mutation of any kind.
     api = FakeAPI(pull(labels=("run-ci-short",)), permission="none")
 
     with pytest.raises(HANDLER.CommentCommandError, match="not authorized"):
@@ -1891,6 +2285,9 @@ def test_prior_contributor_access_user_id_grants_no_label_command(body):
 
 
 def test_contributor_reruns_failed_ci_without_a_permission_lookup():
+    # [FUNCTION DOC] A CONTRIBUTOR actor (permission none) rerunning failed CI for a pull request
+    # with one failed run (id 10) is allowed: no permission lookup, run 10 rerun, decision
+    # ALLOW_RERUN_REQUESTED.
     api = FakeAPI(pull(), permission="none")
     workflow_file, workflow_path = HANDLER.RERUN_WORKFLOWS[0]
     api.workflow_runs[workflow_file] = [workflow_run(workflow_path)]
@@ -1903,6 +2300,9 @@ def test_contributor_reruns_failed_ci_without_a_permission_lookup():
 
 
 def test_prior_contributor_access_user_id_reruns_failed_ci():
+    # [FUNCTION DOC] An actor listed by id in the prior contributor group (association FIRST_TIMER,
+    # permission none) reruns failed CI without a permission lookup: run 10 is rerun and the decision
+    # is ALLOW_RERUN_REQUESTED.
     api = FakeAPI(pull(), permission="none")
     workflow_file, workflow_path = HANDLER.RERUN_WORKFLOWS[0]
     api.workflow_runs[workflow_file] = [workflow_run(workflow_path)]
@@ -1920,6 +2320,9 @@ def test_prior_contributor_access_user_id_reruns_failed_ci():
 
 @pytest.mark.parametrize("author_association", [None, True, "", "collaborator", "EVERYONE"])
 def test_event_parser_rejects_an_invalid_author_association(author_association):
+    # [FUNCTION DOC] Parametrized over a missing author association, a boolean, an empty string, a
+    # lowercase value and an unknown value. Parsing the event raises the comment command error "author
+    # association is invalid".
     invalid = event(body=RUN_FILE_BODY)
     if author_association is None:
         del invalid["comment"]["author_association"]
@@ -1931,18 +2334,27 @@ def test_event_parser_rejects_an_invalid_author_association(author_association):
 
 
 def test_create_workflow_dispatch_requests_and_returns_exact_run_details(monkeypatch):
+    # [FUNCTION DOC] The recording opener answers 200 with run details (id, api url, html url).
+    # Dispatching run-ci-file.yml on ref feature/test with one input via the real client sends one
+    # POST to the fixed repository's workflow dispatches endpoint whose JSON body has the ref, the
+    # inputs and return_run_details true, with a 15 second timeout, and returns the html url.
     requests = []
 
     class Response:
+        # [CLASS DOC] HELPER: Fake context-manager response with status 200 and a JSON body of run
+        # details.
         status = 200
 
         def __enter__(self):
+            # [FUNCTION DOC] HELPER: Return the response itself.
             return self
 
         def __exit__(self, *_args):
+            # [FUNCTION DOC] HELPER: Never suppress exceptions.
             return False
 
         def read(self):
+            # [FUNCTION DOC] HELPER: Return the JSON bytes of workflow_run_id, run_url and html_url.
             return json.dumps(
                 {
                     "workflow_run_id": WORKFLOW_RUN_ID,
@@ -1952,6 +2364,7 @@ def test_create_workflow_dispatch_requests_and_returns_exact_run_details(monkeyp
             ).encode("utf-8")
 
     def urlopen(request, *, timeout):
+        # [FUNCTION DOC] HELPER: Record (request, timeout) and return a response.
         requests.append((request, timeout))
         return Response()
 
@@ -1979,22 +2392,31 @@ def test_create_workflow_dispatch_requests_and_returns_exact_run_details(monkeyp
     [(204, b"", "expected 200"), (200, b"", "invalid JSON")],
 )
 def test_create_workflow_dispatch_rejects_unconfirmed_response(monkeypatch, status, body, message):
+    # [FUNCTION DOC] Parametrized over (204 with empty body -> "expected 200") and (200 with empty
+    # body -> "invalid JSON"). Dispatching raises the comment command error matching the message and
+    # the opener ran exactly once (no retry).
     attempts = 0
 
     class Response:
+        # [CLASS DOC] HELPER: Fake context-manager response returning the parametrized body.
         def __enter__(self):
+            # [FUNCTION DOC] HELPER: Return the response itself.
             return self
 
         def __exit__(self, *_args):
+            # [FUNCTION DOC] HELPER: Never suppress exceptions.
             return False
 
         def read(self):
+            # [FUNCTION DOC] HELPER: Return the parametrized body bytes.
             return body
 
     response = Response()
     response.status = status
 
     def urlopen(_request, *, timeout):
+        # [FUNCTION DOC] HELPER: Count the call, assert the 15 second timeout, return the shared
+        # response.
         nonlocal attempts
         attempts += 1
         assert timeout == 15
@@ -2029,16 +2451,25 @@ def test_create_workflow_dispatch_rejects_unconfirmed_response(monkeypatch, stat
     ],
 )
 def test_create_workflow_dispatch_rejects_invalid_run_details(monkeypatch, details, message):
+    # [FUNCTION DOC] Parametrized over 200 responses with bad details: missing run id (error "workflow
+    # run ID must be a positive integer"), a run api url for a different run (mismatched details), and
+    # an html url on a foreign host (invalid workflow run url). Dispatching raises the matching
+    # comment command error.
     class Response:
+        # [CLASS DOC] HELPER: Fake context-manager response with status 200 and the parametrized
+        # details as JSON.
         status = 200
 
         def __enter__(self):
+            # [FUNCTION DOC] HELPER: Return the response itself.
             return self
 
         def __exit__(self, *_args):
+            # [FUNCTION DOC] HELPER: Never suppress exceptions.
             return False
 
         def read(self):
+            # [FUNCTION DOC] HELPER: Return the details serialized as JSON bytes.
             return json.dumps(details).encode("utf-8")
 
     monkeypatch.setattr(HANDLER.urllib.request, "urlopen", lambda _request, timeout: Response())
@@ -2047,21 +2478,31 @@ def test_create_workflow_dispatch_rejects_invalid_run_details(monkeypatch, detai
 
 
 def test_create_issue_comment_uses_exact_endpoint_and_confirms_body(monkeypatch):
+    # [FUNCTION DOC] The recording opener answers 201 with the created comment (body and id). The
+    # real client's create call for pull 123 returns the new comment id and has sent one POST to the
+    # fixed repository's issue comments endpoint with a JSON body holding only the body text, within
+    # a 15 second timeout.
     requests = []
 
     class Response:
+        # [CLASS DOC] HELPER: Fake context-manager response with status 201 and a JSON body of the
+        # comment text and id.
         status = 201
 
         def __enter__(self):
+            # [FUNCTION DOC] HELPER: Return the response itself.
             return self
 
         def __exit__(self, *_args):
+            # [FUNCTION DOC] HELPER: Never suppress exceptions.
             return False
 
         def read(self):
+            # [FUNCTION DOC] HELPER: Return the JSON bytes with the announce body and new comment id.
             return json.dumps({"body": ANNOUNCE_BODY, "id": NEW_COMMENT_ID}).encode("utf-8")
 
     def urlopen(request, *, timeout):
+        # [FUNCTION DOC] HELPER: Record (request, timeout) and return a response.
         requests.append((request, timeout))
         return Response()
 
@@ -2089,22 +2530,31 @@ def test_create_issue_comment_rejects_unconfirmed_response_without_retry(
     body,
     message,
 ):
+    # [FUNCTION DOC] Parametrized over (status 200 -> "expected 201"), (201 with a different body ->
+    # "did not confirm") and (201 without an id -> "comment ID"). Creating the comment raises the
+    # matching comment command error and the opener ran exactly once.
     attempts = 0
 
     class Response:
+        # [CLASS DOC] HELPER: Fake context-manager response returning the parametrized body as JSON.
         def __enter__(self):
+            # [FUNCTION DOC] HELPER: Return the response itself.
             return self
 
         def __exit__(self, *_args):
+            # [FUNCTION DOC] HELPER: Never suppress exceptions.
             return False
 
         def read(self):
+            # [FUNCTION DOC] HELPER: Return the body mapping serialized as JSON bytes.
             return json.dumps(body).encode("utf-8")
 
     response = Response()
     response.status = status
 
     def urlopen(_request, *, timeout):
+        # [FUNCTION DOC] HELPER: Count the call, assert the 15 second timeout, return the shared
+        # response.
         nonlocal attempts
         attempts += 1
         assert timeout == 15
@@ -2118,22 +2568,32 @@ def test_create_issue_comment_rejects_unconfirmed_response_without_retry(
 
 @pytest.mark.parametrize("status", [200, 201])
 def test_add_comment_reaction_accepts_created_or_existing_reaction(monkeypatch, status):
+    # [FUNCTION DOC] Parametrized over status 200 (reaction already existed) and 201 (created), both
+    # with a body confirming content "+1". Adding the reaction to comment 5678 sends one POST to the
+    # fixed repository's issue comment reactions endpoint with a JSON body of the content, within a 15
+    # second timeout.
     requests = []
 
     class Response:
+        # [CLASS DOC] HELPER: Fake context-manager response confirming a "+1" reaction; the status is
+        # set on the instance afterwards.
         def __enter__(self):
+            # [FUNCTION DOC] HELPER: Return the response itself.
             return self
 
         def __exit__(self, *_args):
+            # [FUNCTION DOC] HELPER: Never suppress exceptions.
             return False
 
         def read(self):
+            # [FUNCTION DOC] HELPER: Return the JSON bytes of the confirmed reaction.
             return b'{"content":"+1"}'
 
     response = Response()
     response.status = status
 
     def urlopen(request, *, timeout):
+        # [FUNCTION DOC] HELPER: Record (request, timeout) and return the shared response.
         requests.append((request, timeout))
         return response
 
@@ -2157,22 +2617,31 @@ def test_add_comment_reaction_accepts_created_or_existing_reaction(monkeypatch, 
     ],
 )
 def test_add_comment_reaction_rejects_unconfirmed_response_without_retry(monkeypatch, status, body, message):
+    # [FUNCTION DOC] Parametrized over (202, 204 -> "expected 200 or 201"), (201 with a different
+    # reaction -> "did not confirm") and (201 with invalid JSON -> "invalid JSON"). Adding the
+    # reaction raises the matching comment command error and the opener ran exactly once.
     attempts = 0
 
     class Response:
+        # [CLASS DOC] HELPER: Fake context-manager response returning the parametrized body.
         def __enter__(self):
+            # [FUNCTION DOC] HELPER: Return the response itself.
             return self
 
         def __exit__(self, *_args):
+            # [FUNCTION DOC] HELPER: Never suppress exceptions.
             return False
 
         def read(self):
+            # [FUNCTION DOC] HELPER: Return the parametrized body bytes.
             return body
 
     response = Response()
     response.status = status
 
     def urlopen(_request, *, timeout):
+        # [FUNCTION DOC] HELPER: Count the call, assert the 15 second timeout, return the shared
+        # response.
         nonlocal attempts
         attempts += 1
         assert timeout == 15
@@ -2192,9 +2661,12 @@ def test_add_comment_reaction_rejects_unconfirmed_response_without_retry(monkeyp
     ],
 )
 def test_comment_reaction_api_failure_is_not_retried(monkeypatch, exception, message):
+    # [FUNCTION DOC] Parametrized over opener failures (HTTP 403, a timeout). Adding a reaction raises
+    # the matching comment command error and the opener ran exactly once with a 15 second timeout.
     attempts = []
 
     def urlopen(_request, *, timeout):
+        # [FUNCTION DOC] HELPER: Record the timeout, then raise the parametrized exception.
         attempts.append(timeout)
         raise exception
 
@@ -2205,6 +2677,9 @@ def test_comment_reaction_api_failure_is_not_retried(monkeypatch, exception, mes
 
 
 def test_acknowledge_event_reacts_only_for_run_test_file():
+    # [FUNCTION DOC] Acknowledging a file-run comment adds exactly one "+1" reaction to comment 5678
+    # and returns the ALLOW_SUCCESS_REACTION_CONFIRMED record with actor id, pull number and the
+    # reaction.
     api = FakeAPI(pull())
 
     result = HANDLER.acknowledge_event(event(body=RUN_FILE_BODY), api)
@@ -2219,6 +2694,8 @@ def test_acknowledge_event_reacts_only_for_run_test_file():
 
 
 def test_acknowledge_event_rejects_commands_without_a_success_reaction():
+    # [FUNCTION DOC] Acknowledging a rerun-failed-ci comment (whose spec has no success reaction)
+    # raises an error saying the command does not define one and adds no reaction.
     api = FakeAPI(pull())
 
     with pytest.raises(HANDLER.CommentCommandError, match="does not define"):
@@ -2228,6 +2705,8 @@ def test_acknowledge_event_rejects_commands_without_a_success_reaction():
 
 @pytest.mark.parametrize("comment_id", [None, 0, "5678"])
 def test_acknowledge_event_rejects_an_invalid_comment_id(comment_id):
+    # [FUNCTION DOC] Parametrized over comment ids none, 0 and the string "5678". Acknowledging
+    # raises an error that the comment ID must be a positive integer and adds no reaction.
     api = FakeAPI(pull())
     command_event = event(body=RUN_FILE_BODY)
     command_event["comment"]["id"] = comment_id
@@ -2238,6 +2717,10 @@ def test_acknowledge_event_rejects_an_invalid_comment_id(comment_id):
 
 
 def test_acknowledge_mode_reacts_without_loading_policy(monkeypatch, capsys):
+    # [FUNCTION DOC] Runs the handler main in acknowledge mode (environment flag set, no policy path)
+    # for a file-run comment, with policy loading set to fail the test. Asserts exit 0, the only API
+    # call is the "+1" reaction on comment 5678, and the printed audit record is the confirmed
+    # reaction record.
     api = FakeAPI(pull())
     monkeypatch.setattr(HANDLER, "load_json", lambda _path: event(body=RUN_FILE_BODY))
     monkeypatch.setattr(HANDLER, "load_policy", lambda _path: pytest.fail("policy must not be loaded"))
@@ -2257,6 +2740,8 @@ def test_acknowledge_mode_reacts_without_loading_policy(monkeypatch, capsys):
 
 
 def test_acknowledge_mode_rejects_a_command_without_a_success_reaction(monkeypatch):
+    # [FUNCTION DOC] Runs acknowledge mode for a rerun comment; asserts main exits 1 and the API was
+    # never called.
     api = FakeAPI(pull())
     monkeypatch.setattr(HANDLER, "load_json", lambda _path: event(body="/rerun-failed-ci"))
     monkeypatch.setattr(HANDLER, "load_policy", lambda _path: pytest.fail("policy must not be loaded"))
@@ -2270,6 +2755,10 @@ def test_acknowledge_mode_rejects_a_command_without_a_success_reaction(monkeypat
 
 
 def test_announce_posts_a_running_status_comment_keyed_to_the_run(monkeypatch):
+    # [FUNCTION DOC] With the clock fixed at the sample report time, announcing a file run creates one
+    # comment on pull 123 whose body is the running message (file path, workflow run link, start time
+    # formatted in UTC, and a hidden marker with the run id) and returns the record with the new
+    # comment id, decision FILE_RUN_ANNOUNCED, pull number, run id and test file.
     api = FakeAPI(pull())
     monkeypatch.setattr(HANDLER, "_utc_now", lambda: REPORT_NOW)
 
@@ -2288,6 +2777,10 @@ def test_announce_posts_a_running_status_comment_keyed_to_the_run(monkeypatch):
 
 
 def test_report_updates_the_announced_comment_with_the_result_and_duration(monkeypatch):
+    # [FUNCTION DOC] With the clock fixed 3m11s after the run start, reporting a successful run edits
+    # the existing comment (no new comment) to "<check mark> `<file>` **passed** on `<suite>` in
+    # 3m11s", an em dash, a workflow run link and the hidden run marker, and returns the record with
+    # decision FILE_RUN_PASSED, the duration and ids.
     api = FakeAPI(pull())
     monkeypatch.setattr(HANDLER, "_utc_now", lambda: REPORT_NOW)
 
@@ -2346,6 +2839,11 @@ def test_report_updates_the_announced_comment_with_the_result_and_duration(monke
     ],
 )
 def test_report_never_calls_a_non_passing_run_a_pass(monkeypatch, overrides, decision, icon, explanation):
+    # [FUNCTION DOC] Parametrized over job result overrides: execution job failed, resolve step failed
+    # (execution skipped), execution cancelled, resolve cancelled, and both execution jobs skipped.
+    # Asserts the edited comment starts with the expected icon (cross mark for failure, white circle
+    # for cancelled), never contains "**passed**", contains the matching explanation sentence, and
+    # the record's decision is FILE_RUN_FAILED or FILE_RUN_CANCELLED accordingly.
     api = FakeAPI(pull())
     monkeypatch.setattr(HANDLER, "_utc_now", lambda: REPORT_NOW)
 
@@ -2359,6 +2857,9 @@ def test_report_never_calls_a_non_passing_run_a_pass(monkeypatch, overrides, dec
 
 
 def test_report_reads_the_run_start_from_the_api_not_from_an_input(monkeypatch):
+    # [FUNCTION DOC] The fake API's workflow run started an hour earlier than the sample. Reporting
+    # fetches the run detail exactly once for the run id and the duration is "1h03m11s" (hours,
+    # zero-padded minutes and seconds).
     api = FakeAPI(pull())
     api.workflow_run = {"run_started_at": "2026-08-23T08:25:25Z"}
     monkeypatch.setattr(HANDLER, "_utc_now", lambda: REPORT_NOW)
@@ -2382,6 +2883,10 @@ def test_report_reads_the_run_start_from_the_api_not_from_an_input(monkeypatch):
     ],
 )
 def test_report_fails_closed_on_an_unusable_run_start(monkeypatch, workflow_run):
+    # [FUNCTION DOC] Parametrized over run details lacking a usable start: empty mapping, only a
+    # created-at field, empty start, a non-timestamp, a timestamp without timezone marker, a number,
+    # or a string instead of a mapping. Reporting raises the comment command error and neither edits
+    # nor creates a comment.
     api = FakeAPI(pull())
     api.workflow_run = workflow_run
     monkeypatch.setattr(HANDLER, "_utc_now", lambda: REPORT_NOW)
@@ -2397,10 +2902,14 @@ def test_report_fails_closed_on_an_unusable_run_start(monkeypatch, workflow_run)
     [(0, "0s"), (9, "9s"), (59, "59s"), (60, "1m00s"), (191, "3m11s"), (3600, "1h00m00s"), (3791, "1h03m11s")],
 )
 def test_duration_formatting_is_stable(seconds, formatted):
+    # [FUNCTION DOC] The private duration formatter renders 0 s, 9 s, 59 s as seconds only, 60 s as
+    # "1m00s", 191 s as "3m11s", 3600 s as "1h00m00s" and 3791 s as "1h03m11s".
     assert HANDLER._format_duration(seconds) == formatted
 
 
 def test_negative_duration_is_a_hard_error():
+    # [FUNCTION DOC] Formatting a negative duration raises the comment command error mentioning
+    # negative.
     with pytest.raises(HANDLER.CommentCommandError, match="negative"):
         HANDLER._format_duration(-1)
 
@@ -2423,11 +2932,19 @@ def test_negative_duration_is_a_hard_error():
     ],
 )
 def test_file_run_status_inputs_fail_closed(mode, overrides, message):
+    # [FUNCTION DOC] Parametrized over invalid environment values: an unknown mode, a zero /
+    # non-numeric / empty pull number, a negative run id, a test file with parent traversal or empty,
+    # an invalid suite name, an unknown resolve result, a CPU result alongside a CUDA result (two
+    # executing jobs), and a missing or zero comment id in report mode. Parsing the environment
+    # raises the comment command error matching the message.
     with pytest.raises(HANDLER.CommentCommandError, match=message):
         HANDLER._file_run_status_inputs(file_run_env(mode, **overrides))
 
 
 def test_status_mode_needs_no_event_and_loads_no_policy(monkeypatch, capsys):
+    # [FUNCTION DOC] Runs the handler main in report status mode with the event path unset and event
+    # and policy loading set to fail the test; the token and all file-run variables are set. Asserts
+    # exit 0 and the printed record has decision FILE_RUN_PASSED.
     api = FakeAPI(pull())
     monkeypatch.setattr(HANDLER, "load_json", lambda _path: pytest.fail("no event payload may be read"))
     monkeypatch.setattr(HANDLER, "load_policy", lambda _path: pytest.fail("policy must not be loaded"))
@@ -2443,6 +2960,9 @@ def test_status_mode_needs_no_event_and_loads_no_policy(monkeypatch, capsys):
 
 
 def test_announce_mode_writes_the_created_comment_id(monkeypatch, tmp_path, capsys):
+    # [FUNCTION DOC] Runs main in announce mode with a GitHub output file; asserts exit 0, the output
+    # file holds exactly "comment_id=<new id>" and the printed record's decision is
+    # FILE_RUN_ANNOUNCED.
     api = FakeAPI(pull())
     output_path = tmp_path / "github-output"
     monkeypatch.setattr(HANDLER, "GitHubAPI", lambda _token: api)
@@ -2458,6 +2978,9 @@ def test_announce_mode_writes_the_created_comment_id(monkeypatch, tmp_path, caps
 
 
 def test_status_mode_reports_a_handler_error_as_a_failed_step(monkeypatch, capsys):
+    # [FUNCTION DOC] In report mode with an invalid test file value (and API construction set to
+    # fail the test, proving inputs are validated first), main exits 1 and prints the GitHub error
+    # annotation "file run test file is invalid".
     monkeypatch.setattr(HANDLER, "GitHubAPI", lambda _token: pytest.fail("token is validated first"))
     monkeypatch.setenv("CI_COMMAND_API_TOKEN", "status-token")
     for name, value in file_run_env("report", FILE_RUN_TEST_FILE="not-a-test").items():
@@ -2468,6 +2991,8 @@ def test_status_mode_reports_a_handler_error_as_a_failed_step(monkeypatch, capsy
 
 
 def test_the_gateway_no_longer_owns_a_reply_path():
+    # [FUNCTION DOC] Asserts the handler module has no reply-event function and no workflow-run-url
+    # writer: the dispatched run reports its own progress and result.
     # The run itself reports progress and the result; a second static comment
     # from the gateway would duplicate it.
     assert not hasattr(HANDLER, "reply_event")
@@ -2475,6 +3000,23 @@ def test_the_gateway_no_longer_owns_a_reply_path():
 
 
 def test_workflow_runs_only_trusted_code_with_minimal_permissions():
+    # [FUNCTION DOC] Reads the comment-ci-command workflow text and asserts security invariants by
+    # substring, count and ordering checks: triggers only on created issue comments and never
+    # interpolates the comment body; read-only contents permission; checks out the workflow's own sha
+    # pinned by action sha without persisting credentials; exactly one CI App token step (pinned
+    # action, client id variable, private key secret), scoped to issues write; no actions permission
+    # in that token; the token for the issues command comes from that step while the other jobs use
+    # the job token; preflight precedes token minting; label commands fail loudly when the App is
+    # disabled; routing outputs (capability, success reaction) drive three jobs (handle-command,
+    # actions-command, acknowledge-command) with the actions job queued per issue number without
+    # cancellation; the issues token step requests issues and pull-requests write only (no contents,
+    # no pull-requests read); the App requirement check comes before minting; the actions job has
+    # contents read, actions write and pull-requests read, no issues write and no App token; the
+    # acknowledge job has issues and pull-requests write, no actions write and no App token, runs
+    # after the actions job, only when it succeeded and the success reaction is "+1", never under an
+    # always condition, and sets the acknowledge flag; no reply job or reply / run-url variables
+    # remain; no pull_request_target trigger, head ref use, pip install, or contents / workflow
+    # actions write permissions.
     workflow = WORKFLOW_PATH.read_text()
     assert "issue_comment:\n    types: [created]" in workflow
     assert "github.event.comment.body" not in workflow

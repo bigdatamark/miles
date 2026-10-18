@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Tests for the planning mode of tests/ci/run_suite.py (list-only with a GitHub output file), which
+# decides whether a GPU stage has any test to run so that an empty shard never requests a GPU
+# runner. Plans are produced by running the script as a subprocess in a temporary directory
+# containing at most one generated test file (which raises if imported, proving planning only
+# parses it). Also checks that the GPU reusable workflows (CUDA and ROCm) plan on a hosted
+# runner and gate the run job on the plan. SUITES maps hardware kind to the sample suite used
+# (cuda: stage-c-4-gpu-h200, rocm: stage-c-4-gpu-mi350). Registers itself as a CPU test (est_time 2)
+# in suite stage-a-cpu.
 """GPU allocation plans must select a nonempty shard without importing tests."""
 
 import os
@@ -17,6 +26,15 @@ SUITES = {"cuda": "stage-c-4-gpu-h200", "rocm": "stage-c-4-gpu-mi350"}
 
 
 def _plan(tmp_path, hw, selection_args, *, registration_options="", empty=False):
+    # [FUNCTION DOC] HELPER: Run the suite runner in list-only mode for the hardware kind and its
+    # sample suite, writing the plan to a pre-seeded GitHub output file (containing "existing=value"),
+    # with extra selection arguments. Unless empty is set, first creates tests/e2e/test_selected.py
+    # in the temporary directory: it imports the register function for the hardware kind, registers
+    # with est_time 1, the sample suite, label megatron, (for CUDA) hopper and blackwell hardware,
+    # plus the extra registration option text, then raises an assertion error so any import or
+    # execution is detected. The runner is invoked with the interpreter's site import disabled,
+    # the repository on the module path and the temporary directory as working directory.
+    # Returns (completed process, mapping parsed from the output file lines).
     if not empty:
         test_file = tmp_path / "tests/e2e/test_selected.py"
         test_file.parent.mkdir(parents=True)
@@ -68,6 +86,12 @@ def _plan(tmp_path, hw, selection_args, *, registration_options="", empty=False)
     ],
 )
 def test_plan_applies_selection_without_runtime_dependencies(tmp_path, hw, options, selection_args, has_tests):
+    # [FUNCTION DOC] Parametrized over hardware kind (cuda, rocm) and registration options /
+    # selection arguments: no filters or a non-matching label selects nothing; the matching label or
+    # match-all-labels selects the test; a disabled registration never; a nightly registration only
+    # for nightly, weekly or release cadence. Asserts exit code 0, the output file has exactly the
+    # pre-seeded line plus has_tests set to the expected true/false, and standard output says "No
+    # tests to run." exactly when none are selected.
     result, output = _plan(tmp_path, hw, selection_args, registration_options=options)
 
     assert result.returncode == 0, result.stderr
@@ -78,6 +102,8 @@ def test_plan_applies_selection_without_runtime_dependencies(tmp_path, hw, optio
 @pytest.mark.parametrize("hw", ["cuda", "rocm"])
 @pytest.mark.parametrize("cadence", ["regular", "nightly", "weekly", "release"])
 def test_empty_suite_never_requests_a_gpu(tmp_path, hw, cadence):
+    # [FUNCTION DOC] With no test files at all, for each hardware kind and each cadence, planning
+    # with match-all-labels exits 0 and reports has_tests false.
     result, output = _plan(tmp_path, hw, ["--cadence", cadence, "--match-all-labels"], empty=True)
 
     assert result.returncode == 0, result.stderr
@@ -88,6 +114,9 @@ def test_empty_suite_never_requests_a_gpu(tmp_path, hw, cadence):
 @pytest.mark.parametrize("cadence", ["regular", "nightly", "weekly", "release"])
 @pytest.mark.parametrize("partition", [0, 1, 2])
 def test_plan_checks_each_shard_after_partitioning(tmp_path, hw, cadence, partition):
+    # [FUNCTION DOC] With one test and an automatic partition into 3 shards, planning for shard 0, 1
+    # or 2 exits 0 and reports has_tests true only for shard 0 (the one holding the test), for every
+    # hardware kind and cadence.
     result, output = _plan(
         tmp_path,
         hw,
@@ -107,6 +136,9 @@ def test_plan_checks_each_shard_after_partitioning(tmp_path, hw, cadence, partit
 
 
 def test_arch_dispatch_does_not_allocate_the_tests_original_runner(tmp_path):
+    # [FUNCTION DOC] Planning the hopper CUDA stage with the megatron label plus run-on-blackwell
+    # (the portable test is dispatched to the blackwell stage) exits 0 and reports has_tests false for
+    # this stage.
     result, output = _plan(tmp_path, "cuda", ["--labels", "run-ci-megatron", "run-on-blackwell"])
 
     assert result.returncode == 0, result.stderr
@@ -115,6 +147,9 @@ def test_arch_dispatch_does_not_allocate_the_tests_original_runner(tmp_path):
 
 @pytest.mark.parametrize("hw", ["cuda", "rocm"])
 def test_invalid_registration_fails_without_an_empty_success_plan(tmp_path, hw):
+    # [FUNCTION DOC] A registration with nightly given as the integer 1 makes planning exit
+    # non-zero with "nightly must be a boolean" on stderr and write no has_tests key (no false
+    # success plan), for both hardware kinds.
     result, output = _plan(tmp_path, hw, ["--match-all-labels"], registration_options=", nightly=1")
 
     assert result.returncode != 0
@@ -123,6 +158,9 @@ def test_invalid_registration_fails_without_an_empty_success_plan(tmp_path, hw):
 
 
 def test_selection_output_cannot_be_requested_while_executing_tests(tmp_path):
+    # [FUNCTION DOC] Runs the suite runner as a module from the repository root with a GitHub output
+    # path but without list-only; asserts a non-zero exit, stderr saying the output option requires
+    # list-only, and that the output file was not created.
     output = tmp_path / "github-output"
     result = subprocess.run(
         [
@@ -150,6 +188,15 @@ def test_selection_output_cannot_be_requested_while_executing_tests(tmp_path):
 
 @pytest.mark.parametrize("workflow", ["_run-ci.yml", "_run-ci-rocm.yml"])
 def test_gpu_workflow_requires_a_successful_hosted_plan(workflow):
+    # [FUNCTION DOC] Parses the CUDA and ROCm reusable workflow files and asserts: the plan job runs
+    # on a hosted ubuntu runner without a container, with read-only contents permission, exposes
+    # has_tests and ref outputs from the select step; its checkout uses the input ref without
+    # persisted credentials; the select step runs the execute command with list-only and the GitHub
+    # output file and records the head commit as ref; the run job needs the plan, runs only when the
+    # plan succeeded and has tests, has no list-only step, and checks out the plan's ref. For the
+    # CUDA workflow only: the plan job is skipped when the plan is already resolved, the run
+    # condition accepts an already-resolved plan, is not cancelled, and the checkout ref uses the
+    # input ref when the plan is already resolved.
     jobs = yaml.safe_load((ROOT / ".github/workflows" / workflow).read_text())["jobs"]
     plan, run = jobs["plan"], jobs["run"]
 

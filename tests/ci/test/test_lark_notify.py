@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Tests for the Lark notification script (.github/workflows/scripts/lark_notify.py, loaded by path
+# under a test-only module name as HANDLER) and the workflows that call it. The script renders
+# Lark interactive cards for finished CI runs (nightly status with failed jobs, flaky jobs that
+# passed on rerun, optional AI failure reasons from ci_failure_analysis; Docker build and wheel
+# build failures), reruns failed jobs of a first failed nightly attempt before reporting, and
+# downloads job logs through the GitHub API (following the redirect without the token and bounding
+# the download to the log tail). Tests use fake GitHub clients, fake blob servers, monkeypatched
+# network functions and post functions, and read workflow YAML text for security invariants.
+# Helper builders: run and job build GitHub run/job mappings; markdown joins the markdown elements
+# of a card; args builds an argument object. Registers itself as a CPU test in suite stage-a-cpu.
 import base64
 import importlib.util
 import json
@@ -19,6 +30,8 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 
 def load_module(name, path):
+    # [FUNCTION DOC] HELPER: Import a Python file by path under the given module name, registering
+    # it in the module table before executing its body; return the module.
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
@@ -31,6 +44,9 @@ ANALYSIS = HANDLER.analyze_failures.__globals__["JobAnalysis"]
 
 
 def run(**overrides):
+    # [FUNCTION DOC] HELPER: Build a completed, failed scheduled workflow run mapping (id 123, name
+    # "PR Test", attempt 1, timestamps on 2026-09-04, head sha of forty "a", a head commit message,
+    # run url and repository radixark/miles) with keyword overrides applied.
     value = {
         "id": 123,
         "name": "PR Test",
@@ -51,16 +67,22 @@ def run(**overrides):
 
 
 def job(job_id=10, name="unit", conclusion="failure"):
+    # [FUNCTION DOC] HELPER: Build a job mapping (id 10, name "unit", conclusion failure by default)
+    # with an html url "https://example/jobs/<id>".
     return {"id": job_id, "name": name, "conclusion": conclusion, "html_url": f"https://example/jobs/{job_id}"}
 
 
 def markdown(card):
+    # [FUNCTION DOC] HELPER: Return the content of all markdown elements in the card body joined by
+    # newlines.
     return "\n".join(
         element.get("content", "") for element in card["card"]["body"]["elements"] if element.get("tag") == "markdown"
     )
 
 
 def test_analysis_disabled_preserves_exact_original_card():
+    # [FUNCTION DOC] Rendering with a disabled analysis outcome gives a card equal to rendering with
+    # no outcome.
     jobs = [job(), job(20, "pass", "success")]
     original = HANDLER.render_ci_status(run(), jobs, None)
     disabled = HANDLER.AnalysisOutcome(enabled=False, reasons={})
@@ -68,6 +90,11 @@ def test_analysis_disabled_preserves_exact_original_card():
 
 
 def test_validated_reason_is_directly_beneath_its_existing_job_link():
+    # [FUNCTION DOC] With an enabled outcome holding one analysis (tags megatron and lora, a test
+    # name, a reason sentence and related pull request 2754) for job 10, the card markdown contains
+    # the job link line followed by indented lines: the tags in brackets with the test name in code
+    # style, the reason, and a "related to PR #2754" link to the pull request; exactly three
+    # continuation markers appear.
     outcome = HANDLER.AnalysisOutcome(
         enabled=True,
         reasons={
@@ -92,6 +119,8 @@ def test_validated_reason_is_directly_beneath_its_existing_job_link():
 
 
 def shard(index):
+    # [FUNCTION DOC] HELPER: Build a failed job mapping for the CPU shard with the given index (id =
+    # index, name "stage-a-cpu (<index>) / run-cpu", url "https://example/jobs/<index>").
     return {
         "id": index,
         "name": f"stage-a-cpu ({index}) / run-cpu",
@@ -101,6 +130,9 @@ def shard(index):
 
 
 def test_one_defect_across_every_shard_collapses_to_a_single_row():
+    # [FUNCTION DOC] Five shards sharing one identical analysis (reason and a tag) render as a single
+    # row: two continuation markers total (tags and reason), all five shard names present, and no
+    # separate bullet rows.
     same = ANALYSIS(reason="Collection failed because the hardware list was rejected.", tags=("rollout",))
     content = HANDLER.list_jobs_md([shard(i) for i in range(5)], reasons={i: [same] for i in range(5)})
     assert content.count("↳") == 2, content
@@ -109,6 +141,8 @@ def test_one_defect_across_every_shard_collapses_to_a_single_row():
 
 
 def test_a_different_failure_keeps_its_own_row():
+    # [FUNCTION DOC] Three shards where two share a reason and one differs render as two rows (one
+    # separate bullet) and the different reason text appears.
     same = ANALYSIS(reason="Collection failed because the hardware list was rejected.")
     other = ANALYSIS(reason="The deterministic test exited with code 1.")
     content = HANDLER.list_jobs_md([shard(0), shard(1), shard(2)], reasons={0: [same], 1: [same], 2: [other]})
@@ -117,11 +151,17 @@ def test_a_different_failure_keeps_its_own_row():
 
 
 def test_rows_stay_separate_when_no_analysis_is_available():
+    # [FUNCTION DOC] Three shards with no reasons at all render as three separate rows (two bullet
+    # separators).
     content = HANDLER.list_jobs_md([shard(0), shard(1), shard(2)], reasons=None)
     assert content.count("\n- ") == 2, content
 
 
 def test_rerun_reasons_apply_only_to_current_failures():
+    # [FUNCTION DOC] On attempt 2 with current failing jobs 20 (still failing) and 30 (new) and a
+    # previous failure 10 that was fixed (flaky), the outcome carries reasons for jobs 10, 20 and 30.
+    # Asserts the card has the flaky section, does not show job 10's stale reason, and shows exactly
+    # two continuation markers (for 20 and 30).
     current = [job(20, "still"), job(30, "new")]
     previous = {"fixed": job(10, "fixed"), "still": job(19, "still")}
     outcome = HANDLER.AnalysisOutcome(
@@ -138,6 +178,9 @@ def test_rerun_reasons_apply_only_to_current_failures():
 
 
 def test_jobs_fixed_by_the_rerun_count_as_flaky_not_failed():
+    # [FUNCTION DOC] Previously failed "flaky" and "still" jobs; in attempt 2 "still" fails again and
+    # "flaky" succeeds. The title is "Nightly Test: FAILED (1 of 2 jobs, 1 flaky)" and the body has
+    # sections "Flaky, passed on rerun (1)" and "Still failing (1)".
     previous = {"flaky": job(10, "flaky"), "still": job(19, "still")}
     current = [job(20, "still"), job(11, "flaky", "success")]
     card = HANDLER.render_ci_status(run(run_attempt=2), current, previous)
@@ -147,6 +190,8 @@ def test_jobs_fixed_by_the_rerun_count_as_flaky_not_failed():
 
 
 def test_a_rerun_that_fixes_every_failure_passes_with_a_flaky_count():
+    # [FUNCTION DOC] A successful attempt 2 whose only job failed before: title "Nightly Test: PASSED
+    # (1 job, 1 flaky)" and a green header template.
     previous = {"flaky": job(10, "flaky")}
     card = HANDLER.render_ci_status(run(run_attempt=2, conclusion="success"), [job(11, "flaky", "success")], previous)
     assert card["card"]["header"]["title"]["content"] == "Nightly Test: PASSED (1 job, 1 flaky)"
@@ -154,6 +199,8 @@ def test_a_rerun_that_fixes_every_failure_passes_with_a_flaky_count():
 
 
 def test_model_failure_adds_one_note_without_removing_original_rows():
+    # [FUNCTION DOC] An enabled but unavailable outcome keeps the job link row, adds exactly one "AI
+    # analysis unavailable" note, and no continuation lines.
     outcome = HANDLER.AnalysisOutcome(enabled=True, reasons={}, unavailable=True)
     content = markdown(HANDLER.render_ci_status(run(), [job()], None, outcome))
     assert "[unit](https://example/jobs/10)" in content
@@ -162,6 +209,9 @@ def test_model_failure_adds_one_note_without_removing_original_rows():
 
 
 def test_per_job_missing_log_reason_and_omitted_footer_render_compactly():
+    # [FUNCTION DOC] An outcome whose reason is the analyzer's fixed unavailable reason and whose
+    # omitted count is 2 renders a continuation line "unavailable" under the job and a footer "AI
+    # analysis omitted for 2 additional failed jobs".
     outcome = HANDLER.AnalysisOutcome(
         enabled=True,
         reasons={10: [ANALYSIS(reason=HANDLER.analyze_failures.__globals__["UNAVAILABLE_REASON"])]},
@@ -173,32 +223,44 @@ def test_per_job_missing_log_reason_and_omitted_footer_render_compactly():
 
 
 class FakeGitHub:
+    # [CLASS DOC] HELPER: In-memory GitHub client for the notifier: serves a fixed run, its current
+    # jobs and the previous attempt's jobs, and records every call as a tuple in the calls list.
     def __init__(self, current_run, jobs, previous=None):
+        # [FUNCTION DOC] HELPER: Store the run, jobs and previous-attempt jobs (default empty list)
+        # and an empty call log.
         self.current_run = current_run
         self.jobs = jobs
         self.previous = previous or []
         self.calls = []
 
     def run(self, run_id):
+        # [FUNCTION DOC] HELPER: Record the call and return the fixed run.
         self.calls.append(("run", run_id))
         return self.current_run
 
     def run_jobs(self, run_id):
+        # [FUNCTION DOC] HELPER: Record the call and return the fixed current jobs.
         self.calls.append(("run_jobs", run_id))
         return self.jobs
 
     def run_attempt_jobs(self, run_id, attempt):
+        # [FUNCTION DOC] HELPER: Record the call and return the fixed previous-attempt jobs.
         self.calls.append(("run_attempt_jobs", run_id, attempt))
         return self.previous
 
     def rerun_failed_jobs(self, run_id):
+        # [FUNCTION DOC] HELPER: Record a rerun request; nothing else happens.
         self.calls.append(("rerun_failed_jobs", run_id))
 
     def rerun_calls(self):
+        # [FUNCTION DOC] HELPER: Return the recorded rerun-failed-jobs calls.
         return [call for call in self.calls if call[0] == "rerun_failed_jobs"]
 
 
 def args(**overrides):
+    # [FUNCTION DOC] HELPER: Build a simple object (a dynamically created type instance) whose
+    # attributes mimic the parsed command line: run id 123, any_event false, a placeholder webhook,
+    # dry_run false and repo radixark/miles, with keyword overrides applied.
     value = {
         "run_id": 123,
         "any_event": False,
@@ -211,6 +273,8 @@ def args(**overrides):
 
 
 def test_green_card_makes_no_analysis_call_and_posts_once(monkeypatch):
+    # [FUNCTION DOC] For a successful run with a successful job, the status command never calls the
+    # analyzer, posts exactly one card, and its title ends with "PASSED (1 job)".
     calls = []
     monkeypatch.setattr(HANDLER, "analyze_failures", lambda **kwargs: calls.append(kwargs))
     posted = []
@@ -221,6 +285,10 @@ def test_green_card_makes_no_analysis_call_and_posts_once(monkeypatch):
 
 
 def test_failed_rerun_analyzes_only_still_and_new_displayed_jobs(monkeypatch):
+    # [FUNCTION DOC] Sets the analysis app token in the environment and replaces the analyzer with a
+    # recorder returning a disabled outcome. On attempt 2 with current failures 20 (still) and 30
+    # (new) and previous failures 10 (fixed) and 19 (still), asserts the analyzer received exactly
+    # jobs 20 and 30 and a GitHub client carrying the app token.
     captured = []
     monkeypatch.setenv("CI_FAILURE_ANALYSIS_GITHUB_TOKEN", "app-token")
     monkeypatch.setattr(
@@ -240,6 +308,8 @@ def test_failed_rerun_analyzes_only_still_and_new_displayed_jobs(monkeypatch):
 
 
 def test_unexpected_analyzer_exception_still_posts_original_card_once(monkeypatch):
+    # [FUNCTION DOC] The analyzer raises a type error. The status command still posts exactly one
+    # card containing the job link and exactly one "AI analysis unavailable" note.
     monkeypatch.setattr(HANDLER, "analyze_failures", lambda **kwargs: (_ for _ in ()).throw(TypeError("bad")))
     posted = []
     monkeypatch.setattr(HANDLER, "post_card", lambda card, webhook, dry_run: posted.append(card))
@@ -251,10 +321,14 @@ def test_unexpected_analyzer_exception_still_posts_original_card_once(monkeypatc
 
 
 def no_analysis():
+    # [FUNCTION DOC] HELPER: Return a disabled analysis outcome with no reasons.
     return HANDLER.AnalysisOutcome(enabled=False, reasons={})
 
 
 def test_first_failed_nightly_attempt_reruns_its_failed_jobs_instead_of_posting(monkeypatch):
+    # [FUNCTION DOC] A failed first attempt of a scheduled run: the status command requests a rerun of
+    # failed jobs for run 123 exactly once, posts nothing, and (the analyzer fails the test if
+    # called) does not analyze before the rerun.
     posted = []
     monkeypatch.setattr(HANDLER, "post_card", lambda *values: posted.append(values))
     monkeypatch.setattr(HANDLER, "analyze_failures", lambda **kwargs: pytest.fail("analysis before the rerun"))
@@ -264,6 +338,8 @@ def test_first_failed_nightly_attempt_reruns_its_failed_jobs_instead_of_posting(
 
 
 def test_a_rerun_attempt_is_reported_and_never_rerun_again(monkeypatch):
+    # [FUNCTION DOC] For a failed attempt 2, the status command requests no rerun and posts exactly
+    # one card (analysis disabled).
     posted = []
     monkeypatch.setattr(HANDLER, "post_card", lambda card, webhook, dry_run: posted.append(card))
     monkeypatch.setattr(HANDLER, "analyze_failures", lambda **kwargs: no_analysis())
@@ -273,6 +349,8 @@ def test_a_rerun_attempt_is_reported_and_never_rerun_again(monkeypatch):
 
 
 def test_cancelled_and_manually_dispatched_runs_are_not_rerun(monkeypatch):
+    # [FUNCTION DOC] A cancelled scheduled run and a manually dispatched run (with the any-event
+    # option) both request no rerun, and two cards are posted in total.
     posted = []
     monkeypatch.setattr(HANDLER, "post_card", lambda card, webhook, dry_run: posted.append(card))
     monkeypatch.setattr(HANDLER, "analyze_failures", lambda **kwargs: no_analysis())
@@ -285,6 +363,8 @@ def test_cancelled_and_manually_dispatched_runs_are_not_rerun(monkeypatch):
 
 
 def test_dry_run_announces_the_rerun_without_requesting_it(monkeypatch, capsys):
+    # [FUNCTION DOC] In dry-run mode a failed first attempt requests no rerun and posts nothing, and
+    # standard output says it "would rerun 1 failed job".
     posted = []
     monkeypatch.setattr(HANDLER, "post_card", lambda *values: posted.append(values))
     gh = FakeGitHub(run(), [job()])
@@ -294,6 +374,8 @@ def test_dry_run_announces_the_rerun_without_requesting_it(monkeypatch, capsys):
 
 
 def test_a_refused_rerun_still_posts_the_first_attempt_then_fails(monkeypatch):
+    # [FUNCTION DOC] The rerun request raises a runtime error ("403"). The status command first posts
+    # the first-attempt card (title ending "FAILED (1 of 1 job)"), then re-raises the error.
     posted = []
     monkeypatch.setattr(HANDLER, "post_card", lambda card, webhook, dry_run: posted.append(card))
     monkeypatch.setattr(HANDLER, "analyze_failures", lambda **kwargs: no_analysis())
@@ -306,15 +388,21 @@ def test_a_refused_rerun_still_posts_the_first_attempt_then_fails(monkeypatch):
 
 
 def test_rerun_failed_jobs_posts_to_the_run_with_the_token(monkeypatch):
+    # [FUNCTION DOC] Replaces the URL opener with a recorder returning a fake 201 response; the real
+    # client's rerun call sends exactly one POST to the repository's actions runs rerun-failed-jobs
+    # endpoint for run 123 with an Authorization header "Bearer token".
     requests = []
 
     class Created:
+        # [CLASS DOC] HELPER: Fake HTTP response with status 201 usable as a context manager.
         status = 201
 
         def __enter__(self):
+            # [FUNCTION DOC] HELPER: Return the response itself.
             return self
 
         def __exit__(self, *unused):
+            # [FUNCTION DOC] HELPER: Do not suppress exceptions.
             return False
 
     monkeypatch.setattr(
@@ -328,6 +416,8 @@ def test_rerun_failed_jobs_posts_to_the_run_with_the_token(monkeypatch):
 
 
 def test_rerun_caps_current_failed_rows_across_still_and_new_sections():
+    # [FUNCTION DOC] On attempt 2 with 10 still-failing and 10 new failing jobs, the card shows only
+    # 15 job links in total and the line "... and 5 more".
     previous = {f"still-{index}": job(index, f"still-{index}") for index in range(1, 11)}
     current = [job(index + 100, f"still-{index}") for index in range(1, 11)] + [
         job(index + 200, f"new-{index}") for index in range(1, 11)
@@ -338,6 +428,8 @@ def test_rerun_caps_current_failed_rows_across_still_and_new_sections():
 
 
 def test_non_schedule_and_incomplete_runs_still_skip_before_delivery(monkeypatch, capsys):
+    # [FUNCTION DOC] A pull-request-event run and an in-progress run are both skipped: nothing is
+    # posted and standard output says the run is "not a scheduled run".
     posted = []
     monkeypatch.setattr(HANDLER, "post_card", lambda *values: posted.append(values))
     HANDLER.cmd_ci_status(args(), FakeGitHub(run(event="pull_request"), []))
@@ -347,12 +439,16 @@ def test_non_schedule_and_incomplete_runs_still_skip_before_delivery(monkeypatch
 
 
 def test_dry_run_prints_the_final_card_without_webhook_io(capsys):
+    # [FUNCTION DOC] Posting a rendered card in dry-run mode prints the card as JSON to standard
+    # output (parsed output equals the card) with no network access.
     card = HANDLER.render_ci_status(run(), [job()], None)
     HANDLER.post_card(card, "https://lark.invalid", True)
     assert json.loads(capsys.readouterr().out) == card
 
 
 def test_job_log_rejects_non_numeric_or_non_positive_ids():
+    # [FUNCTION DOC] Fetching a job log with a boolean, a string, zero or a negative id must raise a
+    # value error before any request; any other outcome raises an assertion error naming the id.
     gh = HANDLER.GitHub("token", "radixark/miles")
     for value in (True, "10", 0, -1):
         try:
@@ -364,6 +460,9 @@ def test_job_log_rejects_non_numeric_or_non_positive_ids():
 
 
 def test_file_content_accepts_github_line_wrapped_base64(monkeypatch):
+    # [FUNCTION DOC] The contents endpoint (replaced) returns base64 text with a newline inserted
+    # after eight characters, as GitHub wraps it; the client's file content call decodes it to the
+    # original two lines of text.
     gh = HANDLER.GitHub("token", "radixark/miles")
     encoded = base64.b64encode(b"line one\nline two\n").decode()
     wrapped = encoded[:8] + "\n" + encoded[8:]
@@ -372,15 +471,24 @@ def test_file_content_accepts_github_line_wrapped_base64(monkeypatch):
 
 
 class FakeBlob:
+    # [CLASS DOC] HELPER: Fake blob storage serving a byte body as the target of a log redirect. It
+    # can ignore Range headers and can omit the Content-Length header; it records each request as
+    # (url, range header or none).
     """A redirect target that serves body, honouring an explicit byte range like Azure blob storage."""
 
     def __init__(self, body, *, honour_range=True, announce_length=True):
+        # [FUNCTION DOC] HELPER: Store the body and the two behavior flags (honour range, announce
+        # length; both default true) and an empty request list.
         self.body = body
         self.honour_range = honour_range
         self.announce_length = announce_length
         self.requests = []
 
     def open(self, target, timeout):
+        # [FUNCTION DOC] HELPER: Open a url string or request object. Records (url, Range header);
+        # when a range "bytes=a-b" is given and honoured, serves that inclusive slice of the body,
+        # otherwise the whole body. Headers contain Content-Length of the full body unless announcing
+        # is disabled. Returns a FakeBlobResponse.
         url = target if isinstance(target, str) else target.full_url
         header = None if isinstance(target, str) else target.get_header("Range")
         self.requests.append((url, header))
@@ -393,28 +501,42 @@ class FakeBlob:
 
 
 class FakeBlobResponse:
+    # [CLASS DOC] HELPER: Fake streaming HTTP response over a byte body with a headers mapping and a
+    # read offset; usable as a context manager.
     def __init__(self, body, headers):
+        # [FUNCTION DOC] HELPER: Store the body and headers; start reading at offset 0.
         self.body = body
         self.headers = headers
         self.offset = 0
 
     def __enter__(self):
+        # [FUNCTION DOC] HELPER: Return the response itself.
         return self
 
     def __exit__(self, *unused):
+        # [FUNCTION DOC] HELPER: Do not suppress exceptions.
         return False
 
     def read(self, size):
+        # [FUNCTION DOC] HELPER: Return up to size bytes from the current offset and advance the
+        # offset by the number of bytes returned (empty at the end).
         chunk = self.body[self.offset : self.offset + size]
         self.offset += len(chunk)
         return chunk
 
 
 def redirecting_github(monkeypatch, blob, token="dedicated-app-token"):
+    # [FUNCTION DOC] HELPER: Build a real GitHub client (default token "dedicated-app-token") whose
+    # authenticated opener always answers the log request with an HTTP 302 redirect to a blob storage
+    # url, while the plain url opener is replaced by the fake blob's open. Returns (client, list of
+    # the first, authenticated requests).
     first_requests = []
 
     class Opener:
+        # [CLASS DOC] HELPER: Authenticated opener that only produces a redirect.
         def open(self, request, timeout):
+            # [FUNCTION DOC] HELPER: Record the request, then raise an HTTP 302 error with a Location
+            # header pointing to the blob url.
             first_requests.append(request)
             raise urllib.error.HTTPError(
                 request.full_url,
@@ -430,6 +552,10 @@ def redirecting_github(monkeypatch, blob, token="dedicated-app-token"):
 
 
 def test_job_log_redirect_drops_app_token_and_bounds_the_download(monkeypatch):
+    # [FUNCTION DOC] Fetching the last 10 bytes of a 15-byte log: the result is the final ten bytes
+    # "56789extra"; the first request carried the bearer app token; the blob was requested twice at
+    # the redirect url (a length probe, then a ranged request "bytes=5-14"); no blob request url
+    # contains an Authorization value.
     blob = FakeBlob(b"0123456789extra")
     gh, first_requests = redirecting_github(monkeypatch, blob)
     assert gh.job_log(10, 10) == "56789extra"
@@ -440,12 +566,17 @@ def test_job_log_redirect_drops_app_token_and_bounds_the_download(monkeypatch):
 
 
 def test_job_log_keeps_the_failure_at_the_end_of_an_oversized_log(monkeypatch):
+    # [FUNCTION DOC] A log of 4000 noise lines followed by a process-error line, fetched with a 200
+    # byte tail limit, still contains the final error line.
     body = b"setup noise\n" * 4000 + b"##[error]Process completed with exit code 1.\n"
     gh, _ = redirecting_github(monkeypatch, FakeBlob(body))
     assert "##[error]Process completed with exit code 1." in gh.job_log(10, 200)
 
 
 def test_job_log_keeps_the_tail_when_the_backend_ignores_the_range(monkeypatch):
+    # [FUNCTION DOC] When the blob ignores range headers and serves the whole body, fetching the last
+    # 11 bytes still returns a text ending with "final line" and newline (the client truncates to
+    # the tail).
     body = b"noise\n" * 100 + b"final line\n"
     blob = FakeBlob(body, honour_range=False)
     gh, _ = redirecting_github(monkeypatch, blob)
@@ -453,6 +584,8 @@ def test_job_log_keeps_the_tail_when_the_backend_ignores_the_range(monkeypatch):
 
 
 def test_job_log_streams_the_tail_when_the_backend_reports_no_length(monkeypatch):
+    # [FUNCTION DOC] When the blob reports no content length, fetching the last 11 bytes streams the
+    # body and returns exactly "final line" and newline using a single blob request.
     body = b"noise\n" * 100 + b"final line\n"
     blob = FakeBlob(body, announce_length=False)
     gh, _ = redirecting_github(monkeypatch, blob)
@@ -461,12 +594,20 @@ def test_job_log_streams_the_tail_when_the_backend_reports_no_length(monkeypatch
 
 
 def test_job_log_download_is_bounded_when_the_body_never_ends(monkeypatch):
+    # [FUNCTION DOC] The blob serves an endless stream of "x" with no length; the maximum streamed
+    # byte constant is lowered to 1 MiB. Fetching the last 32 bytes must terminate and return 32
+    # "x" characters (the download is bounded).
     class EndlessResponse(FakeBlobResponse):
+        # [CLASS DOC] HELPER: Response whose read always returns the requested number of "x" bytes.
         def read(self, size):
+            # [FUNCTION DOC] HELPER: Return size bytes of the letter x, never reaching the end.
             return b"x" * size
 
     class EndlessBlob(FakeBlob):
+        # [CLASS DOC] HELPER: Blob whose open always yields the endless response.
         def open(self, target, timeout):
+            # [FUNCTION DOC] HELPER: Record the target and return an endless response with no
+            # headers.
             self.requests.append(target)
             return EndlessResponse(b"", {})
 
@@ -477,6 +618,9 @@ def test_job_log_download_is_bounded_when_the_body_never_ends(monkeypatch):
 
 
 def test_every_configuration_file_the_analyzer_reads_is_checked_out():
+    # [FUNCTION DOC] For the analyzer's default policy, schema, prompt and tags paths, computes the
+    # path relative to the repository root and asserts the notifier workflow text lists it on its own
+    # line (12-space indented) in the sparse checkout.
     analyzer = HANDLER.analyze_failures.__globals__
     workflow = (SCRIPT_DIR.parents[0] / "ci-lark-notify.yml").read_text()
     repo_root = SCRIPT_DIR.parents[2]
@@ -486,6 +630,13 @@ def test_every_configuration_file_the_analyzer_reads_is_checked_out():
 
 
 def test_notifier_workflow_pins_its_identity_boundaries():
+    # [FUNCTION DOC] Reads the notifier workflow text and asserts: it triggers on completion of the
+    # "PR Test" workflow, only in radixark/miles on the main branch; has id-token write and an
+    # actions write job permission but no contents or pull-requests write; the app token requests
+    # only actions, contents and pull-requests read (no issues, no actions write); it references the
+    # analysis app client id and no CI app or OpenAI key; checkout and setup-python are pinned by
+    # commit sha; credentials are not persisted; the comment command script is not used; and manual
+    # dispatch inputs do not offer prompt, model or repository.
     workflow = WORKFLOW_PATH.read_text()
     assert "workflow_run:" in workflow and 'workflows: ["PR Test"]' in workflow
     assert "github.repository == 'radixark/miles'" in workflow
@@ -510,6 +661,10 @@ def test_notifier_workflow_pins_its_identity_boundaries():
 
 
 def test_policy_prompt_and_schema_are_git_versioned_and_strict():
+    # [FUNCTION DOC] Reads the checked-in analysis policy, response schema and prompt. Asserts the
+    # policy is enabled with exactly one model call, the schema and its analyses item schema forbid
+    # additional properties, and the prompt marks logs as untrusted and requires exactly one factual
+    # sentence.
     policy = json.loads((ROOT / ".github/workflows/policies/ci-failure-analysis.json").read_text())
     schema = json.loads((ROOT / ".github/workflows/policies/ci-failure-response-schema.json").read_text())
     prompt = (ROOT / ".github/workflows/prompts/ci-failure-analysis.md").read_text()
@@ -520,10 +675,15 @@ def test_policy_prompt_and_schema_are_git_versioned_and_strict():
 
 
 def docker_run(**overrides):
+    # [FUNCTION DOC] HELPER: Build an in-progress run mapping named "Docker Build & Push" with no
+    # conclusion (from the default run) and keyword overrides applied.
     return run(name="Docker Build & Push", status="in_progress", conclusion=None, **overrides)
 
 
 def build_job(conclusion="failure"):
+    # [FUNCTION DOC] HELPER: Build the job "build-and-push" (id 40, url .../jobs/40) with two steps:
+    # "Login to Docker Hub" (success) and "Build and push" (the given conclusion, default failure),
+    # and the same conclusion on the job.
     return {
         "id": 40,
         "name": "build-and-push",
@@ -537,6 +697,10 @@ def build_job(conclusion="failure"):
 
 
 def test_failed_docker_build_posts_one_card_naming_the_failed_job_and_step(monkeypatch):
+    # [FUNCTION DOC] With a successful check job and a failed build job, the build-failure command
+    # posts exactly one card with title "Docker Build & Push: FAILED" and a red header. The body
+    # lists the failed job as a link followed by " at `Build and push`", omits the successful job,
+    # and mentions a scheduled rebuild.
     posted = []
     monkeypatch.setattr(HANDLER, "post_card", lambda card, webhook, dry_run: posted.append(card))
     check = {"id": 30, "name": "check-upstream", "conclusion": "success", "html_url": "https://example/jobs/30"}
@@ -551,11 +715,15 @@ def test_failed_docker_build_posts_one_card_naming_the_failed_job_and_step(monke
 
 
 def test_push_triggered_build_failure_names_its_branch():
+    # [FUNCTION DOC] Rendering the build-failure card for a push event on branch main includes the
+    # text "push to main".
     card = HANDLER.render_build_failure(docker_run(event="push", head_branch="main"), [build_job()])
     assert "push to main" in json.dumps(card)
 
 
 def test_docker_build_notifier_skips_a_run_without_failed_jobs(monkeypatch, capsys):
+    # [FUNCTION DOC] With only a successful build job, the build-failure command posts nothing and
+    # prints a message containing "no failed job".
     posted = []
     monkeypatch.setattr(HANDLER, "post_card", lambda *values: posted.append(values))
     HANDLER.cmd_build_failure(args(), FakeGitHub(docker_run(), [build_job("success")]))
@@ -564,6 +732,11 @@ def test_docker_build_notifier_skips_a_run_without_failed_jobs(monkeypatch, caps
 
 
 def test_docker_build_workflow_reports_only_failed_automatic_builds():
+    # [FUNCTION DOC] Takes the notify-build-failure job text of the docker-build workflow and asserts:
+    # it needs the build job, runs only when that job failed, not for manual dispatch, only in
+    # radixark/miles; uses the Lark webhook secret and the docker-build-failure subcommand; pins the
+    # checkout by sha without persisting credentials; its sparse checkout lists both the notifier and
+    # the failure-analysis scripts; and no write permission appears before its steps.
     workflow = (SCRIPT_DIR.parents[0] / "docker-build.yml").read_text()
     job = workflow.split("\n  notify-build-failure:\n", 1)[1]
     assert "needs: [build-and-push]" in job
@@ -589,6 +762,15 @@ def test_docker_build_workflow_reports_only_failed_automatic_builds():
     ],
 )
 def test_wheels_failure_cli_renders_one_card_without_rerunning(monkeypatch, capsys, event, failed_name, failed_step):
+    # [FUNCTION DOC] Parametrized over scheduled or manually dispatched runs of "Build Wheels" and
+    # three failed job/step pairs. Builds a fake GitHub client with the failed job (steps: a
+    # successful setup step and the failed step), a skipped job, a finished job and a notifier job
+    # with no conclusion; replaces the client constructor, removes the webhook variable and sets the
+    # command line to dry-run wheels-build-failure for run 123. Asserts main returns 0; the printed
+    # card has title "Build Wheels: FAILED" and a red template; the body links the failed job with
+    # " at `<step>`"; no other job name or setup step appears; the trigger text is "Scheduled
+    # rebuild" for schedule and "workflow_dispatch to main" otherwise; the last element's link
+    # target is the run url; and no rerun was requested.
     failed = job(name=failed_name)
     failed["steps"] = [
         {"name": "Set up job", "conclusion": "success"},
@@ -623,6 +805,8 @@ def test_wheels_failure_cli_renders_one_card_without_rerunning(monkeypatch, caps
 
 @pytest.mark.parametrize("conclusion", ["success", "skipped", "cancelled", None])
 def test_wheels_without_failed_jobs_do_not_post(monkeypatch, conclusion):
+    # [FUNCTION DOC] Parametrized over a lone job whose conclusion is success, skipped, cancelled or
+    # none, in a "Build Wheels" run on attempt 2. The build-failure command posts nothing.
     posted = []
     monkeypatch.setattr(HANDLER, "post_card", lambda *values: posted.append(values))
     HANDLER.cmd_build_failure(

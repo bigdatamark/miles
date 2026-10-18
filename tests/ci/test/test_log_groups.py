@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Tests for the GitHub Actions log-group and per-attempt summary emission in tests.ci.ci_utils:
+# the helpers that print group, end-group and summary lines (only when the GITHUB_ACTIONS
+# environment variable is exactly "true"), their encoding rules (group titles encode percent, then
+# carriage return and newline; summary file names replace those two characters with a visible
+# backslash escape), the summary suffix ordering (exit code, then timeout, then retry marker), and
+# integration runs of run_unittest_files over real throwaway scripts checking marker ordering,
+# timeout handling, retry and the unchanged output outside CI. Defines a regular expression
+# describing a summary line "[i/n] name  STATUS  elapsed=Ns" with optional exit, timeout and
+# retry parts. Registers itself as a CPU test in suite stage-a-cpu.
 """Tests for the GitHub Actions log-group + per-attempt summary emission
 added on top of `tests/ci/ci_utils.py:run_unittest_files`.
 
@@ -33,6 +43,8 @@ register_cpu_ci(est_time=1, suite="stage-a-cpu", labels=[])
 
 
 def _write_script(tmp: Path, name: str, body: str) -> str:
+    # [FUNCTION DOC] HELPER: Write the dedented body as a script file with the given name in the
+    # directory and return the bare name.
     """Write a Python script under ``tmp`` and return its bare filename.
 
     The bare filename is what gets passed into `TestFile(name=...)`;
@@ -53,6 +65,9 @@ SUMMARY_LINE_RE = re.compile(
 
 
 def _extract_marker_lines(stdout: str) -> list[str]:
+    # [FUNCTION DOC] HELPER: Return, in order, the lines of the text that are group starts, end-group
+    # lines or summary lines.
+    # KNOWN ISSUE: this helper is defined but never used in this module.
     """Return only the workflow-command and summary lines, in order."""
     out: list[str] = []
     for line in stdout.splitlines():
@@ -67,7 +82,10 @@ def _extract_marker_lines(stdout: str) -> list[str]:
 
 
 class TestEnvGate:
+    # [CLASS DOC] Tests that the emit helpers print only when GITHUB_ACTIONS is exactly "true".
     def test_group_emitted_when_actions_true(self, monkeypatch, capsys):
+        # [FUNCTION DOC] Group helper prints "::group::hello" plus newline to stdout, nothing to
+        # stderr.
         monkeypatch.setenv("GITHUB_ACTIONS", "true")
         _gha_emit_group("hello")
         captured = capsys.readouterr()
@@ -75,12 +93,15 @@ class TestEnvGate:
         assert captured.err == ""
 
     def test_endgroup_emitted_when_actions_true(self, monkeypatch, capsys):
+        # [FUNCTION DOC] End-group helper prints "::endgroup::" plus newline.
         monkeypatch.setenv("GITHUB_ACTIONS", "true")
         _gha_emit_endgroup()
         captured = capsys.readouterr()
         assert captured.out == "::endgroup::\n"
 
     def test_summary_emitted_when_actions_true(self, monkeypatch, capsys):
+        # [FUNCTION DOC] Summary helper for index 1 of 2, name tests/a.py, PASS, 12.7 seconds prints
+        # "[1/2] tests/a.py  PASS  elapsed=12s" (elapsed truncated to whole seconds).
         monkeypatch.setenv("GITHUB_ACTIONS", "true")
         _gha_emit_summary(1, 2, "tests/a.py", "PASS", 12.7)
         captured = capsys.readouterr()
@@ -88,6 +109,8 @@ class TestEnvGate:
 
     @pytest.mark.parametrize("value", ["", "false", "TRUE", "1", "yes"])
     def test_no_emission_when_actions_not_literal_true(self, monkeypatch, capsys, value):
+        # [FUNCTION DOC] Parametrized over values empty, false, TRUE, 1 and yes: none of the three
+        # helpers prints anything.
         monkeypatch.setenv("GITHUB_ACTIONS", value)
         _gha_emit_group("hello")
         _gha_emit_endgroup()
@@ -96,6 +119,7 @@ class TestEnvGate:
         assert captured.out == ""
 
     def test_no_emission_when_actions_unset(self, monkeypatch, capsys):
+        # [FUNCTION DOC] With the variable removed, none of the three helpers prints anything.
         monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
         _gha_emit_group("hello")
         _gha_emit_endgroup()
@@ -110,7 +134,9 @@ class TestEnvGate:
 
 
 class TestGroupTitleEncoding:
+    # [CLASS DOC] Tests of the workflow-command escaping applied to group titles.
     def test_percent_encoded_first(self, monkeypatch, capsys):
+        # [FUNCTION DOC] The title "100% pass" is printed as "::group::100%25 pass".
         # `%` must be encoded BEFORE `\r` / `\n` to avoid double-encoding.
         monkeypatch.setenv("GITHUB_ACTIONS", "true")
         _gha_emit_group("100% pass")
@@ -118,6 +144,7 @@ class TestGroupTitleEncoding:
         assert captured.out == "::group::100%25 pass\n"
 
     def test_newline_encoded(self, monkeypatch, capsys):
+        # [FUNCTION DOC] A newline in the title becomes "%0A", keeping the output a single line.
         monkeypatch.setenv("GITHUB_ACTIONS", "true")
         _gha_emit_group("line1\nline2")
         captured = capsys.readouterr()
@@ -127,12 +154,15 @@ class TestGroupTitleEncoding:
         assert captured.out.count("\n") == 1
 
     def test_carriage_return_encoded(self, monkeypatch, capsys):
+        # [FUNCTION DOC] A carriage return in the title becomes "%0D".
         monkeypatch.setenv("GITHUB_ACTIONS", "true")
         _gha_emit_group("part1\rpart2")
         captured = capsys.readouterr()
         assert captured.out == "::group::part1%0Dpart2\n"
 
     def test_percent_before_newline_combined(self, monkeypatch, capsys):
+        # [FUNCTION DOC] The title "a%b" newline "c" becomes "a%25b%0Ac": percent is escaped first so
+        # the newline escape is not double-encoded.
         monkeypatch.setenv("GITHUB_ACTIONS", "true")
         _gha_emit_group("a%b\nc")
         captured = capsys.readouterr()
@@ -147,7 +177,10 @@ class TestGroupTitleEncoding:
 
 
 class TestSummaryFilenameEscape:
+    # [CLASS DOC] Tests of how the summary line escapes line-break characters in file names.
     def test_newline_becomes_literal_backslash_n(self, monkeypatch, capsys):
+        # [FUNCTION DOC] A newline in the file name is printed as a backslash followed by the letter
+        # n, so the summary stays one line.
         monkeypatch.setenv("GITHUB_ACTIONS", "true")
         _gha_emit_summary(1, 1, "weird\nname.py", "PASS", 5)
         captured = capsys.readouterr()
@@ -157,12 +190,15 @@ class TestSummaryFilenameEscape:
         assert captured.out.count("\n") == 1
 
     def test_carriage_return_becomes_literal_backslash_r(self, monkeypatch, capsys):
+        # [FUNCTION DOC] A carriage return in the file name is printed as a backslash followed by r.
         monkeypatch.setenv("GITHUB_ACTIONS", "true")
         _gha_emit_summary(1, 1, "weird\rname.py", "PASS", 5)
         captured = capsys.readouterr()
         assert captured.out == "[1/1] weird\\rname.py  PASS  elapsed=5s\n"
 
     def test_percent_passes_through(self, monkeypatch, capsys):
+        # [FUNCTION DOC] A percent sign in the file name is left as is (summary lines are ordinary log
+        # text, not workflow commands).
         # Summary lines are normal log content, not workflow commands;
         # `%` is NOT escaped here (only \r/\n are).
         monkeypatch.setenv("GITHUB_ACTIONS", "true")
@@ -177,33 +213,42 @@ class TestSummaryFilenameEscape:
 
 
 class TestSummarySuffixOrder:
+    # [CLASS DOC] Tests of the optional suffix parts of the summary line and their fixed order:
+    # exit code, timeout-after, retry-of.
     def test_base_only(self, monkeypatch, capsys):
+        # [FUNCTION DOC] No options: "[2/5] x.py  PASS  elapsed=30s" (30.9 truncated).
         monkeypatch.setenv("GITHUB_ACTIONS", "true")
         _gha_emit_summary(2, 5, "x.py", "PASS", 30.9)
         assert capsys.readouterr().out == "[2/5] x.py  PASS  elapsed=30s\n"
 
     def test_exit_suffix(self, monkeypatch, capsys):
+        # [FUNCTION DOC] With an exit code of 1 the line ends with " exit=1".
         monkeypatch.setenv("GITHUB_ACTIONS", "true")
         _gha_emit_summary(2, 5, "x.py", "FAIL", 30.9, exit_code=1)
         assert capsys.readouterr().out == "[2/5] x.py  FAIL  elapsed=30s exit=1\n"
 
     def test_timeout_after_suffix(self, monkeypatch, capsys):
+        # [FUNCTION DOC] With status TIMEOUT and timeout-after 1800 the line ends with
+        # " timeout_after=1800s".
         monkeypatch.setenv("GITHUB_ACTIONS", "true")
         _gha_emit_summary(2, 5, "x.py", "TIMEOUT", 1800.0, timeout_after=1800)
         assert capsys.readouterr().out == "[2/5] x.py  TIMEOUT  elapsed=1800s timeout_after=1800s\n"
 
     def test_retry_of_suffix_alone(self, monkeypatch, capsys):
+        # [FUNCTION DOC] With retry-of 1 the line ends with " retry_of=attempt=1".
         monkeypatch.setenv("GITHUB_ACTIONS", "true")
         _gha_emit_summary(2, 5, "x.py", "PASS", 70.0, retry_of=1)
         assert capsys.readouterr().out == "[2/5] x.py  PASS  elapsed=70s retry_of=attempt=1\n"
 
     def test_timeout_then_retry_of(self, monkeypatch, capsys):
+        # [FUNCTION DOC] With both timeout-after and retry-of, the timeout part comes first.
         # AC-fixed ordering: timeout_after BEFORE retry_of.
         monkeypatch.setenv("GITHUB_ACTIONS", "true")
         _gha_emit_summary(2, 5, "x.py", "TIMEOUT", 1800.0, timeout_after=1800, retry_of=1)
         assert capsys.readouterr().out == "[2/5] x.py  TIMEOUT  elapsed=1800s timeout_after=1800s retry_of=attempt=1\n"
 
     def test_exit_then_retry_of(self, monkeypatch, capsys):
+        # [FUNCTION DOC] With exit code 2 and retry-of 1, the exit part comes before the retry part.
         monkeypatch.setenv("GITHUB_ACTIONS", "true")
         _gha_emit_summary(2, 5, "x.py", "FAIL", 130.0, exit_code=2, retry_of=1)
         assert capsys.readouterr().out == "[2/5] x.py  FAIL  elapsed=130s exit=2 retry_of=attempt=1\n"
@@ -215,7 +260,18 @@ class TestSummarySuffixOrder:
 
 
 class TestIntegrationStatusMatrix:
+    # [CLASS DOC] Integration test of a run mixing passing, failing and timing-out scripts.
     def test_three_statuses_emit_complete_marker_quartet(self, tmp_path: Path, monkeypatch, capfd):
+        # [FUNCTION DOC] Enables CI mode, changes into the temporary directory and writes three
+        # scripts: one printing a marker and exiting 0, one printing a marker and exiting 1, one
+        # printing a marker and sleeping 60 seconds. Runs them via the suite runner with a 2 second
+        # per-file timeout, continue-on-error and no retry; asserts the return code is -1. From the
+        # captured process output asserts exactly three group lines, three end-group lines and three
+        # summary lines; group titles carry the file name, 1-based index of 3, estimated time 1s and
+        # attempt=1; summaries parse to PASS (no exit, timeout or retry), FAIL with exit 1, and
+        # TIMEOUT with timeout 2; and for each file the order is group, child output, end-group,
+        # summary. The helper inside finds the first output line containing a token and raises an
+        # assertion error if absent. Spawns subprocesses.
         monkeypatch.setenv("GITHUB_ACTIONS", "true")
         monkeypatch.chdir(tmp_path)
 
@@ -314,6 +370,8 @@ class TestIntegrationStatusMatrix:
         # Marker ordering per file: group -> child-stdout -> endgroup -> summary.
         # Child stdout strings should appear BETWEEN their group and endgroup.
         def _idx(token: str) -> int:
+            # [FUNCTION DOC] HELPER: Return the index of the first output line containing the token;
+            # raise an assertion error if no line contains it.
             for k, ln in enumerate(lines):
                 if token in ln:
                     return k
@@ -337,7 +395,13 @@ class TestIntegrationStatusMatrix:
 
 
 class TestIntegrationTimeoutClosesGroup:
+    # [CLASS DOC] Integration test that a timeout still closes its log group.
     def test_timeout_summary_includes_timeout_after(self, tmp_path: Path, monkeypatch, capfd):
+        # [FUNCTION DOC] Runs one script that sleeps 60 seconds with a 2 second timeout, no
+        # continue-on-error and no retry; asserts return code -1, exactly one group, one end-group
+        # (group balance kept) and one summary line, whose status is TIMEOUT with timeout 2 (the
+        # effective timeout is the larger of 2 and the integer part of 1.25 times the estimate) and
+        # no exit code or retry marker.
         monkeypatch.setenv("GITHUB_ACTIONS", "true")
         monkeypatch.chdir(tmp_path)
 
@@ -383,7 +447,15 @@ class TestIntegrationTimeoutClosesGroup:
 
 
 class TestIntegrationRetryFailThenPass:
+    # [CLASS DOC] Integration test of the retry path where the first attempt fails and the second
+    # passes.
     def test_retry_emits_two_complete_marker_triples(self, tmp_path: Path, monkeypatch, capfd):
+        # [FUNCTION DOC] Writes a script that, if a state file exists, prints a pass marker and exits
+        # 0; otherwise creates the state file, prints a line containing an accuracy regression
+        # keyword (so the failure is retriable) and exits 1. Runs it with retry enabled, 2 attempts,
+        # no wait and a 10 second timeout. Asserts return code 0, two groups, two end-groups and two
+        # summaries; group titles carry attempt=1 and attempt=2; the first summary is FAIL with exit
+        # 1 and no retry marker; the second is PASS with no exit or timeout and retry-of 1.
         monkeypatch.setenv("GITHUB_ACTIONS", "true")
         monkeypatch.chdir(tmp_path)
 
@@ -451,7 +523,11 @@ class TestIntegrationRetryFailThenPass:
 
 
 class TestIntegrationBaselineLocalMode:
+    # [CLASS DOC] Integration tests that outside CI mode no marker or summary lines appear.
     def test_no_marker_lines_in_stdout_when_actions_unset(self, tmp_path: Path, monkeypatch, capfd):
+        # [FUNCTION DOC] With the variable removed, runs two scripts printing baseline markers with
+        # continue-on-error and no retry; asserts return code 0, no group or end-group text, no line
+        # matching the summary pattern, and both child markers present in the output.
         # Whatever non-`true` value GITHUB_ACTIONS holds, none of the
         # marker emit helpers should produce output, and parent-side
         # stdout must therefore contain only what was already there
@@ -499,6 +575,8 @@ class TestIntegrationBaselineLocalMode:
         assert "BASELINE_B" in out
 
     def test_explicit_false_also_suppresses_markers(self, tmp_path: Path, monkeypatch, capfd):
+        # [FUNCTION DOC] With the variable set to "false", runs one script printing a marker; asserts
+        # return code 0, no group or end-group text, and the child marker present.
         monkeypatch.setenv("GITHUB_ACTIONS", "false")
         monkeypatch.chdir(tmp_path)
 
