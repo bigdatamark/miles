@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Marks worker methods as rpc-exposed and derives, from the worker class, a spec per public method
+# (name, concurrency group, async-ness, serializer built from the type annotations, and the
+# ordered positional parameter names). Every public callable of an rpc-served worker class is
+# exposed, with the decorator only adding configuration (the concurrency group). Methods must be
+# plain annotated methods whose receiver is named self; star-args and positional-only parameters
+# are rejected. Specs are cached per class.
 from __future__ import annotations
 
 import dataclasses
@@ -19,9 +26,14 @@ _F = TypeVar("_F", bound=Callable[..., Any])
 
 
 def rpc(*, concurrency_group: str = DEFAULT_CONCURRENCY_GROUP) -> Callable[[_F], _F]:
+    # [FUNCTION DOC]
+    # Decorator factory attaching rpc configuration (the concurrency group name, default
+    # "default") to a method. The returned decorator stores the configuration on the function as
+    # an attribute and returns the same function unchanged.
     config = _RpcConfig(concurrency_group=concurrency_group)
 
     def decorator(fn: _F) -> _F:
+        # [FUNCTION DOC] HELPER: Attach the captured configuration to the function and return it.
         setattr(fn, _RPC_CONFIG_ATTR, config)
         return fn
 
@@ -30,6 +42,10 @@ def rpc(*, concurrency_group: str = DEFAULT_CONCURRENCY_GROUP) -> Callable[[_F],
 
 @dataclasses.dataclass(frozen=True)
 class RpcMethodSpec:
+    # [CLASS DOC]
+    # Immutable description of one exposed method: its name, concurrency group, whether it is a
+    # coroutine function, the serializer for its arguments and result, and the names of the
+    # parameters that may be passed positionally, in order (receiver excluded).
     name: str
     concurrency_group: str
     is_async: bool
@@ -40,6 +56,12 @@ class RpcMethodSpec:
 def canonicalize_method_arguments(
     *, spec: RpcMethodSpec, args: tuple[Any, ...], kwargs: dict[str, Any]
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Merge positional and keyword arguments of a call into one mapping from parameter name to
+    # value. Positional values are matched to the spec's positional names in order. Raises a type
+    # error if there are more positional values than names, or if a name is given both
+    # positionally and by keyword. Does not check for unknown or missing names (the serializer
+    # does).
     if len(args) > (max_positional := len(spec.positional_parameter_names)):
         raise TypeError(f"{spec.name}() takes at most {max_positional} positional arguments, got {len(args)}")
     named = dict(zip(spec.positional_parameter_names, args, strict=False))
@@ -49,10 +71,15 @@ def canonicalize_method_arguments(
 
 
 def collect_rpc_method_specs(worker_cls: type) -> dict[str, RpcMethodSpec]:
+    # [FUNCTION DOC] Return a fresh copy of the (cached) mapping from method name to spec for the
+    # class. Raises a type error if any public callable is not a valid rpc method.
     return dict(_collect_rpc_method_specs(worker_cls))
 
 
 def declared_concurrency_groups(worker_cls: type) -> dict[str, str]:
+    # [FUNCTION DOC] Return a mapping from method name to concurrency group for the public
+    # callable attributes of the class whose group is not the default one (looking through
+    # wrapper layers for the configuration). Does not validate the methods.
     groups = {}
     for name in sorted(dir(worker_cls)):
         if name.startswith("_"):
@@ -67,6 +94,9 @@ def declared_concurrency_groups(worker_cls: type) -> dict[str, str]:
 
 @functools.cache
 def _collect_rpc_method_specs(worker_cls: type) -> dict[str, RpcMethodSpec]:
+    # [FUNCTION DOC] HELPER: Cached per class. Walk the sorted public attribute names (no leading
+    # underscore) looking at the raw class attributes; skip class methods, static methods,
+    # properties and non-callables; build a spec for each remaining callable.
     specs: dict[str, RpcMethodSpec] = {}
 
     for name in sorted(dir(worker_cls)):
@@ -84,10 +114,14 @@ def _collect_rpc_method_specs(worker_cls: type) -> dict[str, RpcMethodSpec]:
 
 @dataclasses.dataclass(frozen=True)
 class _RpcConfig:
+    # [CLASS DOC] HELPER: Immutable configuration attached by the rpc decorator: the concurrency
+    # group name.
     concurrency_group: str
 
 
 def _find_rpc_config(attr: Callable[..., Any]) -> _RpcConfig:
+    # [FUNCTION DOC] HELPER: Find the configuration on the callable or, following the chain of
+    # wrapped functions, on an inner one; if none, return the default configuration.
     layer: Any = attr
     while layer is not None:
         config = getattr(layer, _RPC_CONFIG_ATTR, None)
@@ -98,6 +132,17 @@ def _find_rpc_config(attr: Callable[..., Any]) -> _RpcConfig:
 
 
 def _build_method_spec(*, worker_cls: type, name: str, attr: Callable[..., Any]) -> RpcMethodSpec:
+    # [FUNCTION DOC]
+    # HELPER: Validate one public callable and build its spec. Unwraps decorators; raises type
+    # errors (with messages naming class and method) when: it is not a plain function or method;
+    # it is async but in a non-default concurrency group; it has no receiver parameter, the receiver
+    # is not named self, or is not positional; any other parameter is star-args, double-star or
+    # positional-only; any parameter lacks an annotation; or there is no return annotation. A
+    # keyword-only parameter named for the ray trace context, defaulting to none and unannotated,
+    # is ignored. Argument fields use the resolved type hints and the defaults (required when no
+    # default). The positional names are those of positional-or-keyword parameters. The query model
+    # is named from the class and the method name in title case without underscores plus a query
+    # suffix. The result type is the resolved return hint.
     fn = inspect.unwrap(attr)
     if not inspect.isroutine(fn):
         raise TypeError(
@@ -167,6 +212,8 @@ def _build_method_spec(*, worker_cls: type, name: str, attr: Callable[..., Any])
 
 
 def _is_ray_trace_ctx_param(param: inspect.Parameter) -> bool:
+    # [FUNCTION DOC] HELPER: True iff the parameter is the keyword-only, none-defaulted,
+    # unannotated trace context parameter that Ray injects into actor methods.
     return (
         param.name == _RAY_TRACE_CONTEXT_PARAMETER
         and param.kind is inspect.Parameter.KEYWORD_ONLY

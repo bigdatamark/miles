@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Turns the parsed pods of a cell into cell infos, worker infos and worker endpoints. Pods of a cell
+# are expected sorted by their index in the cell. A pod hosts workers-per-pod workers; worker names
+# are derived from pool id, cell index and the worker's index in the cell; endpoints come from the
+# pod ip (or a headless service name) and the pool's declared static ports.
 from __future__ import annotations
 
 import functools
@@ -23,6 +28,8 @@ if TYPE_CHECKING:
 
 
 class KubernetesWorkerInfo(FrozenStrictBaseModel):
+    # [CLASS DOC] Immutable view of one worker inside a pod: the pod, the worker name, its index in
+    # the pod and its gpu ids (pod-local share).
     pod: pod_view.ParsedPod
     name: str
     worker_in_pod_index: int
@@ -30,6 +37,12 @@ class KubernetesWorkerInfo(FrozenStrictBaseModel):
 
 
 def compute_cell_info(cell_id: str, *, pods: list[pod_view.ParsedPod], run: KubernetesRunInfo) -> CellInfo | None:
+    # [FUNCTION DOC]
+    # Build the cell info from the cell's pods; none if there are no pods. Pool id comes from the
+    # first pod. Metadata is the spec's metadata function applied to the first pod's cell index,
+    # merged with the pods' own metadata (the pods' values win on conflicts). The cell is alive iff
+    # every pod is ready and not being deleted and all expected pods are present. Worker names are
+    # those of all pods' workers in pod order. The workers hash is derived from pod membership.
     if not pods:
         return None
 
@@ -47,6 +60,9 @@ def compute_cell_info(cell_id: str, *, pods: list[pod_view.ParsedPod], run: Kube
 
 
 def compute_worker_infos(cell_id: str, *, pods: list[pod_view.ParsedPod], run: KubernetesRunInfo) -> list[WorkerInfo]:
+    # [FUNCTION DOC] Build the worker infos of a complete cell. Asserts there is at least one pod,
+    # that the pods' indices in the cell are exactly zero up to the count minus one in order, and
+    # that all expected pods are present. Returns one info per worker, in pod then worker order.
     assert pods, f"cell {cell_id} has no observed worker pods, so it cannot be driven"
     indices = [pod.pod_in_cell_index for pod in pods]
     assert indices == list(range(len(pods))) and _has_all_pods(
@@ -57,10 +73,18 @@ def compute_worker_infos(cell_id: str, *, pods: list[pod_view.ParsedPod], run: K
 
 
 def workers_of_pods(pods: list[pod_view.ParsedPod], *, run: KubernetesRunInfo) -> list[KubernetesWorkerInfo]:
+    # [FUNCTION DOC] All workers of the pods, concatenated in the given pod order.
     return [worker for pod in pods for worker in _workers_of_pod(pod, run=run)]
 
 
 def addrs_of_worker(worker: KubernetesWorkerInfo, *, run: KubernetesRunInfo) -> NamedHostAndPorts:
+    # [FUNCTION DOC]
+    # Endpoints of a worker by port name: the pod's host with each static port declared by the
+    # pool's spec; the rpc port is shifted by the worker's index in the pod, other ports are used
+    # as declared. Asserts the spec declares at least one port.
+    # KNOWN ISSUE: only the rpc port is shifted per worker, while the port declaration's own rule
+    # (effective static port) shifts every per-worker port by the worker's index and by the number of
+    # consecutive ports; the two rules disagree for non-rpc per-worker ports in multi-worker pods.
     host = _host_of_pod(worker.pod, namespace=run.namespace)
     ports = _ports_of_pool(worker.pod.pool_id, run=run)
     assert ports, f"spec {worker.pod.pool_id} declares no ports, so {worker.name} has no address"
@@ -71,6 +95,9 @@ def addrs_of_worker(worker: KubernetesWorkerInfo, *, run: KubernetesRunInfo) -> 
 
 
 def _compute_worker_info(worker: KubernetesWorkerInfo, *, run: KubernetesRunInfo) -> WorkerInfo:
+    # [FUNCTION DOC] HELPER: Build a worker info: name; generation taken from the pod's container
+    # restart count; endpoints; a copy of the gpu ids; and the worker class path only for served
+    # specs.
     pool_id = worker.pod.pool_id
     spec = run.specs[pool_id]
 
@@ -84,6 +111,10 @@ def _compute_worker_info(worker: KubernetesWorkerInfo, *, run: KubernetesRunInfo
 
 
 def _workers_of_pod(pod: pod_view.ParsedPod, *, run: KubernetesRunInfo) -> list[KubernetesWorkerInfo]:
+    # [FUNCTION DOC] HELPER: Split one pod into its workers. The pod's gpu ids (from its annotation)
+    # are divided into equal consecutive shares per worker (asserts divisibility). Worker names use
+    # the pod's cell index and worker-in-cell index = pod index in cell times workers per pod plus
+    # the worker's index in the pod.
     workers_per_pod = run.specs[pod.pool_id].scheduling.workers_per_pod()
     assert len(pod.gpu_ids) % workers_per_pod == 0, (
         f"pod {pod.name} was annotated with {len(pod.gpu_ids)} gpus for the {workers_per_pod} workers it serves, "
@@ -108,10 +139,14 @@ def _workers_of_pod(pod: pod_view.ParsedPod, *, run: KubernetesRunInfo) -> list[
 
 
 def _ports_of_pool(pool_id: str, *, run: KubernetesRunInfo) -> dict[str, int]:
+    # [FUNCTION DOC] HELPER: Mapping from port name to its declared static port for the pool's spec.
     return {port.name: port.static_port for port in run.specs[pool_id].port_infos}
 
 
 def _host_of_pod(pod: pod_view.ParsedPod, *, namespace: str) -> str:
+    # [FUNCTION DOC] HELPER: Host to reach a pod: its ip (ipv6 bracketed) if known; otherwise the
+    # in-cluster dns name built from pod name, headless service subdomain and namespace (asserts the
+    # subdomain exists).
     if pod.pod_ip:
         return wrap_ipv6(pod.pod_ip)
     assert pod.subdomain, f"worker {pod.name} has neither a pod ip nor a headless service"
@@ -119,6 +154,9 @@ def _host_of_pod(pod: pod_view.ParsedPod, *, namespace: str) -> str:
 
 
 def _has_all_pods(pods: list[pod_view.ParsedPod]) -> bool:
+    # [FUNCTION DOC] HELPER: True iff the sorted pod indices are exactly zero up to the cell size
+    # minus one, where the cell size is the largest size any pod reports; true when that size is
+    # zero (unknown).
     expected = max(pod.cell_size for pod in pods)
     if not expected:
         return True
@@ -126,6 +164,8 @@ def _has_all_pods(pods: list[pod_view.ParsedPod]) -> bool:
 
 
 def _spec_meta_of_pod(pod: pod_view.ParsedPod, *, run: KubernetesRunInfo) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: The spec's metadata function applied to the pod's cell index, as a
+    # fresh mapping; empty if the spec has no such function.
     compute_meta = run.specs[pod.pool_id].meta
     if compute_meta is None:
         return {}
@@ -133,4 +173,6 @@ def _spec_meta_of_pod(pod: pod_view.ParsedPod, *, run: KubernetesRunInfo) -> dic
 
 
 def _pod_meta_of_cell(pods: list[pod_view.ParsedPod]) -> dict[str, str]:
+    # [FUNCTION DOC] HELPER: Merge the metadata of all pods into one mapping, asserting that pods
+    # agree on any key they share.
     return functools.reduce(merge_asserting_consistency, (pod.meta for pod in pods), {})

@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# mbridge bridge for DeepSeek V4.1, derived from the V4 bridge. The V4.1 checkpoint uses a flatter
+# naming scheme (no model prefix; embed, norm and head at top level; attn and ffn instead of
+# self_attn and mlp), has no hash-routed layers, an indexer key projection and norm, and engram
+# parameters. The mappings are replaced wholesale, and the config builder fills in attributes the
+# V4.1 Hugging Face config lacks.
 from megatron.core.transformer.enums import AttnBackend
 
 from mbridge.core import register_model
@@ -7,6 +13,15 @@ from .deepseek_v4 import DeepseekV4Bridge
 
 @register_model("deepseek_v41")
 class DeepseekV41Bridge(DeepseekV4Bridge):
+    # [CLASS DOC]
+    # Registered under the name deepseek_v41. Class attributes replace (not extend) the V4 mappings,
+    # from Megatron parameter names to Hugging Face names with layer number and expert id
+    # placeholders: direct mapping (embedding, final norm, output head); attention mapping
+    # (including the input layer norm, which in V4 came from the V3 mapping); other mapping
+    # (hyper-connection and engram parameters); and the MLP mapping (shared and routed experts,
+    # where fused first projections list the gate and up weights separately).
+    # KNOWN ISSUE: the replaced direct mapping drops the V4 final hyper-connection head entries, so
+    # those parameters have no name mapping in this bridge unless handled elsewhere.
     _DIRECT_MAPPING = {
         "embedding.word_embeddings.weight": "embed.weight",
         "decoder.final_layernorm.weight": "norm.weight",
@@ -71,6 +86,9 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
     }
 
     def _weight_name_mapping_mcore_to_hf(self, mcore_weights_name: str) -> list[str]:
+        # [FUNCTION DOC] Hugging Face names for a Megatron parameter: direct mapping hits return a
+        # one-element list; names containing hyper connection or the engram marker use the other
+        # mapping; everything else goes to the parent class lookup.
         if mcore_weights_name in self._DIRECT_MAPPING:
             return [self._DIRECT_MAPPING[mcore_weights_name]]
         if "hyper_connection" in mcore_weights_name or "v41_engram" in mcore_weights_name:
@@ -78,6 +96,17 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
         return super()._weight_name_mapping_mcore_to_hf(mcore_weights_name)
 
     def _build_config(self):
+        # [FUNCTION DOC]
+        # Fill in missing Hugging Face config attributes in place (mutates the shared config): zero
+        # hash-routed layers; first dense layer count default zero; intermediate size defaults to the
+        # mixture-of-experts intermediate size; key-value low-rank size defaults to the head dim;
+        # query-key no-position head dim defaults to head dim minus rope head dim; value head dim
+        # defaults to the head dim; and if the rope scaling mapping exists without rope theta, a copy
+        # of it with the config's rope theta is stored. Then builds the V4 config, resets the backend
+        # to automatic, forces zero hash layers, enables the shared-expert activation clamp, and
+        # applies the V4.1 specific settings from the models plugin (imported locally here).
+        # KNOWN ISSUE: when the rope scaling is none, the parent config builder still reads its rope
+        # theta entry and would fail.
         hf = self.hf_config
         hf.n_hash_layers = 0
         hf.first_k_dense_replace = getattr(hf, "first_k_dense_replace", 0)

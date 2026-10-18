@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Outer launcher of a served worker, run as a module with its own options (spec table function and
+# pool id), optionally followed by a double dash and the worker's own arguments. It resolves the
+# pool's spec, works out the worker's environment variables from the identity given by the platform
+# environment, and then replaces the process (exec) with the inner server module under that
+# environment, so the worker process starts with the environment already in place.
 from __future__ import annotations
 
 import os
@@ -13,6 +19,16 @@ SERVE_INNER_MODULE = "miles.utils.workers.serving.serve_inner"
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Split the command line at the double dash into own options and worker arguments, parse the
+    # own options, load the spec of the requested pool (asserting it exists and is a served spec),
+    # read the worker identity (cell index, worker index, gpu ids) from the process environment and
+    # ask the spec for the environment variables for that launch. Asserts the spec does not set
+    # any platform-owned identity variable (that would misreport the worker's identity). Then
+    # replaces the current process with a new python interpreter running the inner module with the
+    # same own options, a double dash and the worker arguments, with the environment being the
+    # current one overlaid with the spec's variables. Logs progress to standard output; does not
+    # return on success.
     own_argv, worker_argv = split_worker_argv(sys.argv[1:])
     args = parse_own_args(own_argv)
     _log(f"start own_argv={own_argv} worker_argv={worker_argv}")
@@ -39,6 +55,8 @@ def main() -> None:
 
 
 def _log(message: str) -> None:
+    # [FUNCTION DOC] HELPER: Print the message prefixed with the launcher tag to standard output,
+    # flushing immediately.
     print(f"[serve] {message}", flush=True)
 
 

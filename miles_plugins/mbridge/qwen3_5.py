@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# mbridge bridge for Qwen3.5 and Qwen3.6 (dense and mixture-of-experts) vision-language checkpoints,
+# derived from the Qwen2 MoE bridge. The Hugging Face checkpoint nests the text model under a
+# language model prefix, mixes gated linear attention (GDN) layers with full attention layers,
+# stores regular-layer experts as fused 3-d tensors (or per-expert files in round-tripped
+# checkpoints), and has multi-token prediction (mtp) layers whose expert layout depends on the
+# release. This module supplies name mappings (with fused/unfused detection from the safetensor
+# index), the qkv merge and GDN layout conversions for import and export, the mtp block spec, and
+# the Megatron config.
 import inspect
 
 import torch
@@ -15,6 +24,16 @@ from miles_plugins.mbridge.linear_attn import LinearAttentionBridgeMixin
 
 @register_model(["qwen3_5", "qwen3_5_moe", "qwen3_6", "qwen3_6_moe"])
 class Qwen3_5Bridge(LinearAttentionBridgeMixin, Qwen2MoEBridge):
+    # [CLASS DOC]
+    # Registered under the model type names qwen3_5, qwen3_5_moe, qwen3_6 and qwen3_6_moe. Class
+    # attributes (mappings from Megatron parameter names to Hugging Face names with layer number and
+    # expert id placeholders): the group-major tuple of linear attention parameters that the
+    # head-sharded layer stores group-major but the checkpoint stores flat; the direct mapping
+    # (embedding, final norm, output head); the attention mapping (full attention projections plus
+    # all linear attention and gated attention names generated from a list); the MLP mapping (dense,
+    # shared expert, router and fused expert names); the mtp MLP mappings in fused and unfused
+    # forms; the unfused main-layer expert mapping; and the config mapping with an optional ffn size
+    # and a head dim default. Caches for the fused expert detections are stored on the instance.
     """
     Bridge for Qwen3.5 / Qwen3.6 models (both dense and MoE variants).
     These share the ``qwen3_5_moe`` HF config schema: VLM layout under
@@ -152,29 +171,42 @@ class Qwen3_5Bridge(LinearAttentionBridgeMixin, Qwen2MoEBridge):
     }
 
     def _get_text_config(self):
+        # [FUNCTION DOC] HELPER: The nested text config if the Hugging Face config has one, else the
+        # config itself.
         """Get the text config, handling VLM nesting."""
         if hasattr(self.hf_config, "text_config"):
             return self.hf_config.text_config
         return self.hf_config
 
     def _is_tied_word_embeddings(self) -> bool:
+        # [FUNCTION DOC] Whether the output head shares the embedding weight: the tie flag on the
+        # top-level config if set, else on the nested text config; false when absent in both.
         tie_word_embeddings = getattr(self.hf_config, "tie_word_embeddings", None)
         if tie_word_embeddings is None and hasattr(self.hf_config, "text_config"):
             tie_word_embeddings = getattr(self.hf_config.text_config, "tie_word_embeddings", None)
         return bool(tie_word_embeddings)
 
     def _adjust_mapping_for_shared_weights(self):
+        # [FUNCTION DOC] Give this instance its own copy of the direct mapping; when embeddings are tied,
+        # point the output head name at the embedding's Hugging Face name, so only one tensor is read.
         self._DIRECT_MAPPING = dict(self._DIRECT_MAPPING)
         if self._is_tied_word_embeddings():
             embed_key = self._DIRECT_MAPPING["embedding.word_embeddings.weight"]
             self._DIRECT_MAPPING["output_layer.weight"] = embed_key
 
     def _get_hf_shared_weight_keys(self) -> list[str]:
+        # [FUNCTION DOC] Hugging Face names of weights shared between Megatron parameters: the
+        # embedding's name when embeddings are tied, else an empty list.
         if self._is_tied_word_embeddings():
             return [self._DIRECT_MAPPING["embedding.word_embeddings.weight"]]
         return []
 
     def _supports_transformer_config_kwarg(self, kwarg_name: str) -> bool:
+        # [FUNCTION DOC] HELPER: Whether the transformer config class accepts a keyword: true when no
+        # config class is set; otherwise membership in the class's dataclass field names if it is a
+        # dataclass, else membership in its constructor signature parameters (true if the signature
+        # cannot be inspected).
+        # KNOWN ISSUE: not called anywhere in this module, so it may be dead code.
         """Check whether the current TransformerConfig accepts a given kwarg."""
         transformer_config_class = getattr(self, "TransformerConfigClass", None)
         if transformer_config_class is None:
@@ -191,11 +223,17 @@ class Qwen3_5Bridge(LinearAttentionBridgeMixin, Qwen2MoEBridge):
         return kwarg_name in signature.parameters
 
     def _get_transformer_layer_spec(self, vp_stage=None):
+        # [FUNCTION DOC] Build the layer spec with the parent for the virtual pipeline stage (default
+        # none), remember it on the instance for the mtp block spec, and return it.
         transformer_layer_spec = super()._get_transformer_layer_spec(vp_stage)
         self._last_transformer_layer_spec = transformer_layer_spec
         return transformer_layer_spec
 
     def _get_gptmodel_args(self) -> dict:
+        # [FUNCTION DOC] Model constructor arguments from the parent; if the text config declares a
+        # non-null mtp hidden layer count, adds an mtp block spec built (with transformer-engine
+        # layers) from the config and the remembered layer spec, creating that layer spec first if none
+        # was remembered.
         """Override to add MTP block spec if needed."""
         ret = super()._get_gptmodel_args()
         text_config = self._get_text_config()
@@ -208,6 +246,10 @@ class Qwen3_5Bridge(LinearAttentionBridgeMixin, Qwen2MoEBridge):
         return ret
 
     def _experts_fused(self) -> bool:
+        # [FUNCTION DOC] Returns the cached answer if any. Otherwise looks at the safetensor reader's
+        # tensor name index: with no reader or an empty index returns true (the default, not cached);
+        # else the experts are fused iff some regular-layer tensor name ends with the fused expert
+        # first-projection name; that answer is cached on the instance and returned.
         """Detect whether MAIN-layer MoE expert weights are fused 3-D tensors.
 
         Fused (public Qwen3.5-35B-A3B): ``...mlp.experts.gate_up_proj``.
@@ -228,6 +270,12 @@ class Qwen3_5Bridge(LinearAttentionBridgeMixin, Qwen2MoEBridge):
         return fused
 
     def _weight_name_mapping_mlp(self, name: str) -> list[str]:
+        # [FUNCTION DOC] Hugging Face names for an MLP-side parameter. Layer number is the third dotted
+        # segment. For expert names, if the experts are unfused the unfused expert mapping overrides
+        # the fused entries. The first mapping keyword contained in the name selects the names (mapping
+        # order matters because matching is by substring); if the names have an expert id placeholder,
+        # the id is the text after the last occurrence of weight in the Megatron name. Raises
+        # not-implemented if nothing matches.
         """Override to handle fused (default) or unfused per-expert weights."""
         layer_number = name.split(".")[2]
         mapping = self._MLP_MAPPING
@@ -249,6 +297,9 @@ class Qwen3_5Bridge(LinearAttentionBridgeMixin, Qwen2MoEBridge):
         return convert_names
 
     def _mtp_experts_fused(self) -> bool:
+        # [FUNCTION DOC] Same scheme as the main-layer detection but for mtp experts: cached answer if
+        # any; with no reader or an empty index returns false (not cached); else true iff some mtp
+        # expert tensor name ends with the fused first-projection or second-projection name; cached.
         """Detect whether MTP expert weights are stored in fused 3-D tensors.
 
         Qwen3.5 MoE-A3B: unfused per-expert tensors (keys end in ``.weight``).
@@ -274,9 +325,15 @@ class Qwen3_5Bridge(LinearAttentionBridgeMixin, Qwen2MoEBridge):
 
     @property
     def _MTP_MLP_MAPPING(self):
+        # [FUNCTION DOC] HELPER: Property: the fused or the unfused mtp expert mapping, depending on
+        # the detected checkpoint format.
         return self._MTP_MLP_MAPPING_FUSED if self._mtp_experts_fused() else self._MTP_MLP_MAPPING_UNFUSED
 
     def _weight_name_mapping_mtp_mlp(self, name: str) -> list[str]:
+        # [FUNCTION DOC] Hugging Face names for an MLP-side parameter of an mtp layer: expert names use
+        # the detected mtp expert mapping, all others the regular MLP mapping (so shared expert and
+        # router names resolve to regular-layer paths, which the caller rewrites). Otherwise same rules
+        # as the regular MLP name mapping. Raises not-implemented if nothing matches.
         """Handle MTP MLP mappings; per-expert format is detected from HF weights."""
         layer_number = name.split(".")[2]
         mapping = self._MTP_MLP_MAPPING if "mlp.experts.linear_fc" in name else self._MLP_MAPPING
@@ -296,12 +353,24 @@ class Qwen3_5Bridge(LinearAttentionBridgeMixin, Qwen2MoEBridge):
         return convert_names
 
     def _weight_name_mapping_mcore_to_hf(self, mcore_weights_name: str) -> list[str]:
+        # [FUNCTION DOC] Hugging Face names for a Megatron parameter: names containing the mtp marker
+        # use the mtp conversion, all others the parent mapping.
         """Override to handle MTP layer mappings."""
         if "mtp" in mcore_weights_name:
             return self._convert_mtp_param(mcore_weights_name)
         return super()._weight_name_mapping_mcore_to_hf(mcore_weights_name)
 
     def _convert_mtp_param(self, name: str) -> list[str]:
+        # [FUNCTION DOC]
+        # Hugging Face names for an mtp parameter. Raises not-implemented unless the name contains the
+        # mtp layers path. The layer index is the third dotted segment. Four direct entries (projection
+        # to the fc weight, embedding norm, hidden norm, final norm) map to top-level mtp names without
+        # a layer index and return a one-element list. Otherwise, if the name has an inner layer path
+        # (either supported spelling), it is rewritten to a regular decoder layer path with the same
+        # index and mapped via the attention mapping (self attention or input norm names) or the mtp
+        # MLP mapping (mlp or pre-mlp norm names), else raises not-implemented; the regular language
+        # model layer prefix in the results is replaced by the mtp layer prefix. Anything else raises
+        # not-implemented.
         """Convert MTP layer parameters from MCore to HF format."""
         if "mtp.layers." not in name:
             raise NotImplementedError(f"Invalid MTP parameter name: {name}")
@@ -346,6 +415,20 @@ class Qwen3_5Bridge(LinearAttentionBridgeMixin, Qwen2MoEBridge):
     def _weight_to_mcore_format(
         self, mcore_weights_name: str, hf_weights: list[torch.Tensor]
     ) -> tuple[list[str], list[torch.Tensor]]:
+        # [FUNCTION DOC]
+        # Convert Hugging Face tensors to one Megatron weight, by name, in this order. Linear attention
+        # decay log parameter (asserts one input): float32 contiguous. The group-major linear
+        # attention weights (qkv input projection, convolution): convert from flat to group-major layout
+        # using the head counts of the text config. Fused qkv linear (not its norm; asserts three
+        # inputs): query is viewed per key-value group with its gate half and the groups interleaved so
+        # that each group holds query, gate, key, value rows contiguously, key and value are viewed per
+        # group, and all are concatenated per group and flattened to a matrix (or a vector for bias);
+        # the number of groups is derived from the actual tensor so tensor-parallel slices work. Expert
+        # weights given as one stacked 3-d tensor: the local expert index is parsed from the text after
+        # the last weight word of the name, the global index adds the expert-parallel rank times local
+        # experts per rank, and that expert's matrix is returned. Everything else uses the base class.
+        # KNOWN ISSUE: the return annotation says a tuple of names and tensors but a single tensor is
+        # returned in every branch.
         if mcore_weights_name.endswith("self_attention.linear_attn.A_log"):
             assert len(hf_weights) == 1
             # Keep A_log in fp32 before TP scatter; this avoids precision loss
@@ -404,12 +487,23 @@ class Qwen3_5Bridge(LinearAttentionBridgeMixin, Qwen2MoEBridge):
     def _weight_to_hf_format(
         self, mcore_weights_name: str, mcore_weights: torch.Tensor
     ) -> tuple[list[str], list[torch.Tensor]]:
+        # [FUNCTION DOC] Export one weight with the parent; for the group-major linear attention
+        # weights, convert the single returned tensor from group-major back to flat layout using the
+        # text config's head counts. Returns the names and tensors.
         names, weights = super()._weight_to_hf_format(mcore_weights_name, mcore_weights)
         if mcore_weights_name.endswith(self._GDN_GROUP_MAJOR):
             weights = [qkv_group_major_to_flat(weights[0], gdn_heads(self._get_text_config()))]
         return names, weights
 
     def _build_config(self):
+        # [FUNCTION DOC] Build the Megatron config from the (possibly nested) text config via the base
+        # helper: mtp layer count if the text config has the mtp hidden layer attribute; no cpu
+        # initialization; fusion options on; softmax not applied before top-k; query-key layer norm and
+        # attention output gate on. If the text config has an experts count (mixture-of-experts): expert
+        # ffn size, shared expert size (none if absent), router bias update rate 0.001, top-k, expert
+        # count, aux loss coefficient, no load balancing type, grouped gemm, softmax score and shared
+        # expert gate; and, if it has no ordinary intermediate size, the dense ffn size is taken from
+        # the shared expert size. Returns the config.
         text_config = self._get_text_config()
 
         mtp_args = {}

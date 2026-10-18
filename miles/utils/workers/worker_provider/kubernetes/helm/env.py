@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Environment facts for helm-deployed runs: the label and annotation names the chart puts on pods
+# (the cell index and pod index labels come from the upstream leader-worker-set workload), and
+# functions reading the current namespace and release from the environment or the pod's service
+# account.
 from __future__ import annotations
 
 import os
@@ -22,6 +27,9 @@ NAMESPACE_FILE = Path("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
 
 
 def current_namespace() -> str:
+    # [FUNCTION DOC] Namespace of the workers: the namespace environment variable if set and
+    # non-empty; otherwise the content of the service account namespace file, whitespace-stripped.
+    # Asserts the file exists (message: running outside a pod, set the variable) and is not empty.
     if namespace := os.environ.get(NAMESPACE_ENV_VAR, ""):
         return namespace
     assert NAMESPACE_FILE.exists(), (
@@ -34,6 +42,8 @@ def current_namespace() -> str:
 
 
 def current_release() -> str:
+    # [FUNCTION DOC] The helm release name from its environment variable; asserts it is set and not
+    # empty.
     release = os.environ.get(RELEASE_ENV_VAR, "")
     assert release, (
         f"the orchestrator cannot tell which release created its workers, so it cannot select their pods: "

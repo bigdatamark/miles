@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# mbridge bridge for the Inkling multimodal model (text decoder only), derived from the Qwen2 MoE
+# bridge. The Hugging Face checkpoint stores the language model under a nested prefix, fuses
+# query/key/value/relative projections, stores all experts of a layer as stacked 3-d tensors with
+# interleaved gate and up rows, and has short convolutions and global scale parameters. This module
+# supplies the name mappings, the tensor reshaping for import, and a tensor-parallel split that keeps
+# per-rank query/key/value/relative blocks together.
 import re
 
 import torch
@@ -7,6 +14,9 @@ from mbridge.models import Qwen2MoEBridge
 
 
 def _deinterleave_w13(w13: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Convert a fused gate-up weight whose rows alternate gate, up, gate, up
+    # into the concatenated layout: all even rows (gate) followed by all odd rows (up), along the
+    # first axis. Returns a new tensor.
     gate = w13[0::2]
     up = w13[1::2]
     return torch.cat([gate, up], dim=0)
@@ -14,6 +24,14 @@ def _deinterleave_w13(w13: torch.Tensor) -> torch.Tensor:
 
 @register_model("inkling_mm_model")
 class InklingBridge(Qwen2MoEBridge):
+    # [CLASS DOC]
+    # Registered under the name inkling_mm_model. Class attributes: direct mapping (embedding,
+    # embedding norm, final norm, output head under the language model prefix); attention mapping (the
+    # fused qkv weight takes four Hugging Face tensors: query, key, value and relative; norms, short
+    # convolutions and the relative projection); MLP mapping (router, expert and dense weights, shared
+    # experts, scales; the router weight and the shared gate share one Hugging Face tensor, split on
+    # import); and the config mapping from Megatron config fields to Hugging Face fields (a pair
+    # gives field name and default).
     _DIRECT_MAPPING = {
         "embedding.word_embeddings.weight": "model.llm.embed.weight",
         "embedding.embed_norm.weight": "model.llm.embed_norm.weight",
@@ -70,20 +88,32 @@ class InklingBridge(Qwen2MoEBridge):
     }
 
     def _get_text_config(self):
+        # [FUNCTION DOC] HELPER: The nested text config if the Hugging Face config has one, else the
+        # config itself.
         if hasattr(self.hf_config, "text_config"):
             return self.hf_config.text_config
         return self.hf_config
 
     def _is_tied_word_embeddings(self) -> bool:
+        # [FUNCTION DOC] Always false: the embedding and output head are separate weights.
         return False
 
     def _adjust_mapping_for_shared_weights(self):
+        # [FUNCTION DOC] Override that disables the base class adjustment for tied weights; does nothing.
         pass
 
     def _get_hf_shared_weight_keys(self):
+        # [FUNCTION DOC] Override reporting that no Hugging Face weights are shared; returns an empty
+        # list.
         return []
 
     def _weight_name_mapping_mlp(self, name: str) -> list[str]:
+        # [FUNCTION DOC] Hugging Face names for an MLP-side Megatron parameter. The layer number is the
+        # third dotted segment. Per-expert shared expert weights (name with a shared experts expert
+        # index and fc1 or fc2) map to the shared first-projection or second-projection stacked tensor
+        # of that layer. Otherwise the first keyword of the MLP mapping contained in the name selects
+        # the formatted names (mapping order matters because matching is by substring). Raises
+        # not-implemented if none match.
         layer_number = name.split(".")[2]
         m = re.search(r"mlp\.shared_experts\.experts\.(\d+)\.(linear_fc1|linear_fc2)\.weight", name)
         if m is not None:
@@ -104,6 +134,19 @@ class InklingBridge(Qwen2MoEBridge):
         return convert_names
 
     def _weight_to_mcore_format(self, mcore_weights_name: str, hf_weights: list[torch.Tensor]) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Convert Hugging Face tensors to the Megatron weight, by name, checked in this order. Fused
+        # qkv weight (not its norm): asserts four inputs, casts to the target dtype if set, and
+        # concatenates them along the first axis. Router weight: asserts one input and takes the first
+        # n-routed-experts rows (cast to target dtype). Shared gate: takes the next n-shared-experts rows.
+        # Any global scale: reshaped to one element. Router expert bias: unchanged, made contiguous.
+        # Routed expert first or second projection given a stacked 3-d tensor: selects the expert by its
+        # global index (expert-parallel rank times local experts, plus the local index parsed from
+        # the text after the last weight word in the name); the first projection is de-interleaved.
+        # Shared expert per-expert weights given a 3-d tensor: picks the expert by index from the
+        # name; first projection de-interleaved. Dense MLP first projection of a 2-d tensor: cast and
+        # de-interleaved; second projection of a 2-d tensor: cast only. Everything else uses the base
+        # class. All returned tensors are contiguous.
         if "self_attention.linear_qkv." in mcore_weights_name and "layer_norm" not in mcore_weights_name:
             assert len(hf_weights) == 4, f"qkvr expects 4 HF tensors, got {len(hf_weights)}"
             if getattr(self, "dtype", None) is not None:
@@ -135,6 +178,9 @@ class InklingBridge(Qwen2MoEBridge):
             return hf_weights[0].contiguous()
 
         def _global_eid(name):
+            # [FUNCTION DOC] HELPER: Global expert index for a local expert parameter name: the
+            # expert-parallel rank times the experts per rank plus the integer found after the last
+            # occurrence of the word weight in the name.
             nr = self._get_text_config().n_routed_experts
             return self.mpu.ep_rank * (nr // self.mpu.ep_size) + int(name.split("weight")[-1])
 
@@ -172,6 +218,14 @@ class InklingBridge(Qwen2MoEBridge):
         param: torch.Tensor,
         tp_split_size: int,
     ) -> list[torch.Tensor]:
+        # [FUNCTION DOC]
+        # Split a weight across tensor-parallel ranks. For the fused qkv weight (not its norm) with more
+        # than one rank: reads the head count, head dim and relative dim (default 16) from the text
+        # config, derives the query, key/value and relative row counts, asserts the row arithmetic is
+        # consistent and that head counts divide by the rank count, splits rows into query, key, value
+        # and relative parts, chunks each part across ranks and rebuilds each rank's block as the
+        # concatenation of its query, key, value and relative chunks. Returns one contiguous tensor per
+        # rank. Everything else uses the base class.
         """Split fused linear_qkv into per-rank [q_i|k_i|v_i|r_i] blocks (base chunk(tp) scrambles them)."""
         if (
             tp_split_size > 1
@@ -210,6 +264,12 @@ class InklingBridge(Qwen2MoEBridge):
         return super()._weight_split_across_tp(mcore_weights_name, mcore_weights, param, tp_split_size)
 
     def _build_config(self):
+        # [FUNCTION DOC] Build the Megatron config through the base helper, reading the nested text
+        # config when present: no cpu initialization; expert count, top-k, expert ffn size and shared
+        # expert size from the text config (shared size equals the same intermediate size); sigmoid router
+        # score with expert bias and softmax before top-k; sequence aux-loss balancing with coefficient
+        # zero; grouped gemm; all-to-all dispatcher; query-key layer norm on; no qkv or linear bias.
+        # Returns the config.
         tc = self._get_text_config()
         return self._build_base_config(
             text_config_key="text_config" if hasattr(self.hf_config, "text_config") else None,

@@ -1,5 +1,10 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+# [MODULE DOC]
+# mbridge bridge for MiMo models: the Qwen2 bridge plus multi-token prediction (mtp) layers. Adds the
+# mtp configuration and block spec, the mtp parameter name mapping (Hugging Face stores mtp layers
+# under a separate mtp layers prefix) and swaps the two halves of the embedding-hidden projection
+# between the two frameworks' concatenation orders.
 import torch
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
 
@@ -9,6 +14,8 @@ from mbridge.models import Qwen2Bridge
 
 @register_model("mimo")
 class MimoBridge(Qwen2Bridge):
+    # [CLASS DOC] Registered under the name mimo. Supports a single stack of mtp layers numbered from
+    # zero.
     """
     Bridge implementation for Mimo models.
 
@@ -20,6 +27,11 @@ class MimoBridge(Qwen2Bridge):
     """
 
     def _build_config(self):
+        # [FUNCTION DOC] Build the config through the base helper with qkv bias on and no query-key
+        # layer norm; when the Hugging Face config contains the next-token-prediction layer count,
+        # passes it as the mtp layer count. Returns the config.
+        # KNOWN ISSUE: the presence test uses a containment check directly on the config object, which
+        # only works if the config type supports it; plain config objects usually do not.
         """Override to add MTP configuration."""
         hf_config = self.hf_config
 
@@ -35,6 +47,10 @@ class MimoBridge(Qwen2Bridge):
         )
 
     def _get_gptmodel_args(self) -> dict:
+        # [FUNCTION DOC] Model constructor arguments from the base class; if the config has mtp layers,
+        # also adds an mtp block spec built with transformer-engine layers.
+        # KNOWN ISSUE: the config object itself is passed where the transformer layer spec is
+        # expected, which looks like a mistake (the layer spec is never obtained).
         """Override to add MTP block spec if needed."""
         ret = super()._get_gptmodel_args()
 
@@ -47,6 +63,8 @@ class MimoBridge(Qwen2Bridge):
         return ret
 
     def _weight_name_mapping_mcore_to_hf(self, mcore_weights_name: str) -> list[str]:
+        # [FUNCTION DOC] Hugging Face names for a Megatron parameter: names containing the mtp marker
+        # use the mtp conversion; all others use the parent mapping.
         """Override to handle MTP layer mappings."""
         # Check if this is an MTP layer weight
         if "mtp" in mcore_weights_name:
@@ -56,6 +74,17 @@ class MimoBridge(Qwen2Bridge):
         return super()._weight_name_mapping_mcore_to_hf(mcore_weights_name)
 
     def _convert_mtp_param(self, name: str) -> list[str]:
+        # [FUNCTION DOC]
+        # Hugging Face names for an mtp parameter. Raises not-implemented unless the name contains the
+        # mtp layers path. The mtp layer index is the third dotted segment. Four direct entries (token
+        # norm, hidden norm, input projection, final norm) map to the mtp layer path of the index and
+        # return a one-element list. Otherwise, if the name contains an inner layer path (either
+        # supported inner module spelling), it is rewritten to a regular decoder layer path with the
+        # same index and mapped by the attention mapping (self attention or input layer norm names) or
+        # the MLP mapping (mlp names; else raises not-implemented), and the resulting regular layer
+        # path is replaced by the mtp layer path. Names without such an inner path raise
+        # not-implemented.
+        # KNOWN ISSUE: the final return statement after the if/else is unreachable.
         """Convert MTP layer parameters from MCore to HF format."""
         # For now, assume single MTP layer support
         if "mtp.layers." not in name:
@@ -103,6 +132,8 @@ class MimoBridge(Qwen2Bridge):
         return convert_names
 
     def _weight_to_mcore_format(self, mcore_weights_name: str, hf_weights: list[torch.Tensor]) -> torch.Tensor:
+        # [FUNCTION DOC] Convert using the base class, then for the embedding-hidden projection weight
+        # split the result in two halves along the second axis and concatenate them in swapped order.
         """Swap halves of eh_proj weights before handing off to Megatron-Core."""
         weight = super()._weight_to_mcore_format(mcore_weights_name, hf_weights)
         if mcore_weights_name.endswith("eh_proj.weight"):
@@ -113,6 +144,8 @@ class MimoBridge(Qwen2Bridge):
     def _weight_to_hf_format(
         self, mcore_weights_name: str, mcore_weights: torch.Tensor
     ) -> tuple[list[str], list[torch.Tensor]]:
+        # [FUNCTION DOC] Export: for the embedding-hidden projection weight, first swap the two halves
+        # along the second axis (the inverse of the import), then use the base class export.
         """Swap halves back when exporting eh_proj weights to HuggingFace format."""
         if mcore_weights_name.endswith("eh_proj.weight"):
             first_half, second_half = mcore_weights.chunk(2, dim=1)

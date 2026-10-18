@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Ray actor body that hosts a worker and serves it over the http rpc server on a background
+# thread. If the server ever stops or crashes, the whole process is terminated so the failure is
+# visible to the supervisor.
 from __future__ import annotations
 
 import logging
@@ -19,11 +23,19 @@ _SERVER_THREAD_NAME = "miles-rpc-server"
 
 
 class ServeActor(NodeProbeMixin):
+    # [CLASS DOC]
+    # Generic actor holding one worker object, built by a factory at construction. Inherits node
+    # probing from the node probe mixin. The rpc server is started separately and at most once.
     def __init__(self, *, build_worker: Callable[[], Any]) -> None:
+        # [FUNCTION DOC] Call the factory (any exception propagates and fails actor creation) and
+        # keep the worker; no server thread yet.
         self._worker = build_worker()
         self._server_thread: threading.Thread | None = None
 
     def start_rpc_server(self, *, port: int) -> None:
+        # [FUNCTION DOC] Asserts the server was not started yet. Builds the rpc application for the
+        # worker and starts a daemon thread named for the rpc server that listens on the port (all
+        # interfaces). Returns without waiting for the server to be ready.
         assert self._server_thread is None, "the rpc server of this actor is already running"
 
         app = create_rpc_app(self._worker)
@@ -37,10 +49,17 @@ class ServeActor(NodeProbeMixin):
         self._server_thread.start()
 
     def inject_fault(self, mode: str) -> None:
+        # [FUNCTION DOC] Inject a fault of the given mode (string) into this very process through
+        # the shared fault injector helper (which may kill or crash the process).
         _inject_fault(mode=mode)
 
 
 def serve_until_stopped(*, app: Any, port: int) -> None:
+    # [FUNCTION DOC]
+    # Bind a server socket on the port, run the uvicorn server for the application on it (blocking)
+    # and, whenever serving ends, whether by returning normally or by any error including
+    # interrupts, log an error and immediately exit the whole process with status 1 without
+    # cleanup. Therefore never returns.
     try:
         with create_server_socket(port=port) as server_socket:
             logger.info(f"The rpc server listens on {server_socket.getsockname()}")

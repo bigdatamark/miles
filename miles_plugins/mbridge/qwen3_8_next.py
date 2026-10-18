@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# mbridge bridge for Qwen3.8-Next, derived from the Qwen3.5 bridge. Adds hyper-connection, indexer and
+# per-layer embedding (PLE) parameter name mappings, vision tower name mappings, removal of the
+# inherited block and final layer norm entries (the checkpoint folds them into the hyper-connection
+# norms), a device-side weight slicing cache for loading, a memoized state dict during load, and
+# config attributes for the hyper-connections, PLE n-gram tables and the indexer.
 """Bridge for Qwen3.8-Next (HF ``Qwen4ExpForConditionalGeneration``).
 
 Qwen3.5 plus two hyper-connections per layer, a model-level HC mixer, one PLE layer
@@ -13,6 +19,15 @@ from miles_plugins.mbridge.qwen3_5 import Qwen3_5Bridge
 
 @register_model(["qwen3.8_next", "qwen3_8_next", "qwen4_exp"])
 class Qwen38NextBridge(Qwen3_5Bridge):
+    # [CLASS DOC]
+    # Registered under the names qwen3.8_next, qwen3_8_next and qwen4_exp. Class attributes: the
+    # group-major tuple is emptied (this model still uses the replicated linear attention layout);
+    # the direct mapping is the parent's without the final norm plus the model-level hyper-connection
+    # mixer weights; the attention mapping is the parent's without the fused input norm entries plus
+    # the indexer entries; the MLP mapping is the parent's without the fused norm entries; the other
+    # mapping covers per-layer hyper-connections and PLE parameters (mcore's self attention hyper
+    # connection slot is the attn hyper connection in Hugging Face); the vision direct and per-block
+    # mappings map the vision tower; and a two-entry limit on the device slice cache.
     """Weight mapping + Megatron config for Qwen3.8-Next."""
 
     # Qwen3.8-Next still runs the replicated GDN, which holds q/k/v and the conv in HF's own
@@ -135,6 +150,10 @@ class Qwen38NextBridge(Qwen3_5Bridge):
     }
 
     def _weight_name_mapping_vision(self, mcore_weights_name: str) -> list[str]:
+        # [FUNCTION DOC] Hugging Face names for a vision tower parameter. Direct mapping hits return a
+        # one-element list. Names under the vision block prefix are split into the block number and the
+        # remaining tail; if the tail is in the per-block mapping, the block-number placeholder is
+        # filled. Otherwise raises not-implemented.
         """``vision_model.*`` -> ``model.visual.*``."""
         if mcore_weights_name in self._VISION_DIRECT_MAPPING:
             return [self._VISION_DIRECT_MAPPING[mcore_weights_name]]
@@ -149,11 +168,16 @@ class Qwen38NextBridge(Qwen3_5Bridge):
         raise NotImplementedError(f"Unsupported vision parameter name: {mcore_weights_name}")
 
     def _ple_layer_ids(self) -> list[int]:
+        # [FUNCTION DOC] HELPER: The sorted unique zero-based decoder layer indices that carry a per-layer
+        # embedding, from the text config's one-based id list (empty if absent or empty).
         """0-based decoder layer indices carrying PLE; ``ple_layer_ids`` in the HF config is 1-based."""
         text_config = self._get_text_config()
         return sorted({int(i) - 1 for i in getattr(text_config, "ple_layer_ids", None) or []})
 
     def _ngram_rows_per_shard(self) -> int | None:
+        # [FUNCTION DOC] HELPER: Row count of the first n-gram embedding shard of the first PLE layer,
+        # read from the checkpoint tensor shape through the safetensor reader. Returns none when there
+        # are no PLE layers, when the lookup fails for any reason, or when the shape is empty.
         """Height of one n-gram shard, read from the checkpoint; None when the index is unavailable."""
         layer_ids = self._ple_layer_ids()
         if not layer_ids:
@@ -166,6 +190,11 @@ class Qwen38NextBridge(Qwen3_5Bridge):
         return int(shape[0]) if shape else None
 
     def _weight_name_mapping_other(self, mcore_weights_name: str) -> list[str]:
+        # [FUNCTION DOC] Hugging Face names for hyper-connection, indexer-adjacent and PLE parameters.
+        # Strips a leading decoder prefix (a bare transformer block has none); if the name then starts
+        # with the layers prefix, extracts the layer number and the remainder. A remainder found in the
+        # other mapping returns the formatted names, but raises not-implemented if no layer number was
+        # present. Anything else raises not-implemented.
         """HC / indexer / PLE names."""
         layer_number = None
         name = mcore_weights_name
@@ -185,6 +214,9 @@ class Qwen38NextBridge(Qwen3_5Bridge):
         raise NotImplementedError(f"Unsupported parameter name: {mcore_weights_name}")
 
     def _weight_name_mapping_mcore_to_hf(self, mcore_weights_name: str) -> list[str]:
+        # [FUNCTION DOC] Hugging Face names for a Megatron parameter: vision tower names use the vision
+        # mapping; otherwise the parent mapping, falling back to the other mapping when the parent
+        # raises not-implemented.
         if mcore_weights_name.startswith("vision_model."):
             return self._weight_name_mapping_vision(mcore_weights_name)
         try:
@@ -197,6 +229,14 @@ class Qwen38NextBridge(Qwen3_5Bridge):
     _GPU_CACHE_SIZE = 2
 
     def _weight_to_mcore_format(self, mcore_weights_name: str, hf_weights: list[torch.Tensor]):
+        # [FUNCTION DOC]
+        # Without a gpu, defer to the parent. With one, first move every Hugging Face tensor to the
+        # current gpu through a small least-recently-inserted cache keyed by memory address, shape and
+        # dtype (at most two entries; the oldest is evicted), so repeated reads of the same fused expert
+        # tensor upload once; then run the parent conversion on the device tensors. Creates the cache
+        # on the instance lazily.
+        # KNOWN ISSUE: the cache is keyed by data pointer, which can be reused by a different tensor
+        # after the original is freed; the cache evicts by insertion order and does not refresh hits.
         """Slice on the device, reusing one upload across a layer's experts."""
         if not torch.cuda.is_available():
             return super()._weight_to_mcore_format(mcore_weights_name, hf_weights)
@@ -219,6 +259,13 @@ class Qwen38NextBridge(Qwen3_5Bridge):
         return super()._weight_to_mcore_format(mcore_weights_name, moved)
 
     def load_weights(self, model, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Load weights into the model (a single model chunk or a list or tuple of chunks) through the
+        # parent. Before loading, each chunk's state dict is computed once and the chunk's state dict
+        # method is replaced by one returning that cached result (avoiding quadratic recomputation).
+        # Afterwards, always: restore each chunk's original method (by deleting the instance override,
+        # or re-assigning the saved method if deletion is impossible), clear the device weight cache
+        # and empty the gpu allocator cache if a gpu is available. Returns the parent's result.
         """Memoise ``state_dict()`` for the load, then drop the device cache.
 
         mbridge calls ``state_dict()`` once per parameter, which is quadratic with
@@ -244,6 +291,14 @@ class Qwen38NextBridge(Qwen3_5Bridge):
                 torch.cuda.empty_cache()
 
     def _build_config(self):
+        # [FUNCTION DOC] Build the parent config, then attach attributes read from the text config with
+        # defaults when absent: hyper-connections enabled with residual streams (4) and low-rank size
+        # (320); the zero-based PLE layer ids, embedding dim (2560), n-gram size (3), heads per n-gram
+        # (8), n-gram vocabulary base (20000000), split parts (128), PLE convolution kernel size (4),
+        # end-of-sequence token id (0, where the n-gram hash resets) and the rows per n-gram shard read
+        # from the checkpoint (none if unavailable); indexer budget (2048), compress ratio (4), heads
+        # (4), head dim (128) and key-value heads (1); and a flag saying blocks have no layer norms.
+        # Returns the config.
         text_config = self._get_text_config()
         config = super()._build_config()
 

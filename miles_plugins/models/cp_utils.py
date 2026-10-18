@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Context-parallel (CP) token layout helpers used inside model layers. Megatron stores each CP rank's
+# tokens in a zigzag load-balanced layout; flash-linear-attention (fla) CP operators need each rank to
+# hold a contiguous chunk of the packed stream. This module builds the fla CP context (when the
+# optional dependency is importable) and converts between the two layouts with differentiable
+# all-gather based relayouts, computing the index maps on the device.
 """CP token-layout helpers used inside model plugin ``forward`` implementations.
 
 Distinct from ``miles.backends.training_utils.data.context_parallel``, which owns the CP
@@ -21,6 +27,10 @@ except ImportError:
 
 
 def build_fla_cp_context(cu_seqlens: torch.Tensor, cp_group, conv_kernel_size: int, device: torch.device):
+    # [FUNCTION DOC] Build the fla context for this rank. Raises a runtime error if the fla CP module
+    # could not be imported, and a value error if the boundaries are missing or have fewer than two
+    # entries. Otherwise calls the fla builder with the boundaries moved to the device as 32-bit
+    # integers, the CP group and the convolution kernel size, and returns its context.
     """fla CP context for a rank of ``cp_group`` from the global packed boundaries ``cu_seqlens``."""
     if _fla_build_cp_context is None:
         raise RuntimeError(
@@ -36,6 +46,8 @@ def build_fla_cp_context(cu_seqlens: torch.Tensor, cp_group, conv_kernel_size: i
 
 
 def build_gdn_cp_context(module: nn.Module, cu_seqlens: torch.Tensor, device: torch.device):
+    # [FUNCTION DOC] Return none if the module has no CP group attribute (or it is none); otherwise the
+    # fla CP context built from the boundaries, the module's CP group and its convolution kernel size.
     """Build fla CP context for a GatedDeltaNet module from packed sequence boundaries.
 
     Args:
@@ -52,6 +64,19 @@ def build_gdn_cp_context(module: nn.Module, cu_seqlens: torch.Tensor, device: to
 
 
 def _relayout_indices(cu_seqlens, cp_rank, cp_size, total):
+    # [FUNCTION DOC] HELPER:
+    # Compute, entirely with device tensor operations, the row index maps between the zigzag layout and
+    # the contiguous packed layout for a stream of the given total token count. Inputs: sequence
+    # boundaries (cumulative lengths), this rank, the CP size, the total. Uses deferred device-side
+    # assertions that the last boundary equals the total and every sequence length is divisible by the
+    # CP size. For each global packed position it finds the owning sequence, the offset in it, the chunk
+    # size (a 2*size-th of the sequence when the length divides by twice the CP size, zigzag; otherwise a
+    # size-th), the chunk number, and, for zigzag sequences, mirrors chunks beyond the first CP-size
+    # ones so rank r owns chunks r and 2*size-1-r. That gives each packed position's position in the
+    # rank-concatenated zigzag order; the inverse permutation is built by scattering. Returns the two
+    # index vectors restricted to this rank's rows (shard = total / CP size rows starting at rank times
+    # shard): first the positions to select from the rank-concatenated zigzag shards to get this rank's
+    # contiguous shard, then those to select from the packed stream to get this rank's zigzag shard.
     """Index maps between the two layouts of a ``total``-token packed stream, built on device.
 
     Rank ``r``'s zigzag shard holds, per sequence, chunks ``r`` and ``2 * cp_size - 1 - r`` of
@@ -82,31 +107,46 @@ def _relayout_indices(cu_seqlens, cp_rank, cp_size, total):
 
 
 def _gather_select(x, index, cp_group):
+    # [FUNCTION DOC] HELPER: All-gather the per-rank tensors along the first axis across the CP group
+    # (rank order) into one tensor, then select the given rows. Returns the selected rows. Collective
+    # call: every rank must call it.
     gathered = x.new_empty((x.shape[0] * dist.get_world_size(group=cp_group), *x.shape[1:]))
     dist.all_gather_into_tensor(gathered, x.contiguous(), group=cp_group)
     return gathered.index_select(0, index)
 
 
 class _Relayout(torch.autograd.Function):
+    # [CLASS DOC] HELPER: Differentiable relayout. Forward gathers across the CP group and selects rows by
+    # an index; backward does the same to the gradient using the inverse index (the inverse index is saved
+    # for backward; the group is stored on the context).
     """All-gather over CP, then select this rank's rows; the gradient is the same with the inverse map."""
 
     @staticmethod
     def forward(ctx, x, index, inverse_index, cp_group):
+        # [FUNCTION DOC] HELPER: Save the group and inverse index for backward and return the gathered
+        # rows selected by the index.
         ctx.cp_group = cp_group
         ctx.save_for_backward(inverse_index)
         return _gather_select(x, index, cp_group)
 
     @staticmethod
     def backward(ctx, grad_output):
+        # [FUNCTION DOC] HELPER: Gradient for the input is the gathered gradient rows selected by the
+        # inverse index; the other three arguments get no gradient.
         (inverse_index,) = ctx.saved_tensors
         return _gather_select(grad_output, inverse_index, ctx.cp_group), None, None, None
 
 
 def zigzag_to_packed_shard(hidden_states, cu_seqlens, cp_group, cp_rank, cp_size):
+    # [FUNCTION DOC] Convert this rank's zigzag-layout hidden states (first axis tokens) into this rank's
+    # contiguous shard of the packed stream. The total token count is the local count times the CP size.
+    # Collective over the CP group; differentiable.
     to_packed, to_zigzag = _relayout_indices(cu_seqlens, cp_rank, cp_size, hidden_states.size(0) * cp_size)
     return _Relayout.apply(hidden_states, to_packed, to_zigzag, cp_group)
 
 
 def packed_shard_to_zigzag(hidden_states, cu_seqlens, cp_group, cp_rank, cp_size):
+    # [FUNCTION DOC] Inverse of the previous conversion: take this rank's contiguous shard of the packed
+    # stream and return this rank's zigzag-layout rows. Collective over the CP group; differentiable.
     to_packed, to_zigzag = _relayout_indices(cu_seqlens, cp_rank, cp_size, hidden_states.size(0) * cp_size)
     return _Relayout.apply(hidden_states, to_zigzag, to_packed, cp_group)

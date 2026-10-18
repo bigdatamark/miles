@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# mbridge bridge for Kimi K3: a DeepSeek V3 style multi-latent-attention model whose layers mix
+# kimi delta linear attention (KDA) with full attention, use attention residual blocks, a latent
+# projection for routed experts, and a custom layer spec and gated activation. All Hugging Face
+# names live under a language model prefix. Provides the config, name mappings, model arguments,
+# the layer spec and safetensor reader checks, and dtype handling for the KDA parameters.
 import torch
 from megatron.core.transformer import MLATransformerConfig
 from megatron.core.transformer.enums import AttnBackend
@@ -13,6 +19,16 @@ from miles_plugins.models.kimi_k3.ops import situ_and_mul
 
 @register_model("kimi_k3")
 class KimiK3Bridge(LinearAttentionBridgeMixin, DeepseekV3Bridge):
+    # [CLASS DOC]
+    # Registered under the name kimi_k3. Uses the multi-latent-attention transformer config class.
+    # Class attributes: the config mapping from Megatron config fields to Hugging Face fields (a
+    # pair gives field name and default); the direct mapping (embedding, final norm, output head);
+    # the attention mapping (KDA projections, convolutions, gates and norms under the linear attention
+    # path, full multi-latent attention projections, and residual block norms and projections); the MLP
+    # mapping (dense gate/up/down, sparse mixture-of-experts router and its bias, latent projections,
+    # shared experts, routed experts with expert id placeholders); and the other mapping (final
+    # attention residual norm and projection). The mixin removes layout version marker entries from
+    # the local-to-global name mapping.
     TransformerConfigClass = MLATransformerConfig
 
     _CONFIG_MAPPING = {
@@ -140,9 +156,24 @@ class KimiK3Bridge(LinearAttentionBridgeMixin, DeepseekV3Bridge):
 
     @property
     def text_config(self):
+        # [FUNCTION DOC] Property: the nested text config of the Hugging Face config.
         return self.hf_config.text_config
 
     def _build_config(self):
+        # [FUNCTION DOC]
+        # Build the Megatron config from the text config. The per-layer expert flags: zero for the
+        # first dense-replace layers, and one for each later layer whose index is divisible by the
+        # configured moe layer frequency. The base helper receives: automatic attention backend, multi-
+        # latent attention with query-key layer norm, low-rank and head sizes from the config, the
+        # custom gated activation function with fusions off and the transformer-engine activation off,
+        # expert ffn size, latent size and latent norm flag, expert count and top-k, router score
+        # function with softmax before top-k, routed scaling factor, expert bias frozen with update
+        # rate zero, float32 router, no load balancing and zero aux loss, grouped gemm, shared expert
+        # size equal to expert ffn size times the number of shared experts without overlap, the
+        # expert flags and the bf16 reduced-precision matmul disable. Then attaches to the config the
+        # linear attention settings from the config's linear attention mapping: tuple of KDA layer
+        # indices, head count, head dim, convolution kernel size, gate lower bound, plus the attention
+        # residual block size. Returns the config.
         hf_config = self.text_config
         moe_layer_freq = [0] * hf_config.num_hidden_layers
         for layer_idx in range(hf_config.first_k_dense_replace, hf_config.num_hidden_layers):
@@ -193,6 +224,9 @@ class KimiK3Bridge(LinearAttentionBridgeMixin, DeepseekV3Bridge):
         return config
 
     def _get_gptmodel_args(self) -> dict:
+        # [FUNCTION DOC] Model constructor arguments: vocabulary size and maximum sequence length from
+        # the text config and no position embedding (position information comes from the attention
+        # layers).
         return {
             "vocab_size": self.text_config.vocab_size,
             "max_sequence_length": self.text_config.max_position_embeddings,
@@ -200,10 +234,17 @@ class KimiK3Bridge(LinearAttentionBridgeMixin, DeepseekV3Bridge):
         }
 
     def _get_transformer_layer_spec(self, vp_stage=None):
+        # [FUNCTION DOC] Marks the bridge as supporting virtual pipeline stages (sets an attribute) and
+        # returns the Kimi K3 layer spec built from the config for the given virtual pipeline stage
+        # (default none).
         self.has_vp_stage = True
         return build_kimi_k3_spec(self.config, vp_stage=vp_stage)
 
     def _get_safetensor_io(self, weights_path: str):
+        # [FUNCTION DOC] Open the safetensor reader for the checkpoint directory (resolved from the
+        # given path). Asserts that no tensor name ends with the packed-weight suffix, because experts
+        # in four-bit packed format are unsupported and must be converted to bfloat16 first. Returns
+        # the reader.
         safetensor_io = SafeTensorIO(self._get_actual_hf_path(weights_path))
         assert not any(name.endswith(".weight_packed") for name in safetensor_io.index), (
             "Kimi K3 Megatron loading requires the experts to be converted from MXFP4 "
@@ -212,6 +253,10 @@ class KimiK3Bridge(LinearAttentionBridgeMixin, DeepseekV3Bridge):
         return safetensor_io
 
     def _weight_name_mapping_mcore_to_hf(self, mcore_weights_name: str) -> list[str]:
+        # [FUNCTION DOC] Hugging Face names for a Megatron parameter. Asserts it is not an extra
+        # state entry. Order: direct mapping; names with self attention or input layer norm use the
+        # attention mapping; names with mlp use the MLP mapping; everything else uses the other
+        # mapping.
         assert "_extra_state" not in mcore_weights_name
         if mcore_weights_name in self._DIRECT_MAPPING:
             return [self._DIRECT_MAPPING[mcore_weights_name]]
@@ -226,6 +271,10 @@ class KimiK3Bridge(LinearAttentionBridgeMixin, DeepseekV3Bridge):
         mcore_weights_name: str,
         hf_weights: list[torch.Tensor],
     ) -> torch.Tensor:
+        # [FUNCTION DOC] Convert Hugging Face tensors to the Megatron weight. For the three KDA short
+        # convolution weights and the KDA time-step bias (each asserts one input): the tensor as
+        # contiguous float32. For the KDA decay log parameter (asserts one input): the first head-count
+        # entries (from the config) as contiguous float32. Everything else uses the base class.
         if mcore_weights_name.endswith(
             (
                 "self_attention.linear_attn.q_conv1d.weight",

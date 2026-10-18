@@ -1,3 +1,9 @@
+# [PACKAGE DOC]
+# Miles integration with the Megatron-Bridge library. Importing the package performs, each guarded
+# by a catch-all that logs a warning on failure so one problem does not block the others: installs a
+# shim letting the bridge's pipeline-parallel object broadcast work with Miles' reloadable process
+# group wrapper; installs the Qwen3-VL packed mRoPE patch from the models plugin; and imports the
+# model-specific bridge modules (nemotron_h and mimo_v2), which register themselves on import.
 """Miles plugin package for ``megatron.bridge`` integration.
 
 Importing this package is enough to:
@@ -21,6 +27,13 @@ logger = logging.getLogger(__name__)
 
 
 def _install_bridge_pp_group_unwrap() -> None:
+    # [FUNCTION DOC] HELPER:
+    # Monkey-patch the bridge parameter mapping class (idempotent, via a marker attribute on the class):
+    # replace its pipeline-parallel object broadcast method by a wrapper that, when the mapping's
+    # pipeline group is Miles' reloadable group wrapper, temporarily swaps in the wrapped inner group
+    # for the duration of the call (restored afterwards even on error); otherwise calls the original
+    # unchanged. All extra arguments are forwarded. Imports of the bridge and Miles modules are local
+    # (they are heavy and optional). Side effect: global class mutation.
     """Let ``MegatronParamMapping.broadcast_obj_from_pp_rank`` work with
     miles' :class:`~miles.utils.reloadable_process_group.ReloadableProcessGroup`.
 
@@ -42,6 +55,7 @@ def _install_bridge_pp_group_unwrap() -> None:
     _orig = MegatronParamMapping.broadcast_obj_from_pp_rank
 
     def broadcast_obj_from_pp_rank(self, obj, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: The replacement method; see the installer for behavior.
         if not isinstance(self.pp_group, ReloadableProcessGroup):
             return _orig(self, obj, *args, **kwargs)
         saved = self.pp_group

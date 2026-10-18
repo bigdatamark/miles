@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Derives the identity of a worker process running in a Kubernetes pod from platform-provided
+# environment variables (subprocess index, pod index in the cell, cell index), validated against
+# the pool's scheduling shape. Missing variables default to zero only where that cannot make two
+# workers collide; otherwise the variable is required.
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -10,6 +15,10 @@ from miles.utils.workers.worker_spec import SchedulingSpec, WorkerCtorContext
 
 @dataclass(frozen=True)
 class KubernetesWorkerIdentity:
+    # [CLASS DOC]
+    # Immutable identity of one worker: which cell, which pod within the cell, which worker within
+    # the pod, plus the pool's workers per pod and gpu slots per worker used to derive the
+    # cell-wide worker index and the pod-local gpu ids.
     cell_index: int
     pod_in_cell_index: int
     worker_in_pod_index: int
@@ -18,14 +27,20 @@ class KubernetesWorkerIdentity:
 
     @property
     def worker_in_cell_index(self) -> int:
+        # [FUNCTION DOC] Property: index of the worker within its whole cell: pod index times
+        # workers per pod plus the index within the pod.
         return self.pod_in_cell_index * self.workers_per_pod + self.worker_in_pod_index
 
     @property
     def gpu_ids(self) -> list[int]:
+        # [FUNCTION DOC] Property: the worker's gpu ids local to the pod: a consecutive range of
+        # gpu-slots-per-worker ids starting at the index within the pod times that number.
         first = self.worker_in_pod_index * self.gpu_slots_per_worker
         return list(range(first, first + self.gpu_slots_per_worker))
 
     def ctor_context(self, *, capability: BackendCapability) -> WorkerCtorContext:
+        # [FUNCTION DOC] Build the constructor context handed to the worker constructor function:
+        # cell index, cell-wide worker index, gpu ids, and the given backend capability.
         return WorkerCtorContext(
             cell_index=self.cell_index,
             worker_in_cell_index=self.worker_in_cell_index,
@@ -35,6 +50,13 @@ class KubernetesWorkerIdentity:
 
 
 def read_worker_identity(*, scheduling: SchedulingSpec, environ: Mapping[str, str]) -> KubernetesWorkerIdentity:
+    # [FUNCTION DOC]
+    # Read and validate the identity from the environment mapping. The subprocess index defaults to
+    # zero, but is required when the pod runs more than one worker; it must be below workers per
+    # pod. The pod index defaults to zero, but is required when the cell spans more than one pod;
+    # it must be below pods per cell. The cell index is always required and must be below the pool's
+    # number of cells. All values must be decimal digit strings. Violations raise assertion errors
+    # with explanatory messages.
     workers_per_pod = scheduling.workers_per_pod()
     pods_per_cell = scheduling.pods_per_cell()
 
@@ -85,10 +107,15 @@ def read_worker_identity(*, scheduling: SchedulingSpec, environ: Mapping[str, st
 
 
 def read_worker_in_pod_index(environ: Mapping[str, str], *, required_because: str | None = None) -> int:
+    # [FUNCTION DOC] Read the index of the worker within its pod from the subprocess index variable
+    # (default zero if unset unless a reason makes it required). Asserts it is a digit string.
     return _index_from(environ, SUBPROCESS_INDEX_ENV_VAR, required_because=required_because)
 
 
 def _index_from(environ: Mapping[str, str], name: str, *, required_because: str | None) -> int:
+    # [FUNCTION DOC] HELPER: Read a non-negative integer from the named variable. If unset: asserts
+    # that a reason for requiring it was not given, else treats it as zero. Asserts the text consists
+    # only of digits (so no sign, spaces or empty text). Returns the integer.
     value = environ.get(name)
     assert value is not None or required_because is None, f"{name} is not set, but {required_because}"
 

@@ -1,3 +1,10 @@
+# [PACKAGE DOC]
+# Weight-conversion bridges for the mbridge library, one module per model family. Importing this
+# package imports every bridge module, which registers each bridge class under its model type name
+# (through the library's register decorator) and re-exports the main bridge classes. The listed
+# public names are the main bridges of each module; helper bridges defined in the modules (for
+# example the glm moe dsa bridge in the deepseek v32 module) are registered by import without being
+# listed.
 from .deepseek_v4 import DeepseekV4Bridge
 from .deepseek_v4_1 import DeepseekV41Bridge
 from .deepseek_v32 import DeepseekV32Bridge

@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Miles integration for the Megatron-Bridge Nemotron-H model (hybrid of Mamba state-space and attention
+# layers, with mixture-of-experts variants). Provides: extra parameter mappings for MoE variants; a bridge
+# subclass built lazily (on install) and registered for the Nemotron-H causal LM class, which fills the
+# provider's MoE settings; and two idempotent monkey patches installed when a provider is built (one
+# makes transformer layers tolerate identity attention or MLP placeholders in hybrid layouts, one
+# adapts Miles' multi-token-prediction keyword arguments for the Mamba model's forward). Importing the
+# module runs the installation, with failures only logged.
 """Miles integration for ``megatron.bridge`` Nemotron-H (Mamba+Attention hybrid).
 
 This plugin is a non-invasive drop-in that:
@@ -57,6 +65,10 @@ _NEMOTRONH_MOE_ROUTING_FIELDS: tuple[tuple[str, str, type], ...] = (
 
 
 def _build_bridge_subclass():
+    # [FUNCTION DOC] HELPER: Define and register the Miles Nemotron-H bridge class (registration happens
+    # as a side effect of the class decoration, replacing the upstream bridge for that source class)
+    # and return the class. The heavy bridge and Megatron imports are local so they load on first use
+    # only.
     """Build the ``MilesNemotronHBridge`` class lazily so importing this module
     does not force megatron.bridge.models.nemotronh to load until first use.
     """
@@ -68,6 +80,8 @@ def _build_bridge_subclass():
 
     @MegatronModelBridge.register_bridge(source="NemotronHForCausalLM", target=MambaModel)
     class MilesNemotronHBridge(NemotronHBridge):
+        # [CLASS DOC] Extends the upstream dense bridge with MoE provider settings and parameter mappings;
+        # see its two methods.
         """Nemotron-H bridge with MoE support on top of upstream dense bridge.
 
         Upstream :class:`NemotronHBridge` only handles the dense Mamba+Attention
@@ -77,6 +91,18 @@ def _build_bridge_subclass():
         """
 
         def provider_bridge(self, hf_pretrained):
+            # [FUNCTION DOC]
+            # Install the two monkey patches, build the provider with the parent, and, if the Hugging
+            # Face config has a nonzero expert count (from the experts attribute or the routed experts
+            # attribute), set the MoE fields: expert count; top-k (default 1); sigmoid score with expert
+            # bias; float32 router; grouped gemm; expert ffn size (config or provider ffn size); per-layer
+            # MoE frequency derived from the hybrid pattern letters (E marks MoE layers) truncated to the
+            # layer count; shared expert size (from the config's size, else shared expert count times the
+            # expert ffn size); router scaling factor, group count and group top-k when present; and, when
+            # a latent size exists, the latent size with shared expert overlap turned off. Unless an
+            # environment variable asking to keep it is set, multi-token prediction layers and their
+            # pattern are removed. Dense models return the provider right after the parent build
+            # (before the MTP step, so the MTP removal applies only to MoE models). Returns the provider.
             _install_nemotronh_hybrid_layer_shims()
             _install_mamba_model_loss_mask_shim()
             provider = super().provider_bridge(hf_pretrained)
@@ -137,6 +163,10 @@ def _build_bridge_subclass():
             return provider
 
         def mapping_registry(self):
+            # [FUNCTION DOC] Take the parent's registry mappings and append: automatic mappings for the
+            # MoE tensors; and convolution mappings for the Mamba convolution weight and bias unless the
+            # parent already maps those names. Returns a new registry. Mappings unused by dense models
+            # are harmless.
             # Append MoE mappings unconditionally. Dense variants do not carry
             # the extra megatron params so these mappings are simply unreferenced.
             registry = super().mapping_registry()
@@ -157,6 +187,10 @@ def _build_bridge_subclass():
 
 
 def _install_nemotronh_hybrid_layer_shims() -> None:
+    # [FUNCTION DOC] HELPER: Idempotent (marker attribute) global patch of the transformer layer class:
+    # its attention step returns the input hidden states and no bias when the layer's attention module
+    # is an identity placeholder (matched by class name), and its MLP step returns the input unchanged
+    # when the MLP is an identity placeholder; otherwise both call the original methods.
     """Make ``TransformerLayer`` tolerate ``IdentityOp`` self_attention / mlp.
 
     nemotron_h is a Mamba+Attention hybrid: non-attention positions use
@@ -174,12 +208,15 @@ def _install_nemotronh_hybrid_layer_shims() -> None:
     _orig_fwd_mlp = TransformerLayer._forward_mlp
 
     def _forward_attention(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Patched attention step; see the installer. The hidden states are the
+        # first positional argument or the keyword of that name.
         if type(self.self_attention).__name__ == "IdentityOp":
             hidden_states = args[0] if args else kwargs.get("hidden_states")
             return hidden_states, None
         return _orig_fwd_attn(self, *args, **kwargs)
 
     def _forward_mlp(self, hidden_states, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Patched MLP step; see the installer.
         if type(self.mlp).__name__ == "IdentityOp":
             return hidden_states
         return _orig_fwd_mlp(self, hidden_states, *args, **kwargs)
@@ -190,6 +227,11 @@ def _install_nemotronh_hybrid_layer_shims() -> None:
 
 
 def _install_mamba_model_loss_mask_shim() -> None:
+    # [FUNCTION DOC] HELPER: Idempotent (marker attribute) global patch of the Mamba model's forward:
+    # accepts a loss mask and a multi-token-prediction keyword mapping; if the mapping contains
+    # labels, they are shifted left by one position along the last axis (rolled) and passed on as the
+    # model's mtp labels argument; otherwise no such argument is passed. The loss mask is always
+    # forwarded.
     """Adapt Miles MTP arguments while preserving the model loss mask.
 
     The Megatron HybridModel exposed as MambaModel accepts ``loss_mask`` but
@@ -204,6 +246,10 @@ def _install_mamba_model_loss_mask_shim() -> None:
     _orig_forward = MambaModel.forward
 
     def forward(self, *args, loss_mask=None, mtp_kwargs=None, **kwargs):
+        # [FUNCTION DOC] HELPER: Patched forward; see the installer.
+        # KNOWN ISSUE: the roll wraps the first label around to the last position instead of padding
+        # (this is the shift used by the surrounding comment's expectation, so the last position
+        # holds a stale label unless masked by the loss mask).
         # process_mtp_loss expects next-token-shifted labels; miles passes raw tokens.
         mtp_labels = (mtp_kwargs or {}).get("mtp_labels")
         if mtp_labels is not None:
@@ -216,6 +262,8 @@ def _install_mamba_model_loss_mask_shim() -> None:
 
 
 def install() -> None:
+    # [FUNCTION DOC] Build and register the bridge subclass; any exception is logged as a warning and
+    # swallowed so unrelated models are unaffected. Called once when the module is imported.
     """Register the Nemotron-H bridge subclass."""
     for fn in (_build_bridge_subclass,):
         try:

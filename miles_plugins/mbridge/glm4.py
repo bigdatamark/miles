@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# mbridge bridge for dense GLM-4 models: maps Hugging Face parameter names to Megatron names and
+# configures the Megatron transformer with the extra post-attention and post-MLP layer norms that
+# GLM-4 has.
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 
 from mbridge.core import LLMBridge, register_model
@@ -5,6 +9,13 @@ from mbridge.core import LLMBridge, register_model
 
 @register_model("glm4")
 class GLM4Bridge(LLMBridge):
+    # [CLASS DOC]
+    # Registered under the name glm4. Class attributes are mappings from Megatron parameter names
+    # (relative to the model or a layer) to Hugging Face names with a layer number placeholder:
+    # direct (embedding, final norm, output head), attention (fused query-key-value maps to the three
+    # separate projections; the input layer norm is fused into the qkv linear) and MLP (fused gate-up
+    # projection; the post attention layer norm is fused into the first MLP linear).
+    # KNOWN ISSUE: the class docstring and some comments describe Qwen2, copied from another bridge.
     """
     Bridge implementation for Qwen2 models.
 
@@ -43,6 +54,10 @@ class GLM4Bridge(LLMBridge):
     }
 
     def _build_config(self):
+        # [FUNCTION DOC] Build the Megatron transformer config through the base helper with: query-key-
+        # value bias on, no query-key layer norm, extra layer norms after the attention and after the
+        # MLP, and interleaved rotary embeddings. Returns the config.
+        # KNOWN ISSUE: the docstring below describes Qwen2 models, not GLM-4.
         """
         Build the configuration for Qwen2 models.
 
@@ -62,6 +77,9 @@ class GLM4Bridge(LLMBridge):
         )
 
     def _get_transformer_layer_spec(self):
+        # [FUNCTION DOC] Layer spec from the transformer-engine based gpt layer spec helper with the
+        # post-attention and post-MLP layer norms enabled. Returns the spec.
+        # KNOWN ISSUE: the docstring mentions an assertion on RMSNorm that this code does not perform.
         """
         Gets the transformer layer specification.
 
@@ -81,6 +99,11 @@ class GLM4Bridge(LLMBridge):
         return transformer_layer_spec
 
     def _weight_name_mapping_mcore_to_hf(self, mcore_weights_name: str) -> list[str]:
+        # [FUNCTION DOC] Hugging Face names for a Megatron parameter. Asserts the name is not an extra
+        # state entry. Order of checks: direct mapping; names containing the post attention norm or post
+        # MLP norm marker map to the layer's corresponding norm weight (layer number is the third
+        # dotted segment of the Megatron name); names with self attention use the attention mapping;
+        # names with mlp use the MLP mapping; otherwise raises not-implemented.
         """
         Map MCore weight names to Hugging Face weight names.
 

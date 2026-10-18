@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# mbridge bridge for DeepSeek V4, derived from the V3 bridge. V4 differs by: low-rank query and joint
+# key-value projections with different names, grouped output projection, attention sink, compressor
+# and indexer sub-modules, hyper-connections whose three scalar alphas are packed in one Hugging Face
+# tensor, hash-routed experts, and several parameters that must stay in float32. This module remaps
+# parameter names accordingly and builds the Megatron config with the V4 attention variant settings.
 import torch
 from megatron.core.transformer.enums import AttnBackend
 
@@ -7,6 +13,14 @@ from mbridge.models import DeepseekV3Bridge
 
 @register_model("deepseek_v4")
 class DeepseekV4Bridge(DeepseekV3Bridge):
+    # [CLASS DOC]
+    # Registered under the name deepseek_v4. Class attributes are mappings from Megatron parameter
+    # names (relative to a layer or the model) to Hugging Face names (with a layer number placeholder).
+    # The attention mapping starts as a copy of the V3 mapping with the fused layer norm entries of
+    # the up projections removed, then V4 entries are added. The other mapping covers the
+    # hyper-connection parameters. The MLP mapping is V3's plus the hash router table. The direct
+    # mapping is V3's plus the final hyper-connection head parameters. The alpha segment table gives
+    # each alpha's position within the packed scale tensor.
     _ATTENTION_MAPPING = DeepseekV3Bridge._ATTENTION_MAPPING.copy()
 
     _ATTENTION_MAPPING.pop("self_attention.linear_q_up_proj.layer_norm_weight", None)
@@ -85,6 +99,9 @@ class DeepseekV4Bridge(DeepseekV3Bridge):
     )
 
     def _weight_name_mapping_mcore_to_hf(self, mcore_weights_name: str) -> list[str]:
+        # [FUNCTION DOC] Hugging Face names for a Megatron parameter name: try the base class
+        # mapping; if it raises not-implemented (name not found), fall back to the other mapping
+        # (hyper-connection parameters).
         try:
             return super()._weight_name_mapping_mcore_to_hf(mcore_weights_name)
         except NotImplementedError:
@@ -93,6 +110,14 @@ class DeepseekV4Bridge(DeepseekV3Bridge):
     _ALPHA_SEGMENTS = {"alpha_pre": 0, "alpha_post": 1, "alpha_res": 2}
 
     def _weight_to_mcore_format(self, mcore_weights_name: str, hf_weights: list[torch.Tensor]) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Convert Hugging Face tensors to the Megatron weight. For a hyper-connection alpha parameter
+        # (name ends with alpha pre, post or res) the first tensor is flattened and the one element at
+        # that alpha's position is returned as a one-element float32 tensor. For a single float32
+        # source tensor, the base class conversion is run with the bridge's target dtype temporarily
+        # cleared (restored afterwards even on error), so the weight is not rounded down to the lower
+        # precision before reaching float32 model parameters. All other cases use the base class.
+        # The alpha segments are matched by name suffix, tried in table order.
         # The checkpoint packs the hyper-connection alphas as one [pre, post, res] tensor;
         # the model stores one parameter per segment, matching the native module.
         for suffix, segment in self._ALPHA_SEGMENTS.items():
@@ -114,6 +139,17 @@ class DeepseekV4Bridge(DeepseekV3Bridge):
         return super()._weight_to_mcore_format(mcore_weights_name, hf_weights)
 
     def _build_config(self):
+        # [FUNCTION DOC]
+        # Build the Megatron config. First copies the rope theta from the rope scaling mapping into
+        # the Hugging Face config in place (key error or type error if the scaling is missing or
+        # lacks it). Then takes the base config and sets: automatic attention backend; router score
+        # function from the config's scoring function; the V4 attention variant; indexer heads (64),
+        # head dim (128) and top-k (512); number of residual streams (hyper-connection multiplier,
+        # 4) and sinkhorn iterations (20); compression ratios (none) and compression rope base
+        # (160000); when the swiglu limit is positive, disables bias-activation fusion and sets the
+        # activation clamp value to the limit; output groups (8), output low-rank size (1024), number
+        # of hash-routed layers (3) and window size (128). Defaults in parentheses apply when the
+        # config lacks the attribute. Returns the config.
         self.hf_config.rope_theta = self.hf_config.rope_scaling["rope_theta"]
         config = super()._build_config()
 

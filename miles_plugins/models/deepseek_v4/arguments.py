@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Command-line arguments and validation for the DeepSeek-V4 plugin. Declares the implementation selector
+# (the plugin's own implementation or Megatron's native one), maps it onto the Megatron fields that choose
+# the attention variant, rejects incompatible option combinations, recognizes whether a run uses the V4
+# layer spec, and refuses to load checkpoints written with the older weight names. Kept free of heavy
+# imports because argument parsing happens before kernels can load.
 """DeepSeek-V4 command-line arguments.
 
 The model shape is passed through Megatron's own flags (--csa-window-size,
@@ -15,12 +21,16 @@ DSV41_SPEC_MODULE = "miles_plugins.models.deepseek_v4_1.deepseek_v4_1"
 
 
 def is_dsv4_model(args: Namespace) -> bool:
+    # [FUNCTION DOC] True iff the arguments have a non-empty layer spec whose first element is the module
+    # path of the V4 spec module or the V4.1 spec module. Missing spec attribute counts as false.
     """Whether this run builds its layers from the DeepSeek-V4 plugin spec."""
     spec = getattr(args, "spec", None)
     return bool(spec) and spec[0] in (DSV4_SPEC_MODULE, DSV41_SPEC_MODULE)
 
 
 def add_dsv4_arguments(parser: ArgumentParser) -> ArgumentParser:
+    # [FUNCTION DOC] Add a DeepSeek-V4 argument group to the parser with one option, the implementation
+    # selector (text, choices miles or megatron, default megatron). Returns the same parser.
     """Declare the DeepSeek-V4 arguments."""
     group = parser.add_argument_group(title="deepseek-v4")
     group.add_argument(
@@ -41,6 +51,10 @@ def add_dsv4_arguments(parser: ArgumentParser) -> ArgumentParser:
 
 
 def normalize_dsv4_args(args: Namespace) -> None:
+    # [FUNCTION DOC] Validate the implementation choice against other arguments (see the validator; may
+    # raise a value error), then mutate the arguments in place: hyper-connections on, and the
+    # experimental attention variant set to the hybrid variant for the native implementation or the
+    # plugin variant for the Miles implementation. Must run before the transformer config is built.
     """Resolve --dsv4-impl into the Megatron fields that select the implementation.
 
     Must run before ``core_transformer_config_from_args``: the attention variant decides
@@ -53,6 +67,10 @@ def normalize_dsv4_args(args: Namespace) -> None:
 
 
 def _validate_impl(args: Namespace) -> None:
+    # [FUNCTION DOC] HELPER: Raises a value error for incompatible combinations. The native
+    # implementation requires tensor model parallel size 1 and rejects the tilelang attention kernel
+    # backend. The Miles implementation rejects the cudnn kernel backend. Kernel backend absent means no
+    # restriction.
     kernel_backend = getattr(args, "dsa_kernel_backend", None)
     if args.dsv4_impl == "megatron":
         if args.tensor_model_parallel_size > 1:
@@ -73,6 +91,11 @@ def _validate_impl(args: Namespace) -> None:
 
 
 def assert_checkpoint_is_current(load_dir: str) -> None:
+    # [FUNCTION DOC] Inspect a distributed checkpoint directory: if it has a latest-iteration text file,
+    # descend into the iteration folder it names; if the resulting path is not a directory, return
+    # silently. Read the checkpoint metadata (file system I/O) and raise a value error if any stored
+    # tensor key contains the old attention query projection name, meaning the checkpoint predates the
+    # current weight naming and must be re-converted. The distributed checkpoint import is local.
     """Reject DeepSeek-V4 checkpoints from before the weights took Megatron's names."""
     from pathlib import Path
 

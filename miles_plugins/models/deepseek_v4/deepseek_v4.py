@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# DeepSeek-V4 attention layer for the Miles implementation and the layer spec builder that installs it.
+# The attention has low-rank query projection, a single shared key-value head, grouped low-rank output
+# projection, a learnable per-head sink, optional compressed key-value blocks (compression ratio per
+# layer) with a top-k indexer for ratio 4, a sliding window, rotary embeddings on the trailing channels,
+# optional fp8 quantization-aware simulation, tensor and sequence parallelism, and context parallelism
+# for both batch-by-sequence and packed (THD) layouts. Parameters are named like Megatron's native
+# module so checkpoints from either implementation line up.
 import copy
 import os
 
@@ -51,11 +59,22 @@ from miles_plugins.models.deepseek_v4.ops.v4_indexer import V4Indexer
 
 
 def _enable_deepseek_v4_tf32():
+    # [FUNCTION DOC] HELPER: Globally allow tf32 for cuda matrix multiplications (process-wide side
+    # effect) to match the precision of the reference kernels. Called when an attention layer is built.
     # Match TileKernels MHC TF32 GEMM precision for DSV4 fp32 matmuls.
     torch.backends.cuda.matmul.allow_tf32 = True
 
 
 class DeepSeekV4Attention(MegatronModule):
+    # [CLASS DOC]
+    # Attention module registered through the layer spec. Fixed shape constants are asserted at build
+    # (low-rank output size 1024, head dim 512, rotary head dim 64, non-rotary dim 448, window 128).
+    # Parameters and submodules: a core attention holder (sink parameter in float32, optional
+    # compressor, optional indexer), query down projection (duplicated across tensor-parallel ranks),
+    # query layer norm, query up projection (column parallel), shared key-value projection (duplicated)
+    # and norm, a bare grouped output projection parameter (column-parallel over groups) and the output
+    # projection (row parallel). Local head and group counts are the totals divided by the tensor
+    # parallel size.
     def __init__(
         self,
         config: TransformerConfig,
@@ -67,6 +86,21 @@ class DeepSeekV4Attention(MegatronModule):
         pg_collection=None,
         name: str | None = None,
     ):
+        # [FUNCTION DOC]
+        # Build the layer. Enables tf32 globally. Resolves the process groups (builds the tensor group from
+        # the global parallel state if none is given; asserts one has a tensor group otherwise) and the
+        # context-parallel size and rank (size 1, rank 0 if there is no context group). The layer number
+        # (one-based) becomes a zero-based layer id; head dim is the config's key-value low-rank size;
+        # compression ratio is looked up per layer (zero if the config has none). Asserts the fixed
+        # shape constants. Builds a copy of the config with sequence parallelism off for sub-layers that
+        # must not use it, the sink parameter (float32, marked to stay float32 and sharded over heads),
+        # the projections, norms, the grouped output weight (allocated on the current gpu in the
+        # config's parameter dtype and initialized with the config's initializer; asserts bfloat16), and
+        # when the layer has a compression ratio: a compressor, and for ratio 4 an indexer (the tilelang
+        # indexer by default, or the reference indexer when the environment variable selects another
+        # implementation, which requires the torch top-k backend, else raises a value error); other
+        # ratios have no indexer. The name, attention mask type, attention type, context-parallel
+        # communication type and submodules arguments are unused.
         _enable_deepseek_v4_tf32()
         super().__init__(config=config)
 
@@ -217,6 +251,10 @@ class DeepSeekV4Attention(MegatronModule):
         sharded_offsets: tuple = (),
         metadata: dict | None = None,
     ) -> ShardedStateDict:
+        # [FUNCTION DOC] Checkpoint sharding description: the parent's entries plus sharded tensors for the
+        # sink and the grouped output weight (bare parameters the parent does not describe), both sharded
+        # along their first axis over the tensor-parallel group, using the data-and-context-parallel group
+        # from the metadata (required; key error if absent). Returns the combined mapping.
         ans = super().sharded_state_dict(prefix, sharded_offsets, metadata)
         ans.update(
             make_sharded_tensors_for_checkpoint(
@@ -250,6 +288,30 @@ class DeepSeekV4Attention(MegatronModule):
         packed_seq_params=None,
         sequence_len_offset=None,
     ) -> tuple[torch.Tensor, None]:
+        # [FUNCTION DOC]
+        # Attention forward. Input: hidden states [sequence, batch, hidden] (sequence-sharded if sequence
+        # parallelism is on; it is gathered first). Output: a pair of the result [sequence, batch,
+        # hidden] (re-scattered under sequence parallelism) and none. All other arguments are accepted for
+        # interface compatibility; only the packed sequence parameters are used. Steps: (1) work in
+        # batch-first layout; detect the packed (THD) layout from the packed sequence parameters;
+        # compute rotary tables for the global length with the compression-specific base, and select
+        # this rank's rows (zigzag slicing for batch layout; positions from segment boundaries for packed
+        # layout). (2) Query: down projection, layer norm, up projection, split into local heads,
+        # normalize each head by root-mean-square without weights in float32, rotate the trailing
+        # channels. (3) Key-value: single projection, norm, rotate the trailing channels; with fp8
+        # simulation, fake-quantize the non-rotary part in blocks of 64. (4) Stream positions for the
+        # batch layout. (5) If the layer compresses: for packed layout compute compressed boundaries and,
+        # under context parallelism, exchange boundary hidden rows and compact the groups; run the
+        # compressor to get compressed key-values. (6) Index selection: sliding-window indices, plus
+        # for compressing layers either top-k indices from the indexer (validated against causal or
+        # segment limits, converted to rank-major rows if needed and offset past the uncompressed
+        # keys, invalid ones set to minus one) or the full causal compressed indices when there is no
+        # indexer. (7) Under context parallelism all-gather the key-values (and compressed ones), then
+        # concatenate uncompressed and compressed (asserting the offset equals the uncompressed length).
+        # (8) Run the sparse attention kernel with the sink, un-rotate the output's trailing channels,
+        # apply the grouped low-rank output projection by einsum, then the output projection. The
+        # indexer and window indices are cast to 32-bit integers before the kernel. Asserts the sink is
+        # float32.
         if self.sequence_parallel:
             hidden_states = gather_from_sequence_parallel_region(
                 hidden_states, tensor_parallel_output_grad=False, group=self.tp_group
@@ -431,6 +493,10 @@ class DeepSeekV4Attention(MegatronModule):
         return output, None
 
     def _compute_indexer_mask(self, *, q_positions: torch.Tensor, seqlen_global: int) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Build the additive causal mask [queries, compressed groups] for the
+        # reference indexer: groups are fixed at ratio 4 (hard-coded, matching the only layers that have an
+        # indexer); a query may see compressed group g only if g is below (position + 1) divided by 4 (floor);
+        # allowed entries are 0, disallowed negative infinity. The mask is on the positions' device.
         """Dense causal mask for legacy DSAIndexer path."""
         ratio = 4
         device = q_positions.device
@@ -441,6 +507,8 @@ class DeepSeekV4Attention(MegatronModule):
 
 
 def _dsv4_attention_module_spec(config, backend=None):
+    # [FUNCTION DOC] HELPER: Module spec for the attention class with no submodules and metadata saying
+    # the input layer norm is not fused into it. Config and backend arguments are unused.
     return ModuleSpec(
         module=DeepSeekV4Attention,
         submodules=None,
@@ -449,6 +517,14 @@ def _dsv4_attention_module_spec(config, backend=None):
 
 
 def get_dsv4_spec(args, config, vp_stage):
+    # [FUNCTION DOC]
+    # Entry point named on the command line as the layer spec. For the native implementation returns
+    # Megatron's standard block spec for experimental attention variants. For the Miles implementation:
+    # copies the topk backend choice from the arguments onto the config (mutation), then temporarily
+    # replaces the library's per-variant module spec lookup by one that returns this plugin's attention
+    # spec for the V4 variant and defers to the original otherwise, builds the block spec for the
+    # virtual pipeline stage, and always restores the original lookup afterwards. Not thread-safe because
+    # it patches a module-level function during the build.
     """Build the DeepSeek-V4 layer spec for the implementation --dsv4-impl selects.
 
     Usage: --spec miles_plugins.models.deepseek_v4.deepseek_v4 get_dsv4_spec
@@ -460,6 +536,8 @@ def get_dsv4_spec(args, config, vp_stage):
     _orig_get_spec = _eav_specs.get_experimental_attention_variant_module_spec
 
     def _patched_get_spec(config, backend=None):
+        # [FUNCTION DOC] HELPER: Return the plugin attention spec when the config's variant is the V4 one,
+        # else the original lookup's result.
         if config.experimental_attention_variant == "dsv4":
             return _dsv4_attention_module_spec(config, backend)
         return _orig_get_spec(config, backend)

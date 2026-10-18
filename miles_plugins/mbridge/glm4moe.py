@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# mbridge bridge for GLM-4 mixture-of-experts models, derived from the Qwen2 MoE bridge. Adds the
+# expert bias, shared experts and multi-token-prediction (mtp) layer name mappings and configures a
+# sigmoid-scored, bias-corrected router.
 import re
 
 from mbridge.core import register_model
@@ -6,6 +10,13 @@ from mbridge.models import Qwen2Bridge, Qwen2MoEBridge
 
 @register_model("glm4_moe")
 class GLM4MoEBridge(Qwen2MoEBridge):
+    # [CLASS DOC]
+    # Registered under the name glm4_moe. The MLP mapping merges the Qwen2 MoE and dense Qwen2
+    # mappings (the dense one wins on shared keys) and adds the router expert bias and the shared
+    # expert projections. The mtp mapping covers the norms, embedding-hidden projection and final
+    # norm of an mtp layer, which Hugging Face stores as extra layers after the regular ones.
+    # KNOWN ISSUE: the class docstring and the config docstring describe Qwen2, copied from another
+    # bridge.
     """
     Bridge implementation for Qwen2 models.
 
@@ -33,6 +44,16 @@ class GLM4MoEBridge(Qwen2MoEBridge):
     }
 
     def _weight_name_mapping_mtp(self, name: str, num_layers: int) -> str:
+        # [FUNCTION DOC]
+        # Hugging Face names for an mtp parameter, given the number of regular layers (mtp layer i is
+        # stored as layer number of layers plus i). For each mtp mapping keyword in order: if the
+        # keyword occurs in the name, return its formatted names and stop; else if the name contains
+        # mlp (or self attention), rewrite the Megatron prefix of the mtp layer's inner transformer
+        # layer to the regular layer path of the extra layer and map it via the MLP (or attention)
+        # mapping, then stop. Raises not-implemented if nothing matched.
+        # KNOWN ISSUE: the return annotation says string but a list of names is returned; and the
+        # mlp / self attention checks sit inside the keyword loop, so they are evaluated at the first
+        # keyword whose text is absent (the result is the same but the structure is misleading).
         convert_names = []
         for keyword, mapping_names in self._MTP_MAPPING.items():
             if keyword in name:
@@ -62,6 +83,10 @@ class GLM4MoEBridge(Qwen2MoEBridge):
         return convert_names
 
     def _weight_name_mapping_mcore_to_hf(self, mcore_weights_name: str) -> list[str]:
+        # [FUNCTION DOC] Hugging Face names for a Megatron parameter. Asserts it is not an extra state
+        # entry. Direct names (embedding, final norm, output head) map immediately; names containing
+        # mtp use the mtp mapping with the configured number of layers; then self attention and mlp
+        # names use the corresponding mappings; otherwise raises not-implemented.
         """
         Map MCore weight names to Hugging Face weight names.
 
@@ -90,6 +115,12 @@ class GLM4MoEBridge(Qwen2MoEBridge):
             raise NotImplementedError(f"Unsupported parameter name: {mcore_weights_name}")
 
     def _build_config(self):
+        # [FUNCTION DOC] Build the Megatron config through the base helper: no cpu initialization;
+        # expert settings from the Hugging Face config (expert ffn size, experts per token, number of
+        # routed experts), router bias update rate 0.001, no load balancing loss (intended for
+        # reinforcement learning), grouped gemm, sigmoid router score with expert bias and softmax
+        # applied before top-k; fusion options on; query-key layer norm per the config's flag; qkv
+        # bias on, linear bias off; interleaved rotary. Returns the config.
         """
         Build the configuration for Qwen2 models.
 
