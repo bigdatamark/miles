@@ -1,4 +1,10 @@
 #!/usr/bin/env python
+# [MODULE DOC] Command-line tool for GPTQ weight quantization (W4A16 or W8A16) of a local BF16
+# Hugging Face model with llmcompressor, using calibration text from a local parquet file.
+# Arguments: input dir, output dir, data dir, quant type, calibration sample count (256), max
+# sequence length (2048), dampening fraction (0.01), trust-remote-code flag, group size.
+# Attention, shared experts, dense MLP projections, norms, embeddings and the head are excluded.
+# KNOWN ISSUE: the script cannot run as written, see the main function.
 import argparse
 import os
 import random
@@ -13,6 +19,8 @@ from miles.utils.processing_utils import load_tokenizer
 
 
 def parse_args():
+    # [FUNCTION DOC] HELPER: Defines and parses the command-line options (see module doc;
+    # required: input-dir, output-dir, data-dir) and returns the namespace.
     parser = argparse.ArgumentParser()
     parser.add_argument("--input-dir", type=str, required=True, help="local BF16 path")
     parser.add_argument("--output-dir", type=str, required=True)
@@ -27,6 +35,13 @@ def parse_args():
 
 
 def get_calibration_dataset(tokenizer, num_samples, seq_len, local_data_path):
+    # [FUNCTION DOC] HELPER: Builds a calibration dataset. Expects a parquet file named
+    # train-00000-of-00001 in the data directory; prints a message and exits the process with
+    # status 1 if it is missing or fails to load. Concatenates all text rows into one string,
+    # tokenizes it once, then draws the requested number of random windows of seq_len tokens
+    # (uniform start in the valid range; raises if the stream is too short), each with an
+    # all-ones attention mask. Returns a Hugging Face dataset with input ids and attention mask.
+    # Uses the global random generator (unseeded).
 
     train_file = os.path.join(local_data_path, "train-00000-of-00001.parquet")
 
@@ -55,6 +70,13 @@ def get_calibration_dataset(tokenizer, num_samples, seq_len, local_data_path):
 
 
 def main():
+    # [FUNCTION DOC] Entry point: loads the tokenizer (pad token falls back to end-of-sequence),
+    # builds the calibration data, loads the model in bfloat16 spread across devices, builds a
+    # GPTQ recipe over Linear layers with the quant scheme, ignore patterns, dampening fraction
+    # and block size, and runs one-shot quantization saving into the output directory.
+    # KNOWN ISSUE: reads args.local_data_path and args.model_id, which the argument parser never
+    # defines (it defines data-dir and input-dir), so it raises an attribute error; the group
+    # size option is ignored (block size hardcoded to 32).
     args = parse_args()
 
     tokenizer = load_tokenizer(args.input_dir, trust_remote_code=args.trust_remote_code)

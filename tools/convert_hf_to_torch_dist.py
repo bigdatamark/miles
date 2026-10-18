@@ -1,3 +1,10 @@
+# [MODULE DOC] Distributed command-line tool (launch with torchrun or under SLURM) converting a
+# Hugging Face checkpoint into a Megatron distributed checkpoint. Each rank initializes NCCL and
+# Megatron, builds the Megatron model without data-parallel wrapping, loads Hugging Face weights
+# through the mbridge bridge (memory-efficient), saves a checkpoint at iteration 1, then rank
+# zero publishes it as a "release" checkpoint and (as the final step, after a barrier) writes
+# the release marker into the tracker file, which higher-level scripts treat as the success
+# signal. Uses the Megatron argument parser plus conversion-specific options.
 import gc
 import os
 
@@ -23,6 +30,11 @@ from miles_plugins.models.glm5.arguments import add_dsa_arguments
 
 
 def add_conversion_args(parser):
+    # [FUNCTION DOC] HELPER: Argument-extension hook for the Megatron parser. Adds the DeepSeek-V4
+    # and DSA plugin arguments, then required hf-checkpoint path, linear-attention backend
+    # (choices from the shared list, default "fla"), allgather-cp flag, megatron-to-hf mode
+    # ("raw" default or "bridge"), an optional custom model provider path, and a padded vocab
+    # size (ignored if the parser already defines it). Returns the parser.
     """Add conversion arguments, plus the plugin arguments the model scripts pass through."""
     add_dsv4_arguments(parser)
     add_dsa_arguments(parser)
@@ -55,6 +67,14 @@ def add_conversion_args(parser):
 
 
 def get_args():
+    # [FUNCTION DOC] Parses and finalizes Megatron arguments. Applies Miles defaults, disables
+    # deterministic-collective debugging and witness, sets save interval 1, micro batch 1 and
+    # global batch equal to world size (dummy values to pass validation). Asserts pipeline size
+    # does not exceed layer count. Auto pipeline parallel (unless the keep-PP1 environment
+    # variable is set): when TP, PP, CP and expert-TP are all 1 and world size is a larger
+    # multiple of expert parallel size, sets PP = world / EP and shrinks it (halving when even,
+    # else raising a value error) until the last stage's layer count, layers minus (ceil(layers /
+    # PP) times (PP minus 1)), is positive. Prints the result, validates, returns args.
     args = parse_args(add_conversion_args)
     args = set_default_megatron_args(args)
 
@@ -73,6 +93,7 @@ def get_args():
     )
 
     def ceildiv(a, b):
+        # [FUNCTION DOC] HELPER: Integer division rounding up.
         return -(a // -b)
 
     auto_pipeline_parallel = (
@@ -112,6 +133,14 @@ def get_args():
 
 
 def main():
+    # [FUNCTION DOC] Entry point per rank. Reads world size, local rank and rank from torchrun or
+    # SLURM environment variables (default 1, 0, 0), binds the GPU, fills missing rendezvous
+    # environment variables (master address localhost, port 12355), initializes the NCCL group,
+    # parses args, initializes Megatron, builds the model (encoder-or-decoder type, no DDP),
+    # enforces marked parameter dtypes, loads the Hugging Face weights via the bridge (trusting
+    # remote code), prints memory, synchronizes and frees cache, saves a checkpoint at iteration
+    # 1 and has rank zero publish it as release. After a barrier, rank zero writes the word
+    # release in the tracker file as the last step; finally destroys the process group.
     configure_logger_raw()
 
     # Initialize distributed environment

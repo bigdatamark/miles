@@ -1,3 +1,12 @@
+# [MODULE DOC] Command-line tool running helm lint over every chart under the repo's charts
+# directory (each subdirectory holding a chart descriptor). Each chart is linted with its base
+# value overrides alone and with every listed value-override variant (inline JSON/set arguments
+# exercising shared-infra volume shapes, extra RBAC settings, engines, static workers, a command
+# job and colocation layouts); additionally, "rejected" variants must make the lint fail (e.g.
+# an infra env override), and a chart accepting one is reported as a failure. Charts with a lock
+# file first get their dependencies built. If helm is missing: exit 1 when the CI environment
+# variable is set, else skip with exit 0. Output goes to standard error. Exit status 0 means all
+# passed.
 from __future__ import annotations
 
 import argparse
@@ -99,15 +108,26 @@ REJECTED_VARIANTS: dict[str, list[list[str]]] = {
 
 
 def run(command: list[str]) -> subprocess.CompletedProcess:
+    # [FUNCTION DOC] HELPER: Echoes the command to standard error with a plus prefix, runs it as
+    # a subprocess capturing output as text, and returns the completed process (no exception on
+    # non-zero exit).
     print("+ " + " ".join(command), file=sys.stderr)
     return subprocess.run(command, capture_output=True, text=True)
 
 
 def all_charts() -> list[Path]:
+    # [FUNCTION DOC] HELPER: Returns the sorted directories directly under the charts directory
+    # that contain a chart descriptor file.
     return sorted(chart_yaml.parent for chart_yaml in CHARTS_DIR.glob("*/Chart.yaml"))
 
 
 def lint_chart(chart: Path) -> bool:
+    # [FUNCTION DOC] Lints one chart; returns true if all checks pass. If the chart has a
+    # dependency lock file, builds dependencies first (on failure prints output and returns
+    # false). Then lints with base values plus no extras and each accepted variant for the chart
+    # (a non-zero status prints combined output and marks failure), and lints each rejected
+    # variant, marking failure (with a message) if the lint unexpectedly succeeds. All variants
+    # run even after a failure.
     if (chart / "Chart.lock").exists():
         built = run(["helm", "dependency", "build", str(chart)])
         if built.returncode != 0:
@@ -130,6 +150,10 @@ def lint_chart(chart: Path) -> bool:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    # [FUNCTION DOC] Entry point returning the exit code. Parses arguments (the parser defines
+    # none, only help). If helm is not on the path: with the CI variable set prints an error and
+    # returns 1; otherwise prints a skip message and returns 0. Else lints all charts (all
+    # evaluated, no short-circuit) and returns 0 only if every chart passed, else 1.
     argparse.ArgumentParser(description="helm lint every chart under charts/").parse_args(argv)
 
     if shutil.which("helm") is None:

@@ -1,3 +1,12 @@
+# [MODULE DOC] Command-line tool converting a MiMo-V2 checkpoint to BF16 (details in the module
+# text below). Key constants: the 16-entry FP4 value table (sign bit as the high bit of a
+# nibble), FP8 block size 128, MXFP4 group size 32, output shard size about 5 GiB. Options:
+# model dir, save dir, comma-separated source layer indices to keep (renumbered consecutively),
+# number of routed experts to keep (first N; also trims router weights/bias), keep-quant flag
+# (reindex only), device (default cpu). Output shards are named model-NNNNN.safetensors, with a
+# new index and a config rewritten for the kept layers; a completeness check runs on dequantized
+# output; other files and directories are copied (hidden entries skipped; the drafter
+# subdirectory is skipped when layers are subset).
 """
 Convert an official XiaomiMiMo MiMo-V2 checkpoint (`MiMoV2ForCausalLM`, e.g. MiMo-V2.6-Flash-RL)
 to plain BF16 with split q/k/v projections, optionally keeping a subset of decoder layers and
@@ -42,12 +51,19 @@ _ROUTER_KEYS = ("mlp.gate.weight", "mlp.gate.e_score_correction_bias")
 
 
 def dequant_fp8_block(weight: torch.Tensor, scale_inv: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] Dequantizes a 2-D FP8 weight with 128 by 128 block scales: expands the scale
+    # grid by repetition to per-element, crops to the weight's shape, multiplies in float32 and
+    # returns bfloat16 (the scale is multiplied, i.e. it is the dequantization factor).
     rows, cols = weight.shape
     scale = scale_inv.float().repeat_interleave(FP8_BLOCK, dim=0)[:rows].repeat_interleave(FP8_BLOCK, dim=1)
     return (weight.float() * scale[:, :cols]).to(torch.bfloat16)
 
 
 def dequant_mxfp4(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] Dequantizes packed 4-bit floats (two per byte, low nibble first) with one
+    # exponent byte per 32 inputs. Input width is twice the packed width; asserts the scale has
+    # shape rows by (width / 32). Values come from the 16-entry table; each scale is two to the
+    # power (byte minus 127), repeated over its 32 columns. Returns bfloat16 of shape rows by width.
     out_dim, in_dim = packed.shape[0], packed.shape[1] * 2
     assert scale.shape == (out_dim, in_dim // MXFP4_BLOCK), f"{packed.shape=} {scale.shape=}"
     packed = packed.view(torch.uint8)
@@ -57,6 +73,9 @@ def dequant_mxfp4(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 
 
 def dequant_fused_qkv(weight: torch.Tensor, scale_inv: torch.Tensor, shards: int) -> torch.Tensor:
+    # [FUNCTION DOC] Splits weight rows into equal shards, scale rows into groups of
+    # ceil(rows per shard / 128) (asserting the total matches), dequantizes each shard with its
+    # own scales and concatenates them along rows.
     """Each kv-head shard of a fused qkv_proj is block-quantized on its own, padded to whole blocks."""
     rows = weight.shape[0] // shards
     scale_rows = -(-rows // FP8_BLOCK)
@@ -67,6 +86,13 @@ def dequant_fused_qkv(weight: torch.Tensor, scale_inv: torch.Tensor, shards: int
 
 
 def split_fused_qkv(qkv: torch.Tensor, config: dict, is_swa: bool) -> list[torch.Tensor]:
+    # [FUNCTION DOC] Splits the fused projection into query, key, value matrices. The number of
+    # shards is the config's key-value head count; for sliding-window layers the head counts and
+    # dims come from the "swa_"-prefixed config entries. Per shard the row sizes are query heads
+    # per shard times head dim, then key heads per shard times head dim and value heads per shard
+    # times value head dim (asserts divisibility and the total row count). Views the matrix as
+    # shards by shard rows, splits along rows and merges shards back, giving three matrices in
+    # head order with the original column count.
     """Undo the kv-head interleave of a fused qkv_proj and return [q, k, v] in head order."""
     shards = config["num_key_value_heads"]
     prefix = "swa_" if is_swa else ""
@@ -82,6 +108,10 @@ def split_fused_qkv(qkv: torch.Tensor, config: dict, is_swa: bool) -> list[torch
 
 
 def output_name(name: str, layer_map: dict[int, int] | None, num_experts: int | None) -> str | None:
+    # [FUNCTION DOC] Maps a source tensor name to its output name. Names outside decoder layers
+    # are unchanged. Layer tensors are dropped (none) if a layer map exists and the layer is not
+    # in it, or if the tensor belongs to a routed expert with index at or above the kept
+    # expert count; otherwise the layer index is renumbered through the map (if any).
     """Output name of a source tensor, or None when the tensor is not kept."""
     match = _LAYER_RE.match(name)
     if match is None:
@@ -96,6 +126,12 @@ def output_name(name: str, layer_map: dict[int, int] | None, num_experts: int | 
 
 
 def convert_config(config: dict, layer_map: dict[int, int] | None, num_experts: int | None, keep_quant: bool) -> dict:
+    # [FUNCTION DOC] Returns an adjusted deep copy of the config. With a layer map: asserts no
+    # hybrid block size, sets the layer count and subsets the hybrid layer pattern and MoE layer
+    # frequency lists to the kept layers. With an expert count: asserts it lies between
+    # experts-per-token and the routed expert count, then sets the routed expert count. With
+    # keep-quant: renames ignored-layer module names through the output-name mapping, dropping
+    # removed ones. Otherwise removes the quantization section and attention projection layout.
     config = json.loads(json.dumps(config))
     if layer_map is not None:
         assert config.get("hybrid_block_size") is None, "per-layer schedules must be explicit lists"
@@ -121,7 +157,12 @@ def convert_config(config: dict, layer_map: dict[int, int] | None, num_experts: 
 
 
 class ShardWriter:
+    # [CLASS DOC] Buffers tensors in CPU memory and writes numbered safetensors shards once the
+    # buffered size reaches about 5 GiB (and on explicit flush), tracking the weight map and
+    # total bytes written.
     def __init__(self, save_dir: Path):
+        # [FUNCTION DOC] Stores the target directory and initializes empty buffer, zero counters
+        # and an empty name-to-file map.
         self.save_dir = save_dir
         self.buffer: dict[str, torch.Tensor] = {}
         self.buffer_bytes = 0
@@ -130,6 +171,8 @@ class ShardWriter:
         self.weight_map: dict[str, str] = {}
 
     def add(self, name: str, tensor: torch.Tensor) -> None:
+        # [FUNCTION DOC] Asserts the name is new, buffers a contiguous CPU copy, adds its byte
+        # size, and flushes when the buffer reaches the shard size.
         assert name not in self.weight_map and name not in self.buffer, f"duplicate tensor {name}"
         self.buffer[name] = tensor.contiguous().cpu()
         self.buffer_bytes += tensor.numel() * tensor.element_size()
@@ -137,6 +180,9 @@ class ShardWriter:
             self.flush()
 
     def flush(self) -> None:
+        # [FUNCTION DOC] If the buffer is non-empty: increments the shard counter, saves the
+        # buffer as model-NNNNN.safetensors (five digits, format metadata), records the names in
+        # the weight map, adds the buffered bytes to the total and clears the buffer.
         if not self.buffer:
             return
         self.num_shards += 1
@@ -148,6 +194,11 @@ class ShardWriter:
 
 
 def check_output(weight_map: dict[str, str], config: dict) -> None:
+    # [FUNCTION DOC] Asserts completeness per output layer: norms and output projection always
+    # required; separate q/k/v projections unless a fused qkv exists; the attention sink bias for
+    # sliding-window layers when the config enables it; for MoE layers the router weight and
+    # correction bias and exactly all routed expert indices; for dense layers gate/up/down MLP
+    # weights. Raises assertion errors listing what is missing.
     """Every kept decoder layer carries the tensors its attention/MLP variant needs."""
     for layer in range(config["num_hidden_layers"]):
         prefix = f"model.layers.{layer}."
@@ -173,6 +224,17 @@ def check_output(weight_map: dict[str, str], config: dict) -> None:
 def main(
     model_dir: str, save_dir: str, layers: list[int] | None, num_experts: int | None, keep_quant: bool, device: str
 ):
+    # [FUNCTION DOC] Performs the conversion. Validates the architecture name, layer indices and
+    # option compatibility (keep-quant cannot combine with expert trimming). Per source shard (in
+    # name order) and tensor: skips dropped tensors and, when dequantizing, scale tensors; loads
+    # it (CPU file, moved to the device); keep-quant copies as is; fused qkv weights are
+    # dequantized if FP8 and split into q/k/v (sliding-window layers use their own head dims; the
+    # layer type is looked up from the hybrid pattern); FP8 weights are block-dequantized;
+    # byte-typed expert weights are MXFP4-dequantized with the matching scale; router tensors
+    # are trimmed to the kept expert count. Counts conversions, flushes, writes the new config,
+    # verifies completeness when dequantizing, copies other files and directories, and writes
+    # the index atomically via a temporary file. Prints a summary.
+    # KNOWN ISSUE: every tensor lookup scans the whole weight map per shard (quadratic cost).
     src, dst = Path(model_dir), Path(save_dir)
     dst.mkdir(parents=True, exist_ok=True)
     config = json.loads((src / "config.json").read_text())
@@ -186,6 +248,8 @@ def main(
     handles = {}
 
     def load(name: str) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Returns the named tensor on the target device, opening and
+        # caching a CPU file handle per source file.
         file_name = weight_map[name]
         if file_name not in handles:
             handles[file_name] = safe_open(str(src / file_name), framework="pt", device="cpu")

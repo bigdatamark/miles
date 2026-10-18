@@ -1,3 +1,11 @@
+# [MODULE DOC] Command-line tool converting a Hugging Face safetensors checkpoint to MXFP8
+# (fp8 values with per-32-element power-of-two scales stored as unsigned bytes). Sources:
+# BF16/FP16/FP32 checkpoints, or block-scaled FP8 with ue8m0 scales and 128 by 128 blocks (scales
+# reused by expansion when they are power-of-two, otherwise dequantized and requantized).
+# Excluded from quantization: names with norm, embed, router, head and similar substrings,
+# optional extra substrings, and optionally the first/last N decoder layers (kept in BF16; FP8
+# sources are dequantized to BF16 for them). Needs CUDA. Writes updated config with a
+# quantization section and a new weight index (total size in bytes).
 """
 python tools/convert_hf_to_mxfp8.py [-h] [--model-dir MODEL_DIR] [--save-dir SAVE_DIR]
                                     [--extra-high-precision-layers-hf ...]
@@ -48,12 +56,15 @@ SOURCE_FP8_DTYPES = (torch.float8_e4m3fn,) + ((torch.float8_e4m3fnuz,) if hasatt
 
 
 def _strip_weight_suffix(weight_key: str) -> str:
+    # [FUNCTION DOC] HELPER: Removes the trailing ".weight"; raises a value error if absent.
     if not weight_key.endswith(".weight"):
         raise ValueError(f"Expected key ending with '.weight', got: {weight_key}")
     return weight_key[: -len(".weight")]
 
 
 def _is_source_block_fp8_ue8m0_checkpoint(cfg: dict) -> bool:
+    # [FUNCTION DOC] HELPER: True when the config's quantization section has method fp8, block
+    # size exactly 128 by 128, and scale format ue8m0.
     qcfg = cfg.get("quantization_config", {}) if isinstance(cfg, dict) else {}
     return (
         qcfg.get("quant_method") == "fp8"
@@ -63,6 +74,8 @@ def _is_source_block_fp8_ue8m0_checkpoint(cfg: dict) -> bool:
 
 
 def _is_bf16_source_checkpoint(cfg: dict) -> bool:
+    # [FUNCTION DOC] HELPER: True when the config has no (or an empty/non-mapping) quantization
+    # section, or its method is none, empty or "bf16".
     qcfg = cfg.get("quantization_config", {}) if isinstance(cfg, dict) else {}
     if not isinstance(qcfg, dict) or not qcfg:
         return True
@@ -78,6 +91,13 @@ def _load_source_scale_u8(
     device: str,
     current_filename: str,
 ) -> tuple[torch.Tensor, torch.Tensor | None, str]:
+    # [FUNCTION DOC] HELPER: Fetches the block scale of a source FP8 weight (name with ".weight"
+    # replaced by ".weight_scale_inv"), from the current file's loaded tensors or by opening the
+    # file the index says holds it. Crops to the number of 128-blocks of the weight. If the
+    # scale is stored as unsigned bytes (exponents), returns (float scale = exponent shifted into
+    # the float exponent field, the bytes, scale key). If float32, returns (the float scale,
+    # the exponent bytes if every value is non-negative with zero mantissa, i.e. an exact power
+    # of two, else none, key); other dtypes fail an assertion.
     scale_key = _strip_weight_suffix(weight_key) + SOURCE_FP8_SCALE_KEY_SUFFIX
     scale_file = source_scale_index[scale_key]
     if scale_file == current_filename and scale_key in weights:
@@ -111,6 +131,9 @@ def _load_source_scale_u8(
 
 
 def _source_fp8_to_mxfp8_scale_u8(weight: torch.Tensor, source_scale_u8: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Expands 128 by 128 block exponent scales to per-row, per-32-column
+    # scales by repeating 128 times along rows and 4 times along columns, then crops to the
+    # weight's rows and columns divided by 32. Returns a contiguous byte tensor.
     n, k = weight.shape[-2], weight.shape[-1]
     mxfp8_scale_u8 = source_scale_u8.repeat_interleave(SOURCE_FP8_BLOCK_SIZE[0], dim=-2).repeat_interleave(
         SOURCE_FP8_BLOCK_SIZE[1] // TARGET_MXFP8_BLOCK_SIZE[1], dim=-1
@@ -124,6 +147,9 @@ def should_quantize(
     skip_weight_substrings=SKIP_WEIGHT_SUBSTRINGS,
     allow_source_fp8: bool = False,
 ) -> bool:
+    # [FUNCTION DOC] Decides whether a tensor is converted: true only if the name ends with
+    # ".weight", contains none of the skip substrings, the dtype is 16/32-bit float (or FP8 when
+    # allowed), it has at least two dims, and the last dim is divisible by 32.
     allowed_dtypes = (torch.float16, torch.bfloat16, torch.float32)
     if allow_source_fp8:
         allowed_dtypes += SOURCE_FP8_DTYPES
@@ -141,7 +167,10 @@ def should_quantize(
 
 
 class ConversionResult:
+    # [CLASS DOC] HELPER: Accumulates the tensor-to-file map, total byte size and list of module
+    # names left unconverted. Not thread-safe (files are processed sequentially).
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Starts with an empty map, zero size and empty list.
         self.weight_map: dict[str, str] = {}
         self.total_size: int = 0
         self.modules_to_not_convert: list[str] = []
@@ -152,6 +181,8 @@ class ConversionResult:
         q_weights: dict[str, torch.Tensor],
         module_names: list[str],
     ) -> None:
+        # [FUNCTION DOC] HELPER: Records each tensor's file, adds its byte size, and extends the
+        # unconverted module list.
         for key, tensor in q_weights.items():
             self.weight_map[key] = filename
             self.total_size += tensor.numel() * tensor.element_size()
@@ -171,6 +202,19 @@ def process_file(
     extra_high_precision_layers_hf: tuple[str, ...],
     source_scale_index: dict[str, str],
 ) -> None:
+    # [FUNCTION DOC] Converts one safetensors file. Loads all tensors on the device. Computes the
+    # layer-name prefixes of the first and last N layers to keep in BF16 (recorded as unconverted
+    # modules) and combines them with the fixed and extra skip substrings. For each weight
+    # tensor: if convertible, an FP8 source with a power-of-two scale keeps its FP8 data and gets
+    # expanded exponent scales; an FP8 source with other scales is dequantized to float32 and
+    # requantized; a high-precision source is quantized directly; the scale is stored under the
+    # ".weight_scale_inv" name. If not convertible, the module name (minus ".weight", skipping
+    # expert weights) is recorded as unconverted and the tensor is kept, or dequantized to BF16
+    # if it was source FP8. Non-weight tensors are copied, except source block-scale tensors of
+    # FP8 sources which are dropped. Saves the file and reports to the collector.
+    # KNOWN ISSUE: in the FP8-source path the scale tensor may be stored under the original
+    # scale key found by lookup, but the scale for the non-FP8 dtype source path uses the
+    # same suffix; behavior is consistent only because both use the same key name.
     weights: dict[str, torch.Tensor] = {}
     q_weights: dict[str, torch.Tensor] = {}
 
@@ -273,6 +317,13 @@ def convert_mxfp8(
     num_layers_at_end_in_bf16: int = 0,
     extra_high_precision_layers_hf: tuple[str, ...] = (),
 ) -> None:
+    # [FUNCTION DOC] Converts a whole model directory. Reads the config (layer count), decides
+    # the source type (block FP8 ue8m0, or BF16-like; otherwise raises a value error), copies
+    # non-safetensors files, reads the weight index to get the sorted file list and (for FP8
+    # sources) a map from scale tensor names to files, processes files one at a time freeing
+    # memory between, then writes a config with a dynamic e4m3 mxfp8 quantization section (block
+    # size 1 by 32, ue8m0 scales, naturally sorted deduplicated unconverted modules if any) and
+    # a new weight index with total byte size. Requires an index file in the input.
     input_path = os.path.abspath(model_dir)
     output_path = os.path.abspath(save_dir)
     os.makedirs(output_path, exist_ok=True)
@@ -334,6 +385,8 @@ def convert_mxfp8(
     if len(result_collector.modules_to_not_convert) > 0:
 
         def natural_key(s):
+            # [FUNCTION DOC] HELPER: Sort key splitting a string into digit runs (as integers)
+            # and non-digit runs, for natural ordering of layer indices.
             return [int(t) if t.isdigit() else t for t in re.findall(r"\d+|\D+", s)]
 
         quantization_config["modules_to_not_convert"] = sorted(
@@ -358,6 +411,12 @@ def convert_mxfp8(
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point. Parses known options (model dir, save dir, device default
+    # "cuda", counts of layers kept in BF16 at start and end, extra skip substrings; unknown
+    # options ignored). Raises a runtime error without CUDA or if the device is not CUDA; a bare
+    # digit device means that GPU index; no index means GPU 0. Sets the device, creates the save
+    # directory (value error if it is a non-directory) and runs the conversion with stripped,
+    # non-empty extra substrings.
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-dir", type=str, required=True, help="Path to HF safetensors model.")
     parser.add_argument("--save-dir", type=str, required=True, help="Path to save converted model.")

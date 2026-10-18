@@ -4,6 +4,11 @@
 #   python -m tools.visualize.cpu_memory_profiler_visualize visualize profile.csv
 #   python -m tools.visualize.cpu_memory_profiler_visualize visualize profile.csv -o chart.png --title "My Run"
 #   python -m tools.visualize.cpu_memory_profiler_visualize visualize-multiple a.csv b.csv -o compare.png
+#
+# [MODULE DOC] Command-line tool (typer app with two commands) that renders the CSV timelines
+# produced by the CPU memory profiler as PNG charts: one chart per file with phase markers
+# annotated, or several files overlaid for comparison. Plotting library and CSV reader are
+# imported inside the commands. Expected CSV columns: time_s, used_gb, marker.
 
 import logging
 
@@ -16,6 +21,17 @@ app.callback()(lambda: None)
 
 @app.command()
 def visualize(csv_path: str, output_path: str = None, title: str = None, show: bool = False):
+    # [FUNCTION DOC] Draws one profile. Output defaults to the CSV path with a png suffix; title
+    # defaults to a fixed prefix plus the file name. Reads time, used gigabytes and marker label
+    # per row (blank labels ignored). Plots used memory against time as a line with a light fill;
+    # each marker gets a dashed vertical line and a dot, colored by phase: the label's part after
+    # the first slash, with trailing start/end suffix removed, is looked up in a table (generate,
+    # train, offload_train, offload_rollout, onload_weights, onload_kv, update_weights), gray if
+    # unknown. With markers, widens the y-axis upper bound and annotates each label rotated 45
+    # degrees at one of 4 staggered heights above the peak. Adds axis labels, grid, and a peak
+    # annotation (value in GB). Saves at 150 dpi with tight bounds, logs, optionally shows
+    # interactively, closes the figure and returns the output path. Raises on an empty CSV
+    # (maximum of nothing) or missing columns.
     """Visualize a CPU memory profile CSV as a timeline chart with phase markers."""
     import csv as csv_mod
     from pathlib import Path
@@ -50,6 +66,8 @@ def visualize(csv_path: str, output_path: str = None, title: str = None, show: b
     }
 
     def get_color(label):
+        # [FUNCTION DOC] HELPER: Maps a marker label to a hex color via the phase table (see the
+        # enclosing command); unknown phases get gray.
         phase = label.split("/", 1)[-1] if "/" in label else label
         base = phase.rsplit("_start", 1)[0].rsplit("_end", 1)[0]
         return phase_colors.get(base, "#6b7280")
@@ -120,6 +138,12 @@ def visualize_multiple(
     title: str = typer.Option(None, "--title"),
     show: bool = typer.Option(False, "--show"),
 ):
+    # [FUNCTION DOC] Overlays several profiles. Reads time and used gigabytes from each file.
+    # Output defaults to a file named compare.png beside the first input; title defaults to a
+    # comparison title. Each trace gets a line plus light fill in a color cycled from a list of
+    # seven and a legend entry equal to the file name stem. Saves at 150 dpi, logs, optionally
+    # shows, closes the figure and returns the output path. Markers are ignored. Raises if no
+    # files are given.
     """Overlay multiple CPU memory profiles on one chart with different colors."""
     import csv as csv_mod
     from pathlib import Path

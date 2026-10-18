@@ -1,3 +1,13 @@
+# [MODULE DOC] Command-line tool converting routed-expert weights of a Hugging Face safetensors
+# checkpoint to NVFP4 (packed fp4 with 1x16 block scales plus a global scale). Only expert
+# projection weights inside the main language decoder layers are quantized; shared experts,
+# dense layers, extra layers (appended multi-token-prediction layers beyond the configured
+# count), vision/audio parts, optionally the first/last N layers and user-given substrings stay
+# unchanged. Gate and up projections of one expert group are quantized jointly (pair routine,
+# shared global scale) even when they live in different files, using deferred output entries.
+# Also writes a ModelOpt-style quantization config into config.json and a separate quant config
+# file, with an ignore list augmented with fused-qkv and expert container names, and a new
+# weight index. The input scale is stored as ones. Runs on CUDA by default.
 """
 python tools/convert_hf_to_nvfp4.py [-h] [--model-dir MODEL_DIR] [--save-dir SAVE_DIR]
                                    [--device DEVICE]
@@ -73,6 +83,8 @@ GATED_PAIR_SUFFIXES = {
 
 
 def _is_routed_expert_weight_name(name: str) -> bool:
+    # [FUNCTION DOC] HELPER: True for a weight name that ends with ".weight", is not a shared
+    # expert, contains a routed-expert marker and ends with a known expert projection suffix.
     if not name.endswith(".weight"):
         return False
     if any(marker in name for marker in SHARED_EXPERT_NAME_MARKERS):
@@ -83,6 +95,9 @@ def _is_routed_expert_weight_name(name: str) -> bool:
 
 
 def _get_num_hidden_layers(model_dir: str) -> int:
+    # [FUNCTION DOC] HELPER: Reads config.json in the directory (value error if missing) and
+    # returns the layer count, preferring the nested text config's value over the top-level one;
+    # raises a value error if neither exists.
     config_path = os.path.join(model_dir, "config.json")
     if not os.path.exists(config_path):
         raise ValueError("config.json is required to identify the main language decoder layers.")
@@ -97,6 +112,8 @@ def _get_num_hidden_layers(model_dir: str) -> int:
 
 
 def _get_bf16_layer_prefixes(num_hidden_layers: int, num_at_start: int, num_at_end: int) -> tuple[str, ...]:
+    # [FUNCTION DOC] HELPER: Builds the sorted tuple of name prefixes (each known layer prefix,
+    # a dot, layer index, trailing dot) for the first and last given numbers of layers.
     layer_indices = set(range(num_at_start)) | set(range(num_hidden_layers - num_at_end, num_hidden_layers))
     return tuple(sorted(f"{prefix}.{i}." for prefix in LANGUAGE_MODEL_LAYER_PREFIXES for i in layer_indices))
 
@@ -108,6 +125,10 @@ def should_quantize(
     *,
     num_hidden_layers: int | None = None,
 ) -> bool:
+    # [FUNCTION DOC] Decides whether a tensor is quantized: false unless the name belongs to a
+    # language-model decoder layer (index below the layer count when given), has no skip
+    # substring, is a routed expert weight, is a 16/32-bit float and has at least two dims.
+    # Raises a value error if all other conditions hold but the last dim is not divisible by 16.
     # An allowlist keeps modality towers and separately named MTP stacks out.
     # DeepSeek/GLM checkpoints append MTP to model.layers, so also bound its index.
     match = LANGUAGE_MODEL_LAYER_PATTERN.match(name)
@@ -131,6 +152,8 @@ def should_quantize(
 def _quantize_nvfp4_1d(
     weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Makes the weight contiguous, checks the last dim is divisible by 16
+    # (value error otherwise) and delegates to the shared 1-D quantizer, returning its triple.
     """
     NVFP4 1D quantization (tile shape = 1x16).
 
@@ -150,6 +173,9 @@ def _quantize_nvfp4_1d(
 def quantize_nvfp4(
     weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Quantizes a 2-D weight directly, or a 3-D stack (experts first) one slice at
+    # a time with results stacked along a new first axis; other ranks raise a value error.
+    # Returns (packed weight, block scale, global scale).
     if weight.dim() == 2:
         return _quantize_nvfp4_1d(weight)
     if weight.dim() == 3:
@@ -170,12 +196,16 @@ def quantize_nvfp4(
 
 
 class ConversionResult:
+    # [CLASS DOC] HELPER: Accumulates tensor-to-file map, total byte size and unconverted module
+    # names across files (sequential use, no locking).
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Empty map, zero size, empty list.
         self.weight_map: dict[str, str] = {}
         self.total_size: int = 0
         self.modules_to_not_convert: list[str] = []
 
     def add_result(self, filename: str, q_weights: dict[str, torch.Tensor], module_names: list[str]) -> None:
+        # [FUNCTION DOC] HELPER: Records each tensor's file, adds byte sizes, extends module list.
         for key, tensor in q_weights.items():
             self.weight_map[key] = filename
             self.total_size += tensor.numel() * tensor.element_size()
@@ -183,6 +213,11 @@ class ConversionResult:
 
 
 def _update_quantization_config(cfg: dict, ignore_list: list[str]) -> None:
+    # [FUNCTION DOC] HELPER: Mutates a model config mapping in place. Ensures a quantization
+    # section with algorithm NVFP4, method modelopt, group size 16, the ignore list, and a
+    # default kv-cache scheme if missing; for each existing config group sets default targets
+    # (Linear) and, for input-activation and weight sections, default non-dynamic 4-bit float and
+    # group size 16. Recurses into a nested text config that carries its own quantization section.
     quant_cfg = cfg.get("quantization_config")
     if not isinstance(quant_cfg, dict):
         quant_cfg = {}
@@ -217,6 +252,10 @@ def _update_quantization_config(cfg: dict, ignore_list: list[str]) -> None:
 
 
 def _write_hf_quant_config(output_path: str, ignore_list: list[str], input_path: str) -> None:
+    # [FUNCTION DOC] HELPER: Writes hf_quant_config.json in the output directory, starting from
+    # the input's file of that name if present (else a ModelOpt producer stub), setting the
+    # quantization section to NVFP4 with FP8 kv cache algorithm, group size 16 and the ignore
+    # list as excluded modules.
     hf_quant_path = os.path.join(input_path, "hf_quant_config.json")
     if os.path.exists(hf_quant_path):
         with open(hf_quant_path) as f:
@@ -239,6 +278,10 @@ def _write_hf_quant_config(output_path: str, ignore_list: list[str], input_path:
 
 
 def _augment_ignore_list(ignore_list: list[str]) -> list[str]:
+    # [FUNCTION DOC] HELPER: Returns the sorted deduplicated ignore list plus extras: for a name
+    # ending in a separate q, k or v projection, the fused qkv projection name of the same parent;
+    # for a name of the form experts (optionally an expert index) followed by a projection name,
+    # the experts container name.
     ignore_set = set(ignore_list)
     extra = set()
     for name in ignore_list:
@@ -255,6 +298,9 @@ def _augment_ignore_list(ignore_list: list[str]) -> list[str]:
 
 
 def _split_gated_pair_name(name: str) -> tuple[str | None, str | None]:
+    # [FUNCTION DOC] HELPER: If the name ends with a gate or up projection suffix (gate_proj, w1
+    # for gate; up_proj, w3 for up), returns (name without the suffix, "gate" or "up"); else
+    # (none, none).
     for suffix, role in GATED_PAIR_SUFFIXES.items():
         if name.endswith(suffix):
             return name[: -len(suffix)], role
@@ -269,6 +315,11 @@ def _collect_gated_pair_locations(
     skip_weight_substrings: tuple[str, ...],
     num_hidden_layers: int,
 ) -> dict[str, dict[str, tuple[str, str]]]:
+    # [FUNCTION DOC] HELPER: Pre-scan of all files to locate gate/up weight pairs. Loads every
+    # tensor of every file (slow, memory heavy on the device), keeps those that would be
+    # quantized and have a gate/up suffix, and records for each base name the file and key of
+    # each role; a duplicate role raises a value error. Returns only bases with both roles,
+    # mapping base to a mapping role to (file name, tensor key).
     gated_pairs: dict[str, dict[str, tuple[str, str]]] = {}
     for filename in safetensors_files:
         with safetensors.safe_open(os.path.join(input_path, filename), framework="pt", device=device) as f:
@@ -297,6 +348,10 @@ def _nvfp4_quantized_entries(
     block_scale: torch.Tensor,
     weight_scale_2: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Returns the four checkpoint entries for one quantized weight: the
+    # packed weight under the original key, block scale as ".weight_scale", global scale as
+    # ".weight_scale_2", and an input scale of ones (float32, same shape as the global scale)
+    # as ".input_scale".
     return {
         key: qweight,
         key.replace(".weight", ".weight_scale"): block_scale,
@@ -306,6 +361,7 @@ def _nvfp4_quantized_entries(
 
 
 def _load_safetensors_tensor(input_path: str, filename: str, key: str, device: str) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Opens the named file and returns the one tensor on the device.
     with safetensors.safe_open(os.path.join(input_path, filename), framework="pt", device=device) as f:
         return f.get_tensor(key)
 
@@ -324,6 +380,16 @@ def process_file(
     processed_gated_pairs: set[str],
     deferred_quantized_entries: dict[str, dict[str, dict[str, torch.Tensor]]],
 ) -> None:
+    # [FUNCTION DOC] Converts one file (returns at once for non-safetensors names). Builds skip
+    # substrings from extra substrings and BF16 layer prefixes. For each tensor key: if entries
+    # were deferred for it by a pair processed from another file, uses them; else loads it and,
+    # if quantizable: for a gate/up pair, loads the partner (from another file if needed),
+    # quantizes the pair together, stores the entries for this file's key now and defers the
+    # partner's entries when it lives in another file (raises a value error if the pair was
+    # already processed but nothing deferred); otherwise quantizes alone. Unquantized weights are
+    # kept and their modules recorded as unconverted (matched BF16 layer prefixes, the module
+    # name; for experts only the experts container when inside a BF16 layer, else the module).
+    # Saves the file and reports. Mutates the shared pair-tracking containers.
     if not filename.endswith(".safetensors"):
         return
 
@@ -411,6 +477,11 @@ def convert_nvfp4(
     num_layers_at_end_in_bf16: int = 0,
     extra_high_precision_layers_hf: tuple[str, ...] = (),
 ) -> None:
+    # [FUNCTION DOC] Converts a whole model directory: copies non-safetensors files, determines
+    # the layer count, pre-scans gate/up pair locations, processes each safetensors file in
+    # listing order (freeing GPU cache between), raises a runtime error if any deferred pair
+    # entries were never written, builds the augmented ignore list, writes the updated config (if
+    # present), the separate quant config file and a new weight index with total byte size.
     input_path = os.path.abspath(model_dir)
     output_path = os.path.abspath(save_dir)
     os.makedirs(output_path, exist_ok=True)
@@ -487,6 +558,11 @@ def convert_nvfp4(
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point. Parses known options (model dir, save dir, device default
+    # "cuda", BF16 start and end layer counts, extra skip substrings; unknown options ignored).
+    # A digit-only device means that GPU index. For a CUDA device: raises a runtime error if CUDA
+    # is unavailable, defaults to GPU 0, sets it. Creates the save directory (value error if the
+    # path is not a directory) and runs the conversion with stripped, non-empty substrings.
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-dir", type=str, required=True, help="Path to HF safetensors model.")
     parser.add_argument("--save-dir", type=str, required=True, help="Path to save converted model.")

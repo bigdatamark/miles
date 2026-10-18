@@ -1,3 +1,12 @@
+# [MODULE DOC] Distributed command-line tool (one process per GPU rank, launched like training)
+# that loads a Megatron checkpoint through the normal training initialization (optimizer and
+# RNG not loaded) and converts it to Hugging Face format. Parameters are collected one by one:
+# the owner rank supplies each (others allocate empty buffers), broadcast across pipeline
+# and (for expert weights) expert-parallel groups, gathered across tensor parallel, un-padded to
+# the vocabulary size (tokenizer size unless overridden), converted to HF names on the saving
+# rank (data-parallel rank 0 with context parallel, tensor rank 0) and moved to CPU. The saving
+# rank then loads the original HF model on CPU, optionally checks exact equality with the
+# converted tensors, and optionally saves tokenizer and model to the output directory.
 import torch
 import torch.distributed as dist
 from megatron.core import mpu
@@ -11,6 +20,8 @@ from miles.utils.processing_utils import load_tokenizer
 
 
 def add_checkpoint_args(parser):
+    # [FUNCTION DOC] HELPER: Adds the output-dir option (default none) and the check-same flag
+    # (default off) to the argument parser and returns it; passed as the custom-argument hook.
     parser.add_argument(
         "--output-dir",
         type=str,
@@ -27,6 +38,20 @@ def add_checkpoint_args(parser):
 
 
 def main(args):
+    # [FUNCTION DOC] Runs the conversion on every rank (see module doc). Initializes the
+    # Megatron backend with a trivial independent-data-parallel setup, builds the model with
+    # optimizer and RNG loading disabled, derives the HF model name from the config class name in
+    # lower case, and loops over all parameter infos in order. If the pipeline size is above 1,
+    # broadcasts each parameter within the pipeline group when its source rank belongs to it; if
+    # the expert size is above 1, broadcasts expert parameters in the expert group from the source
+    # rank (or from the rank itself if the source is outside the group). Restores recorded
+    # attributes on the tensor, gathers across tensor parallel and strips padding. Only the save
+    # rank converts and stores CPU tensors. Then, on the save rank, loads the HF model; with
+    # check-same, asserts equal shape and exact values for each shared name (prints a warning for
+    # names missing from the converted state); with an output dir, saves the tokenizer, prints the
+    # non-strict load result and saves the model. All ranks end with a barrier.
+    # KNOWN ISSUE: if a parameter is not found among the named parameters on its source rank, the
+    # variable keeps a stale value from the previous iteration (or is undefined at the first).
     from miles.utils.ft_utils.indep_dp import IndepDPInfo
 
     megatron_utils.init(

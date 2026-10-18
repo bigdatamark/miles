@@ -1,3 +1,9 @@
+# [MODULE DOC] Command-line tool converting an MXFP4 pack-quantized checkpoint to BF16. Supports
+# parallel runs: each process may take a stride of the file list (shard rank among shard count,
+# no explicit file list allowed), rank zero (or an unsharded run) copies metadata, and a final
+# finalize-only run (or an unsharded run) builds the weight index. Existing outputs are skipped
+# unless overwrite is given. Options: model dir, save dir (must differ), device (cpu or cuda,
+# default cpu), file list, shard rank, shard count, finalize-only, overwrite.
 """Convert an ``mxfp4-pack-quantized`` compressed-tensors checkpoint to BF16.
 
 Every ``<name>.weight_packed`` / ``<name>.weight_scale`` pair becomes a dequantized
@@ -18,6 +24,7 @@ from miles.utils.mxfp4 import dequantize_mxfp4
 
 
 def parse_args() -> argparse.Namespace:
+    # [FUNCTION DOC] HELPER: Defines and parses the options listed in the module doc.
     parser = argparse.ArgumentParser(description="Convert MXFP4-packed compressed-tensors weights to BF16.")
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--save-dir", type=Path, required=True)
@@ -31,11 +38,16 @@ def parse_args() -> argparse.Namespace:
 
 
 def quantization_section(config: dict) -> dict:
+    # [FUNCTION DOC] HELPER: Returns the nested text config if present, else the config itself;
+    # the section holding the quantization entry.
     """Multimodal checkpoints nest ``quantization_config`` under ``text_config``."""
     return config.get("text_config", config)
 
 
 def load_group_size(model_dir: Path) -> int:
+    # [FUNCTION DOC] HELPER: Reads the config and asserts the quantization format is the MXFP4
+    # pack-quantized one with 4-bit float weights and byte-typed scales; returns the group size.
+    # Raises assertion or key errors otherwise.
     with (model_dir / "config.json").open() as file:
         config = json.load(file)
     quantization_config = quantization_section(config)["quantization_config"]
@@ -48,6 +60,9 @@ def load_group_size(model_dir: Path) -> int:
 
 
 def copy_metadata(model_dir: Path, output_dir: Path) -> None:
+    # [FUNCTION DOC] HELPER: Creates the output directory; copies every regular file except
+    # safetensors and any index json; then rewrites the copied config without the quantization
+    # entry (in the text config section when nested). Overwrites existing files.
     output_dir.mkdir(parents=True, exist_ok=True)
     for source in model_dir.iterdir():
         if not source.is_file() or source.suffix == ".safetensors" or source.name.endswith(".index.json"):
@@ -68,6 +83,11 @@ def convert_file(
     group_size: int,
     device: str,
 ) -> None:
+    # [FUNCTION DOC] Converts one file. Reads on CPU; for each packed weight with a matching
+    # scale (asserted to exist), moves both to the device, dequantizes with the shared routine
+    # (BF16 result per its contract), brings it to CPU and stores it under the name with
+    # ".weight". Asserts no scale is left without a packed partner. Copies every other tensor
+    # unchanged. Writes to a temporary file then atomically renames over the output.
     tensors = {}
     with safe_open(source_path, framework="pt", device="cpu") as reader:
         keys = set(reader.keys())
@@ -101,6 +121,9 @@ def convert_file(
 
 
 def build_index(output_dir: Path) -> None:
+    # [FUNCTION DOC] Scans the output safetensors files (sorted), asserting no duplicate tensor
+    # names and a supported dtype (BF16, F16, F32, F64, I32, I64, U8), and writes the weight
+    # index with total byte size computed from shapes and dtype sizes.
     dtype_sizes = {
         "BF16": 2,
         "F16": 2,
@@ -128,6 +151,12 @@ def build_index(output_dir: Path) -> None:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point. Validates arguments (model dir exists, save dir differs, rank
+    # and count given together with rank in range, no explicit files with sharding). Reads the
+    # group size. Finalize-only: copies metadata, builds the index, returns. Otherwise rank zero
+    # (or unsharded) copies metadata; the file list is the given names or all safetensors files
+    # sorted, strided by rank and count when sharded (asserts non-empty); each file is skipped
+    # if its output exists without overwrite, else converted. An unsharded run then builds the index.
     args = parse_args()
     assert args.model_dir.is_dir(), args.model_dir
     assert args.save_dir != args.model_dir

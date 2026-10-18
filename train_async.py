@@ -1,3 +1,7 @@
+# [MODULE DOC] Entry script for asynchronous (non-colocated) RL training: generation of the next
+# rollout overlaps training on the current one, and weights are pushed to inference every
+# configured interval of rounds. Running it parses arguments and runs the training coroutine
+# under a disposer for cleanup. See the training function for the algorithm.
 import asyncio
 import logging
 import os
@@ -21,6 +25,26 @@ logger = logging.getLogger(__name__)
 
 # The framework supports other asynchronous approaches such as fully async (see miles/rollout/fully_async_rollout.py).
 async def train(args, *, disposer: Disposer):
+    # [FUNCTION DOC] Asynchronous training driver. Asserts colocation is off and validates the
+    # off-policy correction settings for async mode. Setup mirrors the synchronous driver (rollout
+    # components first, then training models, optional services, initial weight sync, optional
+    # weight-equality check, eval dispatcher, pre-training eval only for a fresh run with an eval
+    # interval and not skipped). No offloading logic: training and inference use separate GPUs.
+    # Loop per round: take the already-started generation for this round (a future created one
+    # round earlier); compute whether a next round exists and whether a weight update is due
+    # after this round (every update-interval rounds, counting from one); start generating the
+    # next round immediately, unless fully-async mode is on and a weight update is due (the drain
+    # is deferred until after the update so the new weights are used); train critic then actor
+    # (past the critic-only steps, passing critic values) or the actor alone; drop data references;
+    # save when an external trigger file exists or the periodic rule fires (forced synchronous on
+    # trigger or last round; saves actor, critic if present, and rollout state; removes the
+    # trigger file); on weight-update rounds, in non-fully-async mode first wait for the in-flight
+    # generation to finish (so weights do not change mid-generation) and clear its future, then
+    # sync weights, then start the deferred generation if one was deferred; run eval when due
+    # (forced on the last round); stop early at the debug rollout count.
+    # Note: on a non-fully-async weight-update round the awaited next-round data is stored in the
+    # current-round variable and the future is cleared, so the next iteration uses that data
+    # directly instead of awaiting a future.
     assert not args.colocate, "Colocation is not supported for async training."
     validate_async_off_policy_correction(args)
     _worker_manager = init_orchestration_script(args, disposer=disposer)
@@ -56,6 +80,8 @@ async def train(args, *, disposer: Disposer):
         await eval_dispatcher.dispatch(0, hf_dir=args.hf_checkpoint)
 
     async def save_training_model(model, rollout_id, force_sync):
+        # [FUNCTION DOC] HELPER: Onloads the model first if critic and train offload are on,
+        # saves it for the round (optionally synchronously), then offloads it again.
         if args.use_critic and args.offload_train:
             await model.onload()
         await model.save_model(rollout_id, force_sync=force_sync)
@@ -63,6 +89,8 @@ async def train(args, *, disposer: Disposer):
             await model.offload()
 
     async def prepare_and_generate(rollout_id):
+        # [FUNCTION DOC] HELPER: Prepares the inference side for the round, then fetches and
+        # returns that round's rollout data reference. Run as an eagerly started task.
         await inference_controller.prepare_rollout(rollout_id)
         return await rollout_executor.get(rollout_id)
 

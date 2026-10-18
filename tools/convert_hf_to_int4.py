@@ -1,4 +1,11 @@
 #!/usr/bin/env python
+# [MODULE DOC] Command-line tool for GPTQ weight quantization (W4A16 or W8A16) of a local BF16
+# Hugging Face model with llmcompressor, calibrated on random windows from a local parquet text
+# file. Same options as the sibling hf-to-hf-int4 tool (input dir, output dir, data dir, quant
+# type, sample count 256, max sequence length 2048, dampening 0.01, trust-remote-code flag,
+# group size 32 used as the GPTQ block size). Excluded from quantization: head, norms,
+# embeddings, attention, shared experts, dense MLP projections, router gate, vision tower and
+# multimodal projector.
 import argparse
 import os
 import random
@@ -13,6 +20,8 @@ from miles.utils.processing_utils import load_tokenizer
 
 
 def parse_args():
+    # [FUNCTION DOC] HELPER: Defines and parses the command-line options (required: input-dir,
+    # output-dir, data-dir) and returns the namespace.
     parser = argparse.ArgumentParser()
     parser.add_argument("--input-dir", type=str, required=True, help="local BF16 path")
     parser.add_argument("--output-dir", type=str, required=True)
@@ -27,6 +36,11 @@ def parse_args():
 
 
 def get_calibration_dataset(tokenizer, num_samples, seq_len, local_data_path):
+    # [FUNCTION DOC] HELPER: Builds calibration data from the parquet file train-00000-of-00001
+    # in the data directory (prints and exits with status 1 if missing or unreadable). Joins all
+    # text rows, tokenizes once, and samples the requested number of random windows of seq_len
+    # tokens with all-ones attention masks (raises if the stream is too short). Returns a
+    # Hugging Face dataset. Uses the unseeded global random generator.
 
     train_file = os.path.join(local_data_path, "train-00000-of-00001.parquet")
 
@@ -55,6 +69,11 @@ def get_calibration_dataset(tokenizer, num_samples, seq_len, local_data_path):
 
 
 def main():
+    # [FUNCTION DOC] Entry point: loads the tokenizer (pad token falls back to end-of-sequence),
+    # builds calibration data, loads the model from the input dir in bfloat16 across devices,
+    # creates a GPTQ recipe over Linear layers (scheme from quant type, ignore patterns,
+    # dampening fraction, block size equal to the group size option) and runs one-shot
+    # quantization, saving to the output directory.
     args = parse_args()
 
     tokenizer = load_tokenizer(args.input_dir, trust_remote_code=args.trust_remote_code)

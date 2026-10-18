@@ -1,4 +1,12 @@
 # Adapt from https://github.com/alibaba/Pai-Megatron-Patch/blob/2b201af08336dea0403df7c6b497c964cf5a2e75/toolkits/model_checkpoints_convertor/deepseek/fp8_cast_bf16.py
+# [MODULE DOC] Command-line tool dequantizing a block-FP8 Hugging Face checkpoint (DeepSeek
+# style: weights stored as 1-byte values with a companion tensor named like the weight plus
+# "_scale_inv", one scale per 128 by 128 block) to BF16 on the GPU. Tensor names are remapped
+# through the parameter-name remap helper (sibling module imported by bare name, so the script
+# must run with this directory on the module path). Copies config, python files, tokenizer and
+# chat template files with shell commands (unquoted paths), converts each safetensors file, and
+# writes a new index without the dequantized weights' scale entries. Options: input FP8 dir,
+# output BF16 dir. Sets the global default dtype to bfloat16 (affects dequantized output dtype).
 import json
 import os
 from argparse import ArgumentParser
@@ -14,6 +22,10 @@ from tqdm import tqdm
 
 @triton.jit
 def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
+    # [FUNCTION DOC] Triton kernel; one program per square tile (grid over rows and columns of
+    # tiles). Loads the tile of the M by N row-major quantized matrix (masked at the edges) as
+    # float32, multiplies by the tile's single scale (scale grid indexed by tile row times the
+    # number of column tiles plus tile column), and stores to the output buffer in its dtype.
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
     n = tl.cdiv(N, BLOCK_SIZE)
@@ -28,12 +40,18 @@ def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
 
 
 def weight_dequant(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> torch.Tensor:
+    # [FUNCTION DOC] Dequantizes a 2-D contiguous quantized matrix with a contiguous 2-D scale
+    # grid (one per block of the given size, default 128) using the Triton kernel. The output
+    # has the current default dtype (set to bfloat16 by the main routine), same shape as the
+    # input. Asserts contiguity and rank.
     assert x.is_contiguous() and s.is_contiguous()
     assert x.dim() == 2 and s.dim() == 2
     M, N = x.size()
     y = torch.empty_like(x, dtype=torch.get_default_dtype())
 
     def grid(meta):
+        # [FUNCTION DOC] HELPER: Launch grid: number of row tiles and column tiles for the block
+        # size chosen in the kernel meta-parameters.
         return (triton.cdiv(M, meta["BLOCK_SIZE"]), triton.cdiv(N, meta["BLOCK_SIZE"]))
 
     weight_dequant_kernel[grid](x, s, y, M, N, BLOCK_SIZE=block_size)
@@ -41,6 +59,18 @@ def weight_dequant(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> t
 
 
 def main(fp8_path, bf16_path):
+    # [FUNCTION DOC] Runs the conversion. Sets default dtype bfloat16, creates the output dir,
+    # copies metadata files by shell command, reads the weight index and builds the remapped
+    # weight map plus a reverse map from new to raw names (asserting no collisions). For each
+    # safetensors file in sorted order: loads it to the GPU, caches it; for each tensor, remaps
+    # its name; scale tensors (name ending "_scale_inv") are skipped; 1-byte tensors are
+    # dequantized with the scale looked up (possibly from another file) after conversion to
+    # float32, or kept unchanged with a warning when the scale is missing (KeyError); other
+    # tensors are copied. Saves the file under the same name; evicts the oldest cached file when
+    # more than two are cached. Finally removes scale entries of converted weights from the
+    # remapped map and writes the index (empty metadata).
+    # KNOWN ISSUE: the oldest-cached eviction can drop the file just processed or still needed,
+    # and a scale tensor present only in a not-yet-loaded file is reloaded on demand.
     torch.set_default_dtype(torch.bfloat16)
     os.makedirs(bf16_path, exist_ok=True)
     os.system("cp -rf " + fp8_path + "/config.json " + bf16_path)
@@ -70,6 +100,9 @@ def main(fp8_path, bf16_path):
 
     # Helper function to get tensor from the correct file
     def get_tensor(tensor_name):
+        # [FUNCTION DOC] HELPER: Returns the tensor for a remapped name from the file the index
+        # says holds it, loading and caching that file on the GPU if needed. Raises a key error if
+        # the name is unknown.
         raw_tensor_name = raw_name_by_renamed[tensor_name]
         file_name = weight_map_raw[raw_tensor_name]
         if file_name not in loaded_files:

@@ -1,3 +1,11 @@
+# [MODULE DOC] Command-line tool converting a distributed-checkpoint (FSDP) training checkpoint
+# into a Hugging Face safetensors model. Arguments: input checkpoint directory (a model
+# subdirectory is used if present), output directory, original Hugging Face directory (for
+# config and tokenizer assets), and a force flag. Refuses to run if the output directory exists
+# without force. Steps: load all non-optimizer tensors on CPU without a process group, build an
+# empty model from the original config, choose the key prefix (among known wrappers) that
+# matches the most model keys, load with non-strict matching (prints missing and unexpected
+# keys), save as safetensors, then copy every non-weight regular file from the original directory.
 import argparse
 import os
 import pickle
@@ -13,10 +21,17 @@ from miles.utils.hf_utils.config import load_hf_config
 
 
 class UnpicklerWrapper(pickle.Unpickler):
+    # [CLASS DOC] HELPER: Unpickler that lets checkpoint metadata load without Megatron or GLM
+    # packages installed, by substituting a placeholder class for any class from modules whose
+    # name starts with megatron or glm; all other classes resolve normally.
     @override
     def find_class(self, mod_name, name):
+        # [FUNCTION DOC] HELPER: Returns the placeholder class (accepts any constructor
+        # arguments, stores nothing) for megatron/glm modules, else the default lookup.
         class DummyClass:
+            # [CLASS DOC] HELPER: Placeholder that ignores all construction arguments.
             def __init__(self, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: Accepts and ignores any arguments.
                 pass
 
         if mod_name.startswith("megatron") or mod_name.startswith("glm"):
@@ -25,8 +40,14 @@ class UnpicklerWrapper(pickle.Unpickler):
 
 
 class WrappedStorageReader(dist_cp.FileSystemReader):
+    # [CLASS DOC] HELPER: Filesystem checkpoint reader whose metadata loading tolerates missing
+    # Megatron/GLM classes and older metadata lacking storage info or planner data.
     @override
     def read_metadata(self):
+        # [FUNCTION DOC] HELPER: Reads the hidden metadata file in the checkpoint directory with
+        # the tolerant unpickler. If storage metadata is absent, creates an empty one; sets its
+        # load id from the reader; if planner data is none, sets it to an empty mapping.
+        # Returns the metadata object.
         path = self.fs.concat_path(self.path, ".metadata")
         with self.fs.create_stream(path, "rb") as metadata_file:
             metadata = UnpicklerWrapper(metadata_file).load()
@@ -39,6 +60,8 @@ class WrappedStorageReader(dist_cp.FileSystemReader):
 
 
 class EmptyStateDictLoadPlanner(dist_cp.default_planner.DefaultLoadPlanner):
+    # [CLASS DOC] HELPER: Load planner that fills the destination state dict from the checkpoint
+    # metadata itself, so no model needs to exist before loading.
     @override
     def set_up_planner(
         self,
@@ -46,6 +69,11 @@ class EmptyStateDictLoadPlanner(dist_cp.default_planner.DefaultLoadPlanner):
         metadata: dist_cp.metadata.Metadata | None = None,
         is_coordinator: bool = False,
     ) -> None:
+        # [FUNCTION DOC] HELPER: For each entry in the metadata (skipping keys containing
+        # "optimizer"), prints a found message; tensor entries become uninitialized CPU tensors of
+        # the recorded size and dtype, other entries are stored as-is; then calls the parent setup.
+        # Mutates the given state dict. The metadata argument is required in practice despite its
+        # none default.
         for k, v in metadata.state_dict_metadata.items():
             if "optimizer" in k:
                 continue
@@ -57,11 +85,16 @@ class EmptyStateDictLoadPlanner(dist_cp.default_planner.DefaultLoadPlanner):
 
 
 def _detect_model_dir(input_dir: str) -> str:
+    # [FUNCTION DOC] HELPER: Returns the model subdirectory of the input if it exists, else the
+    # input directory itself.
     model_dir = os.path.join(input_dir, "model")
     return model_dir if os.path.isdir(model_dir) else input_dir
 
 
 def _load_fsdp_state_dict(input_dir: str) -> dict[str, torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Loads the whole checkpoint into a new mapping on CPU using the
+    # tolerant reader and the metadata-driven planner, without a distributed group (private
+    # torch loader API). Returns the mapping from key to tensor (may include non-tensor values).
     state_dict: dict[str, torch.Tensor] = {}
     dist_cp.state_dict_loader._load_state_dict(
         state_dict,
@@ -73,6 +106,9 @@ def _load_fsdp_state_dict(input_dir: str) -> dict[str, torch.Tensor]:
 
 
 def _get_candidate_prefixes(keys: list[str]) -> list[str]:
+    # [FUNCTION DOC] HELPER: From the fixed ordered list (model_state.model., model_state.,
+    # model., module., empty), returns those that at least one key starts with, in that order;
+    # the empty prefix is always included.
     predefined = [
         "model_state.model.",
         "model_state.",
@@ -94,6 +130,11 @@ def _get_candidate_prefixes(keys: list[str]) -> list[str]:
 
 
 def _strip_best_prefix(keys: list[str], target_keys: set[str]) -> tuple[str, int]:
+    # [FUNCTION DOC] HELPER: For each candidate prefix, strips it from all keys and counts overlap
+    # with the target key set; returns (prefix, count) for the strictly best count (ties keep the
+    # earliest candidate in order).
+    # KNOWN ISSUE: keys lacking the prefix are left unchanged but still counted, and the later
+    # conversion strips the prefix from every key the same way.
     best_prefix = ""
     best_match = -1
 
@@ -112,6 +153,11 @@ def _convert_fsdp_to_hf(
     input_dir: str,
     output_dir: str,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Core conversion (see module doc). Loads and times the checkpoint,
+    # keeps only tensor values, builds a model from the original config with random weights,
+    # picks and prints the best prefix and match count, strips the prefix, raises a value error
+    # if no tensors were found, loads non-strictly and prints missing and unexpected keys, then
+    # creates the output directory and saves safetensors. Does not copy assets.
     print(f"loading FSDP model from {input_dir}")
     t = time.time()
     state_dict = _load_fsdp_state_dict(input_dir)
@@ -145,6 +191,9 @@ def _convert_fsdp_to_hf(
 
 
 def copy_assets(origin_hf_dir: str, output_dir: str) -> None:
+    # [FUNCTION DOC] Copies every regular file of the original directory into the output
+    # directory except safetensors weight files and the safetensors index; subdirectories are
+    # skipped with a message. Prints each copy; overwrites existing files.
     for filename in os.listdir(origin_hf_dir):
         if filename == "model.safetensors.index.json" or filename.endswith(".safetensors"):
             continue

@@ -1,3 +1,11 @@
+# [MODULE DOC] Command-line tool converting a DeepSeek-V4 MXFP4-expert checkpoint to blockwise
+# FP8 (details in the module text below). Identifies packed expert weights as tensors with
+# 8-bit signed integer dtype (names must end in ".weight"), their scales being the tensors
+# named with ".scale" in place of ".weight". Processes shard by shard: converts such weights,
+# drops the old scale tensors, stores the new scales under the same ".scale" names (index entry
+# points to the weight's shard), writes the shards and a new index (empty metadata), and a
+# config without the expert dtype entries. Tokenizer, chat template and generation config files
+# are copied with a shell command. Options: model dir, save dir, device (default cuda).
 """
 Convert an official DeepSeek-V4 checkpoint with MXFP4 routed experts to uniform
 blockwise-FP8 (the sgl-project/DeepSeek-V4-*-FP8 layout).
@@ -27,6 +35,14 @@ FP4_TABLE = torch.tensor(
 
 # copied from deepseek-ai/DeepSeek-V4-Flash-0731 inference/convert.py
 def cast_e2m1fn_to_e4m3fn(x: torch.Tensor, scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Converts a packed 4-bit float weight (2-D signed 8-bit, two values per byte,
+    # low nibble first) with per-32-input exponent scales to FP8 e4m3 with per-128 by 128 tile
+    # scales. Asserts dtype/rank, that both output dims are multiples of 128 and the scale shape
+    # (rows by width / 32). Unpacks via the 16-entry value table, groups into 128 by 128 tiles,
+    # sets the tile scale to the maximum of its 32-wide scales divided by 64, and multiplies
+    # each value by the ratio of its own scale to the tile scale (a power of two, so the
+    # conversion is exact within FP8 range). Returns (FP8 weight, float32 tile scales of shape
+    # row tiles by column tiles). Copied from the upstream DeepSeek conversion script.
     assert x.dtype == torch.int8 and x.ndim == 2
     out_dim, in_dim = x.size(0), x.size(1) * 2
     fp8_block_size, fp4_block_size = 128, 32
@@ -50,6 +66,14 @@ def cast_e2m1fn_to_e4m3fn(x: torch.Tensor, scale: torch.Tensor) -> tuple[torch.T
 
 
 def main(model_dir: str, save_dir: str, device: str):
+    # [FUNCTION DOC] Performs the conversion. Creates the output directory; writes the config
+    # with the expert dtype key removed (also inside the quantization section); copies tokenizer,
+    # chat template and generation config files with a shell command (errors suppressed, paths
+    # not quoted). Scans shard headers for 8-bit integer tensors (asserting ".weight" names) to
+    # find expert weights. For each shard, loads it onto the device, converts expert weights
+    # (fetching the scale from another shard if absent from this one), skips old scale tensors
+    # and copies the rest, and saves the shard under the same name. Writes the new index and, at
+    # the end, asserts at least one expert weight was found (after already writing outputs).
     os.makedirs(save_dir, exist_ok=True)
 
     config = json.loads((Path(model_dir) / "config.json").read_text())

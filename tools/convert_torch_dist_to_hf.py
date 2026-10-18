@@ -1,3 +1,14 @@
+# [MODULE DOC] Single-process command-line tool converting a Megatron distributed checkpoint to
+# a Hugging Face safetensors model, without GPUs or a process group. Loads the whole checkpoint
+# on CPU (skipping optimizer entries and state entries), prefixes names with the Megatron module
+# wrapper prefix, expands stacked layer tensors into per-layer tensors and stacked expert tensors
+# into per-expert tensors, optionally strips vocabulary padding, converts to HF names with the
+# shared conversion routines, packs outputs into chunks of at most the chunk size, writes the
+# index first and then the numbered safetensors files, and optionally copies non-weight assets
+# from an original HF directory. Importing this module replaces the global pickle unpickler class
+# with the tolerant one (side effect). Options: model name (or derived from the original HF
+# config class name), input dir, output dir, original HF dir, force, chunk size (default 5 GiB),
+# vocab size.
 import argparse
 import json
 import os
@@ -16,10 +27,16 @@ from miles.utils.hf_utils.config import load_hf_config
 
 
 class UnpicklerWrapper(pickle.Unpickler):
+    # [CLASS DOC] HELPER: Unpickler substituting a placeholder class for classes from modules
+    # starting with megatron or glm, so checkpoint metadata loads without those packages.
     @override
     def find_class(self, mod_name, name):
+        # [FUNCTION DOC] HELPER: Returns the placeholder (accepts any constructor arguments) for
+        # megatron/glm modules, else the normal lookup.
         class DummyClass:
+            # [CLASS DOC] HELPER: Placeholder ignoring all constructor arguments.
             def __init__(self, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: Accepts and ignores all arguments.
                 pass
 
         if mod_name.startswith("megatron") or mod_name.startswith("glm"):
@@ -31,8 +48,13 @@ pickle.Unpickler = UnpicklerWrapper
 
 
 class WrappedStorageReader(dist_cp.FileSystemReader):
+    # [CLASS DOC] HELPER: Filesystem checkpoint reader tolerant of missing Megatron/GLM classes
+    # and of metadata without storage info or planner data.
     @override
     def read_metadata(self):
+        # [FUNCTION DOC] HELPER: Loads the hidden metadata file with the tolerant unpickler;
+        # creates empty storage metadata when absent, sets its load id from the reader, and
+        # replaces missing planner data by an empty mapping. Returns the metadata.
         path = self.fs.concat_path(self.path, ".metadata")
         with self.fs.create_stream(path, "rb") as metadata_file:
             metadata = UnpicklerWrapper(metadata_file).load()
@@ -45,6 +67,8 @@ class WrappedStorageReader(dist_cp.FileSystemReader):
 
 
 class EmptyStateDictLoadPlanner(dist_cp.default_planner.DefaultLoadPlanner):
+    # [CLASS DOC] HELPER: Load planner that creates the destination tensors from checkpoint
+    # metadata, so the whole checkpoint loads into an initially empty mapping.
     @override
     def set_up_planner(
         self,
@@ -52,6 +76,10 @@ class EmptyStateDictLoadPlanner(dist_cp.default_planner.DefaultLoadPlanner):
         metadata: dist_cp.metadata.Metadata | None = None,
         is_coordinator: bool = False,
     ) -> None:
+        # [FUNCTION DOC] HELPER: For every metadata entry whose key contains neither "optimizer"
+        # nor "_state", prints a found message and stores an uninitialized CPU tensor of the
+        # recorded size and dtype (tensor entries) or the metadata value itself (others) in the
+        # state dict; then runs the parent setup. Metadata is required in practice.
         for k, v in metadata.state_dict_metadata.items():
             if "optimizer" in k or "_state" in k:
                 continue
@@ -63,6 +91,11 @@ class EmptyStateDictLoadPlanner(dist_cp.default_planner.DefaultLoadPlanner):
 
 
 def get_expert_param(args, name, param):
+    # [FUNCTION DOC] HELPER: Generator of (name, tensor) pairs. Names without ".experts." pass
+    # through. For an expert tensor whose name lacks a trailing expert index after "weight"
+    # (stacked experts; asserts the first dim equals the configured expert count), yields one
+    # pair per expert: the name with the doubled "experts.experts." collapsed and the expert
+    # index appended, and that expert's slice. Names that already carry the index pass through.
     if ".experts." not in name:
         yield name, param
         return
@@ -80,6 +113,11 @@ def get_expert_param(args, name, param):
 
 
 def get_layer_param(args, name, param):
+    # [FUNCTION DOC] HELPER: Generator of (name, tensor) pairs. Names without ".layers." pass
+    # through. A layers name with no layer index (stacked layers; asserts first dim equals the
+    # configured layer count) is expanded into one entry per layer, with the layer index inserted
+    # after ".layers.", each passed on to the expert expansion. Names with an index go straight
+    # to the expert expansion.
     if ".layers." not in name:
         yield name, param
         return
@@ -97,12 +135,23 @@ def get_layer_param(args, name, param):
 
 
 def get_named_params(args, state_dict):
+    # [FUNCTION DOC] HELPER: Generator over the loaded state dict, prefixing each name with the
+    # doubled module wrapper prefix and yielding the layer- and expert-expanded pairs.
     for name, param in state_dict.items():
         name = f"module.module.{name}"
         yield from get_layer_param(args, name, param)
 
 
 def save_tensors(args, model_name, state_dict, output_dir, chunk_size, vocab_size=None):
+    # [FUNCTION DOC] Converts and writes all tensors. Sets the expert-parallel MoE flag on the
+    # args to false (mutation, needed for compatibility). Creates the output directory. For each
+    # expanded parameter: strips vocabulary padding when a vocab size is given, converts to HF
+    # (name, tensor) pairs, and appends to the current chunk, starting a new chunk when adding
+    # would exceed the chunk size in bytes (an oversized single tensor gets its own chunk; an
+    # empty first chunk can result if the first tensor alone exceeds the chunk size). Writes
+    # the index (total size and weight map to files named model-IIIII-of-NNNNN.safetensors)
+    # before the data files, then saves each file with timing output.
+    # KNOWN ISSUE: the chunk-size help text and an inline comment say 2GB but the default is 5 GiB.
     # for miles update_weight compatible
     args.sglang_enable_ep_moe = False
 
@@ -145,6 +194,9 @@ def save_tensors(args, model_name, state_dict, output_dir, chunk_size, vocab_siz
 
 
 def copy_assets(origin_hf_dir, output_dir):
+    # [FUNCTION DOC] Copies every regular file from the original HF directory to the output
+    # directory except safetensors files and the safetensors index; directories are skipped with
+    # a message. Prints each copy; overwrites.
     for filename in os.listdir(origin_hf_dir):
         if filename == "model.safetensors.index.json" or filename.endswith(".safetensors"):
             continue

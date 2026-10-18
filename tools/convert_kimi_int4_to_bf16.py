@@ -1,3 +1,10 @@
+# [MODULE DOC] Command-line tool dequantizing the routed-expert weights of a Kimi (compressed
+# tensors, 4-bit packed) checkpoint to BF16. Per safetensors file (on GPU), expert projection
+# triples (packed weight, scale, shape) of gate/up/down projections are unpacked and multiplied
+# by group scales to a BF16 weight; everything else is copied; incomplete triples are kept as
+# is. Then tokenizer/config-like files are copied, and a new weight index is built by scanning
+# outputs. Group size comes from the config (default 128). Existing outputs are skipped unless
+# overwrite is given. Needs CUDA.
 """
 Usage:
 ------
@@ -37,6 +44,10 @@ from tqdm import tqdm
 
 
 def _load_config(model_dir: str, config_path: str | None) -> tuple[int, int, int]:
+    # [FUNCTION DOC] HELPER: Reads the config (explicit path or the model directory's), uses the
+    # nested text config if present, and returns (hidden size, MoE intermediate size, group
+    # size); group size comes from the first config group's weight section, default 128. Raises
+    # if the hidden size or MoE intermediate size is missing (conversion of none to integer).
     """Read config.json and return hidden_size, inter_size, and group_size."""
     cfg_path = config_path or os.path.join(model_dir, "config.json")
     with open(cfg_path) as f:
@@ -60,6 +71,11 @@ def _dequantize_tensor(
     weight_shape: torch.Tensor,
     group_size: int,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Unpacks 4-bit values from int32 words to the given 2-D shape (a
+    # tensor or sequence of dimensions), expands the scales by repeating each group-size times
+    # along columns (a 1-D scale gets a column axis first; group size zero or less means use the
+    # scale as-is), reshapes if only the element count matches (else raises a value error),
+    # multiplies in float32 and returns a contiguous bfloat16 tensor.
     """Unpack int32 quantized tensor and multiply with scales to create BF16 tensor."""
     if isinstance(weight_shape, torch.Tensor):
         shape = tuple(int(v) for v in weight_shape.view(-1).tolist())
@@ -87,6 +103,8 @@ def _dequantize_tensor(
 
 
 def _is_quantized_weight_key(key: str) -> bool:
+    # [FUNCTION DOC] HELPER: True for routed expert keys (contains ".mlp.experts.", not a shared
+    # expert) ending in gate/up/down projection followed by packed weight, scale or shape.
     """Check if the key is a quantized MoE expert weight key."""
     if ".mlp.experts." not in key or ".shared_experts." in key:
         return False
@@ -104,6 +122,14 @@ def convert_file(
     group_size: int,
     skip_existing: bool = True,
 ):
+    # [FUNCTION DOC] Converts one file. Returns immediately if skipping and the output exists.
+    # Loads all tensors on the GPU; non-quantized keys are kept; quantized expert keys are
+    # buffered by expert prefix, projection and part. For each projection with all three parts,
+    # dequantizes (packed cast to int32, scale to float32) and stores it under the projection's
+    # ".weight" name; incomplete projections keep their original quantized entries. Moves all to
+    # CPU, creates the output directory and saves. Returns nothing.
+    # KNOWN ISSUE: a buffered projection other than gate/up/down is silently dropped, though the
+    # key filter prevents it.
     """Convert a single safetensors file from quantized format to BF16 (GPU accelerated)."""
     if skip_existing and os.path.exists(output_path):
         return
@@ -158,6 +184,8 @@ def convert_file(
 
 
 def parse_args() -> argparse.Namespace:
+    # [FUNCTION DOC] HELPER: Defines options: model dir (required), output dir (default model dir
+    # plus "_bf16"), specific file names, config path, overwrite flag. Returns the namespace.
     parser = argparse.ArgumentParser(description="Convert GPTQ MoE experts to BF16 weights.")
     parser.add_argument("--model-dir", required=True, help="Directory containing safetensors checkpoints.")
     parser.add_argument(
@@ -185,6 +213,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def main():
+    # [FUNCTION DOC] Entry point. Raises file-not-found if the model directory is missing; reads
+    # the group size; selects target files (given names or all safetensors files sorted), prints
+    # a message and returns if none; converts each existing file (skipping missing paths) with a
+    # progress bar; copies tokenizer files and files ending in json, py, jinja or model (except
+    # the old index) to the output directory; rebuilds the weight index by reading keys of all
+    # output safetensors files; prints a success message.
+    # KNOWN ISSUE: copying fails if the output directory does not exist when no safetensors
+    # file was written; the index lists metadata as empty (no total size).
     args = parse_args()
     model_dir = os.path.abspath(args.model_dir)
     output_dir = os.path.abspath(args.output_dir or f"{model_dir}_bf16")

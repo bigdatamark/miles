@@ -1,3 +1,12 @@
+# [MODULE DOC] Entry script for synchronous (colocated or disaggregated) RL training. Running it
+# parses the command-line arguments and runs the training coroutine under a disposer that
+# cleans up the created components on exit. The coroutine builds the rollout components
+# (inference controller, rollout executor) first because they determine the number of rollouts
+# per epoch, then the actor (and optional critic) training models, optionally starts the API
+# server and mini fault-tolerance controller, syncs initial weights to inference, optionally
+# checks that the transferred weights are equal, and loops over rollouts: generate, optionally
+# offload rollout memory, train (critic first when used), save periodically, hand weights back to
+# inference, evaluate periodically, and optionally exit after a debug number of rollouts.
 import asyncio
 import logging
 import os
@@ -23,6 +32,28 @@ logger = logging.getLogger(__name__)
 
 
 async def train(args, *, disposer: Disposer):
+    # [FUNCTION DOC] The synchronous training driver; runs until all rollouts are done (or the
+    # debug exit). Inputs: parsed arguments and the disposer that receives every created
+    # component for teardown. Raises an assertion error if fully-async mode is on (needs the async
+    # driver), or if the GPU memory-peak mode is set without both offload flags or together with
+    # a critic. Behavior in order: initialize orchestration (the worker manager handle is kept
+    # unused); create rollout components and training models and register them for disposal;
+    # start optional services; push initial weights; optionally compare inference weights against
+    # training (with the quantization-error allowance, selector and skip list from args); when
+    # rollout offload is on, bring the KV cache back; create the evaluation dispatcher (its drain
+    # is registered for disposal); run an eval-only pass if zero rollouts and an eval interval
+    # are set; run a pre-training eval when there are rollouts to do, an eval interval is set and
+    # not skipped (round zero uses the HF checkpoint path; resumed runs evaluate the previous
+    # round). Per rollout round: prepare rollout, fetch data, offload inference memory (GPU
+    # memory-peak mode: KV cache, then onload training, then weights; otherwise CUDA graph memory
+    # plus KV cache and/or weights depending on the offload level string), train critic (offload
+    # after) then actor once past the critic-only steps and pass critic values externally, or
+    # train the actor alone; drop data references; save when an external trigger file exists
+    # (removed after saving) or the periodic rule fires; if more rollouts remain or an eval is due,
+    # move training memory off GPU (and in the memory-peak mode clear memory, offload the
+    # gradient buffer for LoRA rollouts and onload inference weights first), sync weights to
+    # inference and restore KV cache; run eval if due (forced on the last round); stop early once
+    # the debug rollout count since the start is reached.
     assert not args.fully_async, "--fully-async requires the async driver: run train_async.py"
     _worker_manager = init_orchestration_script(args, disposer=disposer)
 
@@ -67,6 +98,8 @@ async def train(args, *, disposer: Disposer):
         await eval_dispatcher.dispatch(0, hf_dir=args.hf_checkpoint)
 
     async def offload_train():
+        # [FUNCTION DOC] HELPER: Does nothing with a critic (critic offload is handled in the
+        # loop). Otherwise offloads the actor if train offload is on, else just clears its memory.
         if args.use_critic:
             return
         if args.offload_train:
@@ -75,9 +108,14 @@ async def train(args, *, disposer: Disposer):
             await actor_model.clear_memory()
 
     async def save(rollout_id, force_sync=False):
+        # [FUNCTION DOC] HELPER: Saves checkpoints for a round. Synchronous saving is forced on
+        # the last round. Saves the actor unless a critic exists and the round is still in the
+        # critic-only phase; saves the critic if present; then saves rollout-side state.
         force_sync = force_sync or rollout_id == args.num_rollout - 1
 
         async def save_training_model(model):
+            # [FUNCTION DOC] HELPER: Onloads the model first if critic and train offload are
+            # both on, saves it, then offloads it again under the same condition.
             if args.use_critic and args.offload_train:
                 await model.onload()
             await model.save_model(rollout_id, force_sync=force_sync)

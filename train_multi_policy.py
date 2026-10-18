@@ -1,3 +1,9 @@
+# [MODULE DOC] Entry script for training several policies (one trainer per model id) that share
+# one rollout executor and inference controller. One policy is the leader, whose configured
+# rollout count defines the run length; followers run until the leader finishes. Save and eval
+# points are synchronized across policies with parking barriers (followers park, the leader
+# acts while all are parked). Multi-policy checkpoint state records the leader id and per-model
+# rollout ids. Running it parses arguments and runs the coroutine under a disposer.
 import asyncio
 import copy
 import itertools
@@ -30,6 +36,17 @@ logger = logging.getLogger(__name__)
 
 
 async def train_multi_policy(args, *, disposer: Disposer) -> None:
+    # [FUNCTION DOC] Top-level driver. Resolves the Megatron configuration, validates the
+    # multi-policy arguments, initializes orchestration (handle unused), defines per-policy metric
+    # groups, creates rollout components and one trainer per model (all registered for disposal),
+    # asserts the restored state is consistent with the leader, starts the API server (mapping
+    # each trainer id to its model's handle) and the optional mini fault-tolerance controller.
+    # For each model in order: syncs initial weights (with start rollout id set to that trainer's
+    # own) and optionally compares inference weights for that model. If eval is enabled, the
+    # leader starts at round zero and eval is not skipped, runs an initial eval. Then creates two
+    # barriers (save, eval) for followers (count = trainers minus one), a run-ended event, a shared
+    # mapping of current rollout ids, and one concurrent task per policy; waits until the first
+    # task completes, cancels the others, and sets the run-ended event on first completion.
     megatron_config = resolve_megatron_config(args)
     validate_multi_policy_args(args, megatron_config=megatron_config)
     _worker_manager = init_orchestration_script(args, disposer=disposer)
@@ -102,6 +119,8 @@ async def train_multi_policy(args, *, disposer: Disposer) -> None:
 
 
 def _startup_args(args, *, trainer: TrainerInfo) -> Namespace:
+    # [FUNCTION DOC] HELPER: Returns a shallow copy of the arguments whose start rollout id is
+    # replaced by the trainer's own (restored) start id; the input is not modified.
     ans = copy.copy(args)
     ans.start_rollout_id = trainer.start_rollout_id
     return ans
@@ -121,6 +140,14 @@ async def _run_policy(
     rollout_ids: dict[str, int],
     num_rollout_per_epoch: int | None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Loop for one policy. The leader iterates from its start id up to the
+    # configured rollout count; followers iterate without bound from their start id and stop when
+    # the run-ended event is set (checked at the top of each round). Per round: record the round
+    # id in the shared mapping, prepare inference and fetch data for this model, train. The leader
+    # then performs a possible global save (all parked); followers park at the save barrier. Every
+    # update-interval rounds the policy syncs its weights to inference. The leader runs eval when
+    # due while all followers are parked at the eval barrier; followers park there. The leader
+    # stops early at the debug rollout count (measured from its own start id).
     model_id = trainer.model_id
 
     rollout_ids_iter = (
@@ -187,6 +214,12 @@ async def _maybe_save_globally(
     rollout_id: int,
     num_rollout_per_epoch: int | None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Leader-only save step. Does nothing unless an external trigger file
+    # exists or the periodic rule says a save is due. Then, with all followers parked, saves every
+    # trainer's model synchronously under that trainer's own current round id, saves rollout
+    # state for the leader's round id, and (if a save path is configured) writes the multi-policy
+    # state (leader model id, copy of all current round ids) there. Afterwards removes the
+    # trigger file if it was the reason.
     external_save = args.save_trigger_sentinel is not None and os.path.exists(args.save_trigger_sentinel)
     if not external_save and not should_run_periodic_action(
         rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout

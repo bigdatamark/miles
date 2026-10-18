@@ -1,3 +1,12 @@
+# [MODULE DOC] Command-line tool (typer) that generates the JSON schema files for the Helm
+# charts from the Python values models. Three outputs, relative to the repo root: the shared
+# infra schema (charts/shared-infra.schema.json), and values.schema.json for the miles-run and
+# miles-workbench charts. Schemas are draft-07: each model's schema is produced with the
+# model library, definitions moved to the draft-07 location, titles and defaults dropped
+# recursively, and optional-or-null alternatives collapsed. Chart roots forbid unknown keys but
+# explicitly allow the helm-injected global section and the library-chart section. With the check
+# flag, nothing is written and the process exits with code 1 if any file differs. Importing
+# prepends the repo root to the module search path (side effect).
 from __future__ import annotations
 
 import json
@@ -52,12 +61,20 @@ app = typer.Typer(add_completion=False)
 def main(
     check: Annotated[bool, typer.Option(help="Fail instead of writing when a file is out of date")] = False,
 ) -> None:
+    # [FUNCTION DOC] Command entry. Renders all schemas and, for each, writes it or (check mode)
+    # reports staleness (every file is processed, none short-circuited, since the list is built
+    # eagerly). Raises a typer exit with code 1 if any file was out of date in check mode.
+    # In write mode the files are updated and the exit code is zero.
     stale = [path for path, content in generated_schemas().items() if not _write(path, content, check=check)]
     if stale:
         raise typer.Exit(code=1)
 
 
 def generated_schemas() -> dict[Path, str]:
+    # [FUNCTION DOC] Returns a mapping from repo-relative path to rendered schema text for the
+    # shared infra schema, the miles-run chart (title "miles-run values", required sections
+    # infra and run) and the miles-workbench chart (title "miles-workbench values", required
+    # section infra).
     return {
         _SHARED_INFRA_PATH: _rendered(_shared_infra_schema()),
         Path("charts/miles-run/values.schema.json"): _rendered(
@@ -70,6 +87,9 @@ def generated_schemas() -> dict[Path, str]:
 
 
 def _write(path: Path, content: str, *, check: bool) -> bool:
+    # [FUNCTION DOC] HELPER: Returns true if the file already has exactly this content. Else, in
+    # check mode prints a stale message and returns false; otherwise overwrites the file (the
+    # directory must exist), prints a wrote message and returns true.
     absolute = REPO_ROOT / path
     if absolute.exists() and absolute.read_text() == content:
         return True
@@ -82,6 +102,9 @@ def _write(path: Path, content: str, *, check: bool) -> bool:
 
 
 def _shared_infra_schema() -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Builds the draft-07 schema for the infra values model, moves its
+    # definitions to the top level, and wraps it as the "infra" property of an object schema with
+    # a title and the shared description. Definitions are emitted only if non-empty.
     schema = _draft_07(InfraValues)
     definitions = schema.pop("definitions", None)
     return {
@@ -95,6 +118,9 @@ def _shared_infra_schema() -> dict[str, Any]:
 
 
 def _chart_schema(values: type[ValuesModel], *, title: str, required: list[str]) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Builds a chart root schema: object, additional properties forbidden,
+    # given required keys, properties being the Helm-provided sections merged with the model's
+    # properties (the model's win on name clash), plus definitions if the model has any.
     schema = _draft_07(values)
     return {
         "$schema": DRAFT_07,
@@ -108,6 +134,10 @@ def _chart_schema(values: type[ValuesModel], *, title: str, required: list[str])
 
 
 def _draft_07(model: type[ValuesModel]) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Gets the model's JSON schema using field aliases and references of
+    # the form "#/definitions/<model>", detaches the definitions section (default-location
+    # key), simplifies the main schema and each definition, and re-attaches definitions under the
+    # draft-07 key when any exist.
     schema = model.model_json_schema(by_alias=True, ref_template="#/definitions/{model}")
     definitions = schema.pop("$defs", None)
     simplified = _simplify(schema)
@@ -120,6 +150,12 @@ _DROPPED_KEYS = frozenset({"title", "default"})
 
 
 def _simplify(schema: Any) -> Any:
+    # [FUNCTION DOC] HELPER: Recursive cleanup. Lists are simplified element-wise; non-mappings
+    # returned as is; for mappings, first collapses an optional-or-null alternative list, then
+    # drops title and default keys and simplifies the values recursively (including property
+    # maps, where a property literally named title or default would also be dropped).
+    # KNOWN ISSUE: the key filter applies at every mapping level, so a property named "title" or
+    # "default" in a properties map is removed from the schema.
     if isinstance(schema, list):
         return [_simplify(entry) for entry in schema]
     if not isinstance(schema, dict):
@@ -130,6 +166,10 @@ def _simplify(schema: Any) -> Any:
 
 
 def _without_null_branch(schema: dict[str, Any]) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: If the schema has an any-of list with a null-type alternative and
+    # exactly one other alternative, returns the schema without the any-of key merged with that
+    # remaining alternative (alternative's keys win). Otherwise returns the schema unchanged
+    # (no list, no null alternative, or several remaining alternatives).
     branches = schema.get("anyOf")
     if not isinstance(branches, list):
         return schema
@@ -141,6 +181,8 @@ def _without_null_branch(schema: dict[str, Any]) -> dict[str, Any]:
 
 
 def _rendered(schema: dict[str, Any]) -> str:
+    # [FUNCTION DOC] HELPER: Serializes the schema as JSON indented by 2 spaces with a trailing
+    # newline (key order preserved).
     return json.dumps(schema, indent=2) + "\n"
 
 
